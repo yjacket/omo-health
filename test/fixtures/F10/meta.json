@@ -1,0 +1,19 @@
+{
+  "clockStart": "2026-09-29T12:25:00.000Z",
+  "clockEnd": "2026-09-29T12:46:00.000Z",
+  "projects": [
+    "projects/qa"
+  ],
+  "config": {
+    "respawn": {
+      "enabled": false
+    }
+  },
+  "sensors": [
+    {
+      "sessionId": "01a0ecd5-1e30-7c72-9467-1bdf4ee5995b",
+      "pid": 41236,
+      "idle": true
+    }
+  ]
+}

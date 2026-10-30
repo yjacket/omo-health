@@ -1,0 +1,56 @@
+{
+  "findings": [
+    {
+      "detector": "D6",
+      "kind": "not-configured-burst",
+      "severity": "crit",
+      "at": [
+        "2026-09-23T15:47:05.230Z",
+        "2026-09-23T15:47:20.000Z"
+      ]
+    },
+    {
+      "detector": "D7",
+      "kind": "settings-broke-provider",
+      "severity": "crit",
+      "at": [
+        "2026-09-23T15:47:05.163Z",
+        "2026-09-23T15:47:35.000Z"
+      ]
+    },
+    {
+      "detector": "D14",
+      "kind": "global-config-write",
+      "subject": {
+        "sessionId": "01a0ce04-e7f2-74a4-bc28-c6b2c98fb442"
+      },
+      "at": [
+        "2026-09-23T15:47:04.855Z",
+        "2026-09-23T15:47:20.000Z"
+      ]
+    },
+    {
+      "detector": "D8",
+      "kind": "stopped-on-errors",
+      "at": [
+        "2026-09-23T15:56:57.893Z",
+        "2026-09-23T15:57:30.000Z"
+      ]
+    }
+  ],
+  "actions": [
+    {
+      "kind": "revert-settings",
+      "at": [
+        "2026-09-23T15:47:05.163Z",
+        "2026-09-23T15:47:35.000Z"
+      ]
+    }
+  ],
+  "forbiddenActions": [
+    "message:nudge",
+    "kill-pids",
+    "release-shell",
+    "detach-server"
+  ]
+}

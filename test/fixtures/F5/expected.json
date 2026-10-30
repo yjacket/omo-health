@@ -1,0 +1,27 @@
+{
+  "findings": [
+    {
+      "detector": "D4",
+      "kind": "cache-storm",
+      "subject": {
+        "sessionId": "01a0ca81-9d42-7905-b519-718d4bb21306"
+      },
+      "at": [
+        "2026-09-23T08:53:25.897Z",
+        "2026-09-23T08:53:55.897Z"
+      ]
+    }
+  ],
+  "forbiddenActions": [
+    "toast",
+    "kill-pids",
+    "release-shell",
+    "detach-server",
+    "judge"
+  ],
+  "forbiddenFindings": [
+    {
+      "detector": "D15"
+    }
+  ]
+}

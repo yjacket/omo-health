@@ -1,0 +1,63 @@
+{
+  "findings": [
+    {
+      "detector": "D1",
+      "kind": "stall",
+      "cls": "unknown",
+      "subject": {
+        "taskId": "st_01a0ee39",
+        "toolCallId": "toolu_host"
+      }
+    }
+  ],
+  "actions": [
+    {
+      "kind": "analyst-start",
+      "at": [
+        "2026-09-29T19:03:40.000Z",
+        "2026-09-29T19:04:00.000Z"
+      ]
+    },
+    {
+      "kind": "release-shell",
+      "targets": [
+        72000,
+        72010
+      ],
+      "at": [
+        "2026-09-29T19:04:00.000Z",
+        "2026-09-29T19:05:00.000Z"
+      ]
+    },
+    {
+      "kind": "message:relay",
+      "at": [
+        "2026-09-29T19:04:00.000Z",
+        "2026-09-29T19:06:00.000Z"
+      ]
+    }
+  ],
+  "forbiddenActions": [
+    "kill-pids",
+    "detach-server",
+    "message:relay-cancel"
+  ],
+  "investigations": [
+    {
+      "status": "advised",
+      "cls": "unknown",
+      "trigger": "stall"
+    }
+  ],
+  "decisions": [
+    {
+      "event": "investigation",
+      "status": "verdict"
+    },
+    {
+      "event": "investigation",
+      "status": "released"
+    }
+  ],
+  "messages": 1
+}

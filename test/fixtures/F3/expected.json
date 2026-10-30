@@ -1,0 +1,31 @@
+{
+  "findings": [
+    {
+      "detector": "D1",
+      "kind": "stall",
+      "subject": {
+        "taskId": "st_01a0ced9",
+        "toolCallId": "toolu_014cNEwBTgfc3kvMXqxwArLW"
+      },
+      "at": [
+        "2026-09-23T15:38:04.900Z",
+        "2026-09-23T15:47:25.000Z"
+      ]
+    }
+  ],
+  "actions": [
+    {
+      "kind": "kill-pids",
+      "targets": [
+        55000
+      ],
+      "at": [
+        "2026-09-23T15:38:04.900Z",
+        "2026-09-23T15:47:25.000Z"
+      ]
+    }
+  ],
+  "forbiddenActions": [
+    "detach-server"
+  ]
+}

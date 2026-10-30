@@ -1,0 +1,21 @@
+{
+  "findings": [
+    {
+      "detector": "D15",
+      "kind": "drift",
+      "cls": "churn",
+      "subject": {
+        "sessionId": "01a09716-f93f-7c11-829f-d94f423bec60"
+      },
+      "at": [
+        "2026-09-13T04:44:07.000Z",
+        "2026-09-13T04:44:30.000Z"
+      ]
+    }
+  ],
+  "forbiddenActions": [
+    "kill-pids",
+    "release-shell",
+    "detach-server"
+  ]
+}

@@ -1,0 +1,7 @@
+node_modules/
+.omc/
+.claude/
+*.log
+!test/fixtures/**/*.log
+# agent run data (plans, evidence, ledgers) stays local; nested test fixture .omo dirs are tracked
+/.omo/

@@ -1,0 +1,28 @@
+{
+  "findings": [
+    {
+      "detector": "D1",
+      "kind": "stall",
+      "cls": "bounded",
+      "subject": {
+        "taskId": "st_01a0ceff",
+        "toolCallId": "toolu_01Jj8ma5MghuVXVTg8AwGb9b"
+      }
+    }
+  ],
+  "forbiddenActions": [
+    "kill-pids",
+    "release-shell",
+    "detach-server",
+    "judge"
+  ],
+  "forbiddenFindings": [
+    {
+      "severity": "crit"
+    },
+    {
+      "severity": "warn",
+      "detector": "D1"
+    }
+  ]
+}

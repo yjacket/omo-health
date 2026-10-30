@@ -1,0 +1,18 @@
+{
+  "forbiddenActions": [
+    "kill-pids",
+    "release-shell",
+    "detach-server",
+    "judge",
+    "message:relay-cancel"
+  ],
+  "forbiddenFindings": [
+    {
+      "detector": "D1",
+      "kind": "stall"
+    },
+    {
+      "severity": "crit"
+    }
+  ]
+}

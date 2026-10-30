@@ -1,0 +1,32 @@
+{
+  "findings": [
+    {
+      "detector": "D1",
+      "kind": "stall",
+      "cls": "human-wait",
+      "severity": "info",
+      "subject": {
+        "toolCallId": "toolu_01CishEwXy1FDX3sVg3WVsY1"
+      },
+      "at": [
+        "2026-09-23T17:46:07.650Z",
+        "2026-09-23T17:47:00.000Z"
+      ]
+    }
+  ],
+  "forbiddenActions": [
+    "kill-pids",
+    "release-shell",
+    "detach-server",
+    "judge"
+  ],
+  "forbiddenFindings": [
+    {
+      "severity": "crit"
+    },
+    {
+      "severity": "warn",
+      "detector": "D1"
+    }
+  ]
+}

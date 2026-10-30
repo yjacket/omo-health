@@ -1,0 +1,40 @@
+{
+  "task_id": "st_01a0cf10",
+  "status": "running",
+  "residency_state": "resident",
+  "parent_session_id": "01a0cf00-tfdl-7bbb-8ccc-000000000000",
+  "root_session_id": "01a0cf00-tfdl-7bbb-8ccc-000000000000",
+  "depth": 1,
+  "execution_mode": "in-process",
+  "model": "anthropic-subscription/claude-opus-5-5",
+  "notify_on_terminal": true,
+  "created_at": "2026-09-28T00:10:00.000Z",
+  "updated_at": "2026-09-28T00:10:00.100Z",
+  "started_at": "2026-09-28T00:10:00.100Z",
+  "name": "st_01a0cf10",
+  "task_summary": "omo-health qghfl kdqhsgaz xyllt",
+  "category": "unspecified-high",
+  "requested_model": {
+    "provider": "anthropic",
+    "model_id": "claude-opus-5-5",
+    "display": "anthropic/claude-opus-5-5",
+    "source": "category",
+    "variant": "max"
+  },
+  "resolved_model": {
+    "provider": "anthropic-subscription",
+    "model_id": "claude-opus-5-5",
+    "display": "Claude Opus 5.5",
+    "source": "category",
+    "variant": "max"
+  },
+  "spawn_spec": {
+    "version": 1,
+    "cwd": "__FIXTURE__/projects/proj-b"
+  },
+  "child_session_id": "01a0cf10-tfdl-7bbb-8ccc-000000000001",
+  "task_seq": 0,
+  "config_generation": 0,
+  "background_mode": "background",
+  "host_pid": 48212
+}

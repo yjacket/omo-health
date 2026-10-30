@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="ko">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<meta name="color-scheme" content="light dark" />
+		<meta name="description" content="omo-health 로컬 대시보드: 세션 현황, 세션 기록, 감시기 관리" />
+		<meta name="referrer" content="no-referrer" />
+		<title>omo-health</title>
+		<link rel="stylesheet" href="/app.css" />
+		<script src="/app.js" defer></script>
+	</head>
+	<body>
+		<div class="page">
+			<header class="masthead">
+				<div class="masthead__id">
+					<p class="mark-row"><span class="mark" id="mark"></span><span class="wordmark">omo-health</span></p>
+					<p class="meta" id="masthead-meta"></p>
+				</div>
+				<div class="masthead__state" id="state-region" role="status" aria-live="polite">
+					<p class="state" id="state"></p>
+					<p class="state__sub" id="state-sub"></p>
+				</div>
+			</header>
+
+			<main class="main">
+				<nav class="tabs" role="tablist" aria-label="대시보드 보기">
+					<button type="button" class="tab" role="tab" id="tab-sessions" data-tab="sessions" aria-selected="true" aria-controls="panel-sessions">세션 현황</button>
+					<button type="button" class="tab" role="tab" id="tab-ended" data-tab="ended" aria-selected="false" aria-controls="panel-ended" tabindex="-1">세션 기록</button>
+					<button type="button" class="tab" role="tab" id="tab-admin" data-tab="admin" aria-selected="false" aria-controls="panel-admin" tabindex="-1">관리</button>
+				</nav>
+
+				<div class="panel" id="panel-sessions" role="tabpanel" aria-labelledby="tab-sessions" data-panel="sessions">
+					<section id="board" aria-label="실행 중인 세션" hidden>
+						<div class="board" id="board-body"></div>
+					</section>
+				</div>
+
+				<div class="panel" id="panel-ended" role="tabpanel" aria-labelledby="tab-ended" data-panel="ended" hidden>
+					<section id="ended" aria-label="끝난 세션" hidden>
+						<div class="ended" id="ended-body"></div>
+					</section>
+				</div>
+
+				<div class="panel" id="panel-admin" role="tabpanel" aria-labelledby="tab-admin" data-panel="admin" hidden>
+					<div class="sections">
+						<section class="card" id="now" hidden>
+							<h2 class="card__title">지금</h2>
+							<div class="card__body" id="now-body"></div>
+						</section>
+
+						<section class="card" id="controls" hidden>
+							<h2 class="card__title">제어</h2>
+							<div class="card__body" id="controls-body"></div>
+						</section>
+
+						<section class="card" id="diagnose" hidden>
+							<h2 class="card__title">작업 진단</h2>
+							<div class="card__body" id="diagnose-body"></div>
+						</section>
+
+						<section class="card" id="investigations" hidden>
+							<h2 class="card__title">조사 목록</h2>
+							<div class="card__body" id="investigations-body"></div>
+						</section>
+
+						<section class="card" id="history" hidden>
+							<h2 class="card__title">최근 7일</h2>
+							<div class="card__body" id="history-body"></div>
+						</section>
+
+						<section class="card" id="settings" hidden>
+							<h2 class="card__title">설정</h2>
+							<div class="card__body" id="settings-body"></div>
+						</section>
+					</div>
+				</div>
+
+				<noscript>
+					<p class="note note--warn">이 페이지는 자바스크립트로 그립니다. 브라우저에서 자바스크립트를 켜고 다시 여세요.</p>
+				</noscript>
+			</main>
+		</div>
+	</body>
+</html>

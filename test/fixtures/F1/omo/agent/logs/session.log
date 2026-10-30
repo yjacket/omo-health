@@ -1,0 +1,40 @@
+{"ts":"2026-09-23T15:46:55.274Z","level":"info","event":"claude_sdk_oauth_session_continuity","kind":"delta","reason":"prefix_matched","count":2}
+{"ts":"2026-09-23T15:46:57.078Z","level":"info","event":"claude_sdk_oauth_session_continuity","kind":"delta","reason":"prefix_matched","count":1}
+{"ts":"2026-09-23T15:46:57.224Z","level":"info","event":"claude_sdk_oauth_session_continuity","kind":"delta","reason":"prefix_matched","count":1}
+{"ts":"2026-09-23T15:47:00.594Z","level":"info","event":"claude_sdk_oauth_session_continuity","kind":"delta","reason":"prefix_matched","count":2}
+{"ts":"2026-09-23T15:47:04.839Z","level":"info","event":"claude_sdk_oauth_session_continuity","kind":"delta","reason":"prefix_matched","count":1}
+{"ts":"2026-09-23T15:47:05.204Z","level":"info","event":"claude_sdk_oauth_session_continuity","kind":"delta","reason":"prefix_matched","count":1}
+{"ts":"2026-09-23T15:47:05.230Z","level":"warn","event":"provider_error","kind":"error","error":"Provider is not configured: anthropic-subscription"}
+{"ts":"2026-09-23T15:47:05.232Z","level":"warn","event":"provider_error","kind":"error","error":"Provider is not configured: anthropic-subscription"}
+{"ts":"2026-09-23T15:47:05.263Z","level":"info","event":"claude_sdk_oauth_session_close","reason":"jcyzr"}
+{"ts":"2026-09-23T15:47:05.934Z","level":"warn","event":"provider_error","kind":"error","error":"Provider is not configured: anthropic-subscription"}
+{"ts":"2026-09-23T15:47:06.027Z","level":"info","event":"claude_sdk_oauth_session_close","reason":"jcyzr"}
+{"ts":"2026-09-23T15:47:06.591Z","level":"warn","event":"provider_error","kind":"error","error":"Provider is not configured: anthropic-subscription"}
+{"ts":"2026-09-23T15:47:12.485Z","level":"warn","event":"provider_error","kind":"error","error":"Provider is not configured: anthropic-subscription"}
+{"ts":"2026-09-23T15:47:12.763Z","level":"warn","event":"provider_error","kind":"error","error":"Provider is not configured: anthropic-subscription"}
+{"ts":"2026-09-23T15:47:12.826Z","level":"warn","event":"provider_error","kind":"error","error":"Provider is not configured: anthropic-subscription"}
+{"ts":"2026-09-23T15:47:13.194Z","level":"warn","event":"provider_error","kind":"error","error":"Provider is not configured: anthropic-subscription"}
+{"ts":"2026-09-23T15:47:13.675Z","level":"warn","event":"provider_error","kind":"error","error":"Provider is not configured: anthropic-subscription"}
+{"ts":"2026-09-23T15:47:14.155Z","level":"warn","event":"provider_error","kind":"error","error":"Provider is not configured: anthropic-subscription"}
+{"ts":"2026-09-23T15:47:14.646Z","level":"warn","event":"provider_error","kind":"error","error":"Provider is not configured: anthropic-subscription"}
+{"ts":"2026-09-23T15:47:15.155Z","level":"warn","event":"provider_error","kind":"error","error":"Provider is not configured: anthropic-subscription"}
+{"ts":"2026-09-23T15:48:32.199Z","level":"info","event":"claude_sdk_oauth_session_close","reason":"idle_ttl"}
+{"ts":"2026-09-23T15:53:40.360Z","level":"warn","event":"provider_error","kind":"error","error":"Provider is not configured: anthropic-subscription"}
+{"ts":"2026-09-23T15:54:08.012Z","level":"info","event":"claude_sdk_oauth_session_close","reason":"idle_ttl"}
+{"ts":"2026-09-23T15:54:17.655Z","level":"debug","event":"queue_enqueue","mode":"steer","count":1}
+{"ts":"2026-09-23T15:54:45.603Z","level":"info","event":"claude_sdk_oauth_session_close","reason":"idle_ttl"}
+{"ts":"2026-09-23T15:55:47.957Z","level":"warn","event":"provider_error","kind":"error","error":"Jlknv error: The usage limit has been eaqcubx"}
+{"ts":"2026-09-23T15:55:50.706Z","level":"info","event":"claude_sdk_oauth_session_close","reason":"jcyzr"}
+{"ts":"2026-09-23T15:55:50.708Z","level":"info","event":"claude_sdk_oauth_session_continuity","kind":"flatten","reason":"query_failed"}
+{"ts":"2026-09-23T15:55:54.661Z","level":"warn","event":"provider_error","kind":"error","error":"Jlknv error: The usage limit has been eaqcubx"}
+{"ts":"2026-09-23T15:56:00.820Z","level":"info","event":"claude_sdk_oauth_session_close","reason":"idle_ttl"}
+{"ts":"2026-09-23T15:56:21.006Z","level":"info","event":"claude_sdk_oauth_session_continuity","kind":"bootstrap","reason":"registry_miss","count":1}
+{"ts":"2026-09-23T15:56:23.754Z","level":"info","event":"claude_sdk_oauth_session_continuity","kind":"delta","reason":"prefix_matched","count":1}
+{"ts":"2026-09-23T15:56:34.018Z","level":"info","event":"claude_sdk_oauth_session_continuity","kind":"delta","reason":"prefix_matched","count":1}
+{"ts":"2026-09-23T15:56:57.868Z","level":"info","event":"claude_sdk_oauth_session_continuity","kind":"fork","reason":"jcyzr","count":6}
+{"ts":"2026-09-23T15:56:59.263Z","level":"warn","event":"provider_error","kind":"error","error":"Jlknv error: The usage limit has been eaqcubx"}
+{"ts":"2026-09-23T15:57:05.337Z","level":"info","event":"claude_sdk_oauth_session_continuity","kind":"delta","reason":"prefix_matched","count":1}
+{"ts":"2026-09-23T15:57:09.666Z","level":"info","event":"claude_sdk_oauth_session_continuity","kind":"bootstrap","reason":"registry_miss","count":1}
+{"ts":"2026-09-23T15:57:12.498Z","level":"info","event":"claude_sdk_oauth_session_continuity","kind":"delta","reason":"prefix_matched","count":1}
+{"ts":"2026-09-23T15:57:23.385Z","level":"info","event":"claude_sdk_oauth_session_continuity","kind":"delta","reason":"prefix_matched","count":1}
+{"ts":"2026-09-23T15:57:24.334Z","level":"info","event":"claude_sdk_oauth_session_continuity","kind":"delta","reason":"prefix_matched","count":1}

@@ -1,0 +1,26 @@
+{
+  "task_id": "st_01a0ed19",
+  "status": "running",
+  "residency_state": "resident",
+  "parent_session_id": "01a0ecd5-1e30-7c72-9467-1bdf4ee5995b",
+  "root_session_id": "01a0ecd5-1e30-7c72-9467-1bdf4ee5995b",
+  "depth": 1,
+  "execution_mode": "in-process",
+  "model": "anthropic-subscription/claude-opus-5-5",
+  "notify_on_terminal": true,
+  "created_at": "2026-09-29T12:18:02.410Z",
+  "updated_at": "2026-09-29T12:18:02.420Z",
+  "started_at": "2026-09-29T12:18:02.420Z",
+  "name": "t11-qa",
+  "task_summary": "W5 t11-qa: gqacoyd QA of the app on :8082",
+  "category": "unspecified-high",
+  "spawn_spec": {
+    "version": 1,
+    "cwd": "__FIXTURE__/projects/qa"
+  },
+  "host_pid": 41236,
+  "child_session_id": "01a0ed19-4ea1-7c3c-925b-4971d4dd8ff9",
+  "task_seq": 11,
+  "config_generation": 0,
+  "background_mode": "background"
+}

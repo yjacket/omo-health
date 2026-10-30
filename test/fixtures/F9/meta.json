@@ -1,0 +1,16 @@
+{
+  "clockStart": "2026-09-29T10:30:00.000Z",
+  "clockEnd": "2026-09-29T12:30:00.000Z",
+  "tickMs": 60000,
+  "projects": [
+    "projects/proj"
+  ],
+  "sensors": [
+    {
+      "sessionId": "01a0d700-0007-7000-8000-000000000007",
+      "pid": 31000,
+      "idle": false,
+      "sensorVersion": "0.3.2"
+    }
+  ]
+}

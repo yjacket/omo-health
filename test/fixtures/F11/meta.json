@@ -1,0 +1,29 @@
+{
+  "clockStart": "2026-09-29T12:48:30.000Z",
+  "clockEnd": "2026-09-29T13:20:00.000Z",
+  "projects": [
+    "projects/qa"
+  ],
+  "sensors": [
+    {
+      "sessionId": "01a0ecd5-1e30-7c72-9467-1bdf4ee5995b",
+      "pid": 41236,
+      "idle": true
+    }
+  ],
+  "analyst": {
+    "durationMs": 30000,
+    "result": {
+      "verdict": "stuck",
+      "cause": "blocked-input",
+      "evidence": [
+        "node driver.mjs and its headless Chrome have shown no output for 15 minutes",
+        "the tree uses almost no CPU and writes only IPC bytes"
+      ],
+      "confidence": 0.85,
+      "diagnosis": "The driver waits on an idle headless Chrome and will not return the call.",
+      "mechanism": "node driver.mjs waits on a headless Chrome that never answers, so the bash call holding it never returns",
+      "avoid": "Run the driver with an explicit timeout and close Chrome when the script ends"
+    }
+  }
+}

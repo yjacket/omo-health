@@ -1,0 +1,13 @@
+{
+  "forbiddenActions": [
+    "message:scope-check",
+    "kill-pids",
+    "release-shell",
+    "detach-server"
+  ],
+  "forbiddenFindings": [
+    {
+      "detector": "D15"
+    }
+  ]
+}

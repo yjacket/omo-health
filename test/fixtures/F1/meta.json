@@ -1,0 +1,24 @@
+{
+  "clockStart": "2026-09-23T15:46:50.000Z",
+  "clockEnd": "2026-09-23T15:57:30.000Z",
+  "mtimes": {
+    "omo/agent/settings.json": "2026-09-23T15:00:00.000Z"
+  },
+  "fileWrites": [
+    {
+      "at": "2026-09-23T15:47:05.100Z",
+      "file": "omo/agent/settings.json",
+      "from": "_writes/settings.broken.json"
+    }
+  ],
+  "sensors": [
+    {
+      "sessionId": "01a0ce04-e7f2-74a4-bc28-c6b2c98fb442",
+      "pid": 20132
+    },
+    {
+      "sessionId": "01a0ca8d-ad63-7b58-922c-de67b8ca3d4b",
+      "pid": 40600
+    }
+  ]
+}

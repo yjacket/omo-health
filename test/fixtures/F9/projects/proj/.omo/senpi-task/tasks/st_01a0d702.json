@@ -1,0 +1,27 @@
+{
+  "task_id": "st_01a0d702",
+  "status": "running",
+  "residency_state": "resident",
+  "parent_session_id": "01a0d700-0007-7000-8000-000000000007",
+  "root_session_id": "01a0d700-0007-7000-8000-000000000007",
+  "depth": 1,
+  "execution_mode": "in-process",
+  "model": "anthropic-subscription/claude-opus-5-5",
+  "notify_on_terminal": false,
+  "created_at": "2026-09-29T10:30:00.000Z",
+  "updated_at": "2026-09-29T10:30:00.000Z",
+  "started_at": "2026-09-29T10:30:00.000Z",
+  "name": "st_01a0d702",
+  "task_summary": "Review the tokenizer, part 2",
+  "description": "Review part 2",
+  "category": "unspecified-high",
+  "spawn_spec": {
+    "version": 1,
+    "cwd": "__FIXTURE__/projects/proj"
+  },
+  "host_pid": 31000,
+  "child_session_id": "01a0d702-c000-7000-8000-000000000002",
+  "task_seq": 2,
+  "config_generation": 0,
+  "background_mode": "background"
+}

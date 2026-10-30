@@ -1,0 +1,39 @@
+{
+  "task_id": "st_01a0ccfc",
+  "status": "running",
+  "residency_state": "resident",
+  "parent_session_id": "01a0ca8d-ad63-7b58-922c-de67b8ca3d4b",
+  "root_session_id": "01a0ca8d-ad63-7b58-922c-de67b8ca3d4b",
+  "depth": 1,
+  "execution_mode": "in-process",
+  "model": "anthropic-subscription/claude-opus-5",
+  "notify_on_terminal": true,
+  "created_at": "2026-09-23T06:38:28.366Z",
+  "updated_at": "2026-09-23T11:23:55.929Z",
+  "started_at": "2026-09-23T06:38:28.374Z",
+  "name": "todo5-machine",
+  "task_summary": "todo5: idle-live state machine, udovgr CLI, nlrs-run hpxwc (w1)",
+  "category": "implementer",
+  "requested_model": {
+    "provider": "anthropic-subscription",
+    "model_id": "claude-opus-5:high",
+    "display": "anthropic-subscription/claude-opus-5:high",
+    "source": "category"
+  },
+  "resolved_model": {
+    "provider": "anthropic-subscription",
+    "model_id": "claude-opus-5",
+    "display": "Claude Opus 5",
+    "source": "category",
+    "variant": "high"
+  },
+  "spawn_spec": {
+    "version": 1,
+    "cwd": "__FIXTURE__/projects/proj-b"
+  },
+  "host_pid": 40600,
+  "child_session_id": "01a0ccfc-b41c-7721-9121-f66fa6c54769",
+  "task_seq": 0,
+  "config_generation": 0,
+  "background_mode": "background"
+}

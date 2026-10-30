@@ -1,0 +1,20 @@
+{
+  "findings": [
+    {
+      "detector": "D15",
+      "kind": "drift",
+      "cls": "stuck"
+    }
+  ],
+  "actions": [
+    {
+      "kind": "message:scope-check"
+    }
+  ],
+  "forbiddenActions": [
+    "kill-pids",
+    "release-shell",
+    "detach-server",
+    "toast"
+  ]
+}

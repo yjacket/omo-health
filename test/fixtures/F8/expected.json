@@ -1,0 +1,23 @@
+{
+  "findings": [
+    {
+      "detector": "D15",
+      "kind": "drift",
+      "cls": "stuck",
+      "subject": {
+        "sessionId": "01a0d800-0008-7000-8000-000000000008"
+      }
+    }
+  ],
+  "actions": [
+    {
+      "kind": "message:scope-check"
+    }
+  ],
+  "forbiddenActions": [
+    "kill-pids",
+    "release-shell",
+    "detach-server",
+    "toast"
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "forbiddenActions": [
+    "kill-pids",
+    "release-shell",
+    "detach-server",
+    "judge"
+  ],
+  "forbiddenFindings": [
+    {
+      "severity": "crit"
+    },
+    {
+      "detector": "D1"
+    }
+  ]
+}

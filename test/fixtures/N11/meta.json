@@ -1,0 +1,13 @@
+{
+  "clockStart": "2026-09-29T09:00:00.000Z",
+  "clockEnd": "2026-09-29T13:50:00.000Z",
+  "tickMs": 120000,
+  "sensors": [
+    {
+      "sessionId": "01a0d900-0009-7000-8000-000000000009",
+      "pid": 31000,
+      "idle": false,
+      "sensorVersion": "0.3.2"
+    }
+  ]
+}

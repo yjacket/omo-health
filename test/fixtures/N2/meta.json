@@ -1,0 +1,14 @@
+{
+  "clockStart": "2026-09-23T16:24:50.000Z",
+  "clockEnd": "2026-09-23T16:31:30.000Z",
+  "projects": [
+    "projects/proj-b"
+  ],
+  "sensors": [
+    {
+      "sessionId": "01a0ce04-e7f2-74a4-bc28-c6b2c98fb442",
+      "pid": 48212,
+      "idle": true
+    }
+  ]
+}

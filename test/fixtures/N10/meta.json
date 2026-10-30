@@ -1,0 +1,11 @@
+{
+  "clockStart": "2026-09-28T17:47:35.000Z",
+  "clockEnd": "2026-09-28T17:50:00.000Z",
+  "sensors": [
+    {
+      "sessionId": "01a0cf20-bbbb-7ccc-8ddd-000000000002",
+      "pid": 25872,
+      "idle": true
+    }
+  ]
+}

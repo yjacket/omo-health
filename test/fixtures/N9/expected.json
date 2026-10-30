@@ -1,0 +1,48 @@
+{
+  "findings": [
+    {
+      "detector": "D1",
+      "kind": "stall",
+      "cls": "withheld",
+      "subject": {
+        "taskId": "st_01a0cf10",
+        "toolCallId": "toolu_write_A"
+      }
+    },
+    {
+      "detector": "D1",
+      "kind": "stall",
+      "cls": "bounded",
+      "subject": {
+        "taskId": "st_01a0cf10",
+        "toolCallId": "toolu_bash_A"
+      }
+    }
+  ],
+  "forbiddenActions": [
+    "kill-pids",
+    "release-shell",
+    "detach-server",
+    "judge",
+    "message:relay-cancel"
+  ],
+  "forbiddenFindings": [
+    {
+      "detector": "D1",
+      "kind": "stall",
+      "cls": "inproc"
+    },
+    {
+      "detector": "D1",
+      "kind": "stall",
+      "cls": "unmatched"
+    },
+    {
+      "severity": "crit"
+    },
+    {
+      "severity": "warn",
+      "detector": "D1"
+    }
+  ]
+}

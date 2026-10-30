@@ -1,0 +1,74 @@
+{
+  "findings": [
+    {
+      "detector": "D1",
+      "kind": "stall",
+      "cls": "progressing",
+      "subject": {
+        "taskId": "st_01a0ed19",
+        "toolCallId": "toolu_driver"
+      }
+    },
+    {
+      "detector": "D1",
+      "kind": "stall",
+      "cls": "quiet-hang",
+      "severity": "warn",
+      "subject": {
+        "taskId": "st_01a0ed19",
+        "toolCallId": "toolu_driver"
+      },
+      "at": [
+        "2026-09-29T13:03:43.000Z",
+        "2026-09-29T13:05:00.000Z"
+      ]
+    }
+  ],
+  "actions": [
+    {
+      "kind": "analyst-start",
+      "at": [
+        "2026-09-29T13:03:43.000Z",
+        "2026-09-29T13:05:00.000Z"
+      ]
+    },
+    {
+      "kind": "release-shell",
+      "targets": [
+        70100,
+        70112,
+        84800,
+        84812,
+        84820
+      ],
+      "at": [
+        "2026-09-29T13:04:00.000Z",
+        "2026-09-29T13:06:30.000Z"
+      ]
+    },
+    {
+      "kind": "message:relay",
+      "at": [
+        "2026-09-29T13:05:00.000Z",
+        "2026-09-29T13:09:00.000Z"
+      ]
+    }
+  ],
+  "forbiddenActions": [
+    "kill-pids",
+    "detach-server",
+    "message:relay-cancel"
+  ],
+  "investigations": [
+    {
+      "status": "advised",
+      "cls": "quiet-hang"
+    }
+  ],
+  "decisions": [
+    {
+      "event": "investigation",
+      "status": "released"
+    }
+  ]
+}

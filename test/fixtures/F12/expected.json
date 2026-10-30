@@ -1,0 +1,76 @@
+{
+  "findings": [
+    {
+      "detector": "D1",
+      "kind": "stall",
+      "cls": "progressing",
+      "subject": {
+        "taskId": "st_01a0ee70",
+        "toolCallId": "toolu_py"
+      }
+    },
+    {
+      "detector": "D1",
+      "kind": "stall",
+      "cls": "unknown",
+      "subject": {
+        "taskId": "st_01a0ee70",
+        "toolCallId": "toolu_py"
+      },
+      "at": [
+        "2026-09-29T19:32:30.000Z",
+        "2026-09-29T19:32:45.000Z"
+      ]
+    }
+  ],
+  "actions": [
+    {
+      "kind": "analyst-start",
+      "at": [
+        "2026-09-29T19:32:30.000Z",
+        "2026-09-29T19:32:45.000Z"
+      ]
+    },
+    {
+      "kind": "release-shell",
+      "targets": [
+        71000,
+        71010
+      ],
+      "at": [
+        "2026-09-29T19:33:00.000Z",
+        "2026-09-29T19:34:30.000Z"
+      ]
+    },
+    {
+      "kind": "message:relay",
+      "at": [
+        "2026-09-29T19:33:00.000Z",
+        "2026-09-29T19:35:00.000Z"
+      ]
+    }
+  ],
+  "forbiddenActions": [
+    "kill-pids",
+    "detach-server",
+    "message:relay-cancel"
+  ],
+  "investigations": [
+    {
+      "status": "advised",
+      "cls": "unknown",
+      "trigger": "stall"
+    }
+  ],
+  "decisions": [
+    {
+      "event": "investigation",
+      "status": "verdict"
+    },
+    {
+      "event": "investigation",
+      "status": "released"
+    }
+  ],
+  "messages": 1
+}

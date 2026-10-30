@@ -1,0 +1,29 @@
+{
+  "clockStart": "2026-09-29T18:58:00.000Z",
+  "clockEnd": "2026-09-29T19:08:00.000Z",
+  "projects": [
+    "projects/qa"
+  ],
+  "sensors": [
+    {
+      "sessionId": "01a0ee28-7a10-7c11-8f2d-3b6c0d5e9a41",
+      "pid": 41236,
+      "idle": true
+    }
+  ],
+  "analyst": {
+    "durationMs": 30000,
+    "result": {
+      "verdict": "stuck",
+      "cause": "blocked-input",
+      "evidence": [
+        "node scripts/fake-host.mjs has run in the foreground for 10 minutes",
+        "its tree uses no CPU and writes nothing"
+      ],
+      "confidence": 0.88,
+      "diagnosis": "A fake host started in the foreground never returns the tool call; releasing the call lets the worker continue.",
+      "mechanism": "node scripts/fake-host.mjs was started in the foreground, so the server runs forever and the bash call never returns",
+      "avoid": "Start the fake host in the background (with &) or under a bounded timeout, then poll it"
+    }
+  }
+}

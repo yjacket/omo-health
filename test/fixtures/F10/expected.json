@@ -1,0 +1,31 @@
+{
+  "findings": [
+    {
+      "detector": "D1",
+      "kind": "stall",
+      "cls": "progressing",
+      "subject": {
+        "taskId": "st_01a0ed19",
+        "toolCallId": "toolu_qa1"
+      }
+    }
+  ],
+  "forbiddenActions": [
+    "kill-pids",
+    "detach-server",
+    "release-shell",
+    "analyst-start",
+    "message:relay",
+    "message:relay-cancel"
+  ],
+  "forbiddenFindings": [
+    {
+      "detector": "D17"
+    },
+    {
+      "cls": "respawn-loop"
+    }
+  ],
+  "investigations": [],
+  "messages": 0
+}

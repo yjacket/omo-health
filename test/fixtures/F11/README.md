@@ -1,0 +1,11 @@
+# F11: quiet 77-min wait on an idle headless Chrome (#52 stall 2, st_01a0ed19, 12:48-13:20Z)
+
+Rebuilt from issue #52 and #55 (the session files were not kept): ids are the real ones, paths, pids and byte counts are placeholders.
+- Child transcript: "Syntax-checking and starting the driver.", `node --check driver.mjs` (returns), then `cd C:/dev/qa/t11 && node driver.mjs` at 12:48:43.000Z, which never returns (the parent cancelled the task at 14:06:39Z).
+- `procs.ndjson` (every 20 s): host 41236, the call's bash 70100, `node driver.mjs` 70112 (driver.log "driver ready" at 12:48:55Z, idle afterwards) and the headless Chrome it launched: browser 84800 (`--remote-debugging-port=0`, the real pid), GPU 84812 and renderer 84820. After start-up Chrome uses about 0.15 % CPU and writes 3.3 KB per snapshot (IPC pipes and profile flushes).
+- Assumption: those trickling bytes are why 0.2.18 showed only `헬스 ✓ (관찰 1)` and never asked the judge (#55): R10 reads a tree that writes more than 1 KB per two snapshots as `progressing` and leaves it alone for 60 min.
+
+Expected: `progressing` first. There is no tier-1 recheck any more. Since the tree has shown no sign of life (no transcript event, no output file, no CPU with writes) since the first snapshot at 12:49:00Z, it becomes `quiet-hang` at 13:04:00Z: that is only a suspicion, so the daemon opens an investigation and starts the analyst (no notice to the parent, no clock release). `meta.analyst` answers `stuck` 30 s later: the shell tree is released quietly (investigation `released`, no message). The replay data still lists the tree afterwards, so the ladder reaches its last rung (the release did not unblock the call) and the parent gets the one `relay-cancel`; the investigation then reads `advised`.
+
+2026-10-16: analyst answers carry mechanism and avoid (0.6.0 contract)
+2026-10-16 (0.6.0, analyst-why IS-3/C12/C13): expected.json changed. After the release the parent no longer gets the ladder's `relay-cancel`: the decided `stuck` verdict owes it the one why message instead (a `relay` with `details.why`, cause, mechanism and avoid), and once that went out nothing more is relayed for this fp, so `message:relay-cancel` is now forbidden and `message:relay` expected. The investigation still reads `advised`.
