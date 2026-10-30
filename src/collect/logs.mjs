@@ -7,6 +7,7 @@ export const KNOWN_EVENTS = {
 	"session.log": new Set([
 		"claude_sdk_oauth_session_continuity",
 		"claude_sdk_oauth_session_close",
+		"claude_sdk_oauth_session_auth",
 		"provider_error",
 		"queue_enqueue",
 		"compaction_start",
