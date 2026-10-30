@@ -1,12 +1,12 @@
 # omo-health: health check and care for omo/senpi sessions (design)
 
-> Note (2026-09-29): this is the original design proposal and is kept as written. The current behavior is described in `README.md`. The later plans (autocontinue, selfcare) are kept in the private omo-health-archive repository.
+> Note (2026-09-29): this is the original design proposal and is kept as written. The current behavior is described in `README.md`.
 
 Status: proposal, intended as PR #1 (`docs/design.md`) of a new `omo-health` repository.
 Written 2026-09-24 KST by senpi-task child `st_01a0cf16` from read-only research on this machine. Nothing was modified, killed, steered or filed.
 Times are UTC unless marked KST (UTC+9). "Verified" means read from files, code or the process table during this research. "Inferred" and "unverified" are marked where they apply.
 
-Companion drafts written today by sibling tasks, which this design builds on and does not repeat (kept in the private omo-health-archive repository):
+Companion drafts written today by sibling tasks, which this design builds on and does not repeat (not published):
 - stuck-subagents triage (st_01a0cf15): live triage of the three stuck sessions.
 - subagent stall after a host tool: root cause of the host-tool stall (upstream issue draft, not filed).
 - senpi resident session stale token: the recurring 401 "token revoked" outage (filed as oh-my-openagent#8762 at 15:39:13Z).
@@ -608,7 +608,7 @@ Each fixture directory contains:
 
 ## 11. Control plane (0.3.0)
 
-The operator occasionally wants to see what omo-health did and, now and then, pause it, flip a feature or answer an approval. The control plane serves that without making work for them: nothing points at it, and it exists only while it is open. Its plan and evidence are kept in the private omo-health-archive repository.
+The operator occasionally wants to see what omo-health did and, now and then, pause it, flip a feature or answer an approval. The control plane serves that without making work for them: nothing points at it, and it exists only while it is open.
 
 ### 11.1 Shape
 

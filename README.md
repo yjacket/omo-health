@@ -23,26 +23,26 @@ omo install git:github.com/yjacket/omo-health
 
 감시기는 감시 대상과 같은 권한으로 뜹니다. 윈도우 무결성 수준이 낮은 감시기(로그온 자동 실행)는 관리자 권한 세션의 프로세스를 읽을 수도 끌 수도 없습니다. 관리자 권한으로 뜬 omo 호스트의 센서가 응답 중이면 감시기가 스스로 종료하고, 센서가 감시기를 그 권한으로 다시 띄웁니다. 재기동이 부적절한 권한으로 반복되지 않도록 30분에 한 번만 넘겨줍니다.
 
-**업데이트:** `omo update --extensions`(또는 `omo update git:github.com/yjacket/omo-health`). 1분 안에 새 커밋이 고정 설치되고 감시기가 새 버전으로 바뀝니다. 열려 있는 세션은 쉬는 동안 새 센서로 다시 로드됩니다.
+**업데이트:** `omo update --extensions`로 git으로 설치한 확장을 모두 갱신합니다(이것만: `omo update --extension git:github.com/yjacket/omo-health`). 설치본이 바뀌면 센서가 1분 안에 새 커밋을 `~/.omo-health/app/releases/<버전>-<sha>/`에 고정 설치하고 감시기를 새 버전으로 스스로 다시 띄웁니다. 열려 있는 세션은 쉬는 동안 새 센서로 다시 로드되고, `/reload`나 새 세션에서도 바로 바뀝니다.
 
 **제거:** omo 세션에서 `/health uninstall`(데이터까지 지우려면 `/health uninstall --purge`)을 입력한 다음 `omo remove git:github.com/yjacket/omo-health`를 실행합니다. 제거하면 자동 실행이 지워지고 감시기가 멈추며, 패키지가 남아 있어도 다시 설치하지 않습니다. 다시 켜려면 `/health install`을 입력합니다. `/health uninstall` 없이 `omo remove`만 했다면 감시기가 패키지가 사라진 것을 20분 뒤 알아채고 자동 실행을 지운 뒤 스스로 멈춥니다. 데이터(`~/.omo-health`)는 지우지 않습니다.
 
 **예전 `install`에서 옮기기:** 저장소에서 `node bin/omo-health.mjs install`로 설치했다면 `omo install git:github.com/yjacket/omo-health`만 실행하면 됩니다. 패키지 센서가 고정 설치를 넘겨받고 예전 센서 스텁(`~/.omo/agent/extensions/omo-health-sensor.ts`)을 지운 뒤, 열려 있는 세션을 쉬는 동안 다시 로드합니다. 옮기는 동안 센서가 두 번 로드되지 않습니다.
 
-**개발용:** 저장소를 직접 쓰려면 지금처럼 `node bin/omo-health.mjs install`(HEAD 고정 설치, 커밋하지 않은 변경이 있으면 거부) 또는 `install --dev`(이 폴더를 그대로 실행)를 씁니다. `--dev`로 설치한 동안에는 패키지가 설치를 넘겨받지 않습니다. 저장소에서 제거할 때는 아래 명령을 씁니다.
+**개발 확인용:** 저장소 체크아웃에서 `node bin/omo-health.mjs install`(HEAD 고정 설치, 커밋하지 않은 변경이 있으면 거부)이나 `install --dev`(그 폴더를 그대로 실행)를 쓸 수 있지만, 개발 중 확인할 때만 씁니다. `--dev`로 설치한 동안에는 패키지가 설치를 넘겨받지 않습니다. 확인이 끝나면 `node bin/omo-health.mjs uninstall`로 되돌리고 `omo install git:github.com/yjacket/omo-health`로 다시 설치합니다.
 
 ```powershell
-node C:\dev\omo\omo-health\bin\omo-health.mjs uninstall          # 스텁·자동 실행 제거, 감시기 중지
-node C:\dev\omo\omo-health\bin\omo-health.mjs uninstall --purge  # ~/.omo-health 데이터까지 삭제
+node %USERPROFILE%/.omo-health/app/boot.mjs uninstall          # 스텁·자동 실행 제거, 감시기 중지
+node %USERPROFILE%/.omo-health/app/boot.mjs uninstall --purge  # ~/.omo-health 데이터까지 삭제
 ```
 
 ## 멈추고 끄는 법
 
 ```powershell
-node C:\dev\omo\omo-health\bin\omo-health.mjs pause --minutes 30  # 자동 조치만 30분 멈춤 (감지·알림은 계속)
-node C:\dev\omo\omo-health\bin\omo-health.mjs resume
-node C:\dev\omo\omo-health\bin\omo-health.mjs stop               # 감시기 중지 (센서가 다시 띄우지 않음)
-node C:\dev\omo\omo-health\bin\omo-health.mjs start
+node %USERPROFILE%/.omo-health/app/boot.mjs pause --minutes 30 # 자동 조치만 30분 멈춤 (감지·알림은 계속)
+node %USERPROFILE%/.omo-health/app/boot.mjs resume
+node %USERPROFILE%/.omo-health/app/boot.mjs stop               # 감시기 중지 (센서가 다시 띄우지 않음)
+node %USERPROFILE%/.omo-health/app/boot.mjs start
 ```
 
 대시보드(`/health ui`)에서도 일시정지·재개와 주요 기능 켜고 끄기를 할 수 있습니다. 아래 "대시보드"를 보세요.
@@ -58,7 +58,7 @@ node C:\dev\omo\omo-health\bin\omo-health.mjs start
 | `daemon` | 감시기를 이 창에서 실행 (`--shadow`, `--config <파일>`, `--echo`) |
 | `start` | 감시기를 백그라운드로 실행 |
 | `stop` | 감시기를 멈추고 계속 멈춰 있게 함 |
-| `status` | 감시기, 세션, 최근 사건 보기. `~/.omo-keepwarm/status/_global.json`이 있으면 keepwarm 상태 줄도 보여줌 (`--json`: 에이전트용, `keepwarm` 필드) |
+| `status` | 감시기, 세션, 최근 사건 보기. 예전 omo-keepwarm이 남긴 `~/.omo-keepwarm/status/_global.json`이 있으면 keepwarm 상태 줄도 보여줌 (`--json`: 에이전트용, `keepwarm` 필드) |
 | `pause` | 자동 조치 일시 정지 (`--minutes N`) |
 | `resume` | 자동 조치 재개 |
 | `ui` | 로컬 대시보드를 기본 브라우저로 열고 바로 끝남 (`--no-open`, `--json`, `--idle-minutes N`). 서버는 30분 동안 쓰지 않으면 스스로 닫힘 |
@@ -191,7 +191,7 @@ node %USERPROFILE%/.omo-health/app/boot.mjs diagnose st_01a0ed19 --json   # 에�
 - `tool.monitor` 명령 감시가 끝났거나 그 세션이 꺼졌는데 남은 감시 프로세스를 60초 유예 후 조용히 정리합니다(D16). 판단은 프로세스로만 합니다(실행 셸이 사라졌거나 그 부모인 senpi 호스트가 사라짐). 소유 세션에는 다음 턴에 알림을 한 번 붙입니다(턴을 새로 시작하지 않음). 알림에는 UTC와 KST 시각이 있고, persistent monitor는 senpi가 재시작 때 스스로 다시 실행하므로 다시 등록하지 말라고, 나머지는 필요하면 다시 등록하라고 적습니다. 전달되지 못한 알림은 30분이 지나거나(`withdrawn:expired`), 알림에 적힌 감시가 모두 다른 실행 셸 아래 다시 돌고 있으면(senpi가 복원함, `withdrawn:restored`) 거둬들이고 결정 로그에 남깁니다.
 - 메모리 reflection 실행(D22)이 `final.json`으로 끝났는데 남은 `node`/`bun` 자식 프로세스는 10분 유예 후 조용히 정리합니다. 최근에 생긴 같은 실행 디렉터리의 프로세스는 건드리지 않고, 종료 직전에 pid·생성시각·명령을 다시 확인합니다. 알림은 없고 결정 로그에만 남습니다.
 - omo 호스트가 정상 종료 없이 죽으면(Bun 크래시 등) 기록합니다(D18). 센서 하트비트 파일이 죽은 pid로 남아 있고, 그 하트비트가 호스트와 함께 멈췄다는 증거(감시기가 직전까지 살아 있는 호스트를 봤거나, senpi의 `process-crashes` 생존 표식·크래시 기록 시각이 맞음)가 있어야 크래시로 봅니다. 진행 중인 턴이나 활성 목표(ulw 루프 포함)가 있었으면 같은 herdr 작업공간에 새 탭을 열고 그 탭의 새 셸에서만 `omo --session <세션 id>`를 실행합니다. 원래 pane에는 아무것도 입력하지 않고 진단용으로 그대로 둡니다. 원래 pane이 남아 있고, 셸 프롬프트에 멈춰 있고(포그라운드 프로그램 없음), 작업 폴더가 같을 때만 새 탭을 엽니다. 새 센서가 뜨면 "이전 실행이 크래시로 끊겼고 프로세스 안 서브에이전트는 사라졌으니 작업 트리를 확인하고 이어 가라"는 안내를 한 번 보냅니다. 턴은 새로 시작하지 않습니다(유휴면 `nextTurn`, 이미 목표로 다시 돌고 있으면 `steer`). 진행 중인 턴도 활성 목표도 없던 크래시는 열린 할 일이나 서브에이전트가 남아 있어도 기록만 합니다(목표를 이미 달성한 세션이 종료 중에 죽는 경우). 크래시 뒤 같은 작업 폴더에서 다른 세션이 돌고 있거나 더 늦게 기록된 세션 파일이 있으면 누군가 이어받은 것으로 보고 기록만 합니다. 세션당 시간당 2번(`crashResume.perHour`)까지만 재개하고, 30분 안에 2번 크래시하거나(`crashResume.loopCount`, `crashResume.loopWindowMs`), 새 탭을 열 수 없거나(herdr 밖, pane이 닫히거나 다른 프로그램 실행 중), 3분 안에 새 센서가 뜨지 않으면(`crashResume.startupMs`) 재개를 멈추고 세션과 작업 폴더를 적은 윈도우 알림을 한 번 띄웁니다. 결과를 기록한 뒤 남은 하트비트 파일은 지웁니다. 마지막 하트비트로부터 10분(`crashResume.maxAgeMs`)이 지나서야 처음 발견한 남은 하트비트(설치 직후 쌓여 있던 것 등)는 재개하지 않고 한꺼번에 조용히 정리합니다.
-- omo-limitless가 사용량 한도로 세션을 내리며 남긴 파킹 기록(`~/.omo-health/parks/<세션>.<생성 ms>.park.json`)을 한도 리셋 1분 뒤에 이어받아(D20 `park-resume`, `actions.resume` 스위치) 원래 터미널 앱(Orca면 `orca terminal create`, herdr면 D18과 같은 새 탭)에서 `omo --session <세션 id>`를 다시 띄웁니다. 기록은 `pending` → `claimed` → `launched` → `completed`로 바뀌고 처음 쓴 뒤로는 omo-health만 고칩니다. 완료는 재개된 세션의 확인 파일(`.ack.json`)이나 살아 있는 센서 하트비트로만 판정합니다. `--session <세션 id>` 프로세스가 떠 있으면 시작 중으로 보고 기다리고, 15분 넘게 확인이 없으면 `failed: hung-start`로 한 번 알리며 그 프로세스는 건드리지 않습니다. 청구 뒤 2분, 실행 뒤 5분이 지나도록 확인·하트비트·프로세스가 없으면 다시 `pending`으로 돌리고, 그 전에 omo-health가 열었던 터미널이 빈 채 남아 있으면 그것만 닫습니다. 3번 시도해도 안 되면 `failed: relaunch-exhausted`로 한 번 알립니다. D18과 같은 세션당 시간당 한도(`crashResume.perHour`)에 걸리면 `pending`(`lastError: rate-capped`)으로 기다리며 시도 횟수에 넣지 않습니다. 한 세션에 끝나지 않은 기록이 여러 개면 가장 새 것만 띄우고 나머지는 `superseded`로 둡니다. 터미널을 모르는 기록(`unknown`)은 `failed: no-launcher`로 한 번 알리고, omo-limitless가 직접 띄우는 기록(`self`)은 정리만 합니다. 끝나지 않은 기록이 있는 동안 데몬은 유휴 종료하지 않고 D18은 그 세션을 재개하지 않습니다. 끝난 기록과 확인 파일은 7일 뒤 지웁니다. 데몬은 매 틱 `~/.omo-health/daemon.json`에 `capabilities: ["park-resume"]`를 실어 보내고, omo-limitless는 이 표식이 있을 때만 세션을 내리며 맡길 수 있는 데몬 없는 파킹이 남지 않게 합니다.
+- omo-keepalive(예전 이름 omo-limitless)가 사용량 한도로 세션을 내리며 남긴 파킹 기록(`~/.omo-health/parks/<세션>.<생성 ms>.park.json`)을 한도 리셋 1분 뒤에 이어받아(D20 `park-resume`, `actions.resume` 스위치) 원래 터미널 앱(Orca면 `orca terminal create`, herdr면 D18과 같은 새 탭)에서 `omo --session <세션 id>`를 다시 띄웁니다. 기록은 `pending` → `claimed` → `launched` → `completed`로 바뀌고 처음 쓴 뒤로는 omo-health만 고칩니다. 완료는 재개된 세션의 확인 파일(`.ack.json`)이나 살아 있는 센서 하트비트로만 판정합니다. `--session <세션 id>` 프로세스가 떠 있으면 시작 중으로 보고 기다리고, 15분 넘게 확인이 없으면 `failed: hung-start`로 한 번 알리며 그 프로세스는 건드리지 않습니다. 청구 뒤 2분, 실행 뒤 5분이 지나도록 확인·하트비트·프로세스가 없으면 다시 `pending`으로 돌리고, 그 전에 omo-health가 열었던 터미널이 빈 채 남아 있으면 그것만 닫습니다. 3번 시도해도 안 되면 `failed: relaunch-exhausted`로 한 번 알립니다. D18과 같은 세션당 시간당 한도(`crashResume.perHour`)에 걸리면 `pending`(`lastError: rate-capped`)으로 기다리며 시도 횟수에 넣지 않습니다. 한 세션에 끝나지 않은 기록이 여러 개면 가장 새 것만 띄우고 나머지는 `superseded`로 둡니다. 터미널을 모르는 기록(`unknown`)은 `failed: no-launcher`로 한 번 알리고, omo-limitless가 직접 띄우는 기록(`self`)은 정리만 합니다. 끝나지 않은 기록이 있는 동안 데몬은 유휴 종료하지 않고 D18은 그 세션을 재개하지 않습니다. 끝난 기록과 확인 파일은 7일 뒤 지웁니다. 데몬은 매 틱 `~/.omo-health/daemon.json`에 `capabilities: ["park-resume"]`를 실어 보내고, omo-limitless는 이 표식이 있을 때만 세션을 내리며 맡길 수 있는 데몬 없는 파킹이 남지 않게 합니다.
 - 활성 목표가 있는 메인 세션이 깨어날 거리 없이 멈춰 있으면 그 세션을 깨웁니다(D21 `goal-liveness`, `src/detect/goal-liveness.mjs`). 센서 하트비트의 `wakeSources`(소스별 개수, `terminal-monitors` 포함), `holds`, `goalWait`(목표 이어가기 타이머)를 봅니다. 세션이 유휴인데 남은 깨움 소스가 실제로는 끝났거나, omo-keepalive가 백스톱을 붙잡은 채 세션이 오래 조용하면 사유와 함께 감지합니다. 기본 사유는 네 가지입니다(0.8.0에서 더해진 근거 사유 네 가지는 아래에 따로 적습니다): `leaked-monitor`(끝난 monitor가 소스로 남음), `leaked-task`(끝난 서브에이전트 작업이 남음), `leaked-workflow`(끝난 워크플로가 남음), `silent`(`omo-keepalive` 보류 중인데 세션 이벤트가 없음). 작업과 워크플로 기록은 senpi가 실제로 쓰는 곳(작업 폴더의 `.omo/senpi-task`에 기록이 있으면 그곳, 없으면 `~/.omo/agent/projects/<폴더 이름>-<해시>/senpi-task`)에서 읽고, 그곳이 없거나 기록 하나라도 읽지 못하면 새었다고 보지 않습니다. 끝난 소스는 그 상태가 `graceMs`(120000, 2분) 이어지면 깨우고, `silent`는 마지막 이벤트에서 `livenessMs`(3570000, 약 59.5분)가 지나면 깨웁니다. 깨움은 그 세션 자신의 inbox로 가고(`wake`, `followUp`, 턴 시작, 5분 뒤 만료), 같은 세션은 `minWakeGapMs`(3570000) 안에 다시 깨우지 않습니다. `actions.wake` 스위치를 따르며 프로세스 조치는 하지 않습니다. 이 감지가 켜져 있으면 데몬은 `daemon.json`의 `capabilities`에 `"goal-liveness"`를 싣고, `goalLiveness: { wakeReady, actionScope }`를 매 틱 다시 씁니다. `wakeReady`는 지금 모드, 일시정지, 스위치에서 목표 깨움이 실제로 실행되는지를 뜻하고, `actionScope`는 `config.actionScope`(비었으면 `null`)입니다. omo-keepalive의 백스톱은 이 표식과 그 세션의 새 하트비트(`goalLivenessSchema: 1`)가 모두 있을 때만 senpi의 목표 백스톱 타이머를 붙잡아 둡니다(`omo-keepalive` 보류). omo-health가 세션을 지켜보고 있을 때만 타이머를 미루는 셈입니다. 센서 쪽 변경은 이미 열린 세션에는 그 세션을 다시 시작해야 반영됩니다(`/reload`로는 바뀌지 않습니다). 끄려면 대시보드의 "목표 대기 확인" 스위치를 끄거나 `{"goalLiveness": {"enabled": false}}`로 설정합니다. 그러면 표식이 빠지고 keepalive도 보류하지 않습니다. 0.8.0부터는 세션의 살아 있는 작업(서브에이전트 작업, 워크플로 실행, eval 로그)도 읽습니다. 노드의 작업은 이미 끝났는데 실행에 반영되지 않은 워크플로(`unfolded-workflow`)나 실행할 노드가 하나도 없는 워크플로(`stalled-workflow`)는 2분(`goalLiveness.foldGraceMs`) 뒤 실행, 노드, 작업 id를 적어 깨웁니다. 명령 monitor나 백그라운드 세션의 프로세스 트리 전체가 30분(`goalLiveness.quietMs`) 동안 아무 일도 하지 않으면(`idle-monitor`, `idle-background`, 종류 `goal-wait-idle`) 먼저 분석가에게 묻고, 정상이라 하면 미루며, 늦어도 10분(`goalLiveness.idleWakeHoldMs`) 뒤 깨웁니다. 상시 감시로 띄운 monitor(persistent)는 원래 조용한 것이 정상이라 유휴로 보지 않고 한 시간 기준의 `silent` 확인만 받습니다. 끝난 소스로 깨울 때는 그 작업, 워크플로 실행, monitor와 그 프로세스를 적어 보내고, 작업 기록을 읽지 못하면 진행했다고 보지 않아 예전처럼 한 시간 기준으로 깨웁니다. `silent`는 선언된 작업 소스가 `quietMs` 안에 진척을 보였으면 미룹니다. 사람만 기다리는 대기(ask-user)는 예전처럼 한 시간마다 깨웁니다. 깨움 메시지에는 대기의 근거(실행, 노드, 작업, 프로세스, 멈춘 분)와 분석가의 원리·회피가 들어갑니다.
 - 감시기가 10분(`bootGap.minGapMs`) 넘게 꺼져 있었으면(재부팅, D18이 이어 줄 수 없는 긴 중단) 그 기록을 `~/.omo-health/boot-gaps/`에 남깁니다. 꺼져 있던 동안 끊긴 서브에이전트 작업과 워크플로 실행이 있는 메인 세션이 다시 살아나면 2분(`bootGap.settleMs`) 뒤 그 목록을 담은 안내를 한 번 보냅니다(D23 `work-lost`, `boot-notice`). 재시작 뒤 하루(`bootGap.windowMs`) 안에만 보내고, 같은 중단에 두 번 보내지 않습니다. 살아 있는 omo 호스트가 없어 스스로 끝난 경우는 중단으로 치지 않습니다.
 - 서브에이전트 작업과 워크플로 실행은 senpi가 쓰는 저장소에서 읽습니다. `<cwd>/.omo/senpi-task`에 기록이 있으면 그곳, 없으면 `~/.omo/agent/projects/<이름>-<sha256 12자>/senpi-task`입니다. 서브에이전트 찾기, 세션 기록 채우기(한 번 다시 실행됨), D18이 모두 이 규칙을 씁니다. 그렇게 보이게 된 오래된 기록 중 `sessions.recentMs`보다 오래된 호스트 종료·오류 기록(D8)과 한 시간보다 오래된 느린 턴(D5)은 지금의 문제로 치지 않습니다.
@@ -443,7 +443,7 @@ omo -p --no-session -ne -ns -nc --no-tools --model <모델> --session-id <id> "<
 
 보존: `alignment/`, `status/`, 수신 확인, 빈 `inbox/` 폴더는 7일이 지나면 저절로 지웁니다. `decisions/`, `reports/`, `snapshots/`는 이 정리에서 빠집니다(스냅샷은 위 한도만 따름).
 
-`~/.omo-keepwarm/status/_global.json`은 omo-keepwarm이 쓰는 상태 스냅샷입니다. omo-health는 읽기만 하고, `status`와 `/health`에 한 줄로 보입니다(`staleAfter`가 지났거나 깨졌으면 `keepwarm: unknown`). 위치는 `OMO_KEEPWARM_HOME`으로 바꿀 수 있습니다.
+`~/.omo-keepwarm/status/_global.json`은 더 이상 쓰지 않는 omo-keepwarm(omo-keepalive에 합쳐짐)이 남기던 상태 스냅샷입니다. 파일이 없으면 아무것도 보이지 않습니다. omo-health는 읽기만 하고, `status`와 `/health`에 한 줄로 보입니다(`staleAfter`가 지났거나 깨졌으면 `keepwarm: unknown`). 위치는 `OMO_KEEPWARM_HOME`으로 바꿀 수 있습니다.
 
 ## 알려진 한계
 
@@ -456,8 +456,16 @@ omo -p --no-session -ne -ns -nc --no-tools --model <모델> --session-id <id> "<
 
 ## 개발
 
+외부 의존성은 없습니다(Node 24 ESM). 테스트는 가짜 시계와 주입된 소스를 쓰고, `test/fixtures/`의 실제 사고 재생 픽스처를 실제 엔진으로 돌립니다.
+
+- 변경은 새 worktree의 브랜치에서 하고 PR로 올립니다. 기본 브랜치(`main`)에는 직접 push, 강제 push, 브랜치 삭제가 막혀 있습니다.
+- PR은 `test` 체크(`.github/workflows/test.yml`, windows-latest, Node 24, `npm test`)가 통과해야 머지됩니다.
+- 로컬에서는 저장소 루트에서 실행합니다.
+
 ```powershell
 npm test
 ```
 
-외부 의존성은 없습니다(Node 24 ESM). 테스트는 가짜 시계와 주입된 소스를 쓰고, `test/fixtures/`의 실제 사고 재생 픽스처를 실제 엔진으로 돌립니다.
+- `npm test`는 `test/helpers/tmp-root.mjs`로 임시 루트를 잡아 실제 `~/.omo-health`를 건드리지 않습니다.
+- 실제 감시기를 띄워 보는 확인은 실제 `~/.omo`, 돌고 있는 감시기, HKCU Run 값을 건드리지 않게 따로 합니다. `C:/Windows/Temp/<실행>` 아래 임시 폴더를 `HOME`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`로 잡고, `OMO_HEALTH_HOME`, `OMO_HEALTH_OMO_HOME`, `OMO_HEALTH_CLAUDE_HOME`도 그 아래로 돌립니다. 테스트에서 `install`을 실행하지 않습니다.
+- 공개 저장소이므로 토큰, 내부 호스트 이름, 다른 프로젝트의 비공개 내용, `.omo/` 작업 파일(증거, 스크린샷, 기록)은 커밋하지 않습니다.
