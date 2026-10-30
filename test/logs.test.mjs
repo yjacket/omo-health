@@ -190,7 +190,7 @@ test("senpi circuit breaker events in fallback.log are known by default", () => 
 	assert.deepEqual(stats.unknownCounts, {});
 });
 
-test("senpi 2026.10.x log events (omo 5.1.44-5.1.48) are known by default", () => {
+test("senpi 2026.10.x log events (omo 5.1.44-5.1.51) are known by default", () => {
 	const dir = tmpDir();
 	const write = (file, records) => fs.writeFileSync(path.join(dir, file), records.map(([level, event], i) => line({ ts: `2026-10-28T10:00:${String(i).padStart(2, "0")}Z`, level, event })).join(""));
 	write("session.log", [
@@ -204,6 +204,7 @@ test("senpi 2026.10.x log events (omo 5.1.44-5.1.48) are known by default", () =
 		["warn", "turn_deadline_unsettled"],
 		["info", "model_change"],
 		["info", "request_shape_recovery"],
+		["info", "claude_sdk_oauth_session_auth"],
 	]);
 	write("fallback.log", [["info", "refusal_pin_released"]]);
 	write("config-reload.log", [
