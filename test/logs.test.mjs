@@ -206,7 +206,10 @@ test("senpi 2026.10.x log events (omo 5.1.44-5.1.51) are known by default", () =
 		["info", "request_shape_recovery"],
 		["info", "claude_sdk_oauth_session_auth"],
 	]);
-	write("fallback.log", [["info", "refusal_pin_released"]]);
+	write("fallback.log", [
+		["info", "refusal_pin_released"],
+		["warn", "model_config_error"],
+	]);
 	write("config-reload.log", [
 		["warn", "registration_rejected"],
 		["warn", "reload_loop_stopped"],
