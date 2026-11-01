@@ -226,3 +226,21 @@ test("the journal never contains the refresh token", () => {
 	assert.deepEqual(keysOf(JSON.parse(fs.readFileSync(file, "utf8")).slots["account-1"]), ["basis", "digest", "expires", "loginMs", "recoveryGrant"]);
 	for (const key of keysOf(JSON.parse(fs.readFileSync(file, "utf8")).slots["account-1"])) assert.ok(FIELDS.includes(key), key);
 });
+
+test("environment token slots are not tracked as logins", () => {
+	const state = trackOmoLogins(undefined, [slot(), slot({ name: "env", source: "env", digest: undefined })], BASE);
+	assert.deepEqual(Object.keys(state.slots), ["account-1"]);
+});
+
+test("a failed ledger write keeps the source answering from memory", () => {
+	const dir = tmpDir();
+	const blocker = path.join(dir, "not-a-dir");
+	fs.writeFileSync(blocker, "x");
+	const warnings = [];
+	let now = BASE;
+	const poll = createOmoLoginSource({ file: path.join(blocker, "omo-login.json"), authFile: "unused", clock: { now: () => now }, read: () => [slot()], log: { warn: (event) => warnings.push(event) } });
+	assert.equal(poll().slots[0].loginMs, BASE);
+	now += HOUR;
+	assert.equal(poll().slots[0].loginMs, BASE, "the in-memory ledger survives the failed write");
+	assert.deepEqual(warnings, ["omo_login_write_failed"]);
+});

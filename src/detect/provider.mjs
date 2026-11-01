@@ -9,6 +9,8 @@ import { makeFinding } from "./finding.mjs";
 export const id = "D6";
 
 const LANE_DEFAULT = "anthropic-subscription";
+/** A refresh failure this long before the first blocked error still belongs to that run. */
+const CAUSE_LEAD_MS = 30 * 60_000;
 
 /** Classify a provider error text. */
 export function classifyProviderError(text) {
@@ -192,11 +194,16 @@ function blockedFindings(world, errors, findings) {
 		accounts: accountBlocks.map((a) => ({ name: a.name, blockReason: a.blockReason, blockedUntil: a.blockedUntil })),
 		affectedSessions: affectedSessions(run),
 	};
+	// A refresh failure explains the block only after the last good turn, and only while an account is auth-blocked or
+	// the failure came with this run of blocked errors (an old one must not explain a later quota block).
 	const lastOk = lastOkBefore(world, LANE_DEFAULT, world.now + 1);
+	const authBlocked = accountBlocks.some((a) => a.blockReason === "auth_error");
+	const runFloor = firstMs === undefined ? Infinity : firstMs - CAUSE_LEAD_MS;
+	const causeFloor = Math.max(lastOk ?? -Infinity, authBlocked ? -Infinity : runFloor);
 	let causeEntry;
 	for (const session of world.sessions.values()) {
 		for (const err of session.errors ?? []) {
-			if (!err.cause || !(err.ms > (lastOk ?? -Infinity))) continue;
+			if (!err.cause || !(err.ms > causeFloor)) continue;
 			if (!causeEntry || err.ms >= causeEntry.ms) causeEntry = err;
 		}
 	}

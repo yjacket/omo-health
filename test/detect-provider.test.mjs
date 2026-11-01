@@ -170,3 +170,16 @@ test("2 of 2 accounts blocked -> crit", () => {
 	assert.equal(f.severity, "crit");
 	assert.equal(f.humanNeeded, true);
 });
+
+test("an old refresh failure does not explain a later block of rate-limited accounts; an auth_error block keeps it", () => {
+	const now = T("2026-11-01T10:00:00Z");
+	const old = sessionState({ id: "s1", errors: [{ ms: now - 3 * 86_400_000, text: REAL_REFRESH, cause: "refresh-expired", provider: "anthropic-subscription" }] });
+	const rate = { authBlocks: [{ name: "a", blockReason: "rate_limit" }, { name: "b", blockReason: "rate_limit" }] };
+	const quota = detect(makeWorld({ now, secrets: rate, sessions: [old] })).find((x) => x.kind === "accounts-blocked");
+	assert.equal(quota.titleKo, "Claude 계정이 모두 차단됨 - /login 필요");
+	assert.equal("cause" in quota.data, false);
+	const auth = { authBlocks: [{ name: "a", blockReason: "auth_error" }] };
+	const expired = detect(makeWorld({ now, secrets: auth, sessions: [old] })).find((x) => x.kind === "accounts-blocked");
+	assert.equal(expired.titleKo, "omo 로그인 만료 - /login 필요");
+	assert.equal(expired.data.cause, "refresh-expired");
+});

@@ -260,7 +260,7 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 		dbError = error;
 	}
 	const dbMaintainer = db ? createMaintainer({ db, config, clock, log }) : undefined;
-	const omoLogin = createOmoLoginSource({ file: paths.health.omoLoginFile, authFile: paths.authFile, clock });
+	const omoLogin = createOmoLoginSource({ file: paths.health.omoLoginFile, authFile: paths.authFile, clock, log });
 	const buildEngine = async () => (overrides.createEngine ?? createEngine)({
 		paths,
 		config,

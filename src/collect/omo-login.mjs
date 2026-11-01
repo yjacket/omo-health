@@ -36,7 +36,8 @@ export function trackOmoLogins(prev, slots, nowMs) {
 	if (slots === undefined) return prev;
 	const slotsOut = {};
 	for (const slot of slots) {
-		if (!slot || typeof slot.name !== "string") continue;
+		// Environment tokens (CLAUDE_CODE_OAUTH_TOKEN*) are not logins this machine made.
+		if (!slot || typeof slot.name !== "string" || slot.source === "env") continue;
 		const prevSlot = prev?.slots?.[slot.name];
 		if (!prev?.slots) {
 			slotsOut[slot.name] = recordFrom(slot, nowMs, "first-seen");
@@ -73,7 +74,7 @@ export function omoLoginView(state) {
  * Writes only when the slot records themselves moved, so an idle account never
  * rewrites the file just because time passed.
  */
-export function createOmoLoginSource({ file, authFile, clock, read = readAuthSlots }) {
+export function createOmoLoginSource({ file, authFile, clock, read = readAuthSlots, log }) {
 	let state;
 	let loaded = false;
 	return function readOmoLogin() {
@@ -83,7 +84,14 @@ export function createOmoLoginSource({ file, authFile, clock, read = readAuthSlo
 			state = stored && typeof stored === "object" && stored.v === 1 ? stored : undefined;
 		}
 		const next = trackOmoLogins(state, read(authFile), clock.now());
-		if (JSON.stringify(next?.slots) !== JSON.stringify(state?.slots)) atomicWriteJson(file, next);
+		if (JSON.stringify(next?.slots) !== JSON.stringify(state?.slots)) {
+			// A failed write keeps the ledger in memory: the secrets source must not fail with it (D6 reads the same tick).
+			try {
+				atomicWriteJson(file, next);
+			} catch (error) {
+				log?.warn?.("omo_login_write_failed", { error: error.message });
+			}
+		}
 		state = next;
 		return omoLoginView(state);
 	};
