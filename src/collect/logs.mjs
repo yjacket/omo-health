@@ -71,6 +71,8 @@ export const KNOWN_EVENTS = {
 		"circuit_open_skip",
 		// senpi 2026.10.x, info.
 		"refusal_pin_released",
+		// senpi 2026.10.27-2 (omo 5.1.54), warn: the provider does not serve the configured model; no retry or fallback.
+		"model_config_error",
 	]),
 	"config-reload.log": new Set([
 		"reload_deferred",
