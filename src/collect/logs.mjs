@@ -56,6 +56,11 @@ export const KNOWN_EVENTS = {
 		"turn_deadline_abort_failed",
 		"turn_deadline_unsettled",
 		"goal_continuation_record_write_failed",
+		// senpi 2026.10.31-x (omo 5.1.57): a late agent_settled handler failed after the settle reached clients (warn),
+		// a skill invoked twice in one prompt (debug), and a Claude CLI account profile not saved (info, bookkeeping).
+		"agent_settled_handlers_failed",
+		"skill_expansion_duplicate",
+		"claude_cli_profile_write_failed",
 	]),
 	"fallback.log": new Set([
 		"cooldown_noted",

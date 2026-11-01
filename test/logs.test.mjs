@@ -205,6 +205,9 @@ test("senpi 2026.10.x log events (omo 5.1.44-5.1.51) are known by default", () =
 		["info", "model_change"],
 		["info", "request_shape_recovery"],
 		["info", "claude_sdk_oauth_session_auth"],
+		["warn", "agent_settled_handlers_failed"],
+		["debug", "skill_expansion_duplicate"],
+		["info", "claude_cli_profile_write_failed"],
 	]);
 	write("fallback.log", [
 		["info", "refusal_pin_released"],
