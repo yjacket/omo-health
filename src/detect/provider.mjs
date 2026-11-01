@@ -20,6 +20,14 @@ export function classifyProviderError(text) {
 	return "other";
 }
 
+/** Cause class of a token-refresh failure text, if the text carries one. */
+export function refreshFailureOf(text) {
+	const t = String(text ?? "");
+	if (/refresh token expired/i.test(t)) return "refresh-expired";
+	if (/invalid_grant/i.test(t) && /token refresh|oauth\/token/i.test(t)) return "refresh-rejected";
+	return undefined;
+}
+
 /** Provider named by an error text, if recoverable. */
 export function providerOfError(text) {
 	const t = String(text ?? "");
@@ -148,11 +156,30 @@ function latestBurst(errors, count, windowMs) {
 
 function blockedFindings(world, errors, findings) {
 	const blocked = errors.filter((e) => e.cls === "blocked");
-	const accountBlocks = (world.secrets?.authBlocks ?? []).filter((a) => a && a.blockReason);
+	const allAccounts = world.secrets?.authBlocks ?? [];
+	const accountBlocks = allAccounts.filter((a) => a && a.blockReason);
+	const allBlocked = accountBlocks.length > 0 && accountBlocks.length === allAccounts.filter((a) => a).length;
 	const last = blocked.at(-1);
 	const recoveredAt = last ? laneRecoveredAfter(world, LANE_DEFAULT, last.ms) : undefined;
 	const logActive = last && recoveredAt === undefined;
-	if (!logActive && accountBlocks.length === 0) return undefined;
+	if (!logActive && accountBlocks.length && !allBlocked) {
+		const names = accountBlocks.map((a) => a.name).join(", ");
+		const reasons = [...new Set(accountBlocks.map((a) => a.blockReason))].join(", ");
+		findings.push(
+			makeFinding({
+				detector: id,
+				kind: "account-blocked-partial",
+				severity: "warn",
+				subject: { key: `provider:${LANE_DEFAULT}:partial` },
+				evidence: [`blocked:${accountBlocks.length}`, `accounts:${allAccounts.length}`],
+				titleKo: `Claude 계정 일부 차단: ${names}`,
+				detailKo: `anthropic-subscription 계정 ${allAccounts.length}개 중 ${accountBlocks.length}개(${names})가 차단되었습니다(${reasons}). 나머지 계정으로 계속 동작합니다.`,
+				data: { provider: LANE_DEFAULT, accounts: accountBlocks.map((a) => ({ name: a.name, blockReason: a.blockReason, blockedUntil: a.blockedUntil })) },
+			}),
+		);
+		return undefined;
+	}
+	if (!logActive && !allBlocked) return undefined;
 	// the incident is every blocked error after the last successful lane turn
 	const okBefore = logActive ? lastOkBefore(world, LANE_DEFAULT, last.ms) : undefined;
 	const run = logActive ? blocked.filter((e) => okBefore === undefined || e.ms > okBefore) : [];
@@ -165,6 +192,19 @@ function blockedFindings(world, errors, findings) {
 		accounts: accountBlocks.map((a) => ({ name: a.name, blockReason: a.blockReason, blockedUntil: a.blockedUntil })),
 		affectedSessions: affectedSessions(run),
 	};
+	const lastOk = lastOkBefore(world, LANE_DEFAULT, world.now + 1);
+	let causeEntry;
+	for (const session of world.sessions.values()) {
+		for (const err of session.errors ?? []) {
+			if (!err.cause || !(err.ms > (lastOk ?? -Infinity))) continue;
+			if (!causeEntry || err.ms >= causeEntry.ms) causeEntry = err;
+		}
+	}
+	if (causeEntry) {
+		data.cause = causeEntry.cause;
+		data.causeMs = causeEntry.ms;
+	}
+	const causeDetail = (why) => `omo(anthropic-subscription) 갱신 토큰이 ${why} 모든 계정이 차단되었습니다(오류 ${run.length}건, 차단 계정 ${accountBlocks.length}개). 사람이 /login으로 다시 로그인해야 풀립니다.`;
 	findings.push(
 		makeFinding({
 			detector: id,
@@ -172,9 +212,11 @@ function blockedFindings(world, errors, findings) {
 			severity: "crit",
 			humanNeeded: true,
 			subject: { key: `provider:${LANE_DEFAULT}` },
-			evidence: [`blocked:${run.length}`, `accounts:${accountBlocks.length}`],
-			titleKo: "Claude 계정이 모두 차단됨 - /login 필요",
-			detailKo: `anthropic-subscription 계정이 모두 차단되어 Claude 레인이 멈췄습니다(오류 ${run.length}건, 차단 계정 ${accountBlocks.length}개). 사람이 /login으로 다시 로그인해야 합니다.`,
+			evidence: [`blocked:${run.length}`, `accounts:${accountBlocks.length}`, ...(causeEntry ? [`cause:${causeEntry.cause}`] : [])],
+			titleKo: causeEntry ? "omo 로그인 만료 - /login 필요" : "Claude 계정이 모두 차단됨 - /login 필요",
+			detailKo: causeEntry
+				? causeDetail(causeEntry.cause === "refresh-expired" ? "만료되어(Refresh token expired)" : "거부되어(invalid_grant)")
+				: `anthropic-subscription 계정이 모두 차단되어 Claude 레인이 멈췄습니다(오류 ${run.length}건, 차단 계정 ${accountBlocks.length}개). 사람이 /login으로 다시 로그인해야 합니다.`,
 			data,
 		}),
 	);
