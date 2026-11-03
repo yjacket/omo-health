@@ -49,8 +49,8 @@ const HOUR_MS = 3600_000;
 const FINDING_KEEP_MS = 24 * HOUR_MS;
 const MAX_EVIDENCE = 12;
 const BUDGET_FILE = "analyst-budget.json";
-/** A D6 finding of these kinds means the lane itself is down: starting a job would only fail */
-const PROVIDER_OPEN = /usage-limit|outage|blocked/;
+/** A D6 finding of these kinds means the lane itself is down: starting a job would only fail (a partial block leaves the lane up) */
+const PROVIDER_OPEN = /^(?:usage-limit-storm|outage-human|accounts-blocked)$/;
 
 /** Last JSON object with a `verdict` key in free text (omo -p prints a preamble line before the answer). */
 export function parseAnalystOutput(text) {

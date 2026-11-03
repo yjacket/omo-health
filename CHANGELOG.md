@@ -1,6 +1,10 @@
 # Changelog
 
 ## Unreleased
+- D24 `omo-login-aging` warns when the newest working `anthropic-subscription` login is older than `omoLogin.warnAfterMs` (14 days): the footer reads `👀 재로그인` in every session and one Windows toast appears. A new login is recognized from a new account slot, a token change before a renewal was due, or a blocked or recovery-marked slot coming back clean. The ledger `~/.omo-health/omo-login.json` keeps the account name, expiry, block fields and the sha256 prefix of the refresh token (senpi's `authGrantDigest`), never the token. Environment-token slots are not tracked. A failed ledger write is logged (`omo_login_write_failed`) and the ledger stays in memory. The first observation after install counts as the login time; a re-login onto the same name while the access token had already expired is indistinguishable from a renewal and keeps the warning. (#5)
+- D6 names the cause: when every account is blocked and a session log carries a refresh-token expiry (`Refresh token expired`, `invalid_grant`) after the last good turn, while an account is `auth_error`-blocked or within 30 minutes before the blocked errors began, the title becomes `omo 로그인 만료 - /login 필요` with `data.cause` `refresh-expired` or `refresh-rejected`. The session error keeps its `cause` tag before the text is truncated. A partial block is a warn `account-blocked-partial` (`Claude 계정 일부 차단: <names>`) in `/health` and `status --json` open, with no footer entry and no toast, and it does not stop the analyst. (#5)
+- The footer shows a person-only global warning only when it is at least as severe as the session's own problem. (#5)
+- Replay fixtures describe omo logins as `meta.omoLogin`, replacing the dead `meta.loginExpiry`. (#5)
 
 ## 0.8.0 - 2026-10-20
 - D21 takes over the goal backstop's liveness check while omo-keepalive holds it: an idle goal session is woken once when a wake source is provably finished (`leaked-monitor`, `leaked-task`, `leaked-workflow`, 120 s grace) or silent for `goalLiveness.livenessMs` under the hold. `goalLiveness.enabled` is a dashboard switch.

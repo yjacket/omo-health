@@ -30,3 +30,8 @@ test("an investigation never changes an ok, info or finding-less footer (#56 C8)
 	assert.equal(footerText("info", { detector: "D1", kind: "stall" }, 2, true), "👀 관찰2", "an observation count is not a problem under investigation");
 	assert.equal(footerText("warn", undefined, 0, true), "👀 정상");
 });
+
+test("the footer words for the omo login kinds (issue #5)", () => {
+	assert.equal(footerText("warn", { detector: "D24", kind: "omo-login-aging" }), "👀 재로그인");
+	assert.equal(footerText("crit", { detector: "D6", kind: "accounts-blocked" }), "👀 로그인");
+});

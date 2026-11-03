@@ -74,7 +74,7 @@ export function probeFile(file) {
 
 /** Every detector, in evaluation order (D1 first: it attributes processes for D2/D9). */
 export async function loadDetectors() {
-	const names = ["stall", "runaway", "respawn", "tokens", "tps", "provider", "config", "orphans", "monitor-orphans", "reflection-orphans", "crashes", "parks", "leftovers", "loops", "reload", "self", "offtrack", "align", "goal-liveness", "boot-gap"];
+	const names = ["stall", "runaway", "respawn", "tokens", "tps", "provider", "omo-login", "config", "orphans", "monitor-orphans", "reflection-orphans", "crashes", "parks", "leftovers", "loops", "reload", "self", "offtrack", "align", "goal-liveness", "boot-gap"];
 	const detectors = [];
 	for (const name of names) {
 		try {

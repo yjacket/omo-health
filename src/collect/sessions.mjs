@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { promotedTodo } from "../align/steps.mjs";
 import { redirectTargets } from "../detect/classify.mjs";
+import { refreshFailureOf } from "../detect/provider.mjs";
 import { listDirSafe, statSafe } from "../util/fsx.mjs";
 import { JsonlTail } from "../util/tail.mjs";
 import { redact, sha1, truncate } from "../util/text.mjs";
@@ -308,7 +309,11 @@ export class SessionTracker {
 				tps: durMs && durMs > 0 ? output / (durMs / 1000) : undefined,
 			});
 		}
-		if (m.stopReason === "error") pushCapped(s.errors, { ms, text: truncate(redact(m.errorMessage ?? textOf(content)), 300), provider: m.provider, model: m.model }, 100);
+		if (m.stopReason === "error") {
+			const errorText = m.errorMessage ?? textOf(content);
+			const cause = refreshFailureOf(errorText);
+			pushCapped(s.errors, { ms, text: truncate(redact(errorText), 300), provider: m.provider, model: m.model, ...(cause ? { cause } : {}) }, 100);
+		}
 		calls.forEach((call, index) => {
 			const args = call.arguments ?? {};
 			const activity = s.activity;

@@ -12,6 +12,8 @@ export const FINDING_LABELS = Object.freeze({
 	"tps-collapse": "응답 속도 저하",
 	"hung-turn-child": "서브에이전트 모델 응답 정지",
 	"accounts-blocked": "Claude 계정 모두 차단",
+	"account-blocked-partial": "Claude 계정 일부 차단",
+	"omo-login-aging": "omo 다시 로그인 권장",
 	"not-configured-burst": "공급자 설정 오류 폭발",
 	"usage-limit-storm": "사용량 한도 폭풍",
 	"outage-human": "공급자 장애 지속",

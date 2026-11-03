@@ -25,6 +25,11 @@ test("the analyst budget bounds the wider why routing (8/h, 40/day, 2 per findin
 	assert.deepEqual([DEFAULT_CONFIG.analyst.perHour, DEFAULT_CONFIG.analyst.perDay, DEFAULT_CONFIG.analyst.perFinding], [8, 40, 2]);
 });
 
+test("the omo login ledger lives in the health home", () => {
+	const healthHome = path.join(os.tmpdir(), "omoh-omo-login-path");
+	assert.equal(resolvePaths({ OMO_HEALTH_HOME: healthHome }).health.omoLoginFile, path.join(healthHome, "omo-login.json"));
+});
+
 test("analyst jobs are outside the legacy care jobs directory", () => {
 	const { health, healthHome } = resolvePaths({ HOME: "C:/omo-health-path-test" });
 	assert.equal(health.analystJobsDir, path.join(healthHome, "jobs"));

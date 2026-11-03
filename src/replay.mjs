@@ -133,7 +133,7 @@ export async function runReplay(fixtureDir, { detectors, keep = false } = {}) {
 			logs: new LogCollector({ logsDir: paths.logsDir, full: true }),
 			transcripts: fixtureTranscripts(path.join(dir, "claude")),
 			config: createConfigTracker({ paths, clock: () => clock.now(), config: config.config }),
-			secrets: () => ({ authBlocks: meta.authBlocks ?? [], loginExpiry: meta.loginExpiry }),
+			secrets: () => ({ authBlocks: meta.authBlocks ?? [], omoLogin: meta.omoLogin }),
 			versions: () => meta.versions ?? {},
 			fileProbe: (file) => {
 				try {

@@ -335,10 +335,11 @@ export default function omoHealthSensor(pi, options = {}) {
 		]);
 		if (stopped) return { text: "👀 중지", level: "stopped", session, global, daemon };
 		if (!daemon || now() - (daemon.ts ?? 0) > DAEMON_STALE_MS) return { text: "👀 감시기", level: "crit", session, global, daemon };
-		if ((global?.humanNeeded ?? []).length) return { text: global.text, level: global.level, session, global, daemon };
 		// The more severe of the two wins; a tie goes to the session's own text.
 		const levels = { ok: 0, info: 1, warn: 2, crit: 3 };
 		const rank = (status) => (status ? (levels[status.level] ?? -1) : -2);
+		// A global item needing a human shows only while it is at least as severe as the session's own state.
+		if ((global?.humanNeeded ?? []).length && rank(global) >= rank(session)) return { text: global.text, level: global.level, session, global, daemon };
 		const chosen = rank(session) >= rank(global) ? session : global;
 		return { text: chosen?.text ?? "👀 정상", level: chosen?.level ?? "ok", session, global, daemon };
 	}

@@ -567,3 +567,24 @@ test("collector head fields are redacted before they are cut, so a cut token can
 	// A live tail that starts mid-file reads the first request from the file head.
 	assert.doesNotMatch(new SessionTracker({ file, tailBytes: 400 }).state.firstUserText, /sk-ant-[A-Za-z0-9]/, "head read");
 });
+
+test("the error cause is read from the full text before the 300-char cut", () => {
+	const file = path.join(tmpDir(), "2026_cause.jsonl");
+	const real =
+		'authentication_failed: Anthropic token refresh request failed. url=https://platform.claude.com/v1/oauth/token; details=Error: HTTP request failed. status=400; url=https://platform.claude.com/v1/oauth/token; body={"error":"invalid_grant","error_description":"Refresh token expired"}';
+	const padded = `${'x'.repeat(100)}${real}`;
+	assert.ok(padded.indexOf("Refresh token expired") > 300);
+	writeJsonl(file, [
+		E.header("cause", "C:/p", T0),
+		E.assistant({ ms: T0 + 1000, stopReason: "error", errorMessage: padded }),
+		E.assistant({ ms: T0 + 2000, stopReason: "error", errorMessage: "socket hang up" }),
+	]);
+	const tracker = new SessionTracker({ file });
+	tracker.read();
+	tracker.advance();
+	const errors = tracker.state.errors;
+	assert.equal(errors.length, 2);
+	assert.equal(errors[0].cause, "refresh-expired");
+	assert.ok(errors[0].text.length <= 300);
+	assert.equal(Object.hasOwn(errors[1], "cause"), false);
+});
