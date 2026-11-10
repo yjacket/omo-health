@@ -21,7 +21,9 @@ export function sameDir(a, b) {
 /**
  * The first prompt of a crash-resumed session (#109). Since omo 5.1.48 a session that died mid-run reopens under an
  * interrupted-run hold: extension messages only queue until a person types, while a command-line prompt counts as that
- * input and starts the turn. Older omo starts the turn from it the same way. Plain ASCII so every shell quotes it alike.
+ * input and starts the turn. Older omo starts the turn from it the same way. Since omo 5.1.65 (senpi 2026.11.6-2) a
+ * session that died with an active goal first asks "Resume blocked goal?" in the TUI and runs this prompt only after a
+ * person answers, so D18 reports it as no-turn. Plain ASCII so every shell quotes it alike.
  */
 export const CRASH_RESUME_PROMPT = "[omo-health] Reopened after a host crash. Check the worktree state and continue.";
 

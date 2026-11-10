@@ -227,7 +227,7 @@ function stoppedFindings(world, memory) {
 		// A session left open without a turn must be continued where it is: a second `omo --session` would run it twice.
 		const detailKo =
 			stopped.reason === "no-turn"
-				? `${stopped.cwd} 세션 ${sid}: ${reasonKo}. 새 탭(${stopped.tabId ?? "?"})에서 열린 세션에 입력하거나 /resume 하세요.\n호스트가 비정상 종료되어 omo-health가 세션을 다시 열었지만 새 호스트(pid ${stopped.pid})가 사람 입력을 기다리고 있습니다.`
+				? `${stopped.cwd} 세션 ${sid}: ${reasonKo}. 새 탭(${stopped.tabId ?? "?"})에 "Resume blocked goal?" 창이 떠 있으면 Resume goal을 고르고, 없으면 그 세션에 입력하거나 /resume 하세요.\n호스트가 비정상 종료되어 omo-health가 세션을 다시 열었지만 새 호스트(pid ${stopped.pid})가 사람 확인을 기다리고 있습니다.`
 				: `${stopped.cwd} 세션 ${sid}: ${reasonKo}. 터미널에서 직접 이어 가세요: omo --session ${sid}\n호스트(pid ${stopped.pid})가 비정상 종료되었고 남은 작업이 있지만 omo-health가 자동으로 다시 열지 않았습니다.`;
 		out.push(
 			makeFinding({
