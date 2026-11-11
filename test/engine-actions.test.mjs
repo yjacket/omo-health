@@ -168,13 +168,115 @@ test("a boot notice is delivered once, recorded, and not sent again after a rest
 	assert.equal(restarted.sent.length, 0);
 });
 
-test("a D4 image-load notice goes once to a child's parent with the remedy, plus one owner toast; none below the threshold", async () => {
+test("a long-run review reaches the session and the owner only on a non-normal verdict; an unanswered look sends nothing", async () => {
+	const longRun = () => makeFinding({
+		detector: "D15",
+		kind: "drift",
+		severity: "info",
+		cls: "long-run",
+		subject: { sessionId: "p1", key: "align:p1:long-run:1" },
+		titleKo: "작업 범위 점검: long-run",
+		data: { signal: "long-run", metric: 8, evidence: "'26차 QA' repeated over rounds 19..26 (8 rounds)", goal: "ship the review UI", remedy: { kind: "scope-check" } },
+	});
+	const sensors = () => new Map([["p1", { sessionId: "p1", pid: 1, ts: T0, idle: false, sensorVersion: "0.8.0" }]]);
+	const analyst = { start: () => ({ tier: 1, verdict: "escalate", assessment: "abnormal", confidence: 0.9, mechanism: "each QA round finds new nits and the criteria never close", avoid: "freeze the criteria list and finish the open rows only" }) };
+	const twoTicks = async (h, map) => {
+		await h.engine.tick();
+		// The verdict lands during the first tick; the next one acts on it.
+		h.clock.advance(1000);
+		map.get("p1").ts = h.clock.now();
+		await h.engine.tick();
+	};
+	const spinSensors = sensors();
+	const spinning = harness({ findings: [longRun()], sensors: spinSensors, analyst });
+	await twoTicks(spinning, spinSensors);
+	assert.equal(spinning.sent.length, 1);
+	assert.equal(spinning.sent[0].kind, "scope-check");
+	assert.equal(spinning.toasts.filter((t) => t.tag?.startsWith("long-run-")).length, 1);
+	const quietSensors = sensors();
+	const unanswered = harness({ findings: [longRun()], sensors: quietSensors, analyst: { start: () => ({ failed: true, reason: "timeout" }) } });
+	await twoTicks(unanswered, quietSensors);
+	assert.equal(unanswered.sent.length, 0, "age and repetition alone never nudge");
+	assert.equal(unanswered.toasts.filter((t) => t.tag?.startsWith("long-run-")).length, 0);
+});
+
+test("image steering (tokens.imageSteer steer): a child's parent is woken once to forward the steer, once more at the trim level to split the work", async () => {
 	const MIB = 1024 * 1024;
-	const child = (id, imageBytes) => ({ ...sessionState({ id, kind: "child", taskId: `st_${id}`, parentSessionId: "p1" }), images: 70, imageBytes });
-	const sessions = [sessionState({ id: "p1", kind: "main" }), child("c1", 17 * MIB), child("c2", 15 * MIB)];
+	const c1 = { ...sessionState({ id: "c1", kind: "child", taskId: "st_c1", parentSessionId: "p1" }), images: 40, imageBytes: 17 * MIB };
+	const sessions = [sessionState({ id: "p1", kind: "main" }), c1];
 	const sensors = new Map([["p1", { sessionId: "p1", pid: 1, ts: T0, idle: true, sensorVersion: "0.8.0" }]]);
 	const d4 = (world, memory) => tokens.detect(world, memory).filter((f) => f.kind === "image-load");
-	const h = harness({ findings: d4, detectorName: "tokens", sensors, sessions });
+	const h = harness({ findings: d4, detectorName: "tokens", sensors, sessions, config: { tokens: { ...DEFAULT_CONFIG.tokens, imageSteer: "steer" } } });
+	await h.engine.tick();
+	assert.equal(h.sent.length, 1);
+	const [steer] = h.sent;
+	assert.equal(steer.sessionId, "p1", "a child has no sensor: its parent passes the steer on");
+	assert.equal(steer.details.actionKind, "image-steer");
+	assert.equal(steer.details.level, "warn");
+	assert.equal(steer.triggerTurn, true, "an idle parent is woken to forward it now, not after the child is done");
+	assert.equal(steer.deliverAs, "followUp");
+	assert.match(steer.content, /task_send\(st_c1/);
+	h.clock.advance(60_000);
+	sensors.get("p1").ts = h.clock.now();
+	await h.engine.tick();
+	assert.equal(h.sent.length, 1, "once per level");
+	c1.images = 60;
+	c1.imageBytes = 25 * MIB;
+	h.clock.advance(60_000);
+	sensors.get("p1").ts = h.clock.now();
+	await h.engine.tick();
+	assert.equal(h.sent.length, 2);
+	const trim = h.sent[1];
+	assert.equal(trim.sessionId, "p1");
+	assert.equal(trim.details.level, "trim");
+	assert.equal(trim.details.taskId, "st_c1");
+	h.clock.advance(60_000);
+	sensors.get("p1").ts = h.clock.now();
+	await h.engine.tick();
+	assert.equal(h.sent.length, 2);
+	assert.ok(h.sent.every((m) => m.kind !== "relay-cancel"), "steering never cancels work");
+});
+
+test("image steering reaches a busy parent at its next tool boundary (steer), not after its turn", async () => {
+	const MIB = 1024 * 1024;
+	const c1 = { ...sessionState({ id: "c1", kind: "child", taskId: "st_c1", parentSessionId: "p1" }), images: 45, imageBytes: 11 * MIB };
+	const sensors = new Map([["p1", { sessionId: "p1", pid: 1, ts: T0, idle: false, sensorVersion: "0.8.0" }]]);
+	const d4 = (world, memory) => tokens.detect(world, memory).filter((f) => f.kind === "image-load");
+	const h = harness({ findings: d4, detectorName: "tokens", sensors, sessions: [sessionState({ id: "p1", kind: "main" }), c1], config: { tokens: { ...DEFAULT_CONFIG.tokens, imageSteer: "steer" } } });
+	await h.engine.tick();
+	assert.equal(h.sent.length, 1);
+	assert.equal(h.sent[0].sessionId, "p1");
+	assert.equal(h.sent[0].deliverAs, "steer");
+	// senpi joins a custom message to the running turn (agent.steer) only when triggerTurn is not false;
+	// with false it is only written to the session and the model never sees it in that turn.
+	assert.equal(h.sent[0].triggerTurn, true);
+	assert.match(h.sent[0].content, /task_send\(st_c1/);
+});
+
+test("image steering on a main session steers the session itself mid-turn; imageSteer off sends nothing", async () => {
+	const MIB = 1024 * 1024;
+	const main = { ...sessionState({ id: "m1", kind: "main" }), images: 85, imageBytes: 5 * MIB };
+	const sensors = new Map([["m1", { sessionId: "m1", pid: 1, ts: T0, idle: false, sensorVersion: "0.8.0" }]]);
+	const d4 = (world, memory) => tokens.detect(world, memory).filter((f) => f.kind === "image-load");
+	const h = harness({ findings: d4, detectorName: "tokens", sensors, sessions: [main], config: { tokens: { ...DEFAULT_CONFIG.tokens, imageSteer: "steer" } } });
+	await h.engine.tick();
+	assert.equal(h.sent.length, 1);
+	assert.equal(h.sent[0].sessionId, "m1");
+	assert.equal(h.sent[0].details.actionKind, "image-steer");
+	assert.equal(h.sent[0].deliverAs, "steer", "a busy session reads it at its next tool boundary");
+	assert.equal(h.sent[0].triggerTurn, true, "a steer with triggerTurn false never reaches the running turn");
+	const off = harness({ findings: d4, detectorName: "tokens", sensors, sessions: [{ ...main }], config: { tokens: { ...DEFAULT_CONFIG.tokens, imageSteer: "off" } } });
+	await off.engine.tick();
+	assert.equal(off.sent.length, 0);
+});
+
+test("imageSteer notice: a D4 image-load notice goes once to a child's parent with the remedy, plus one owner toast; none below the threshold", async () => {
+	const MIB = 1024 * 1024;
+	const child = (id, images, imageBytes) => ({ ...sessionState({ id, kind: "child", taskId: `st_${id}`, parentSessionId: "p1" }), images, imageBytes });
+	const sessions = [sessionState({ id: "p1", kind: "main" }), child("c1", 70, 17 * MIB), child("c2", 15, 4 * MIB)];
+	const sensors = new Map([["p1", { sessionId: "p1", pid: 1, ts: T0, idle: true, sensorVersion: "0.8.0" }]]);
+	const d4 = (world, memory) => tokens.detect(world, memory).filter((f) => f.kind === "image-load");
+	const h = harness({ findings: d4, detectorName: "tokens", sensors, sessions, config: { tokens: { ...DEFAULT_CONFIG.tokens, imageSteer: "notice" } } });
 	await h.engine.tick();
 	assert.equal(h.sent.length, 1);
 	const [notice] = h.sent;

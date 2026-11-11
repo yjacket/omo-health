@@ -53,6 +53,8 @@ export const SWITCH_OF = {
 	"triage-notice": "relay",
 	// D4: the one notice about cache rewrites or image load; allowed on main sessions (not in MAIN_SESSION_BLOCKED).
 	"cache-notice": "relay",
+	// D4 tokens.imageSteer: the image steer, once per level; allowed on main sessions (not in MAIN_SESSION_BLOCKED).
+	"image-steer": "relay",
 	// D23: the downtime notice is a relay; it may reach a main session.
 	"boot-notice": "relay",
 	wake: "wake",
@@ -411,12 +413,15 @@ function planDrift({ finding, record, now, config, remedy }) {
 	if (record.remedyDone) return { requests, state: "remedied" };
 	// A nudge that could not be delivered retries after nextNudgeMs, without spending the alignment gap slot.
 	if (now < (record.nextNudgeMs ?? 0)) return { requests, state: "waiting-analyst" };
-	if (!config.align?.requireVerdict || !config.analyst?.enabled) return nudge();
+	// A long run is only age and repetition: it reaches the session on the analyst's non-normal verdict alone, so with no
+	// analyst, or one that could not answer, it spends its review slot quietly.
+	const longRun = finding.data?.signal === "long-run";
+	if (!config.align?.requireVerdict || !config.analyst?.enabled) return longRun ? { requests, state: "drift-normal" } : nudge();
 	const settled = settle({ record, config });
 	if (settled.kind === "analyzing") return { requests, state: "analyzing" };
 	if (settled.kind === "decided") {
 		const verdict = settled.verdict;
-		if (couldNotAnswer(verdict)) return nudge();
+		if (couldNotAnswer(verdict)) return longRun ? { requests, state: "drift-normal" } : nudge();
 		if (verdict.assessment !== "normal") return nudge(verdict);
 		return { requests, state: "drift-normal" };
 	}

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { pendingMessages, sendToSession, sweepUndelivered } from "./act/inbox.mjs";
 import { executeKill } from "./act/kill.mjs";
-import { composeAbortContinue, composeActionNotice, composeBootGapNotice, composeCacheNotice, composeGoalWake, composeRefusalResume, composeMainStallNotice, composeMonitorOrphanNotice, composeNudge, composeRelayCancel, composeRespawnNotice, composeRespawnTriageNotice, composeRevertNotice, composeScopeCheck, composeTriageNotice, composeWake, composeWhyNotice, composeWrongCommandRelease } from "./act/messages.mjs";
+import { composeAbortContinue, composeActionNotice, composeBootGapNotice, composeCacheNotice, composeImageSteer, composeGoalWake, composeRefusalResume, composeMainStallNotice, composeMonitorOrphanNotice, composeNudge, composeRelayCancel, composeRespawnNotice, composeRespawnTriageNotice, composeRevertNotice, composeScopeCheck, composeTriageNotice, composeWake, composeWhyNotice, composeWrongCommandRelease } from "./act/messages.mjs";
 import { ownerKeyOf } from "./baseline.mjs";
 import { footerText, waitingText, writeGlobalStatus, writeSessionStatus } from "./act/notify.mjs";
 import { writeReport } from "./act/reports.mjs";
@@ -781,6 +781,10 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 					const memory = memoryFor("align");
 					if (!Array.isArray(memory[target])) memory[target] = [];
 					memory[target].push({ ms: now, key: finding.subject?.key });
+					// A long run the analyst judged not to converge also tells the owner, once per review.
+					if (finding.data?.signal === "long-run" && req.verdict) {
+						actors.notifier?.toast({ title: "omo-health: 오래 도는 세션이 수렴하지 않습니다", body: truncate(`${s.sessionId}: ${req.verdict.mechanism ?? finding.data?.evidence ?? ""}`, 200), tag: `long-run-${finding.fp}` });
+					}
 				} else {
 					// An undelivered nudge spends nothing; the policy retries after nextNudgeMs instead of every tick.
 					record.remedyDone = false;
@@ -795,6 +799,20 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 				const self = session?.kind !== "child";
 				const target = self ? s.sessionId : deliveryTarget(finding, world);
 				const message = composeCacheNotice({ finding, sessionId: target, now, forward: !self });
+				const delivery = deliver(world, target, message, finding, record, { selfOnly: true });
+				record.history.push({ atMs: now, kind: req.kind, status: delivery.delivered ? "delivered" : "not-delivered", detail: `${delivery.via} -> ${delivery.sessionId ?? target ?? "-"}` });
+				if (delivery.delivered) record.remedyDone = true;
+				else record.executed.delete(req.key);
+				return { delivery };
+			}
+			case "image-steer": {
+				// D4 tokens.imageSteer: once per level. A child has no sensor, so its parent gets it to pass on (warn) or to split
+				// the remaining image work into a fresh child (trim); an idle parent is woken so the child hears it in time.
+				const session = world.sessions.get(s.sessionId);
+				const self = session?.kind !== "child";
+				const target = self ? s.sessionId : deliveryTarget(finding, world);
+				const hb = target ? world.sensorFor(target) : undefined;
+				const message = composeImageSteer({ finding, sessionId: target, now, forward: !self, idle: hb?.idle === true });
 				const delivery = deliver(world, target, message, finding, record, { selfOnly: true });
 				record.history.push({ atMs: now, kind: req.kind, status: delivery.delivered ? "delivered" : "not-delivered", detail: `${delivery.via} -> ${delivery.sessionId ?? target ?? "-"}` });
 				if (delivery.delivered) record.remedyDone = true;

@@ -54,11 +54,21 @@ export const DEFAULT_CONFIG = Object.freeze({
 		cacheRewriteWindowMs: 60 * MIN,
 		cacheRewriteCount: 2,
 		// image-load: the Claude Code request builder (claude-sdk-oauth) and senpi's elideOldImages drop the oldest images once
-		// their base64 total passes 24 MiB, and every such trim rewrites the whole cache. Warn at imageWarnBytes; imageWarnCount
-		// is the fallback when the record carries no image data.
-		imageWarnBytes: 16 * 1024 * 1024,
+		// their base64 total passes 24 MiB, and Claude Code also drops them past 100 images whatever their size; every such
+		// trim rewrites the whole cache. Warn at imageWarnBytes or imageWarnCount, whichever comes first; the trim level is
+		// imageTrimBytes or imageTrimCount. Phone screenshots of 0.3-0.6 MiB went from 16 to 24 MiB in 1-4 minutes, so the
+		// warning sits well below the trim.
+		imageWarnBytes: 10 * 1024 * 1024,
 		imageTrimBytes: 24 * 1024 * 1024,
-		imageWarnCount: 80,
+		imageWarnCount: 40,
+		imageTrimCount: 100,
+		// A subagent hears the steer only through its parent's next turn (tens of seconds), so its warning starts earlier.
+		imageWarnChildBytes: 5 * 1024 * 1024,
+		imageWarnChildCount: 20,
+		// What the image warning does: "steer" tells the session (a child through its parent) to crop, finish the current
+		// check and hand the rest of the screenshots to a fresh subtask, and at the trim level tells the parent to split
+		// the remaining image work; "notice" sends the one quiet notice; "off" sends nothing. Never cancels anything.
+		imageSteer: "steer",
 		burnPerHour: 2_000_000,
 		burnMultiple: 3,
 		resendCount: 50,
@@ -204,7 +214,11 @@ export const DEFAULT_CONFIG = Object.freeze({
 	selfBudget: { rssBytes: 300 * 1024 * 1024, cpuFrac: 0.05 },
 	/** The footer shows only subagent problems (engine onFooter); true brings back every finding. */
 	footer: { showAll: false },
-	align: { enabled: true, churnEdits: 8, churnWindowMs: 90 * MIN, failRepeats: 8, reviewLoops: 4, idleGapMs: 15 * MIN, stuckSteps: 12, stuckActiveMs: 20 * MIN, noDoneSteps: 40, repeatSteps: 6, afterCompleteMutations: 10, minGapMs: 45 * MIN, perDay: 4, requireVerdict: true },
+	align: { enabled: true, churnEdits: 8, churnWindowMs: 90 * MIN, failRepeats: 8, reviewLoops: 4, idleGapMs: 15 * MIN, stuckSteps: 12, stuckActiveMs: 20 * MIN, noDoneSteps: 40, repeatSteps: 6, afterCompleteMutations: 10, minGapMs: 45 * MIN, perDay: 4, requireVerdict: true,
+		// A goal session that worked activeMs (idle gaps of idleGapMs or more excluded) or repeated one step over `rounds`
+		// numbered rounds ("26차 QA") asks the analyst whether it converges, at most once per everyMs. Only a non-normal
+		// verdict reaches the session (with one owner toast); an unanswered look sends nothing.
+		longRun: { enabled: true, activeMs: 6 * 60 * MIN, rounds: 8, everyMs: 6 * 60 * MIN } },
 });
 
 const ENUMS = { mode: ["auto", "shadow"] };

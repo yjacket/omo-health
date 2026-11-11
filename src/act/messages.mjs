@@ -451,6 +451,43 @@ export function composeCacheNotice({ finding, sessionId, now, forward = false })
 	return base({ kind: "self-notice", sessionId, now, deliverAs: "nextTurn", triggerTurn: false, content, details: { actionKind: "cache-notice", incidentId: finding.fp, findingKind: finding.kind, taskId: finding.subject?.taskId ?? null, images: finding.data?.images ?? null, imageBytes: finding.data?.imageBytes ?? null } });
 }
 
+/**
+ * D4 with tokens.imageSteer "steer": what a session holding many images should do now, once per level. A main session
+ * reads it at its next tool boundary (steer) or next turn when idle. A child has no sensor, so its parent gets it
+ * (steer while the parent is mid-turn, followUp waking an idle parent): at `warn` with the sentence to pass on through task_send, at `trim` with the
+ * request to split the remaining image work into a fresh child. It never cancels anything.
+ */
+export function composeImageSteer({ finding, sessionId, now, forward = false, idle = false }) {
+	const d = finding.data ?? {};
+	const level = d.level === "trim" ? "trim" : "warn";
+	const taskId = finding.subject?.taskId ?? null;
+	const load = `이미지 ${d.images ?? 0}장${d.imagesPartial ? " 이상" : ""}, base64 ${Math.round(((d.imageBytes ?? 0) / 1048576) * 10) / 10} MiB`;
+	const limit = `24 MiB 또는 ${d.trimCount ?? 100}장`;
+	const passOn = `omo-health: your context holds ${d.images ?? 0} images; past 24 MiB or ${d.trimCount ?? 100} each new image rewrites the whole prompt cache. Stop reading full-size screenshots: crop to what you check or halve the size, never re-read one. Finish this check, then report back so the rest goes to a fresh subtask.`;
+	let content;
+	if (!forward) {
+		content = level === "trim"
+			? `[omo-health] 이 세션 컨텍스트에 ${load}가 쌓여 잘림 기준(${limit})을 넘었습니다. 이미지를 더 읽을 때마다 캐시 전체를 다시 씁니다. 지금 확인을 마친 뒤 남은 스크린샷 작업은 나눠서 새 하위 작업(task)에 맡기고, 이 세션에서는 이미지를 더 읽지 마세요.`
+			: `[omo-health] 이 세션 컨텍스트에 ${load}가 쌓였습니다. ${limit}을 넘으면 이미지를 더 읽을 때마다 캐시 전체를 다시 씁니다. 지금부터 전체 크기 스크린샷을 그대로 읽지 말고 확인할 영역만 잘라 읽거나 절반 크기로 줄이세요. 같은 스크린샷은 다시 읽지 마세요. 지금 하던 확인은 마치고, 남은 스크린샷 작업은 새 하위 작업(task)에 넘기세요.`;
+	} else if (level === "trim") {
+		content = `[omo-health] 서브에이전트 ${taskId}의 컨텍스트에 ${load}가 쌓여 잘림 기준(${limit})을 넘었습니다. 이제 이미지를 더 읽을 때마다 캐시 전체를 다시 씁니다. 이 서브에이전트가 지금 확인을 마치면, 남은 이미지 작업은 나눠서 새 서브에이전트에 다시 맡기세요. ${taskId}에 이미지 작업을 이어서 시키지 마세요. omo-health는 아무것도 취소하지 않았습니다.`;
+	} else {
+		content = `[omo-health] 서브에이전트 ${taskId}의 컨텍스트에 ${load}가 쌓였습니다. ${limit}을 넘으면 이미지를 더 읽을 때마다 캐시 전체를 다시 씁니다. 서브에이전트는 omo-health 알림을 직접 받지 못하니, 지금 task_send(${taskId}, "...")로 다음을 전하세요:\n${passOn}`;
+	}
+	return base({
+		kind: forward ? "relay" : "self-notice",
+		sessionId,
+		now,
+		// A busy session reads it at its next tool boundary (steer) instead of after its whole turn; an idle parent is woken.
+		// senpi (agent-session _deliverCustomMessage) joins a custom message to the running turn only when triggerTurn is
+		// not false: with false it is only written to the session, and the model does not see it until a later turn.
+		deliverAs: forward ? (idle ? "followUp" : "steer") : idle ? "nextTurn" : "steer",
+		triggerTurn: forward ? true : !idle,
+		content,
+		details: { actionKind: "image-steer", level, incidentId: finding.fp, findingKind: finding.kind, taskId, images: d.images ?? null, imageBytes: d.imageBytes ?? null, forwardText: forward && level === "warn" ? passOn : null },
+	});
+}
+
 /** Resume a session that stopped on provider errors once the provider recovered (IS-10b). */
 export function composeNudge({ finding, sessionId, now }) {
 	const recoveredAt = finding.data?.recoveredAt;

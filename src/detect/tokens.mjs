@@ -30,8 +30,24 @@ function warmupText(warm) {
 	return `keepalive warm-up 꺼짐(${warm.disabledReason ?? "이유 없음"}${warm.disabledDetail ? `: ${warm.disabledDetail}` : ""})`;
 }
 
+/** Claude Code drops the oldest images past imageTrimBytes of base64 or imageTrimCount images, whichever comes first. */
 function overTrim(turn, cfg) {
-	return turn.imageBytes ? turn.imageBytes >= cfg.imageTrimBytes : (turn.images ?? 0) >= cfg.imageWarnCount;
+	return (turn.imageBytes ?? 0) >= cfg.imageTrimBytes || (turn.images ?? 0) >= cfg.imageTrimCount;
+}
+
+/** `trim`, `warn` or null: the size or the count, whichever reaches its threshold first. A subagent warns at its own, lower line. */
+function imageLevel(images, bytes, cfg, child = false) {
+	if (bytes >= cfg.imageTrimBytes || images >= cfg.imageTrimCount) return "trim";
+	const warnBytes = child ? cfg.imageWarnChildBytes : cfg.imageWarnBytes;
+	const warnCount = child ? cfg.imageWarnChildCount : cfg.imageWarnCount;
+	if (bytes >= warnBytes || images >= warnCount) return "warn";
+	return null;
+}
+
+/** What the image warning asks for (tokens.imageSteer): a steer, the one quiet notice, or nothing. */
+function imageRemedy(cfg) {
+	if (cfg.imageSteer === "off") return undefined;
+	return { kind: cfg.imageSteer === "notice" ? "cache-notice" : "image-steer" };
 }
 
 function median(values) {
@@ -116,7 +132,7 @@ function cacheRewrite(world, session, cfg) {
 	const warm = world.warmup(session.id);
 	const load = imageText(last.images, last.imageBytes, session.imagesPartial);
 	const cause = images
-		? `이 세션에 쌓인 ${load}로 24 MiB를 넘었습니다. 요청 속 이미지 합이 24 MiB를 넘으면 가장 오래된 이미지가 잘려 나가 프롬프트가 바뀌므로, 이미지를 더 읽을 때마다 캐시 전체를 다시 씁니다.`
+		? `이 세션에 쌓인 ${load}로 잘림 기준(24 MiB 또는 ${cfg.imageTrimCount}장)을 넘었습니다. 요청 속 이미지가 그 기준을 넘으면 가장 오래된 이미지가 잘려 나가 프롬프트가 바뀌므로, 이미지를 더 읽을 때마다 캐시 전체를 다시 씁니다.`
 		: `이 세션에 쌓인 것은 ${load}입니다.`;
 	return [
 		makeFinding({
@@ -148,25 +164,30 @@ function cacheRewrite(world, session, cfg) {
 	];
 }
 
-/** 4f: the images in a session's context near the size where they start rewriting the cache (or the count fallback). */
+/**
+ * 4f: the images in a session's context near where they start rewriting the cache: `warn` at imageWarnBytes or
+ * imageWarnCount, `trim` once past imageTrimBytes or imageTrimCount. Each level is its own finding, so a session is told
+ * once when it should start cutting down and once more when the trimming has begun.
+ */
 function imageLoad(session, cfg) {
 	const bytes = session.imageBytes ?? 0;
 	const images = session.images ?? 0;
-	if (!(bytes ? bytes >= cfg.imageWarnBytes : images >= cfg.imageWarnCount)) return [];
-	const over = bytes ? bytes >= cfg.imageTrimBytes : false;
+	const level = imageLevel(images, bytes, cfg, session.kind === "child");
+	if (!level) return [];
 	const load = imageText(images, bytes, session.imagesPartial);
+	const limit = `24 MiB 또는 ${cfg.imageTrimCount}장`;
 	return [
 		makeFinding({
 			detector: id,
 			kind: "image-load",
 			humanNeeded: true,
-			subject: sessionSubject(session, "image-load"),
-			evidence: [`images:${images}`, `imageMiB:${mib(bytes)}`],
-			titleKo: `이미지 누적: ${load}`,
-			detailKo: over
-				? `세션 ${session.id}의 컨텍스트에 ${load}가 쌓여 24 MiB를 넘었습니다. 이제 이미지를 더 읽을 때마다 가장 오래된 이미지가 잘려 나가 캐시 전체를 다시 씁니다.`
-				: `세션 ${session.id}의 컨텍스트에 ${load}가 쌓였습니다. 이미지 합이 24 MiB를 넘으면 그때부터 이미지를 더 읽을 때마다 캐시 전체를 다시 씁니다.`,
-			data: { images, imageBytes: bytes, imagesPartial: Boolean(session.imagesPartial), warnBytes: cfg.imageWarnBytes, trimBytes: cfg.imageTrimBytes, remedy: { kind: "cache-notice" }, advice: REMEDY_KO },
+			subject: sessionSubject(session, `image-load:${level}`),
+			evidence: [`images:${images}`, `imageMiB:${mib(bytes)}`, `level:${level}`],
+			titleKo: `이미지 누적${level === "trim" ? "(잘림 단계)" : ""}: ${load}`,
+			detailKo: level === "trim"
+				? `세션 ${session.id}의 컨텍스트에 ${load}가 쌓여 잘림 기준(${limit})을 넘었습니다. 이제 이미지를 더 읽을 때마다 가장 오래된 이미지가 잘려 나가 캐시 전체를 다시 씁니다.`
+				: `세션 ${session.id}의 컨텍스트에 ${load}가 쌓였습니다. 이미지가 ${limit}을 넘으면 그때부터 이미지를 더 읽을 때마다 캐시 전체를 다시 씁니다.`,
+			data: { level, images, imageBytes: bytes, imagesPartial: Boolean(session.imagesPartial), warnBytes: cfg.imageWarnBytes, trimBytes: cfg.imageTrimBytes, warnCount: cfg.imageWarnCount, trimCount: cfg.imageTrimCount, remedy: imageRemedy(cfg), advice: REMEDY_KO },
 		}),
 	];
 }
