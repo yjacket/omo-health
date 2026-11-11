@@ -23,8 +23,14 @@ const hostRow = (p, ms) => ({ p, pp: 1, n: "bun.exe", c: new Date(ms).toISOStrin
 /** herdr stand-in: the crashed pane wB:p1 sits at an idle shell (or runs bun when busy); tab create returns wB:t9 / wB:p9. */
 function fakeHerdr({ busy, cwd }) {
 	const calls = [];
+	const screen = { text: " ❯ " };
 	return {
 		calls,
+		screen,
+		read(_terminal, paneId) {
+			calls.push(["pane", "read", paneId]);
+			return { ok: true, text: paneId === "wB:p9" ? screen.text : "" };
+		},
 		call(_terminal, args) {
 			calls.push(args);
 			const [group, verb] = args;
@@ -34,7 +40,7 @@ function fakeHerdr({ busy, cwd }) {
 				return { ok: true, result: { process_info: { shell_pid: 700, foreground_processes: foreground } } };
 			}
 			if (group === "tab" && verb === "create") return { ok: true, result: { tab: { tab_id: "wB:t9" }, root_pane: { pane_id: "wB:p9", cwd } } };
-			if ((group === "tab" && verb === "close") || (group === "pane" && verb === "run")) return { ok: true, result: { type: "ok" } };
+			if ((group === "tab" && verb === "close") || (group === "pane" && verb === "run") || (group === "pane" && verb === "send-keys")) return { ok: true, result: { type: "ok" } };
 			return { ok: false, code: "unexpected" };
 		},
 	};
@@ -216,4 +222,81 @@ test("the resume history survives a daemon restart, so a second crash within 30 
 	await restarted.tick();
 	assert.equal(h.toasts.length, 1);
 	assert.match(h.toasts[0].title, /반복 크래시/);
+});
+
+const CHOOSER = [" Resume blocked goal?", " Goal: finish the report", "", " → Resume goal", "   Leave stopped", "", " ↑↓ navigate  enter select  esc cancel", "", "──────", "C:\\x • fake m", "Goal blocked: user interrupted the turn"].join("\n");
+const NEW_TERMINAL = { ...TERMINAL, tabId: "wB:t9", paneId: "wB:p9" };
+const enters = (h) => h.herdr.calls.filter((args) => args[1] === "send-keys");
+const OTHER_SID = "01a0ed3a-0000-7000-8000-00000000ffff";
+
+/** The new tab's shell (pid 700 in the fake herdr) runs `omo --session <id> "<prompt>"`; its sensor is not up (the chooser holds session_start). */
+async function reopenedWaiting(h, { sessionId = SID } = {}) {
+	await crash(h);
+	h.clock.advance(15_000);
+	h.live.set(700, { p: 700, pp: 1, n: "powershell.exe", c: new Date(h.clock.now() - 20_000).toISOString(), cl: "powershell.exe" });
+	h.live.set(NEW_HOST, { ...hostRow(NEW_HOST, h.clock.now() - 5_000), pp: 700, cl: `bun.exe C:\\x\\cli.js --session ${sessionId} "${CRASH_RESUME_PROMPT}"` });
+}
+const sensorUp = (h, over = {}) => h.writeHb(NEW_HOST, { terminal: NEW_TERMINAL, ...over });
+
+test("option 2: the goal chooser in the new tab gets one Enter before the new sensor is even up; once the run starts the usual notice follows", async () => {
+	const h = harness();
+	await reopenedWaiting(h);
+	h.herdr.screen.text = " ❯ ";
+	await h.engine.tick();
+	assert.deepEqual(enters(h), [], "no chooser on screen yet: nothing pressed");
+	h.clock.advance(15_000);
+	h.herdr.screen.text = CHOOSER;
+	await h.engine.tick();
+	assert.deepEqual(enters(h), [["pane", "send-keys", "wB:p9", "enter"]]);
+	assert.ok(h.decisions.some((d) => d.action?.kind === "crash-answer" && d.result === "execute"));
+	h.clock.advance(15_000);
+	sensorUp(h, { lastAgentStartAt: h.clock.now() - 3_000, idle: false });
+	await h.engine.tick();
+	assert.equal(enters(h).length, 1, "Enter exactly once");
+	assert.equal(h.sent.length, 1);
+	assert.match(h.sent[0].content, /reopened in a new tab/);
+	assert.equal(h.toasts.length, 0);
+	assert.equal(h.herdr.calls.some((args) => ["run", "send-text", "send-keys"].includes(args[1]) && args.includes("wB:p1")), false, "the crashed pane is never written to");
+});
+
+test("option 2: an Enter that does not start a run falls back to the human-needed notice, never a second Enter or a second omo", async () => {
+	const h = harness();
+	await reopenedWaiting(h);
+	h.herdr.screen.text = CHOOSER;
+	await h.engine.tick();
+	assert.equal(enters(h).length, 1);
+	for (let i = 0; i < 4; i++) {
+		h.clock.advance(15_000);
+		await h.engine.tick();
+	}
+	assert.equal(enters(h).length, 1);
+	assert.equal(h.toasts.length, 1);
+	assert.match(`${h.toasts[0].title} ${h.toasts[0].body}`, /작업을 시작하지 않음/);
+	assert.doesNotMatch(h.toasts[0].body, /omo --session/, "a host already runs in the new tab");
+	assert.equal(runs(h).length, 1);
+});
+
+test("option 2: a new tab without this session's omo, or a chooser on Leave stopped, gets no key and one notice at startupMs", async () => {
+	for (const [label, sessionId, screen] of [["another session", OTHER_SID, CHOOSER], ["Leave stopped highlighted", SID, CHOOSER.replace(" → Resume goal", "   Resume goal").replace("   Leave stopped", " → Leave stopped")]]) {
+		const h = harness();
+		await reopenedWaiting(h, { sessionId });
+		h.herdr.screen.text = screen;
+		for (let i = 0; i < 14; i++) {
+			await h.engine.tick();
+			h.clock.advance(15_000);
+		}
+		assert.deepEqual(enters(h), [], label);
+		assert.equal(h.toasts.length, 1, label);
+	}
+});
+
+test("option 2: a session that runs at once (omo 5.1.60, no chooser) gets no key", async () => {
+	const h = harness();
+	await crash(h);
+	h.clock.advance(15_000);
+	h.live.set(NEW_HOST, hostRow(NEW_HOST, h.clock.now() - 5_000));
+	sensorUp(h, { lastAgentStartAt: h.clock.now() - 2_000 });
+	await h.engine.tick();
+	assert.equal(h.sent.length, 1);
+	assert.equal(h.herdr.calls.some((args) => args[1] === "send-keys" || args[1] === "send-text"), false);
 });

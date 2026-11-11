@@ -63,6 +63,7 @@ export const SWITCH_OF = {
 	"scope-check": "nudge",
 	"crash-resume": "resume",
 	"crash-notice": "resume",
+	"crash-answer": "resume",
 	// D20: relaunch a session parked at a usage limit; allowed on main sessions (not in MAIN_SESSION_BLOCKED).
 	"park-resume": "resume",
 	toast: "toast",
