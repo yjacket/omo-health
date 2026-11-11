@@ -1,13 +1,13 @@
 import { makeFinding } from "./finding.mjs";
 
 /**
- * D24 omo login aging (issue #5, GAP-2 / IS-1).
+ * D25 omo login aging (issue #5, GAP-2 / IS-1).
  *
  * omo's anthropic-subscription refresh tokens lived 18-29 days in the field; once one expires every session stops.
  * The secret readers report only when a slot was last seen to log in (`loginMs`) and how that fact was obtained
  * (`basis`), never the token itself.
  */
-export const id = "D24";
+export const id = "D25";
 
 const PROVIDER = "anthropic-subscription";
 const DAY_MS = 86_400_000;

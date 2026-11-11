@@ -16,11 +16,11 @@ test("13d23h of login age is under 14d -> no finding", () => {
 	assert.deepEqual(detect(world([slot("main", 13 * D + 23 * H)])), []);
 });
 
-test("14d of login age -> one D24 warn finding for the operator", () => {
+test("14d of login age -> one D25 warn finding for the operator", () => {
 	const findings = detect(world([slot("main", 14 * D)]));
 	assert.equal(findings.length, 1);
 	const [finding] = findings;
-	assert.equal(finding.detector, "D24");
+	assert.equal(finding.detector, "D25");
 	assert.equal(finding.kind, "omo-login-aging");
 	assert.equal(finding.severity, "warn");
 	assert.equal(finding.humanNeeded, true);
@@ -59,7 +59,7 @@ test("no secrets -> no finding", () => {
 	assert.deepEqual(detect(makeWorld({ now: NOW })), []);
 });
 
-test("loadDetectors registers D24", async () => {
+test("loadDetectors registers D25", async () => {
 	const detectors = await loadDetectors();
-	assert.ok(detectors.some((detector) => detector.id === "D24"));
+	assert.ok(detectors.some((detector) => detector.id === "D25"));
 });

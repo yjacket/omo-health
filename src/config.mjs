@@ -73,7 +73,7 @@ export const DEFAULT_CONFIG = Object.freeze({
 		stormWindowMs: 30 * MIN,
 		outageHumanMs: 5 * MIN,
 	},
-	// D24: warn this long after the newest working omo login (refresh tokens lived 18-29 days); 0 turns the warning off.
+	// D25: warn this long after the newest working omo login (refresh tokens lived 18-29 days); 0 turns the warning off.
 	omoLogin: { warnAfterMs: 14 * D },
 	config: {
 		autoRevert: true,

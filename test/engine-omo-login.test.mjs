@@ -49,22 +49,22 @@ async function harness(secretsAt) {
 	return { engine, clock, toasts };
 }
 
-test("D24: a 15-day-old omo login raises a warn footer and exactly one toast", async () => {
+test("D25: a 15-day-old omo login raises a warn footer and exactly one toast", async () => {
 	const h = await harness((now) => ({ authBlocks: [{ name: "default" }], omoLogin: { slots: [{ name: "default", loginMs: now - 15 * DAY, basis: "login" }] } }));
 	const { globalStatus } = await h.engine.tick();
 	assert.equal(globalStatus.text, "👀 재로그인");
 	assert.equal(globalStatus.level, "warn");
 	assert.ok(globalStatus.humanNeeded.some((f) => f.titleKo === "omo 다시 로그인 권장"));
 	await h.engine.tick();
-	assert.equal(h.toasts.filter((t) => t.tag === "D24-omo-login-aging").length, 1);
+	assert.equal(h.toasts.filter((t) => t.tag === "D25-omo-login-aging").length, 1);
 });
 
-test("D24: a 1-day-old login leaves the footer normal and shows no omo login toast", async () => {
+test("D25: a 1-day-old login leaves the footer normal and shows no omo login toast", async () => {
 	const h = await harness((now) => ({ authBlocks: [{ name: "default" }], omoLogin: { slots: [{ name: "default", loginMs: now - 1 * DAY, basis: "login" }] } }));
 	const { globalStatus } = await h.engine.tick();
 	assert.equal(globalStatus.text, "👀 정상");
 	assert.equal(globalStatus.humanNeeded.length, 0);
-	assert.equal(h.toasts.filter((t) => t.tag === "D24-omo-login-aging").length, 0);
+	assert.equal(h.toasts.filter((t) => t.tag === "D25-omo-login-aging").length, 0);
 });
 
 test("D6: one blocked account is listed as a partial incident without a footer warning or toast", async () => {

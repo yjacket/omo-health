@@ -82,7 +82,7 @@ export function resolvePaths(env = process.env) {
 			parksDir: path.join(healthHome, "parks"),
 			/** One record per daemon downtime that crossed bootGap.minGapMs (D23). */
 			bootGapsDir: path.join(healthHome, "boot-gaps"),
-			/** omo login ledger: per-slot last login times derived from auth.json (D24). */
+			/** omo login ledger: per-slot last login times derived from auth.json (D25). */
 			omoLoginFile: path.join(healthHome, "omo-login.json"),
 		},
 	};

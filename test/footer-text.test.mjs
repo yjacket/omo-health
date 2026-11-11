@@ -32,6 +32,6 @@ test("an investigation never changes an ok, info or finding-less footer (#56 C8)
 });
 
 test("the footer words for the omo login kinds (issue #5)", () => {
-	assert.equal(footerText("warn", { detector: "D24", kind: "omo-login-aging" }), "👀 재로그인");
+	assert.equal(footerText("warn", { detector: "D25", kind: "omo-login-aging" }), "👀 재로그인");
 	assert.equal(footerText("crit", { detector: "D6", kind: "accounts-blocked" }), "👀 로그인");
 });
