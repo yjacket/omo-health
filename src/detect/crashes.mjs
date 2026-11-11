@@ -35,6 +35,8 @@ const HOUR_MS = 3600_000;
 const STOP_SHOW_MS = HOUR_MS;
 const KEEP_MS = 24 * HOUR_MS;
 const DAG_DONE = new Set(["completed", "failed", "cancelled"]);
+/** After D18 answered the goal chooser, a run must start within this long, or the stop notice follows. */
+const ANSWER_VERIFY_MS = 45_000;
 const STOP_OUTCOMES = new Set(["crash-loop", "rate-limit", "resume-off", "no-terminal"]);
 
 export const REASON_KO = {
@@ -203,12 +205,30 @@ function resumedFindings(world, memory, cfg) {
 					data: { crashPid: pending.crashPid, crashTs: pending.crashTs, newPid: hb.pid, idle: hb.idle, lostTasks: pending.lostTasks ?? [], tabId: pending.tabId, remedy: { kind: "crash-notice" } },
 				}),
 			);
-		} else if (world.now - pending.launchedMs > cfg.startupMs) {
+		} else if (world.now - pending.launchedMs > cfg.startupMs || (Number.isFinite(pending.answeredMs) && world.now - pending.answeredMs > ANSWER_VERIFY_MS)) {
 			delete memory.pending[sid];
-			// No turn: the stop belongs to the new host, so its own heartbeat does not clear it.
-			memory.stopped[sid] = reopened
-				? { atMs: world.now, reason: "no-turn", cwd: pending.cwd, pid: hb.pid, tabId: pending.tabId }
+			// No turn: the stop belongs to the new host, so its own heartbeat does not clear it. A host seen in the new tab
+			// (the chooser holds its sensor back) also means no turn: a second `omo --session` would run the session twice.
+			const hostPid = reopened ? hb.pid : pending.hostPid;
+			memory.stopped[sid] = Number.isFinite(hostPid)
+				? { atMs: world.now, reason: "no-turn", cwd: pending.cwd, pid: hostPid, tabId: pending.tabId }
 				: { atMs: world.now, reason: "no-new-sensor", cwd: pending.cwd, pid: pending.crashPid };
+		} else if (pending.terminal?.paneId && pending.answeredMs === undefined && !pending.answerRefused) {
+			// omo 5.1.65+: the reopened host waits on "Resume blocked goal?" inside session_start, before its sensor writes a
+			// heartbeat and before its prompt runs. The action reads the new tab each tick and presses Enter once this
+			// session's host runs there and the chooser shows "Resume goal" highlighted (health#9, option 2).
+			out.push(
+				makeFinding({
+					detector: id,
+					kind: "host-resume-chooser",
+					severity: "info",
+					subject: { sessionId: sid, key: `chooser:${pending.crashPid}@${pending.launchedMs}` },
+					evidence: [`pane:${pending.terminal.paneId}`],
+					titleKo: `재개한 세션의 목표 재개 창 확인: ${nameOf(pending.cwd)}`,
+					detailKo: `다시 연 세션 ${sid}이 아직 작업을 시작하지 않았습니다. 새 탭(${pending.tabId ?? "?"})에서 이 세션의 omo가 "Resume blocked goal?" 창을 띄우고 Resume goal이 선택돼 있으면 Enter를 한 번 보냅니다.`,
+					data: { paneId: pending.terminal.paneId, remedy: { kind: "crash-answer" } },
+				}),
+			);
 		}
 	}
 	return out;

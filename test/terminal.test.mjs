@@ -1,7 +1,7 @@
 import "./helpers/tmp-root.mjs";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { CRASH_RESUME_PROMPT, createHerdrCli, isIdleShell, resumeCommand, resumeInNewTab, sameDir } from "../src/act/terminal.mjs";
+import { answerResumeChooser, CRASH_RESUME_PROMPT, createHerdrCli, isIdleShell, resumeChooserState, sessionHostInPane, resumeCommand, resumeInNewTab, sameDir } from "../src/act/terminal.mjs";
 
 const CWD = "C:\\tmp\\repo-a\\";
 const SID = "ses-abc12345-def";
@@ -191,4 +191,105 @@ test("a prompt rides on the resume command in the new pane", async () => {
 	const r = await h.run({ prompt: CRASH_RESUME_PROMPT });
 	assert.equal(r.command, `omo --session ${SID} "${CRASH_RESUME_PROMPT}"`);
 	assert.deepEqual(h.calls.at(-1), ["pane", "run", "wB:p2", r.command]);
+});
+
+/** The chooser as omo 5.1.68 draws it (extension-selector.js: title, blank, "→ " before the highlighted option). */
+const chooserScreen = (selected = "Resume goal", above = []) =>
+	[
+		...above,
+		"────────────────────────────────────────",
+		"",
+		" Resume blocked goal?",
+		" Goal: finish the report",
+		"",
+		selected === "Resume goal" ? " → Resume goal" : "   Resume goal",
+		selected === "Leave stopped" ? " → Leave stopped" : "   Leave stopped",
+		"",
+		" ↑↓ navigate  enter select  esc cancel",
+		"",
+		"────────────────────────────────────────",
+		"C:\\dev\\x • 12K/1M (1.2%)                 fake m",
+	].join("\n");
+
+test("resumeChooserState: the 5.1.65+ goal chooser with Resume goal highlighted, the other option highlighted, or no chooser", () => {
+	assert.equal(resumeChooserState(chooserScreen()), "shown");
+	assert.equal(resumeChooserState(chooserScreen().replace("Resume blocked goal?", "Resume paused goal? (9s)")), "shown");
+	assert.equal(resumeChooserState(chooserScreen("Leave stopped")), "not-default");
+	assert.equal(resumeChooserState(" ❯ \n─────\nC:\\dev\\x • (auto) m"), "absent");
+	assert.equal(resumeChooserState(""), "absent");
+	assert.equal(resumeChooserState(chooserScreen().replace("   Leave stopped", "   Something else")), "absent", "both options must be there");
+	const scrolledAway = [chooserScreen(), ...Array.from({ length: 20 }, (_, i) => `line ${i}`)].join("\n");
+	assert.equal(resumeChooserState(scrolledAway), "absent", "a chooser left far above the bottom is not the live one");
+});
+
+/** A process table stand-in: shell 10 -> cmd 20 -> node 30 (launcher) -> host 4200, both started with --session SID. */
+function table(rows) {
+	const byPid = new Map(rows.map((r) => [r.pid, r]));
+	const ancestors = (pid) => {
+		const out = [];
+		for (let p = byPid.get(byPid.get(pid)?.ppid); p; p = byPid.get(p.ppid)) out.push(p);
+		return out;
+	};
+	return { get: (pid) => byPid.get(pid), ancestors, descendants: (pid) => rows.filter((r) => ancestors(r.pid).some((a) => a.pid === pid)) };
+}
+const hostRows = (sid = SID) => [{ pid: 10, ppid: 1, cmd: "powershell.exe" }, { pid: 20, ppid: 10, cmd: `cmd.exe /c omo.cmd --session ${sid} "x"` }, { pid: 30, ppid: 20, cmd: `node.exe omo.js --session ${sid} "x"` }, { pid: 4200, ppid: 30, cmd: `bun.exe cli.js --session ${sid} "x"` }];
+
+test("sessionHostInPane: the deepest process under the pane's shell started with --session <id> (herdr lists only the shell on Windows)", () => {
+	const info = { shell_pid: 10, foreground_processes: [{ pid: 10 }] };
+	assert.equal(sessionHostInPane(info, table(hostRows()), SID), 4200);
+	assert.equal(sessionHostInPane({ shell_pid: 99 }, table(hostRows()), SID), undefined, "under another pane's shell");
+	assert.equal(sessionHostInPane(info, table(hostRows("other-session-1")), SID), undefined, "another session");
+	assert.equal(sessionHostInPane(info, table(hostRows(`${SID}x`)), SID), undefined, "a longer id is not this id");
+	assert.equal(sessionHostInPane(info, table(hostRows().slice(0, 1)), SID), undefined, "only the shell: not started yet");
+	assert.equal(sessionHostInPane(undefined, table(hostRows()), SID), undefined);
+});
+
+function chooserCli({ screen = chooserScreen() } = {}) {
+	const calls = [];
+	return {
+		calls,
+		call(_terminal, args) {
+			calls.push(args);
+			if (args[1] === "process-info") return { ok: true, result: { process_info: { shell_pid: 10, foreground_processes: [{ pid: 10 }] } } };
+			if (args[1] === "send-keys") return { ok: true, result: undefined };
+			return { ok: false, code: "unexpected" };
+		},
+		read(_terminal, paneId) {
+			calls.push(["pane", "read", paneId]);
+			return { ok: true, text: screen };
+		},
+	};
+}
+const newTerminal = { ...terminal, tabId: "wB:t2", paneId: "wB:p2" };
+const keys = (cli) => cli.calls.filter((args) => args[1] === "send-keys");
+
+test("answerResumeChooser sends one Enter to the session's own pane when the chooser shows Resume goal", () => {
+	const cli = chooserCli();
+	assert.deepEqual(answerResumeChooser({ terminal: newTerminal, sessionId: SID, table: table(hostRows()), cli }), { state: "sent", hostPid: 4200 });
+	assert.deepEqual(keys(cli), [["pane", "send-keys", "wB:p2", "enter"]]);
+});
+
+test("answerResumeChooser presses nothing without the chooser, with another option highlighted, or without this session's omo in the pane", () => {
+	const cases = [
+		["absent", chooserCli({ screen: " ❯ " }), hostRows()],
+		["not-default", chooserCli({ screen: chooserScreen("Leave stopped") }), hostRows()],
+		["no-host", chooserCli(), hostRows("other-session-1")],
+		["no-host", chooserCli(), hostRows().slice(0, 1)],
+	];
+	for (const [state, cli, rows] of cases) {
+		assert.equal(answerResumeChooser({ terminal: newTerminal, sessionId: SID, table: table(rows), cli }).state, state);
+		assert.deepEqual(keys(cli), [], state);
+	}
+	const unread = chooserCli();
+	assert.equal(answerResumeChooser({ terminal: newTerminal, sessionId: SID, table: table(hostRows("other-session-1")), cli: unread }).state, "no-host");
+	assert.equal(unread.calls.some((args) => args[1] === "read"), false, "the screen of a pane without this session is not even read");
+});
+
+test("createHerdrCli.read returns the visible screen text of one pane", () => {
+	const seen = [];
+	const cli = createHerdrCli({ spawnSync: (_bin, args) => (seen.push(args), { status: 0, stdout: " → Resume goal\n", stderr: "" }), env: {} });
+	assert.deepEqual(cli.read(terminal, "wB:p2"), { ok: true, text: " → Resume goal\n" });
+	assert.deepEqual(seen, [["pane", "read", "wB:p2", "--source", "visible", "--format", "text"]]);
+	const gone = createHerdrCli({ spawnSync: () => ({ status: 1, stdout: "", stderr: JSON.stringify({ error: { code: "pane_not_found" } }) }), env: {} });
+	assert.deepEqual(gone.read(terminal, "wB:p2"), { ok: false, code: "pane_not_found" });
 });
