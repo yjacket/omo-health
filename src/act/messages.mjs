@@ -441,6 +441,16 @@ export function composeWake({ finding, sessionId, now, reportPath }) {
 	return base({ kind: "wake", sessionId, now, deliverAs: "followUp", triggerTurn: true, content, details: { incidentId: finding.fp, taskId: s.taskId, reason, reportPath } });
 }
 
+/**
+ * D4: cache rewrites or image load, told once to the session itself or, for a child, to its parent. Notice only: it
+ * starts no turn.
+ */
+export function composeCacheNotice({ finding, sessionId, now, forward = false }) {
+	const who = forward ? `${childLabel(finding)}의 상태입니다. ` : "";
+	const content = `[omo-health] ${who}${finding.titleKo}. ${finding.detailKo}\n- 할 일: ${finding.data?.advice ?? ""}${forward ? " 이 서브에이전트에 그렇게 전하거나 작업을 나눠 다시 띄우세요." : ""}`;
+	return base({ kind: "self-notice", sessionId, now, deliverAs: "nextTurn", triggerTurn: false, content, details: { actionKind: "cache-notice", incidentId: finding.fp, findingKind: finding.kind, taskId: finding.subject?.taskId ?? null, images: finding.data?.images ?? null, imageBytes: finding.data?.imageBytes ?? null } });
+}
+
 /** Resume a session that stopped on provider errors once the provider recovered (IS-10b). */
 export function composeNudge({ finding, sessionId, now }) {
 	const recoveredAt = finding.data?.recoveredAt;

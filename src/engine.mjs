@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { pendingMessages, sendToSession, sweepUndelivered } from "./act/inbox.mjs";
 import { executeKill } from "./act/kill.mjs";
-import { composeAbortContinue, composeActionNotice, composeBootGapNotice, composeGoalWake, composeRefusalResume, composeMainStallNotice, composeMonitorOrphanNotice, composeNudge, composeRelayCancel, composeRespawnNotice, composeRespawnTriageNotice, composeRevertNotice, composeScopeCheck, composeTriageNotice, composeWake, composeWhyNotice, composeWrongCommandRelease } from "./act/messages.mjs";
+import { composeAbortContinue, composeActionNotice, composeBootGapNotice, composeCacheNotice, composeGoalWake, composeRefusalResume, composeMainStallNotice, composeMonitorOrphanNotice, composeNudge, composeRelayCancel, composeRespawnNotice, composeRespawnTriageNotice, composeRevertNotice, composeScopeCheck, composeTriageNotice, composeWake, composeWhyNotice, composeWrongCommandRelease } from "./act/messages.mjs";
 import { ownerKeyOf } from "./baseline.mjs";
 import { footerText, waitingText, writeGlobalStatus, writeSessionStatus } from "./act/notify.mjs";
 import { writeReport } from "./act/reports.mjs";
@@ -23,6 +23,7 @@ import { createTaskStoreReader, readGoalStore } from "./collect/tasks.mjs";
 import { createWorkReader } from "./collect/work.mjs";
 import { workWakeCount } from "./util/wake-sources.mjs";
 import { readParkRecords } from "./collect/parks.mjs";
+import { readWarmup } from "./collect/warmup.mjs";
 import { defaultLaunchers, defaultTerminals, runParkLifecycle } from "./act/park-resume.mjs";
 import { couldNotAnswer, gate, needsWhy, newRecord, planFinding, planReport, planWhy, PROCESS_ACTIONS, settle } from "./judge/policy.mjs";
 import { ANALYST_POLL_MS } from "./judge/analyst.mjs";
@@ -788,6 +789,18 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 				}
 				return { delivery };
 			}
+			case "cache-notice": {
+				// D4: one notice per incident to the session itself; a child has no sensor, so its parent gets it to pass on.
+				const session = world.sessions.get(s.sessionId);
+				const self = session?.kind !== "child";
+				const target = self ? s.sessionId : deliveryTarget(finding, world);
+				const message = composeCacheNotice({ finding, sessionId: target, now, forward: !self });
+				const delivery = deliver(world, target, message, finding, record, { selfOnly: true });
+				record.history.push({ atMs: now, kind: req.kind, status: delivery.delivered ? "delivered" : "not-delivered", detail: `${delivery.via} -> ${delivery.sessionId ?? target ?? "-"}` });
+				if (delivery.delivered) record.remedyDone = true;
+				else record.executed.delete(req.key);
+				return { delivery };
+			}
 			case "boot-notice": {
 				// D23: the one notice a main session gets about the work the downtime cut off.
 				const target = s.sessionId;
@@ -991,6 +1004,7 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 			attributed,
 			intentFor: ({ session, call }) => sources.transcripts?.find({ toolCallId: call.id, cwd: session.kind === "child" ? (session.task?.spawnCwd ?? session.cwd) : session.cwd, sinceMs: call.ms }) ?? null,
 			fileProbe: sources.fileProbe ?? fileProbe,
+			warmup: (sessionId) => readWarmup(paths?.keepwarmHome, sessionId),
 			terminalManifest: (session) => {
 				if (!manifestCache.has(session.id)) manifestCache.set(session.id, readSessionTerminalManifest(paths, session.id, session.file));
 				return manifestCache.get(session.id);

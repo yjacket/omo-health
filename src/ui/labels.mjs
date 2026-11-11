@@ -6,6 +6,8 @@ export const FINDING_LABELS = Object.freeze({
 	"process-runaway": "omo 아래 프로세스 폭주",
 	"machine-commit": "메모리 커밋 과다",
 	"cache-storm": "캐시 폭풍",
+	"cache-rewrite": "캐시 재작성(식기 전)",
+	"image-load": "이미지 누적",
 	"burn-spike": "토큰 폭증",
 	"full-resend": "전체 재전송",
 	"context-runaway": "컨텍스트 폭주",
@@ -87,6 +89,7 @@ export const ACTION_LABELS = Object.freeze({
 	"refusal-resume": "정책 거부로 멈춘 목표 세션 다시 시작",
 	"park-cleanup": "비정상 한도 대기 기록 정리(기록만)",
 	"boot-notice": "중단 전 작업 안내",
+	"cache-notice": "캐시·이미지 안내",
 	"scope-check": "범위 점검 메시지",
 	toast: "윈도우 알림",
 });

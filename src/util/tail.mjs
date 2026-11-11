@@ -50,6 +50,8 @@ export class JsonlTail {
 			if (this.startTailBytes !== null && stat.size > this.startTailBytes) {
 				this.offset = stat.size - this.startTailBytes;
 				this.skipFirstLine = true;
+				/** The file's start was never read: totals summed from entries (e.g. images) are lower bounds. */
+				this.startedMidFile = true;
 			}
 		}
 		this.identity = identity;

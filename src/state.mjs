@@ -108,6 +108,8 @@ export function buildWorld(input) {
 		fileProbe: input.fileProbe ?? (() => undefined),
 		/** D21: (session) -> the session's terminal manifest (every runtimeKind) | undefined ; engine-provided, cached per tick. */
 		terminalManifest: input.terminalManifest ?? (() => undefined),
+		/** D4: (sessionId) -> omo-keepalive warm-up state (src/collect/warmup.mjs) | undefined ; engine-provided, read only for a finding. */
+		warmup: input.warmup ?? (() => undefined),
 		/** D21: (cwd) -> the senpi-task store senpi uses for that cwd (collect/tasks.mjs readGoalStore) | undefined ; engine-provided, cached per tick. */
 		goalStore: input.goalStore ?? (() => undefined),
 		/** 0.8.0: (session) -> the session's own live work (collect/work.mjs WorkView) | undefined ; engine-provided, cached per tick. */

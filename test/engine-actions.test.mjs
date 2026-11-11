@@ -167,3 +167,26 @@ test("a boot notice is delivered once, recorded, and not sent again after a rest
 	await restarted.engine.tick();
 	assert.equal(restarted.sent.length, 0);
 });
+
+test("a D4 image-load notice goes once to a child's parent with the remedy, plus one owner toast; none below the threshold", async () => {
+	const MIB = 1024 * 1024;
+	const child = (id, imageBytes) => ({ ...sessionState({ id, kind: "child", taskId: `st_${id}`, parentSessionId: "p1" }), images: 70, imageBytes });
+	const sessions = [sessionState({ id: "p1", kind: "main" }), child("c1", 17 * MIB), child("c2", 15 * MIB)];
+	const sensors = new Map([["p1", { sessionId: "p1", pid: 1, ts: T0, idle: true, sensorVersion: "0.8.0" }]]);
+	const d4 = (world, memory) => tokens.detect(world, memory).filter((f) => f.kind === "image-load");
+	const h = harness({ findings: d4, detectorName: "tokens", sensors, sessions });
+	await h.engine.tick();
+	assert.equal(h.sent.length, 1);
+	const [notice] = h.sent;
+	assert.equal(notice.sessionId, "p1");
+	assert.equal(notice.details.actionKind, "cache-notice");
+	assert.equal(notice.details.taskId, "st_c1");
+	assert.equal(notice.triggerTurn, false);
+	assert.match(notice.content, /서브에이전트 st_c1/);
+	assert.match(notice.content, /1568px/);
+	assert.equal(h.toasts.length, 1);
+	h.clock.advance(60_000);
+	await h.engine.tick();
+	assert.equal(h.sent.length, 1);
+	assert.equal(h.toasts.length, 1);
+});

@@ -48,6 +48,17 @@ export const DEFAULT_CONFIG = Object.freeze({
 	tokens: {
 		cacheStormWrite: 100_000,
 		cacheStormReadFrac: 0.25,
+		// cache-rewrite: a rewrite as big as a storm turn that starts this soon after the previous reply, while the prompt
+		// cache (5 min TTL) should still be warm. cacheRewriteCount of them within cacheRewriteWindowMs, or one past imageTrimBytes.
+		cacheWarmMs: 5 * MIN,
+		cacheRewriteWindowMs: 60 * MIN,
+		cacheRewriteCount: 2,
+		// image-load: the Claude Code request builder (claude-sdk-oauth) and senpi's elideOldImages drop the oldest images once
+		// their base64 total passes 24 MiB, and every such trim rewrites the whole cache. Warn at imageWarnBytes; imageWarnCount
+		// is the fallback when the record carries no image data.
+		imageWarnBytes: 16 * 1024 * 1024,
+		imageTrimBytes: 24 * 1024 * 1024,
+		imageWarnCount: 80,
 		burnPerHour: 2_000_000,
 		burnMultiple: 3,
 		resendCount: 50,

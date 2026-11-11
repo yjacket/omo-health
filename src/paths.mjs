@@ -38,6 +38,8 @@ export function resolvePaths(env = process.env) {
 		omoJsonc: path.join(omoHome, "omo.jsonc"),
 		claudeProjectsDir: path.join(claudeHome, "projects"),
 		claudeSettingsFile: path.join(claudeHome, "settings.json"),
+		/** omo-keepalive's idle cache warm-up (keepwarm) home, resolved the way keepalive resolves it. */
+		keepwarmHome: env.OMO_KEEPWARM_HOME || path.join(home, ".omo-keepwarm"),
 		healthHome,
 		health: {
 			dbFile: path.join(healthHome, "omo-health.db"),
