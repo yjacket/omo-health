@@ -51,6 +51,7 @@ export const FINDING_LABELS = Object.freeze({
 	"host-crash-stopped": "크래시 세션 자동 재개 중단",
 	"stale-heartbeats": "남은 센서 하트비트 정리",
 	"park-invalid": "한도 대기 기록 오류",
+	"refusal-orphan": "정책 거부로 목표 멈춤",
 	"park-due": "한도 대기 재개",
 	drift: "작업 범위 점검 신호",
 });
@@ -78,6 +79,7 @@ export const ACTION_LABELS = Object.freeze({
 	"crash-cleanup": "남은 하트비트 정리(기록만)",
 	"crash-notice": "재개된 세션에 크래시 안내",
 	"park-resume": "한도 대기 재개",
+	"refusal-resume": "정책 거부로 멈춘 목표 세션 다시 시작",
 	"park-cleanup": "비정상 한도 대기 기록 정리(기록만)",
 	"boot-notice": "중단 전 작업 안내",
 	"scope-check": "범위 점검 메시지",
