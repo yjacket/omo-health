@@ -67,6 +67,9 @@ export const KNOWN_EVENTS = {
 		"tool_call_preflight_stalled",
 		"bash_spawn_stalled",
 		"bash_auto_reap_failed",
+		// senpi 2026.11.10-2 (omo 5.1.69), warn: a listener threw after a custom message was written; the message and its
+		// delivery still count as written (agent-session.js _appendCustomMessage, senpi#6284).
+		"custom_message_listener_failed",
 	]),
 	"fallback.log": new Set([
 		"cooldown_noted",
