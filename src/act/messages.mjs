@@ -478,9 +478,11 @@ export function composeImageSteer({ finding, sessionId, now, forward = false, id
 		kind: forward ? "relay" : "self-notice",
 		sessionId,
 		now,
-		// A busy parent reads it at its next tool boundary (steer) instead of after its whole turn; an idle one is woken.
+		// A busy session reads it at its next tool boundary (steer) instead of after its whole turn; an idle parent is woken.
+		// senpi (agent-session _deliverCustomMessage) joins a custom message to the running turn only when triggerTurn is
+		// not false: with false it is only written to the session, and the model does not see it until a later turn.
 		deliverAs: forward ? (idle ? "followUp" : "steer") : idle ? "nextTurn" : "steer",
-		triggerTurn: forward ? Boolean(idle) : false,
+		triggerTurn: forward ? true : !idle,
 		content,
 		details: { actionKind: "image-steer", level, incidentId: finding.fp, findingKind: finding.kind, taskId, images: d.images ?? null, imageBytes: d.imageBytes ?? null, forwardText: forward && level === "warn" ? passOn : null },
 	});

@@ -247,7 +247,9 @@ test("image steering reaches a busy parent at its next tool boundary (steer), no
 	assert.equal(h.sent.length, 1);
 	assert.equal(h.sent[0].sessionId, "p1");
 	assert.equal(h.sent[0].deliverAs, "steer");
-	assert.equal(h.sent[0].triggerTurn, false, "a busy parent already has a turn to read it in");
+	// senpi joins a custom message to the running turn (agent.steer) only when triggerTurn is not false;
+	// with false it is only written to the session and the model never sees it in that turn.
+	assert.equal(h.sent[0].triggerTurn, true);
 	assert.match(h.sent[0].content, /task_send\(st_c1/);
 });
 
@@ -262,6 +264,7 @@ test("image steering on a main session steers the session itself mid-turn; image
 	assert.equal(h.sent[0].sessionId, "m1");
 	assert.equal(h.sent[0].details.actionKind, "image-steer");
 	assert.equal(h.sent[0].deliverAs, "steer", "a busy session reads it at its next tool boundary");
+	assert.equal(h.sent[0].triggerTurn, true, "a steer with triggerTurn false never reaches the running turn");
 	const off = harness({ findings: d4, detectorName: "tokens", sensors, sessions: [{ ...main }], config: { tokens: { ...DEFAULT_CONFIG.tokens, imageSteer: "off" } } });
 	await off.engine.tick();
 	assert.equal(off.sent.length, 0);
