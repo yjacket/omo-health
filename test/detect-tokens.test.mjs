@@ -220,14 +220,42 @@ test("cache-rewrite: a rewrite after the cache TTL is not counted, and an old ep
 	assert.equal(ofKind(detect(old, {}), "cache-rewrite").length, 0);
 });
 
-test("image-load: warns at imageWarnBytes and not just below; the count is the fallback without image data", () => {
+test("image-load: warns at imageWarnBytes or imageWarnCount and not just below, and asks for the steer", () => {
 	const at = (images, imageBytes) => ofKind(detect(makeWorld({ now: NOW, sessions: [{ ...sessionState({ id: "i" }), images, imageBytes }] }), {}), "image-load");
-	const [warn] = at(70, 16 * MIB);
+	const [warn] = at(30, 10 * MIB);
 	assert.equal(warn.humanNeeded, true);
-	assert.deepEqual(warn.data.remedy, { kind: "cache-notice" });
-	assert.match(warn.detailKo, /24 MiB를 넘으면/);
-	assert.equal(at(70, 16 * MIB - 1).length, 0);
-	assert.match(at(130, 25 * MIB)[0].detailKo, /24 MiB를 넘었습니다/);
-	assert.equal(at(80, 0).length, 1);
-	assert.equal(at(79, 0).length, 0);
+	assert.deepEqual(warn.data.remedy, { kind: "image-steer" });
+	assert.match(warn.detailKo, /24 MiB 또는 100장을 넘으면/);
+	assert.equal(at(30, 10 * MIB - 1).length, 0);
+	assert.match(at(130, 25 * MIB)[0].detailKo, /잘림 기준\(24 MiB 또는 100장\)을 넘었습니다/);
+	assert.equal(at(40, 0).length, 1);
+	assert.equal(at(39, 0).length, 0);
+	const quiet = (imageSteer) => ofKind(detect(makeWorld({ now: NOW, config: { tokens: { imageSteer } }, sessions: [{ ...sessionState({ id: "i" }), images: 30, imageBytes: 12 * MIB }] }), {}), "image-load")[0].data.remedy;
+	assert.deepEqual(quiet("notice"), { kind: "cache-notice" });
+	assert.equal(quiet("off"), undefined);
+});
+
+test("image-load: a subagent warns earlier (imageWarnChildBytes / imageWarnChildCount) than a main session", () => {
+	const of = (kind, images, imageBytes, config) => ofKind(detect(makeWorld({ now: NOW, config, sessions: [{ ...sessionState({ id: "i", kind, taskId: kind === "child" ? "st_i" : undefined, parentSessionId: kind === "child" ? "p" : undefined }), images, imageBytes }] }), {}), "image-load");
+	// The steer reaches a subagent only through its parent's next turn, so it starts before the main-session line.
+	assert.equal(of("child", 20, 1 * MIB)[0]?.data.level, "warn");
+	assert.equal(of("child", 12, 5 * MIB)[0]?.data.level, "warn");
+	assert.equal(of("child", 19, 5 * MIB - 1).length, 0);
+	assert.equal(of("main", 20, 5 * MIB).length, 0, "a main session keeps imageWarnBytes / imageWarnCount");
+	assert.equal(of("child", 12, 5 * MIB, { tokens: { imageWarnChildBytes: 8 * MIB } }).length, 0, "the child line is a setting");
+	assert.equal(of("child", 60, 24 * MIB)[0]?.data.level, "trim", "the trim level is the same for both");
+});
+
+test("image-load: the image count warns on its own however small the images are, and the trim level comes at the count or the bytes", () => {
+	const LIMITS = { imageWarnBytes: 16 * MIB, imageWarnCount: 80, imageTrimBytes: 24 * MIB, imageTrimCount: 100 };
+	const at = (images, imageBytes, config = { tokens: LIMITS }) => ofKind(detect(makeWorld({ now: NOW, config, sessions: [{ ...sessionState({ id: "i" }), images, imageBytes }] }), {}), "image-load");
+	// Claude Code trims at 100 images whatever their size, so small phone screenshots reach it long before 24 MiB.
+	const [warn] = at(85, 5 * MIB);
+	assert.equal(warn?.data.level, "warn");
+	assert.equal(at(79, 5 * MIB).length, 0);
+	assert.equal(at(55, 5 * MIB, { tokens: { ...LIMITS, imageWarnCount: 50 } })[0]?.data.level, "warn", "imageWarnCount is a setting");
+	assert.equal(at(99, 5 * MIB)[0].data.level, "warn");
+	assert.equal(at(100, 5 * MIB)[0].data.level, "trim");
+	assert.equal(at(70, 24 * MIB)[0].data.level, "trim");
+	assert.equal(at(70, 16 * MIB)[0].data.level, "warn");
 });

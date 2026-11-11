@@ -213,6 +213,81 @@ test("a child whose host is gone gets no alignment finding even with churn evide
 	assert.equal(finding.subject.sessionId, "c1");
 });
 
+// Long-run review: thresholds come from this config, not from the shipped defaults.
+const HOUR = 60 * MIN;
+const LONG_RUN = { enabled: true, activeMs: 6 * HOUR, rounds: 8, everyMs: 6 * HOUR };
+function longRunSetup() {
+	const s = setup();
+	s.world.config = { ...DEFAULT_CONFIG, align: { ...DEFAULT_CONFIG.align, longRun: LONG_RUN } };
+	return s;
+}
+/** `n` steps 10 minutes apart up to `now`, each todo started, worked and finished: steady progress, no other D15 signal. */
+function progressSteps(now, n) {
+	return Array.from({ length: n + 1 }, (_, i) => {
+		const ms = now - (n - i) * 10 * MIN;
+		const todo = `Todo ${alpha(Math.floor(i / 3))}`;
+		const kind = ["start", "eval", "done"][i % 3];
+		return { ms, tool: kind === "eval" ? "eval" : "todo", kind, text: kind === "eval" ? `Work on ${alpha(i)}` : todo };
+	});
+}
+
+test("long-run: a goal session past the active-time threshold asks the analyst once, even while it keeps finishing todos", () => {
+	const { world, session, memory } = longRunSetup();
+	session.steps = progressSteps(T, 35);
+	assert.deepEqual(detect(world, memory), [], "5 h 50 min of activity is under the threshold");
+	session.steps = progressSteps(T, 37);
+	const [finding, ...rest] = detect(world, memory);
+	assert.equal(rest.length, 0);
+	assert.equal(finding.cls, "long-run");
+	assert.equal(finding.data.signal, "long-run");
+	assert.ok(finding.data.ledger.steps.length > 0, "the analyst gets the step ledger");
+	session.anchor = { ...session.anchor, status: "complete" };
+	assert.deepEqual(detect(world, {}), [], "a finished goal is not reviewed");
+});
+
+test("long-run: idle gaps do not count as active time", () => {
+	const { world, session } = longRunSetup();
+	// A 2 h 20 min stretch, a 2 h pause, then 3 h 30 min: almost 8 h of wall time but 5 h 50 min of work.
+	const late = progressSteps(T, 21);
+	const early = progressSteps(T - 21 * 10 * MIN - 2 * HOUR, 14);
+	session.steps = [...early, ...late];
+	assert.deepEqual(detect(world, {}), [], "3 h 30 min + 2 h 20 min of work is under 6 h");
+});
+
+test("long-run: the same step repeated over numbered rounds asks the analyst, even with todos finished between rounds", () => {
+	const { world, session } = longRunSetup();
+	const rounds = (from, to) => Array.from({ length: to - from + 1 }, (_, i) => from + i).flatMap((n, i, all) => {
+		const ms = T - (all.length - 1 - i) * 40 * MIN;
+		return [step((T - ms) / MIN + 2, "start", `QA ${alpha(n)}`), { ms, tool: "eval", kind: "eval", text: `회귀 점검 ${n - 1} 결과를 읽고 ${n}차 QA를 시작합니다` }, step((T - ms) / MIN - 1, "done", `QA ${alpha(n)}`)];
+	});
+	session.steps = rounds(20, 26);
+	assert.deepEqual(detect(world, {}), [], "7 rounds is under the threshold");
+	session.steps = rounds(19, 26);
+	const [finding] = detect(world, {});
+	assert.equal(finding?.cls, "long-run");
+	assert.match(finding.data.evidence, /19.*26/, "the evidence names the round numbers");
+
+	// birsom's wording changed between rounds; the rounds still add up.
+	session.steps = rounds(19, 26).map((s, i) => (s.kind === "eval" && i % 2 ? { ...s, text: s.text.replace("차 QA", "차 전체 QA") } : s));
+	assert.equal(detect(world, {})[0]?.cls, "long-run");
+});
+
+test("long-run: one review per session per everyMs, and the switch turns it off", () => {
+	const { world, session, memory } = longRunSetup();
+	session.steps = progressSteps(T, 37);
+	const [first] = detect(world, memory);
+	memory.s1.push({ ms: world.now, key: first.subject.key });
+	const later = (hours) => {
+		world.now = T + hours * HOUR;
+		session.steps = progressSteps(world.now, 37 + hours * 6);
+		return detect(world, memory).filter((f) => f.cls === "long-run");
+	};
+	assert.deepEqual(later(5), [], "5 h after the last review");
+	assert.equal(later(6.5).length, 1, "6 h 30 min after the last review");
+	world.config = { ...world.config, align: { ...world.config.align, longRun: { ...LONG_RUN, enabled: false } } };
+	assert.deepEqual(detect(world, {}), []);
+});
+
 test("age and tool-call count alone never nudge: a long goal that keeps finishing todos is left alone", () => {
 	const { world, session } = setup();
 	Object.assign(session.activity, { sinceMs: T - 6 * 3600_000, toolCalls: 129 });

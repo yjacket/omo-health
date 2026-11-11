@@ -67,6 +67,52 @@ export function isInformationAsk(text) {
 	return question && !request;
 }
 
+const GOAL_ACTIVE = new Set(["active", "running", "in_progress", "pending"]);
+const HOUR_MS = 3600_000;
+// A round number written next to a step: "26차 QA", "회귀 점검 25", "QA round 7", "3회차" (not 차이, 차원, 차례, 차단...).
+const ROUND = /(\d+)\s*(?:차|회차)(?![이원례단량선트])|(?:round|라운드|회귀 점검)\s*#?(\d+)/gi;
+
+/** Time spent working: the sum of gaps between consecutive steps that are shorter than idleGapMs. */
+export function activeTime(steps, idleGapMs) {
+	const times = steps.map((step) => step.ms).filter(Number.isFinite).sort((a, b) => a - b);
+	let total = 0;
+	for (let i = 1; i < times.length; i += 1) if (times[i] - times[i - 1] < idleGapMs) total += times[i] - times[i - 1];
+	return total;
+}
+
+/**
+ * The numbered rounds the session's steps name: { text (the latest such step), rounds: sorted distinct numbers }.
+ * A step's round is the largest number it names ("회귀 점검 25 결과를 읽고 26차 QA" is round 26). The wording of a round
+ * changes from one to the next ("26차 QA", "27차 전체 QA"), so rounds count across every step, and finished todos
+ * between rounds do not reset them.
+ */
+export function repeatedRounds(steps) {
+	const rounds = new Set();
+	let text = null;
+	for (const step of steps) {
+		const value = String(step.text ?? "");
+		const numbers = [...value.matchAll(ROUND)].map((m) => Number(m[1] ?? m[2]));
+		if (!numbers.length) continue;
+		rounds.add(Math.max(...numbers));
+		text = value;
+	}
+	return text ? { text, rounds: [...rounds].sort((x, y) => x - y) } : null;
+}
+
+/** long-run: a goal session that worked longRun.activeMs or repeated one step over longRun.rounds rounds. */
+function longRun(session, cfg) {
+	const lr = cfg.longRun;
+	if (!lr?.enabled || !GOAL_ACTIVE.has(session.anchor?.status)) return null;
+	const steps = session.steps ?? [];
+	const rounds = repeatedRounds(steps);
+	if (rounds && rounds.rounds.length >= lr.rounds) {
+		return { signal: "long-run", metric: rounds.rounds.length, evidence: `'${truncate(rounds.text, 100)}' repeated over rounds ${rounds.rounds[0]}..${rounds.rounds.at(-1)} (${rounds.rounds.length} rounds)` };
+	}
+	const active = activeTime(steps, cfg.idleGapMs);
+	if (active >= lr.activeMs) return { signal: "long-run", metric: Math.round((active / HOUR_MS) * 10) / 10, evidence: `${Math.round((active / HOUR_MS) * 10) / 10} h of active work on this goal (pauses of ${cfg.idleGapMs / 60_000} min or more not counted)` };
+	return null;
+}
+
 function signals(session, now, cfg, humanInputs, progressTimes) {
 	const activity = session.activity ?? {};
 	const files = activity.files instanceof Map ? activity.files.values() : Object.values(activity.files ?? {});
@@ -107,6 +153,8 @@ function signals(session, now, cfg, humanInputs, progressTimes) {
 		const mutations = activity.sinceMs >= goal.updatedAtMs ? activity.mutations : new Set([...writes.map((write) => write.id), ...shellWrites.map((call) => call.id)]).size;
 		if (mutations >= cfg.afterCompleteMutations) out.push({ signal: "after-complete", metric: mutations });
 	}
+	const long = longRun(session, cfg);
+	if (long) out.push(long);
 	return out;
 }
 
@@ -144,9 +192,13 @@ export function detect(world, memory = {}) {
 		for (const { signal, metric, evidence, request } of signals(session, world.now, cfg, humanInputs, progressTimes)) {
 			if (emitted.has(target)) break;
 			// An overstep belongs to one owner request; growth in mutations is the same request, not a new incident.
+			// A long run is reviewed again once longRun.everyMs has passed since its last review, whatever its metric.
 			const key = signal === "overstep"
 				? `align:${sid}:overstep:${sha1(request).slice(0, 12)}`
-				: `align:${sid}:${signal}:${Math.floor(Math.log2(metric))}`;
+				: signal === "long-run"
+					? `align:${sid}:long-run:${Math.floor(world.now / cfg.longRun.everyMs)}`
+					: `align:${sid}:${signal}:${Math.floor(Math.log2(metric))}`;
+			if (signal === "long-run" && history.some((e) => String(e.key).startsWith(`align:${sid}:long-run:`) && world.now - e.ms < cfg.longRun.everyMs)) continue;
 			if (history.some((e) => e.key === key) || history.filter((e) => new Date(e.ms).toISOString().slice(0, 10) === today).length >= cfg.perDay || history.some((e) => world.now - e.ms < cfg.minGapMs)) continue;
 			const finding = makeFinding({
 				detector: id, kind: "drift", severity: "info", cls: signal,

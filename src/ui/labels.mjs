@@ -90,6 +90,7 @@ export const ACTION_LABELS = Object.freeze({
 	"park-cleanup": "비정상 한도 대기 기록 정리(기록만)",
 	"boot-notice": "중단 전 작업 안내",
 	"cache-notice": "캐시·이미지 안내",
+	"image-steer": "이미지 줄이기 지시",
 	"scope-check": "범위 점검 메시지",
 	toast: "윈도우 알림",
 });
