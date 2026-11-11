@@ -212,6 +212,7 @@ test("senpi 2026.10.x log events (omo 5.1.44-5.1.51) are known by default", () =
 		["warn", "tool_call_preflight_stalled"],
 		["warn", "bash_spawn_stalled"],
 		["warn", "bash_auto_reap_failed"],
+		["warn", "custom_message_listener_failed"],
 	]);
 	write("fallback.log", [
 		["info", "refusal_pin_released"],
