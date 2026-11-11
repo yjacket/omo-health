@@ -56,6 +56,20 @@ export const KNOWN_EVENTS = {
 		"turn_deadline_abort_failed",
 		"turn_deadline_unsettled",
 		"goal_continuation_record_write_failed",
+		// senpi 2026.10.31-x (omo 5.1.57): a late agent_settled handler failed after the settle reached clients (warn),
+		// a skill invoked twice in one prompt (debug), and a Claude CLI account profile not saved (info, bookkeeping).
+		"agent_settled_handlers_failed",
+		"skill_expansion_duplicate",
+		"claude_cli_profile_write_failed",
+		// senpi 2026.11.6-3 / 2026.11.9 (omo 5.1.65-5.1.66), warn: a tool call waited over 30 s on the event queue or its
+		// tool_call hooks, a bash spawn over 30 s, or a background session's auto-reap did not end it. Nothing is aborted.
+		"tool_call_event_queue_stalled",
+		"tool_call_preflight_stalled",
+		"bash_spawn_stalled",
+		"bash_auto_reap_failed",
+		// senpi 2026.11.10-2 (omo 5.1.69), warn: a listener threw after a custom message was written; the message and its
+		// delivery still count as written (agent-session.js _appendCustomMessage, senpi#6284).
+		"custom_message_listener_failed",
 	]),
 	"fallback.log": new Set([
 		"cooldown_noted",
@@ -73,6 +87,8 @@ export const KNOWN_EVENTS = {
 		"refusal_pin_released",
 		// senpi 2026.10.27-2 (omo 5.1.54), warn: the provider does not serve the configured model; no retry or fallback.
 		"model_config_error",
+		// senpi 2026.11.6-3 (omo 5.1.65), info: which model family a weekly usage limit with no family named applies to.
+		"usage_limit_scope_probe",
 	]),
 	"config-reload.log": new Set([
 		"reload_deferred",
