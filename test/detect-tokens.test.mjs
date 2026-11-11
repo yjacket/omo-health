@@ -170,3 +170,64 @@ test("context-runaway: slow growth is not a runaway", () => {
 	const world = makeWorld({ now: NOW, sessions: [sessionState({ turns: contextTurns([400_000, 449_999, 499_998, 549_997, 599_996]) })] });
 	assert.equal(ofKind(detect(world), "context-runaway").length, 0);
 });
+
+// birsom QA child shape (2026-11-10, anonymized and trimmed): screenshot batches, then ONE rewrite 20 s after the previous
+// reply while the cache was still warm, then cache reads again. The image total had passed 24 MiB at the rewrite.
+const MIB = 1024 * 1024;
+function birsomTurns(base, { rewrites = 1, images = 120, imageBytes = Math.round(28.1 * MIB), gapMs = 20_000 } = {}) {
+	const turns = [turn(base, { input: 3, output: 400, cacheRead: 349_000, cacheWrite: 4_000, images: images - 6, imageBytes: imageBytes - 6 * 230_000 })];
+	for (let i = 0; i < rewrites; i += 1) {
+		const prev = turns.at(-1);
+		const rewrite = turn(prev.ms + gapMs + 20_000, { input: 3, output: 500, cacheRead: 20_549, cacheWrite: 329_105, cost: 4.3372, images, imageBytes });
+		rewrite.startMs = prev.ms + gapMs;
+		turns.push(rewrite, turn(rewrite.ms + 40_000, { input: 3, output: 600, cacheRead: 349_654, cacheWrite: 3_000, images, imageBytes }));
+	}
+	return turns;
+}
+
+test("cache-rewrite: one warm-cache rewrite past 24 MiB of images fires for the owner and the session; cache-storm misses it", () => {
+	const base = NOW - 10 * MIN;
+	const warm = { record: true, eligible: false, disabledReason: "prefix_unsafe", disabledDetail: "prompt prefix preview handler not preview-safe" };
+	const world = makeWorld({ now: NOW, sessions: [{ ...sessionState({ id: "c1", kind: "child", taskId: "st_1", parentSessionId: "p1", turns: birsomTurns(base) }), images: 120, imageBytes: Math.round(28.1 * MIB) }], warmup: (id) => (id === "c1" ? warm : undefined) });
+	const findings = detect(world, {});
+	assert.equal(ofKind(findings, "cache-storm").length, 0);
+	const [rewrite] = ofKind(findings, "cache-rewrite");
+	assert.ok(rewrite);
+	assert.equal(rewrite.humanNeeded, true);
+	assert.equal(rewrite.subject.parentSessionId, "p1");
+	assert.deepEqual(rewrite.data.remedy, { kind: "cache-notice" });
+	assert.equal(rewrite.data.rewrites, 1);
+	assert.equal(rewrite.data.images, 120);
+	assert.deepEqual(rewrite.data.warmup, warm);
+	assert.match(rewrite.detailKo, /이미지 120장, base64 28\.1 MiB/);
+	assert.match(rewrite.detailKo, /keepalive warm-up 꺼짐\(prefix_unsafe: prompt prefix preview handler not preview-safe\)/);
+});
+
+test("cache-rewrite: two warm rewrites within the window fire without images; one does not", () => {
+	const small = { images: 0, imageBytes: 0 };
+	const two = makeWorld({ now: NOW, sessions: [sessionState({ id: "a", turns: birsomTurns(NOW - 20 * MIN, { rewrites: 2, ...small }) })] });
+	const [hit] = ofKind(detect(two, {}), "cache-rewrite");
+	assert.equal(hit.data.rewrites, 2);
+	assert.match(hit.detailKo, /keepalive warm-up 기록 없음/);
+	const one = makeWorld({ now: NOW, sessions: [sessionState({ id: "b", turns: birsomTurns(NOW - 20 * MIN, { rewrites: 1, ...small }) })] });
+	assert.equal(ofKind(detect(one, {}), "cache-rewrite").length, 0);
+});
+
+test("cache-rewrite: a rewrite after the cache TTL is not counted, and an old episode resolves", () => {
+	const cold = makeWorld({ now: NOW, sessions: [sessionState({ id: "a", turns: birsomTurns(NOW - 30 * MIN, { rewrites: 2, images: 0, imageBytes: 0, gapMs: 5 * MIN + 1000 }) })] });
+	assert.equal(ofKind(detect(cold, {}), "cache-rewrite").length, 0);
+	const old = makeWorld({ now: NOW + 2 * HOUR, sessions: [{ ...sessionState({ id: "c", turns: birsomTurns(NOW - 10 * MIN) }), images: 120, imageBytes: Math.round(28.1 * MIB) }] });
+	assert.equal(ofKind(detect(old, {}), "cache-rewrite").length, 0);
+});
+
+test("image-load: warns at imageWarnBytes and not just below; the count is the fallback without image data", () => {
+	const at = (images, imageBytes) => ofKind(detect(makeWorld({ now: NOW, sessions: [{ ...sessionState({ id: "i" }), images, imageBytes }] }), {}), "image-load");
+	const [warn] = at(70, 16 * MIB);
+	assert.equal(warn.humanNeeded, true);
+	assert.deepEqual(warn.data.remedy, { kind: "cache-notice" });
+	assert.match(warn.detailKo, /24 MiB를 넘으면/);
+	assert.equal(at(70, 16 * MIB - 1).length, 0);
+	assert.match(at(130, 25 * MIB)[0].detailKo, /24 MiB를 넘었습니다/);
+	assert.equal(at(80, 0).length, 1);
+	assert.equal(at(79, 0).length, 0);
+});

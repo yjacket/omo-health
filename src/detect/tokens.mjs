@@ -1,6 +1,9 @@
 import { makeFinding, RECENT_EVIDENCE_MS } from "./finding.mjs";
 
-/** D4: token anomalies (IS-11) - cache storm, hourly burn spike, full resend, context runaway. Alert only. */
+/**
+ * D4: token anomalies (IS-11) - cache storm, hourly burn spike, full resend, context runaway: alert only.
+ * Cache rewrites of a still-warm cache and a session's image load also tell the owner (toast) and the session (one notice).
+ */
 export const id = "D4";
 
 const HOUR = 3_600_000;
@@ -10,6 +13,26 @@ const RESEND_MATCH_MS = 30_000;
 const contextOf = (turn) => (turn.input ?? 0) + (turn.cacheRead ?? 0) + (turn.cacheWrite ?? 0);
 const tokensOf = (turn) => (turn.input ?? 0) + (turn.output ?? 0) + (turn.cacheRead ?? 0) + (turn.cacheWrite ?? 0);
 const round = (value, digits = 4) => Math.round(value * 10 ** digits) / 10 ** digits;
+const MIB = 1024 * 1024;
+const mib = (bytes) => round((bytes ?? 0) / MIB, 1);
+
+const REMEDY_KO = "확인할 영역만 잘라 읽고, 레이아웃 확인은 절반 크기로 줄이고, 여러 화면은 4-6장씩 1568px 이하 한 장으로 붙여 읽고, 같은 스크린샷은 다시 읽지 마세요. 스크린샷이 40장을 넘는 작업은 서브에이전트를 나눠 새 세션에서 이어 가세요.";
+
+/** Images in the context: `N장(이상), base64 X MiB`. */
+function imageText(images, bytes, partial) {
+	return `이미지 ${images ?? 0}장${partial ? " 이상" : ""}${bytes ? `, base64 ${mib(bytes)} MiB` : ""}`;
+}
+
+/** omo-keepalive's warm-up for the session (src/collect/warmup.mjs). */
+function warmupText(warm) {
+	if (!warm?.record) return "keepalive warm-up 기록 없음";
+	if (warm.eligible) return "keepalive warm-up 켜짐";
+	return `keepalive warm-up 꺼짐(${warm.disabledReason ?? "이유 없음"}${warm.disabledDetail ? `: ${warm.disabledDetail}` : ""})`;
+}
+
+function overTrim(turn, cfg) {
+	return turn.imageBytes ? turn.imageBytes >= cfg.imageTrimBytes : (turn.images ?? 0) >= cfg.imageWarnCount;
+}
 
 function median(values) {
 	const sorted = [...values].sort((a, b) => a - b);
@@ -65,6 +88,85 @@ function cacheStorm(session, cfg) {
 				provider: last.provider,
 				model: last.model,
 			},
+		}),
+	];
+}
+
+/**
+ * 4e: a storm-sized rewrite that starts within cacheWarmMs of the previous reply, while the cache should still be warm.
+ * Unlike 4a these come one at a time (after a batch of screenshot reads), so 4a's two-in-a-row never sees them.
+ */
+function cacheRewrite(world, session, cfg) {
+	const turns = session.turns ?? [];
+	const hits = [];
+	for (let i = 1; i < turns.length; i += 1) {
+		const turn = turns[i];
+		const prev = turns[i - 1];
+		const gap = (turn.startMs ?? turn.ms) - prev.ms;
+		if (!(gap >= 0 && gap <= cfg.cacheWarmMs)) continue;
+		if (turn.cacheWrite >= cfg.cacheStormWrite && turn.cacheRead < cfg.cacheStormReadFrac * contextOf(prev)) hits.push(turn);
+	}
+	const last = hits.at(-1);
+	if (!last || !(world.now - last.ms <= cfg.cacheRewriteWindowMs)) return [];
+	const recent = hits.filter((turn) => last.ms - turn.ms <= cfg.cacheRewriteWindowMs);
+	const images = overTrim(last, cfg);
+	if (recent.length < cfg.cacheRewriteCount && !images) return [];
+	const written = recent.reduce((sum, turn) => sum + turn.cacheWrite, 0);
+	const totalCost = round(recent.reduce((sum, turn) => sum + (turn.cost ?? 0), 0));
+	const warm = world.warmup(session.id);
+	const load = imageText(last.images, last.imageBytes, session.imagesPartial);
+	const cause = images
+		? `이 세션에 쌓인 ${load}로 24 MiB를 넘었습니다. 요청 속 이미지 합이 24 MiB를 넘으면 가장 오래된 이미지가 잘려 나가 프롬프트가 바뀌므로, 이미지를 더 읽을 때마다 캐시 전체를 다시 씁니다.`
+		: `이 세션에 쌓인 것은 ${load}입니다.`;
+	return [
+		makeFinding({
+			detector: id,
+			kind: "cache-rewrite",
+			humanNeeded: true,
+			subject: sessionSubject(session, "cache-rewrite"),
+			evidence: [`rewrites:${recent.length}`, `cacheWrite:${last.cacheWrite}`, `cacheRead:${last.cacheRead}`, `images:${last.images ?? 0}`, `imageMiB:${mib(last.imageBytes)}`],
+			titleKo: `캐시 재작성: ${cfg.cacheRewriteWindowMs / 60_000}분에 ${recent.length}번, ${round(written / 1e6, 1)}M 토큰`,
+			detailKo: `세션 ${session.id}에서 캐시가 식기 전(직전 응답 뒤 ${cfg.cacheWarmMs / 60_000}분 안)에 캐시를 통째로 다시 쓴 요청이 최근 ${cfg.cacheRewriteWindowMs / 60_000}분에 ${recent.length}번, 합계 ${written}토큰(약 $${totalCost})입니다. ${cause} ${warmupText(warm)}.`,
+			data: {
+				rewrites: recent.length,
+				startMs: recent[0].ms,
+				atMs: last.ms,
+				cacheWrite: last.cacheWrite,
+				cacheRead: last.cacheRead,
+				written,
+				totalCost,
+				images: last.images ?? 0,
+				imageBytes: last.imageBytes ?? 0,
+				imagesPartial: Boolean(session.imagesPartial),
+				warmup: warm ?? null,
+				provider: last.provider,
+				model: last.model,
+				remedy: { kind: "cache-notice" },
+				advice: REMEDY_KO,
+			},
+		}),
+	];
+}
+
+/** 4f: the images in a session's context near the size where they start rewriting the cache (or the count fallback). */
+function imageLoad(session, cfg) {
+	const bytes = session.imageBytes ?? 0;
+	const images = session.images ?? 0;
+	if (!(bytes ? bytes >= cfg.imageWarnBytes : images >= cfg.imageWarnCount)) return [];
+	const over = bytes ? bytes >= cfg.imageTrimBytes : false;
+	const load = imageText(images, bytes, session.imagesPartial);
+	return [
+		makeFinding({
+			detector: id,
+			kind: "image-load",
+			humanNeeded: true,
+			subject: sessionSubject(session, "image-load"),
+			evidence: [`images:${images}`, `imageMiB:${mib(bytes)}`],
+			titleKo: `이미지 누적: ${load}`,
+			detailKo: over
+				? `세션 ${session.id}의 컨텍스트에 ${load}가 쌓여 24 MiB를 넘었습니다. 이제 이미지를 더 읽을 때마다 가장 오래된 이미지가 잘려 나가 캐시 전체를 다시 씁니다.`
+				: `세션 ${session.id}의 컨텍스트에 ${load}가 쌓였습니다. 이미지 합이 24 MiB를 넘으면 그때부터 이미지를 더 읽을 때마다 캐시 전체를 다시 씁니다.`,
+			data: { images, imageBytes: bytes, imagesPartial: Boolean(session.imagesPartial), warnBytes: cfg.imageWarnBytes, trimBytes: cfg.imageTrimBytes, remedy: { kind: "cache-notice" }, advice: REMEDY_KO },
 		}),
 	];
 }
@@ -171,7 +273,7 @@ export function detect(world, memory = {}) {
 			if (held && world.now - held.lastHitMs < cfg.burnHoldMs) spike = held.finding;
 			else delete memory.burn[session.id];
 		}
-		out.push(...cacheStorm(session, cfg), ...(spike ? [spike] : []), ...contextRunaway(session, cfg));
+		out.push(...cacheStorm(session, cfg), ...cacheRewrite(world, session, cfg), ...imageLoad(session, cfg), ...(spike ? [spike] : []), ...contextRunaway(session, cfg));
 	}
 	for (const sessionId of Object.keys(memory.burn)) {
 		if (!world.sessions.has(sessionId)) delete memory.burn[sessionId];

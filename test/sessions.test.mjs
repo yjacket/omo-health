@@ -588,3 +588,40 @@ test("the error cause is read from the full text before the 300-char cut", () =>
 	assert.ok(errors[0].text.length <= 300);
 	assert.equal(Object.hasOwn(errors[1], "cause"), false);
 });
+
+test("images in tool results and user messages are counted with their base64 size; compaction resets them", () => {
+	const dir = tmpDir();
+	const file = path.join(dir, "2026_img.jsonl");
+	const image = (n) => ({ type: "image", data: "A".repeat(n), mimeType: "image/png" });
+	const result = (id, ms, content) => ({ type: "message", timestamp: new Date(ms).toISOString(), message: { role: "toolResult", toolCallId: id, toolName: "read", content, isError: false, timestamp: ms } });
+	writeJsonl(file, [
+		E.header("img", "C:\\dev\\x", T0),
+		{ type: "message", timestamp: new Date(T0 + 1000).toISOString(), message: { role: "user", content: [{ type: "text", text: "look" }, image(100)], timestamp: T0 + 1000 } },
+		E.assistant({ ms: T0 + 2000, calls: [{ id: "r1", name: "read", args: { path: "a.png" } }] }),
+		result("r1", T0 + 3000, [image(250), image(50), { type: "text", text: "two screenshots" }]),
+		E.assistant({ ms: T0 + 4000 }),
+	]);
+	const tracker = new SessionTracker({ file });
+	tracker.read();
+	tracker.advance();
+	assert.equal(tracker.state.images, 3);
+	assert.equal(tracker.state.imageBytes, 400);
+	assert.equal(tracker.state.imagesPartial, false);
+	assert.equal(tracker.state.turns.at(-1).imageBytes, 400);
+	appendJsonl(file, [{ type: "compaction", id: "cmp", timestamp: new Date(T0 + 5000).toISOString(), summary: "s" }]);
+	tracker.read();
+	tracker.advance();
+	assert.equal(tracker.state.images, 0);
+	assert.equal(tracker.state.imageBytes, 0);
+});
+
+test("a tracker that starts mid-file marks its image totals as lower bounds", () => {
+	const dir = tmpDir();
+	const file = path.join(dir, "2026_big.jsonl");
+	const filler = Array.from({ length: 40 }, (_, i) => E.user("x".repeat(200), T0 + i));
+	writeJsonl(file, [E.header("big", "C:\\dev\\x", T0), ...filler]);
+	const tracker = new SessionTracker({ file, tailBytes: 1024 });
+	tracker.read();
+	tracker.advance();
+	assert.equal(tracker.state.imagesPartial, true);
+});

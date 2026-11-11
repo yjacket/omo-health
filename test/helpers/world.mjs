@@ -100,6 +100,7 @@ export function makeWorld(options = {}) {
 		intentFor: options.intentFor,
 		fileProbe: options.fileProbe,
 		terminalManifest: options.terminalManifest,
+		warmup: options.warmup,
 		goalStore: options.goalStore,
 		workOf: options.workOf,
 		downtime: options.downtime,

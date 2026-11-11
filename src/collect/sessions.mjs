@@ -186,6 +186,11 @@ export class SessionTracker {
 			resolved: new Map(),
 			abandoned: 0,
 			turns: [],
+			/** Images in the model's context since the last compaction (user and tool-result content), and their base64 size. */
+			images: 0,
+			imageBytes: 0,
+			/** The tracker started mid-file, so `images`/`imageBytes` are lower bounds. */
+			imagesPartial: false,
 			userTurns: [],
 			firstUserText: firstUserFromHead(file),
 			activity: tailBytes === null ? freshActivity(undefined) : seedActivity(alignmentDir, id),
@@ -208,6 +213,7 @@ export class SessionTracker {
 	read() {
 		const result = this.tail.readNew();
 		this.state.badLines += result.badLines;
+		if (this.tail.startedMidFile) this.state.imagesPartial = true;
 		for (const entry of result.entries) {
 			const ms = entryMs(entry);
 			this.queue.push({ entry, ms });
@@ -259,9 +265,23 @@ export class SessionTracker {
 			}
 			return;
 		}
+		if (entry.type === "compaction") {
+			// The summary replaces the earlier messages, images included.
+			s.images = 0;
+			s.imageBytes = 0;
+			s.imagesPartial = false;
+			return;
+		}
 		if (entry.type !== "message" || !entry.message) return;
 		const m = entry.message;
 		const role = m.role;
+		if (role !== "assistant" && Array.isArray(m.content)) {
+			for (const item of m.content) {
+				if (item?.type !== "image") continue;
+				s.images += 1;
+				s.imageBytes += typeof item.data === "string" ? item.data.length : 0;
+			}
+		}
 		if (role === "assistant") this.applyAssistant(entry, m, ms);
 		else if (role === "toolResult") this.applyToolResult(m, ms);
 		else if (role === "user") {
@@ -305,6 +325,8 @@ export class SessionTracker {
 				cacheRead: Number(usage.cacheRead ?? 0),
 				cacheWrite: Number(usage.cacheWrite ?? 0),
 				cost: Number(usage.cost?.total ?? 0),
+				images: s.images,
+				imageBytes: s.imageBytes,
 				stopReason: m.stopReason,
 				tps: durMs && durMs > 0 ? output / (durMs / 1000) : undefined,
 			});

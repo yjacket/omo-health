@@ -51,6 +51,8 @@ export const SWITCH_OF = {
 	"why-notice": "relay",
 	"respawn-notice": "relay",
 	"triage-notice": "relay",
+	// D4: the one notice about cache rewrites or image load; allowed on main sessions (not in MAIN_SESSION_BLOCKED).
+	"cache-notice": "relay",
 	// D23: the downtime notice is a relay; it may reach a main session.
 	"boot-notice": "relay",
 	wake: "wake",
