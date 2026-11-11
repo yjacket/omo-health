@@ -66,6 +66,8 @@ export const SWITCH_OF = {
 	"crash-answer": "resume",
 	// D20: relaunch a session parked at a usage limit; allowed on main sessions (not in MAIN_SESSION_BLOCKED).
 	"park-resume": "resume",
+	// D24: resume a goal session stopped by a policy refusal; allowed on main sessions (not in MAIN_SESSION_BLOCKED).
+	"refusal-resume": "resume",
 	toast: "toast",
 };
 

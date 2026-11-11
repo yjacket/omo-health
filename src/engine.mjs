@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { pendingMessages, sendToSession, sweepUndelivered } from "./act/inbox.mjs";
 import { executeKill } from "./act/kill.mjs";
-import { composeAbortContinue, composeActionNotice, composeBootGapNotice, composeGoalWake, composeMainStallNotice, composeMonitorOrphanNotice, composeNudge, composeRelayCancel, composeRespawnNotice, composeRespawnTriageNotice, composeRevertNotice, composeScopeCheck, composeTriageNotice, composeWake, composeWhyNotice, composeWrongCommandRelease } from "./act/messages.mjs";
+import { composeAbortContinue, composeActionNotice, composeBootGapNotice, composeGoalWake, composeRefusalResume, composeMainStallNotice, composeMonitorOrphanNotice, composeNudge, composeRelayCancel, composeRespawnNotice, composeRespawnTriageNotice, composeRevertNotice, composeScopeCheck, composeTriageNotice, composeWake, composeWhyNotice, composeWrongCommandRelease } from "./act/messages.mjs";
 import { ownerKeyOf } from "./baseline.mjs";
 import { footerText, waitingText, writeGlobalStatus, writeSessionStatus } from "./act/notify.mjs";
 import { writeReport } from "./act/reports.mjs";
@@ -74,7 +74,7 @@ export function probeFile(file) {
 
 /** Every detector, in evaluation order (D1 first: it attributes processes for D2/D9). */
 export async function loadDetectors() {
-	const names = ["stall", "runaway", "respawn", "tokens", "tps", "provider", "config", "orphans", "monitor-orphans", "reflection-orphans", "crashes", "parks", "leftovers", "loops", "reload", "self", "offtrack", "align", "goal-liveness", "boot-gap"];
+	const names = ["stall", "runaway", "respawn", "tokens", "tps", "provider", "config", "orphans", "monitor-orphans", "reflection-orphans", "crashes", "parks", "leftovers", "loops", "reload", "self", "offtrack", "align", "goal-liveness", "refusal", "boot-gap"];
 	const detectors = [];
 	for (const name of names) {
 		try {
@@ -745,6 +745,20 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 					memory.wakes ??= {};
 					memory.lastWake[s.sessionId] = now;
 					memory.wakes[s.sessionId] = (memory.wakes[s.sessionId] ?? 0) + 1;
+				}
+				return { delivery };
+			}
+			case "refusal-resume": {
+				// D24 (issue #10): a goal blocked by a provider policy refusal. One turn-starting message that lists the calls
+				// left without a result and asks for a reworded attempt; the detector caps it per session per hour.
+				record.remedyDone = true;
+				const message = composeRefusalResume({ sessionId: s.sessionId, now, calls: finding.data?.calls ?? [], errorHead: finding.data?.errorHead });
+				const delivery = deliver(world, s.sessionId, message, finding, record, { selfOnly: true });
+				record.history.push({ atMs: now, kind: req.kind, status: delivery.delivered ? "delivered" : "not-delivered", detail: `${delivery.via} -> ${delivery.sessionId ?? s.sessionId ?? "-"}` });
+				if (delivery.delivered) {
+					const memory = memoryFor("refusal");
+					memory.resumes ??= {};
+					memory.resumes[s.sessionId] = [...(memory.resumes[s.sessionId] ?? []), now];
 				}
 				return { delivery };
 			}
