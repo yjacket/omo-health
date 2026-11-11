@@ -113,3 +113,46 @@ test("readAuthSlots returns undefined for missing or malformed files and [] with
 	fs.mkdirSync(unreadable);
 	assert.equal(readAuthSlots(unreadable), undefined);
 });
+
+test("readAuthSlots reads a claude-cli slot's refresh expiry from its CLI credentials file, never the tokens (omo 5.1.58+)", () => {
+	const dir = tmpDir();
+	const file = path.join(dir, "auth.json");
+	const dirId = "3f5ddd493a114772bb53016b06d21194";
+	fs.writeFileSync(
+		file,
+		JSON.stringify({
+			"anthropic-subscription": {
+				type: "oauth",
+				access: "claude-sdk-oauth-managed",
+				refresh: "claude-sdk-oauth-managed",
+				expires: 4_102_444_800_000,
+				accounts: [
+					{ name: "default", source: "login", store: "claude-cli", dirId, signedInAt: 1_793_802_202_171 },
+					{ name: "gone", source: "login", store: "claude-cli", dirId: "0123456789abcdef0123456789abcdef", signedInAt: 1 },
+					{ name: "cleared", source: "login", store: "claude-cli", dirId: "fedcba9876543210fedcba9876543210" },
+				],
+			},
+		}),
+	);
+	const cliDir = (id) => path.join(dir, "anthropic-subscription-claude", id);
+	fs.mkdirSync(cliDir(dirId), { recursive: true });
+	fs.writeFileSync(
+		path.join(cliDir(dirId), ".credentials.json"),
+		JSON.stringify({ claudeAiOauth: { accessToken: SECRET, refreshToken: REFRESH, expiresAt: 1_794_000_000_000, refreshTokenExpiresAt: 1_796_187_276_117 } }),
+	);
+	fs.mkdirSync(cliDir("fedcba9876543210fedcba9876543210"), { recursive: true });
+	fs.writeFileSync(
+		path.join(cliDir("fedcba9876543210fedcba9876543210"), ".credentials.json"),
+		JSON.stringify({ claudeAiOauth: { accessToken: "", refreshToken: "", expiresAt: 0, refreshTokenExpiresAt: 1_796_187_276_117 } }),
+	);
+	const [main, gone, cleared] = readAuthSlots(file);
+	assert.equal(main.store, "claude-cli");
+	assert.equal(main.signedInMs, 1_793_802_202_171);
+	assert.equal(main.refreshExpiresMs, 1_796_187_276_117);
+	assert.equal(main.refreshCleared, false);
+	assert.equal(main.digest, undefined);
+	assert.equal(gone.refreshExpiresMs, undefined);
+	assert.equal(gone.refreshCleared, false);
+	assert.equal(cleared.refreshCleared, true);
+	assert.equal(JSON.stringify(readAuthSlots(file)).includes("SECRET"), false);
+});

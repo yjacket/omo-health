@@ -244,3 +244,25 @@ test("a failed ledger write keeps the source answering from memory", () => {
 	assert.equal(poll().slots[0].loginMs, BASE, "the in-memory ledger survives the failed write");
 	assert.deepEqual(warnings, ["omo_login_write_failed"]);
 });
+
+test("a claude-cli slot is dated by its signedInAt and carries the CLI refresh expiry (omo 5.1.58+)", () => {
+	const cli = { name: "default", source: "login", store: "claude-cli", signedInMs: BASE - 3 * DAY, refreshExpiresMs: BASE + 20 * DAY, refreshCleared: false, recoveryGrant: false, recoveryGrantCurrent: false };
+	const first = trackOmoLogins(undefined, [cli], BASE);
+	assert.equal(first.slots.default.loginMs, BASE - 3 * DAY);
+	assert.equal(first.slots.default.basis, "signed-in");
+	const view = omoLoginView(trackOmoLogins(first, [{ ...cli, refreshExpiresMs: BASE + 21 * DAY }], BASE + HOUR));
+	assert.deepEqual(view.slots[0], { name: "default", loginMs: BASE - 3 * DAY, basis: "signed-in", blockReason: undefined, expires: undefined, store: "claude-cli", refreshExpiresMs: BASE + 21 * DAY, refreshCleared: false });
+});
+
+test("createOmoLoginSource reads the CLI credentials file beside auth.json", () => {
+	const dir = tmpDir();
+	const authFile = path.join(dir, "auth.json");
+	const dirId = "3f5ddd493a114772bb53016b06d21194";
+	fs.writeFileSync(authFile, JSON.stringify({ "anthropic-subscription": { accounts: [{ name: "default", source: "login", store: "claude-cli", dirId, signedInAt: BASE - DAY }] } }));
+	fs.mkdirSync(path.join(dir, "anthropic-subscription-claude", dirId), { recursive: true });
+	fs.writeFileSync(path.join(dir, "anthropic-subscription-claude", dirId, ".credentials.json"), JSON.stringify({ claudeAiOauth: { refreshToken: "r", refreshTokenExpiresAt: BASE + 2 * DAY } }));
+	const read = createOmoLoginSource({ file: path.join(dir, "ledger.json"), authFile, clock: { now: () => BASE } });
+	const [slot] = read().slots;
+	assert.equal(slot.refreshExpiresMs, BASE + 2 * DAY);
+	assert.equal(slot.loginMs, BASE - DAY);
+});

@@ -39,7 +39,16 @@ export function trackOmoLogins(prev, slots, nowMs) {
 		// Environment tokens (CLAUDE_CODE_OAUTH_TOKEN*) are not logins this machine made.
 		if (!slot || typeof slot.name !== "string" || slot.source === "env") continue;
 		const prevSlot = prev?.slots?.[slot.name];
-		if (!prev?.slots) {
+		if (slot.store === "claude-cli") {
+			// omo 5.1.58+: the engine records the sign-in time itself; the CLI credentials carry the refresh expiry.
+			const signed = Number.isFinite(slot.signedInMs);
+			slotsOut[slot.name] = {
+				...recordFrom(slot, signed ? slot.signedInMs : (prevSlot?.loginMs ?? nowMs), signed ? "signed-in" : (prevSlot?.basis ?? "first-seen")),
+				store: "claude-cli",
+				refreshExpiresMs: slot.refreshExpiresMs,
+				refreshCleared: slot.refreshCleared === true,
+			};
+		} else if (!prev?.slots) {
 			slotsOut[slot.name] = recordFrom(slot, nowMs, "first-seen");
 		} else if (!prevSlot) {
 			slotsOut[slot.name] = recordFrom(slot, nowMs, "login");
@@ -64,6 +73,7 @@ export function omoLoginView(state) {
 				basis: rec.basis,
 				blockReason: rec.blockReason,
 				expires: rec.expires,
+				...(rec.store === "claude-cli" ? { store: rec.store, refreshExpiresMs: rec.refreshExpiresMs, refreshCleared: rec.refreshCleared } : {}),
 			}))
 			.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)),
 	};

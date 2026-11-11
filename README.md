@@ -199,8 +199,9 @@ node %USERPROFILE%/.omo-health/app/boot.mjs diagnose st_01a0ed19 --json   # 에�
 - 죽었거나 응답이 없는 서브에이전트, 오류로 끝났는데 아무도 처리하지 않은 서브에이전트가 있으면 부모 세션을 깨웁니다.
 - 공급자 오류로 멈춘 서브에이전트 세션은 공급자가 회복되면 한 번 이어가게 합니다. 메인 세션은 알리기만 합니다(아래 "절대 하지 않는 일").
 - `settings.json`을 고친 직후 공급자 설정 오류가 연달아 나고 직전까지 정상이었다면, 직전 정상본으로 되돌립니다. 거부된 파일은 `~/.omo-health/lkg/rejected/`에 보관합니다.
-- 사람만 풀 수 있는 문제(모든 계정 차단, omo 로그인 14일 경과, 공급자 5분 이상 불능)만 윈도우 알림으로 띄웁니다.
+- 사람만 풀 수 있는 문제(모든 계정 차단, omo 로그인 만료 임박이나 만료, 공급자 5분 이상 불능)만 윈도우 알림으로 띄웁니다.
 - omo 로그인 나이를 봅니다(D25 `omo-login-aging`). `auth.json`의 `anthropic-subscription` 계정 슬롯을 1분마다 보고 새 로그인을 알아챕니다(새 계정 슬롯이 생김, 갱신 시점 전에 토큰이 바뀜, 차단되었던 슬롯이 깨끗하게 바뀜). 가장 최근에 로그인한 정상 슬롯이 `omoLogin.warnAfterMs`(14일)를 넘으면 하단 상태줄에 `👀 재로그인`, 윈도우 알림 한 번. 설치 후 처음 본 슬롯은 처음 본 시각을 로그인 시각으로 칩니다. 같은 이름으로 다시 로그인했는데 그때 접근 토큰이 이미 만료돼 있었다면 갱신과 구분되지 않아 경고가 남습니다. 모든 계정이 막혔고 마지막 정상 응답 뒤 세션 기록에 갱신 토큰 만료(`Refresh token expired`, `invalid_grant`)가 있으면(`auth_error`로 막힌 계정이 있거나, 차단 오류가 시작되기 30분 전 이후의 기록일 때) D6 제목이 `omo 로그인 만료 - /login 필요`가 됩니다. 일부 계정만 막히면 하단 상태줄과 알림 없이 `/health` 최근 사건과 `status --json`에 `Claude 계정 일부 차단`으로 남고, 분석가는 멈추지 않습니다.
+- omo 5.1.58부터는 Claude CLI가 로그인을 맡으므로 위 로그인 나이 대신 실제 만료 시각을 봅니다. `auth.json` 슬롯이 `store: "claude-cli"`이면 `<agentDir>/anthropic-subscription-claude/<dirId>/.credentials.json`의 `refreshTokenExpiresAt`을 읽어 남은 기간이 `omoLogin.warnBeforeMs`(7일) 이하일 때 `👀 재로그인`(D25 `omo-login-aging`), CLI가 갱신 토큰을 비웠거나 만료 시각이 지났으면 `omo 로그인 만료 - /login 필요`(D25 `omo-login-expired`, crit)를 띄웁니다. 정상 계정이 하나라도 있으면 그 계정 기준이고, 만료 시각을 못 읽으면 경고하지 않습니다. D6도 CLI의 `OAuth session expired and could not be refreshed`를 갱신 토큰 만료로 칩니다.
 
 알리기만 하고 조치하지 않는 것도 있습니다. 캐시 폭풍, 토큰 폭증, 전체 재전송, 컨텍스트 폭주, TPS 저하, 도구 반복 루프, 오류 폭풍, 작업 폴더 밖이나 전역 설정 수정, 끝난 작업의 잔존 프로세스, 리로드 기아, 감시기 자신의 상태가 여기에 해당합니다. 토큰 폭증(D4)은 조건이 사라진 뒤에도 10분(`tokens.burnHoldMs`) 동안 같은 사건으로 유지해, 한 시간 합계가 잠깐 기준 아래로 내려갔다 올라와도 닫혔다 다시 열리지 않습니다. 리로드 기아는 보류를 일으킨 작업이 멈춘 것으로 확인된 채(작업은 실행 중인데 그 호스트가 사라짐 등) 15분(`stall.quietMs`)이 지나면 부모 세션을 깨웁니다. 죽은 서브에이전트는 이미 따로 깨우므로 다시 깨우지 않습니다. 리로드 기아는 이름이 아니라 작업 단위로 셉니다. 같은 노드 이름으로 다시 띄운 작업은 처음부터 다시 세고, 취소되거나 끝난 작업의 사건은 다시 열리지 않습니다.
 
@@ -211,7 +212,7 @@ node %USERPROFILE%/.omo-health/app/boot.mjs diagnose st_01a0ed19 --json   # 에�
 - 이미 있는 터미널 pane에 입력하기. 크래시 재개는 omo-health가 새로 만든 탭에만 명령과 Enter 한 번(목표 재개 창)을 보내고, 원래 pane은 읽기만 합니다.
 - 대기 중인 도구 호출, 고아 monitor 기록 또는 끝난 reflection 실행 디렉터리에 정확히 매칭되지 않은 프로세스 종료. 매칭 조건은 전체 명령, 생성 시각 창, 종료 시각 이후 유예, pid·생성시각·명령 해시 재확인입니다.
 - 사용자가 띄운 셸이나 서버, 살아 있는 `tool.monitor` 루프, omo/senpi 호스트, claude.exe, Orca, 터미널 종료. 실행 셸이나 소유자 호스트가 사라진 감시 프로세스, 그리고 `final.json`이 종결된 reflection 실행만 남긴 headless 자식만 정리합니다.
-- 인증 토큰 저장이나 기록. `auth.json`에서는 `anthropic-subscription` 계정의 이름, 출처, 만료 시각, 차단 필드와 갱신 토큰의 sha256 앞 32자(엔진의 `authGrantDigest`와 같은 값)만 만들어 쓰고, 토큰 값은 `~/.omo-health/omo-login.json`을 포함해 어디에도 남기지 않습니다.
+- 인증 토큰 저장이나 기록. `auth.json`에서는 `anthropic-subscription` 계정의 이름, 출처, 만료 시각, 차단 필드와 갱신 토큰의 sha256 앞 32자(엔진의 `authGrantDigest`와 같은 값)만 만들어 쓰고, Claude CLI 자격 파일에서는 갱신 토큰 만료 시각과 토큰이 비었는지만 읽으며, 토큰 값은 `~/.omo-health/omo-login.json`을 포함해 어디에도 남기지 않습니다.
 - 센서의 도구 등록이나 시스템 프롬프트 수정.
 - 목표 정렬 넛지로 턴을 새로 시작하거나 진행 중인 턴을 중단하는 일.
 
@@ -425,7 +426,7 @@ omo -p --no-session -ne -ns -nc --no-tools --model <모델> --session-id <id> "<
 | `config.json`, `config.last-good.json` | 설정과 마지막으로 읽을 수 있었던 사본 |
 | `daemon.json` | 감시기 하트비트. `config` 필드에 반영한 설정의 수정 시각, 적용값, 거부 이유 |
 | `state.json` | 사건 기록과 넛지 이력. 감시기가 다시 떠도 같은 알림을 또 보내지 않게 함 |
-| `omo-login.json` | omo 로그인 기록(D25). 계정 이름, 만료 시각, 차단 필드, 갱신 토큰의 sha256 앞 32자, 로그인 시각과 근거 |
+| `omo-login.json` | omo 로그인 기록(D25). 계정 이름, 만료 시각, 차단 필드, 갱신 토큰의 sha256 앞 32자, 로그인 시각과 근거, Claude CLI 슬롯이면 갱신 토큰 만료 시각과 비움 여부 |
 | `omo-health.db` | 도구 호출 기록과 기준선 표본(위 "기록 DB와 이상 신호") |
 | `investigations/` | 조사 목록. 감지당 파일 하나 |
 | `jobs/` | 분석가 작업(`<작업 id>/bundle.md`, 출력)과 한도 `analyst-budget.json` |

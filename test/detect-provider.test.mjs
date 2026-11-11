@@ -183,3 +183,8 @@ test("an old refresh failure does not explain a later block of rate-limited acco
 	assert.equal(expired.titleKo, "omo 로그인 만료 - /login 필요");
 	assert.equal(expired.data.cause, "refresh-expired");
 });
+
+test("refreshFailureOf: the Claude CLI's refused-refresh text (omo 5.1.58+) counts as an expired refresh", async () => {
+	const { refreshFailureOf } = await import("../src/detect/provider.mjs");
+	assert.equal(refreshFailureOf("Failed to authenticate: OAuth session expired and could not be refreshed"), "refresh-expired");
+});

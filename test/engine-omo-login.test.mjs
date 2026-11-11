@@ -81,3 +81,11 @@ test("D6: one blocked account is listed as a partial incident without a footer w
 	assert.equal(globalStatus.text, "👀 정상");
 	assert.equal(h.toasts.length, 0);
 });
+
+test("D25 on omo 5.1.58+: an old Claude CLI sign-in with 20 days left stays normal, 3 days left raises the warn footer", async () => {
+	const cli = (signedAgo, left) => (now) => ({ authBlocks: [{ name: "default" }], omoLogin: { slots: [{ name: "default", loginMs: now - signedAgo, basis: "signed-in", store: "claude-cli", refreshExpiresMs: now + left, refreshCleared: false }] } });
+	const quiet = await harness(cli(20 * DAY, 20 * DAY));
+	assert.equal((await quiet.engine.tick()).globalStatus.text, "👀 정상");
+	const near = await harness(cli(1 * DAY, 3 * DAY));
+	assert.equal((await near.engine.tick()).globalStatus.text, "👀 재로그인");
+});

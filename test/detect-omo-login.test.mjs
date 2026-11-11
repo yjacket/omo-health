@@ -63,3 +63,36 @@ test("loadDetectors registers D25", async () => {
 	const detectors = await loadDetectors();
 	assert.ok(detectors.some((detector) => detector.id === "D25"));
 });
+
+const cli = (name, signedAgoMs, expiresInMs, extra = {}) => ({ name, loginMs: NOW - signedAgoMs, basis: "signed-in", store: "claude-cli", refreshExpiresMs: expiresInMs === undefined ? undefined : NOW + expiresInMs, refreshCleared: false, ...extra });
+
+test("claude-cli: an old sign-in whose CLI refresh token still has 20 days left -> no finding", () => {
+	assert.deepEqual(detect(world([cli("default", 20 * D, 20 * D)])), []);
+});
+
+test("claude-cli: 3 days left on the CLI refresh token -> one D25 warn naming the days left", () => {
+	const findings = detect(world([cli("default", 1 * D, 3 * D)]));
+	assert.equal(findings.length, 1);
+	assert.deepEqual([findings[0].detector, findings[0].kind, findings[0].severity, findings[0].humanNeeded], ["D25", "omo-login-aging", "warn", true]);
+	assert.match(findings[0].detailKo, /3일 뒤/);
+	assert.deepEqual(findings[0].evidence, ["daysLeft:3", "basis:cli-expiry", "slots:1"]);
+});
+
+test("claude-cli: a refresh token the CLI cleared, or one past its expiry, -> crit omo-login-expired", () => {
+	for (const slots of [[cli("default", 1 * D, 10 * D, { refreshCleared: true })], [cli("default", 30 * D, -1 * H)]]) {
+		const [finding] = detect(world(slots));
+		assert.deepEqual([finding.detector, finding.kind, finding.severity, finding.humanNeeded], ["D25", "omo-login-expired", "crit", true]);
+		assert.equal(finding.titleKo, "omo 로그인 만료 - /login 필요");
+	}
+});
+
+test("claude-cli: one working account is enough, and an unknown expiry never warns", () => {
+	assert.deepEqual(detect(world([cli("a", 1 * D, 10 * D, { refreshCleared: true }), cli("b", 1 * D, 10 * D)])), []);
+	assert.deepEqual(detect(world([cli("default", 40 * D, undefined)])), []);
+});
+
+test("claude-cli: warnBeforeMs 0 turns the warning off but not the expiry", () => {
+	const cfg = { omoLogin: { warnAfterMs: 14 * D, warnBeforeMs: 0 } };
+	assert.deepEqual(detect(world([cli("default", 1 * D, 1 * D)], cfg)), []);
+	assert.equal(detect(world([cli("default", 1 * D, -1 * D)], cfg))[0].kind, "omo-login-expired");
+});

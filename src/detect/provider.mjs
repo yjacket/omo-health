@@ -25,7 +25,8 @@ export function classifyProviderError(text) {
 /** Cause class of a token-refresh failure text, if the text carries one. */
 export function refreshFailureOf(text) {
 	const t = String(text ?? "");
-	if (/refresh token expired/i.test(t)) return "refresh-expired";
+	// omo 5.1.58+: the Claude CLI reports a refused refresh with this text instead of the token endpoint body.
+	if (/refresh token expired|OAuth session expired and could not be refreshed/i.test(t)) return "refresh-expired";
 	if (/invalid_grant/i.test(t) && /token refresh|oauth\/token/i.test(t)) return "refresh-rejected";
 	return undefined;
 }

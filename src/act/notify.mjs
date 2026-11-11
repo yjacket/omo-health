@@ -14,6 +14,7 @@ export const FOOTER_MARK = "👀";
 const WORD_BY_KIND = {
 	"accounts-blocked": "로그인",
 	"omo-login-aging": "재로그인",
+	"omo-login-expired": "로그인",
 	"outage-human": "공급자장애",
 	"host-crash-stopped": "재개중단",
 	"hung-main-turn": "무응답",
