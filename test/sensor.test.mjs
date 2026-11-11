@@ -478,6 +478,49 @@ test("footer shows the more severe of global and session; a degraded global warn
 	assert.equal(ui.status.at(-1)[1], "헬스 ⚠ 세션 문제", "a tie goes to the session");
 });
 
+test("footer: a lower-level global humanNeeded never hides a session crit", async () => {
+	const s = setup({ daemonTs: (c) => c });
+	const { ctx, ui } = fakeCtx();
+	await s.fp.emit("session_start", ctx);
+	fs.mkdirSync(path.join(s.home, "status"), { recursive: true });
+	fs.writeFileSync(path.join(s.home, "status", "_global.json"), JSON.stringify({ level: "warn", text: "👀 재로그인", humanNeeded: [{ titleKo: "omo 다시 로그인 권장" }] }));
+	fs.writeFileSync(path.join(s.home, "status", "s-1.json"), JSON.stringify({ level: "crit", text: "👀 멈춤" }));
+	await s.handle.__test.status();
+	assert.equal(ui.status.at(-1)[1], "👀 멈춤");
+});
+
+test("footer: a global humanNeeded still wins over an ok session", async () => {
+	const s = setup({ daemonTs: (c) => c });
+	const { ctx, ui } = fakeCtx();
+	await s.fp.emit("session_start", ctx);
+	fs.mkdirSync(path.join(s.home, "status"), { recursive: true });
+	fs.writeFileSync(path.join(s.home, "status", "_global.json"), JSON.stringify({ level: "warn", text: "👀 재로그인", humanNeeded: [{ titleKo: "omo 다시 로그인 권장" }] }));
+	fs.writeFileSync(path.join(s.home, "status", "s-1.json"), JSON.stringify({ level: "ok", text: "👀 정상" }));
+	await s.handle.__test.status();
+	assert.equal(ui.status.at(-1)[1], "👀 재로그인");
+});
+
+test("footer: a global humanNeeded shows when the session has no status at all", async () => {
+	const s = setup({ daemonTs: (c) => c });
+	const { ctx, ui } = fakeCtx();
+	await s.fp.emit("session_start", ctx);
+	fs.mkdirSync(path.join(s.home, "status"), { recursive: true });
+	fs.writeFileSync(path.join(s.home, "status", "_global.json"), JSON.stringify({ level: "warn", text: "👀 재로그인", humanNeeded: [{ titleKo: "omo 다시 로그인 권장" }] }));
+	await s.handle.__test.status();
+	assert.equal(ui.status.at(-1)[1], "👀 재로그인");
+});
+
+test("footer: an equal-level global humanNeeded keeps today's priority over the session text", async () => {
+	const s = setup({ daemonTs: (c) => c });
+	const { ctx, ui } = fakeCtx();
+	await s.fp.emit("session_start", ctx);
+	fs.mkdirSync(path.join(s.home, "status"), { recursive: true });
+	fs.writeFileSync(path.join(s.home, "status", "_global.json"), JSON.stringify({ level: "warn", text: "👀 재로그인", humanNeeded: [{ titleKo: "omo 다시 로그인 권장" }] }));
+	fs.writeFileSync(path.join(s.home, "status", "s-1.json"), JSON.stringify({ level: "warn", text: "👀 작업정지" }));
+	await s.handle.__test.status();
+	assert.equal(ui.status.at(-1)[1], "👀 재로그인");
+});
+
 test("a stale daemon is respawned once (claim + cooldown); a stopped one is not", async () => {
 	const s = setup({ daemonTs: (c) => c - 120_000 });
 	const { ctx } = fakeCtx();

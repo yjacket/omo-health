@@ -1,12 +1,15 @@
 import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
-import { readAuthBlocks } from "../src/collect/secrets.mjs";
+import { readAuthBlocks, readAuthSlots } from "../src/collect/secrets.mjs";
 import { tmpDir } from "./helpers/fixtures.mjs";
 
 const SECRET = "sk-ant-oat01-SECRETSECRETSECRET";
+const REFRESH = "refresh-" + SECRET;
+const digestOf = (value) => crypto.createHash("sha256").update(value).digest("hex").slice(0, 32);
 
 test("readAuthBlocks projects exactly name, blockReason, blockedUntil for anthropic-subscription", () => {
 	const dir = tmpDir();
@@ -37,4 +40,119 @@ test("readAuthBlocks returns [] for missing or malformed files", () => {
 	const bad = path.join(dir, "bad.json");
 	fs.writeFileSync(bad, `{"anthropic-subscription": ${SECRET}`);
 	assert.deepEqual(readAuthBlocks(bad), []);
+});
+
+test("readAuthSlots projects exactly the 8 public keys and digests the refresh token", () => {
+	const dir = tmpDir();
+	const file = path.join(dir, "auth.json");
+	const grant = digestOf(REFRESH);
+	fs.writeFileSync(
+		file,
+		JSON.stringify({
+			"anthropic-subscription": {
+				accounts: [
+					{
+						name: "main",
+						access: SECRET,
+						refresh: REFRESH,
+						expires: 1_800_000_000_000,
+						source: "login",
+						blockReason: "quota",
+						blockedUntil: "2026-11-02T00:00:00Z",
+						authRecoveryGrant: grant,
+					},
+					{ name: "other", access: SECRET, refresh: "other-" + SECRET, expires: 1, source: "relogin", authRecoveryGrant: "deadbeef" },
+					{ name: "plain" },
+				],
+			},
+			"chatgpt-subscription": { accounts: [{ name: "gpt", access: SECRET, refresh: SECRET }] },
+		}),
+	);
+	const slots = readAuthSlots(file);
+	assert.equal(slots.length, 3);
+	for (const slot of slots) {
+		assert.deepEqual(Object.keys(slot).sort(), [
+			"blockReason",
+			"blockedUntil",
+			"digest",
+			"expires",
+			"name",
+			"recoveryGrant",
+			"recoveryGrantCurrent",
+			"source",
+		]);
+	}
+	assert.equal(slots[0].digest, grant);
+	assert.equal(slots[0].name, "main");
+	assert.equal(slots[0].source, "login");
+	assert.equal(slots[0].expires, 1_800_000_000_000);
+	assert.equal(slots[0].blockReason, "quota");
+	assert.equal(slots[0].blockedUntil, "2026-11-02T00:00:00Z");
+	assert.equal(slots[0].recoveryGrant, true);
+	assert.equal(slots[0].recoveryGrantCurrent, true);
+	assert.equal(slots[1].digest, digestOf("other-" + SECRET));
+	assert.equal(slots[1].recoveryGrant, true);
+	assert.equal(slots[1].recoveryGrantCurrent, false);
+	assert.equal(slots[2].digest, undefined);
+	assert.equal(slots[2].expires, undefined);
+	assert.equal(slots[2].recoveryGrant, false);
+	assert.equal(slots[2].recoveryGrantCurrent, false);
+	assert.equal(JSON.stringify(slots).includes("SECRET"), false);
+});
+
+test("readAuthSlots returns undefined for missing or malformed files and [] without the provider", () => {
+	const dir = tmpDir();
+	assert.equal(readAuthSlots(path.join(dir, "none.json")), undefined);
+	const bad = path.join(dir, "bad.json");
+	fs.writeFileSync(bad, `{"anthropic-subscription": ${SECRET}`);
+	assert.equal(readAuthSlots(bad), undefined);
+	const other = path.join(dir, "other.json");
+	fs.writeFileSync(other, JSON.stringify({ "chatgpt-subscription": { accounts: [{ name: "gpt", access: SECRET, refresh: SECRET }] } }));
+	assert.deepEqual(readAuthSlots(other), []);
+	const unreadable = path.join(dir, "dir.json");
+	fs.mkdirSync(unreadable);
+	assert.equal(readAuthSlots(unreadable), undefined);
+});
+
+test("readAuthSlots reads a claude-cli slot's refresh expiry from its CLI credentials file, never the tokens (omo 5.1.58+)", () => {
+	const dir = tmpDir();
+	const file = path.join(dir, "auth.json");
+	const dirId = "3f5ddd493a114772bb53016b06d21194";
+	fs.writeFileSync(
+		file,
+		JSON.stringify({
+			"anthropic-subscription": {
+				type: "oauth",
+				access: "claude-sdk-oauth-managed",
+				refresh: "claude-sdk-oauth-managed",
+				expires: 4_102_444_800_000,
+				accounts: [
+					{ name: "default", source: "login", store: "claude-cli", dirId, signedInAt: 1_793_802_202_171 },
+					{ name: "gone", source: "login", store: "claude-cli", dirId: "0123456789abcdef0123456789abcdef", signedInAt: 1 },
+					{ name: "cleared", source: "login", store: "claude-cli", dirId: "fedcba9876543210fedcba9876543210" },
+				],
+			},
+		}),
+	);
+	const cliDir = (id) => path.join(dir, "anthropic-subscription-claude", id);
+	fs.mkdirSync(cliDir(dirId), { recursive: true });
+	fs.writeFileSync(
+		path.join(cliDir(dirId), ".credentials.json"),
+		JSON.stringify({ claudeAiOauth: { accessToken: SECRET, refreshToken: REFRESH, expiresAt: 1_794_000_000_000, refreshTokenExpiresAt: 1_796_187_276_117 } }),
+	);
+	fs.mkdirSync(cliDir("fedcba9876543210fedcba9876543210"), { recursive: true });
+	fs.writeFileSync(
+		path.join(cliDir("fedcba9876543210fedcba9876543210"), ".credentials.json"),
+		JSON.stringify({ claudeAiOauth: { accessToken: "", refreshToken: "", expiresAt: 0, refreshTokenExpiresAt: 1_796_187_276_117 } }),
+	);
+	const [main, gone, cleared] = readAuthSlots(file);
+	assert.equal(main.store, "claude-cli");
+	assert.equal(main.signedInMs, 1_793_802_202_171);
+	assert.equal(main.refreshExpiresMs, 1_796_187_276_117);
+	assert.equal(main.refreshCleared, false);
+	assert.equal(main.digest, undefined);
+	assert.equal(gone.refreshExpiresMs, undefined);
+	assert.equal(gone.refreshCleared, false);
+	assert.equal(cleared.refreshCleared, true);
+	assert.equal(JSON.stringify(readAuthSlots(file)).includes("SECRET"), false);
 });

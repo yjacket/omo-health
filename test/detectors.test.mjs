@@ -42,4 +42,5 @@ test("detector ids are unique and the 0.8.0 assignments are final", async () => 
 	assert.equal(ids.get("D23"), "boot-gap");
 	assert.equal(ids.get("D21"), "goal-liveness");
 	assert.equal(ids.get("D24"), "refusal");
+	assert.equal(ids.get("D25"), "omo-login");
 });

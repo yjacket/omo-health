@@ -297,6 +297,14 @@ test("no job starts while a D6 usage-limit/outage finding is open, or while the 
 	assert.ok(ask(t, finding(7)).jobId);
 });
 
+test("a D6 partial account block leaves the analyst running (issue #5)", () => {
+	const t = setup({ config: { perFinding: 9, perHour: 9, maxConcurrent: 9 } });
+	const partial = makeFinding({ detector: "D6", kind: "account-blocked-partial", subject: { key: "provider:anthropic-subscription:partial" } });
+	const blocked = makeFinding({ detector: "D6", kind: "accounts-blocked", subject: { key: "provider:anthropic-subscription" } });
+	assert.ok(ask(t, finding(1), { openFindings: [partial] }).jobId);
+	assert.equal(ask(t, finding(2), { openFindings: [blocked] }).reason, "provider-limit");
+});
+
 test("analyst.enabled false starts nothing", () => {
 	const t = setup({ config: { enabled: false } });
 	assert.equal(ask(t).reason, "analyst-off");

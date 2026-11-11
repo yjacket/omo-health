@@ -73,6 +73,9 @@ export const DEFAULT_CONFIG = Object.freeze({
 		stormWindowMs: 30 * MIN,
 		outageHumanMs: 5 * MIN,
 	},
+	// D25: warn this long after the newest working omo login (refresh tokens lived 18-29 days); 0 turns the warning off.
+	// omo 5.1.58+ (Claude CLI login): warn this long before the CLI refresh token expires; 0 turns the warning off.
+	omoLogin: { warnAfterMs: 14 * D, warnBeforeMs: 7 * D },
 	config: {
 		autoRevert: true,
 		revertErrorWindowMs: 60_000,

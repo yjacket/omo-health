@@ -18,6 +18,7 @@ import { createTranscriptIndex } from "./collect/transcripts.mjs";
 import { createConfigTracker } from "./collect/config-files.mjs";
 import { createConfigReloader } from "./config-reload.mjs";
 import { readAuthBlocks } from "./collect/secrets.mjs";
+import { createOmoLoginSource } from "./collect/omo-login.mjs";
 import { createEngine, loadDetectors } from "./engine.mjs";
 import { createEvidence } from "./evidence.mjs";
 import { createAnalyst, parseAnalystOutput, unavailableReason } from "./judge/analyst.mjs";
@@ -259,6 +260,7 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 		dbError = error;
 	}
 	const dbMaintainer = db ? createMaintainer({ db, config, clock, log }) : undefined;
+	const omoLogin = createOmoLoginSource({ file: paths.health.omoLoginFile, authFile: paths.authFile, clock, log });
 	const buildEngine = async () => (overrides.createEngine ?? createEngine)({
 		paths,
 		config,
@@ -272,7 +274,7 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 			logs: new LogCollector({ logsDir: paths.logsDir }),
 			transcripts: createTranscriptIndex({ claudeProjectsDir: paths.claudeProjectsDir, clock }),
 			config: createConfigTracker({ paths, clock: () => clock.now(), config: config.config }),
-			secrets: () => ({ authBlocks: readAuthBlocks(paths.authFile) }),
+			secrets: () => ({ authBlocks: readAuthBlocks(paths.authFile), omoLogin: omoLogin() }),
 		},
 		actors: {
 			// The category-lane analyst (omo -p): a runner job the engine polls; analyst.enabled switches it without a restart.
