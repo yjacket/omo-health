@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { pendingMessages, sendToSession, sweepUndelivered } from "./act/inbox.mjs";
 import { executeKill } from "./act/kill.mjs";
-import { composeAbortContinue, composeActionNotice, composeBootGapNotice, composeCacheNotice, composeImageSteer, composeGoalWake, composeRefusalResume, composeMainStallNotice, composeMonitorOrphanNotice, composeNudge, composeRelayCancel, composeRespawnNotice, composeRespawnTriageNotice, composeRevertNotice, composeScopeCheck, composeTriageNotice, composeWake, composeWhyNotice, composeWrongCommandRelease } from "./act/messages.mjs";
+import { composeAbortContinue, composeActionNotice, composeBootGapNotice, composeCacheNotice, composeImageSteer, composeImageSteerBatch, composeGoalWake, composeRefusalResume, composeMainStallNotice, composeMonitorOrphanNotice, composeNudge, composeRelayCancel, composeRespawnNotice, composeRespawnTriageNotice, composeRevertNotice, composeScopeCheck, composeTriageNotice, composeWake, composeWhyNotice, composeWrongCommandRelease } from "./act/messages.mjs";
 import { ownerKeyOf } from "./baseline.mjs";
 import { footerText, waitingText, writeGlobalStatus, writeSessionStatus } from "./act/notify.mjs";
 import { writeReport } from "./act/reports.mjs";
@@ -772,7 +772,7 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 				const version = hb?.sensorVersion;
 				const parts = typeof version === "string" && version.match(/^(\d+)\.(\d+)\.(\d+)(?:$|[+-])/);
 				const compatible = Boolean(parts && (Number(parts[1]) > 0 || Number(parts[2]) >= 2));
-				const message = composeScopeCheck({ finding, sessionId: target, now, forward: !self, deliverAs: hb?.idle ? "nextTurn" : "steer", verdict: req.verdict });
+				const message = composeScopeCheck({ finding, sessionId: target, now, forward: !self, verdict: req.verdict });
 				const delivery = compatible ? deliver(world, target, message, finding, record, { selfOnly: true }) : { delivered: false, via: "none", sessionId: target };
 				record.history.push({ atMs: now, kind: req.kind, status: delivery.delivered ? "delivered" : "not-delivered", detail: `${delivery.via} -> ${target ?? "-"}` });
 				if (delivery.delivered) {
@@ -806,17 +806,53 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 				return { delivery };
 			}
 			case "image-steer": {
-				// D4 tokens.imageSteer: once per level. A child has no sensor, so its parent gets it to pass on (warn) or to split
-				// the remaining image work into a fresh child (trim); an idle parent is woken so the child hears it in time.
+				// D4 tokens.imageSteer, once per level, only for a provider in imageSteerProviders (the detector gives no remedy
+				// otherwise). A main session gets it in its running turn or its next one, never woken.
 				const session = world.sessions.get(s.sessionId);
-				const self = session?.kind !== "child";
-				const target = self ? s.sessionId : deliveryTarget(finding, world);
-				const hb = target ? world.sensorFor(target) : undefined;
-				const message = composeImageSteer({ finding, sessionId: target, now, forward: !self, idle: hb?.idle === true });
-				const delivery = deliver(world, target, message, finding, record, { selfOnly: true });
-				record.history.push({ atMs: now, kind: req.kind, status: delivery.delivered ? "delivered" : "not-delivered", detail: `${delivery.via} -> ${delivery.sessionId ?? target ?? "-"}` });
-				if (delivery.delivered) record.remedyDone = true;
-				else record.executed.delete(req.key);
+				if (session?.kind !== "child") {
+					const message = composeImageSteer({ finding, sessionId: s.sessionId, now });
+					const delivery = deliver(world, s.sessionId, message, finding, record, { selfOnly: true });
+					record.history.push({ atMs: now, kind: req.kind, status: delivery.delivered ? "delivered" : "not-delivered", detail: `${delivery.via} -> ${delivery.sessionId ?? s.sessionId ?? "-"}` });
+					if (delivery.delivered) record.remedyDone = true;
+					else record.executed.delete(req.key);
+					return { delivery };
+				}
+				// A child has no sensor, so its parent passes it on. Every parent turn re-reads the parent's whole context, so the
+				// children of one parent share one relay per tokens.imageSteerBatchMs, read at the parent's next turn; only a
+				// child at the trim level is sent at once and may wake the parent, carrying whatever else waits.
+				const parent = deliveryTarget(finding, world);
+				const memory = memoryFor("image-steer");
+				memory.lastSent ??= {};
+				memory.sentFps ??= {};
+				if (memory.sentFps[finding.fp]) {
+					record.remedyDone = true;
+					return { delivery: { delivered: true, via: "batched", sessionId: parent } };
+				}
+				const wake = finding.data?.level === "trim";
+				const due = now - (memory.lastSent[parent] ?? Number.NEGATIVE_INFINITY) >= config.tokens.imageSteerBatchMs;
+				// A warn waits at least one tick, so the siblings that crossed the line in the same tick (their records are made
+				// after this one) share the relay.
+				record.steerSeenMs ??= now;
+				const fresh = record.steerSeenMs === now;
+				if (!wake && (!due || fresh)) {
+					// Asked again next tick; it goes out with the next relay to this parent.
+					record.executed.delete(req.key);
+					if (record.history.at(-1)?.status !== "batched") record.history.push({ atMs: now, kind: req.kind, status: "batched", detail: `waits for the next relay to ${parent ?? "-"}` });
+					return { delivery: { delivered: false, via: "batched", sessionId: parent } };
+				}
+				// Every child of this parent with an open, unsent image steer rides along; one whose finding closed in the
+				// meantime (finished, compacted) is left out.
+				const waiting = [...records.values()].filter((other) => other.fp !== finding.fp && other.resolvedMs === undefined && !other.remedyDone && other.finding?.data?.remedy?.kind === "image-steer" && world.sessions.get(other.finding.subject?.sessionId)?.kind === "child" && deliveryTarget(other.finding, world) === parent && !memory.sentFps[other.fp]);
+				const items = [{ fp: finding.fp, finding }, ...waiting].map((r) => ({ ...r.finding.data, fp: r.fp, taskId: r.finding.subject?.taskId ?? null }));
+				const message = composeImageSteerBatch({ items, sessionId: parent, now, wake });
+				const delivery = deliver(world, parent, message, finding, record, { selfOnly: true });
+				record.history.push({ atMs: now, kind: req.kind, status: delivery.delivered ? "delivered" : "not-delivered", detail: `${delivery.via} -> ${delivery.sessionId ?? parent ?? "-"} (${items.length} children${wake ? ", wake" : ""})` });
+				if (delivery.delivered) {
+					record.remedyDone = true;
+					memory.lastSent[parent] = now;
+					for (const item of items) memory.sentFps[item.fp] = now;
+					for (const [fp, ms] of Object.entries(memory.sentFps)) if (now - ms > DAY_MS) delete memory.sentFps[fp];
+				} else record.executed.delete(req.key);
 				return { delivery };
 			}
 			case "boot-notice": {
@@ -1437,7 +1473,7 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 			const goal = memories.get("goal-liveness") ?? {};
 			const keep = Object.entries(goal.lastWake ?? {}).filter(([, ms]) => Number.isFinite(ms) && clock.now() - ms <= 2 * RECORD_KEEP_MS).map(([id]) => id);
 			const goalLiveness = { lastWake: Object.fromEntries(keep.map((id) => [id, goal.lastWake[id]])), wakes: Object.fromEntries(keep.map((id) => [id, goal.wakes?.[id] ?? 0])) };
-			return { v: 1, savedMs: clock.now(), records: list, jobs, memories: { align: memories.get("align") ?? {}, monitorOrphans: memories.get("monitor-orphans") ?? {}, crashes: memories.get("crashes") ?? {}, bootGap: memories.get("boot-gap") ?? {}, tokens: { burn: memories.get("tokens")?.burn ?? {} }, stall: { stalls: Object.fromEntries(memories.get("stall")?.stalls ?? []) }, goalLiveness } };
+			return { v: 1, savedMs: clock.now(), records: list, jobs, memories: { align: memories.get("align") ?? {}, monitorOrphans: memories.get("monitor-orphans") ?? {}, crashes: memories.get("crashes") ?? {}, bootGap: memories.get("boot-gap") ?? {}, tokens: { burn: memories.get("tokens")?.burn ?? {} }, imageSteer: { lastSent: memories.get("image-steer")?.lastSent ?? {}, sentFps: memories.get("image-steer")?.sentFps ?? {} }, stall: { stalls: Object.fromEntries(memories.get("stall")?.stalls ?? []) }, goalLiveness } };
 		},
 		restoreState(snapshot, now = clock.now()) {
 			if (snapshot?.v !== 1) return 0;
@@ -1490,6 +1526,12 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 			const burn = snapshot.memories?.tokens?.burn;
 			if (burn && typeof burn === "object") {
 				memoryFor("tokens").burn = Object.fromEntries(Object.entries(burn).filter(([, held]) => Number.isFinite(held?.lastHitMs) && now - held.lastHitMs < DAY_MS && typeof held.finding?.fp === "string"));
+			}
+			// D4: the per-parent relay spacing and the children already relayed survive a restart, so none is sent twice.
+			const imageSteer = snapshot.memories?.imageSteer;
+			if (imageSteer && typeof imageSteer === "object") {
+				const memory = memoryFor("image-steer");
+				for (const field of ["lastSent", "sentFps"]) memory[field] = { ...Object.fromEntries(Object.entries(imageSteer[field] ?? {}).filter(([, ms]) => Number.isFinite(ms) && now - ms < DAY_MS)), ...(memory[field] ?? {}) };
 			}
 			// D18: crash history, resume counts and pending/stopped recoveries survive a daemon restart (rate limit, crash loop).
 			const crashes = snapshot.memories?.crashes;

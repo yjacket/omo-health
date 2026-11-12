@@ -62,13 +62,20 @@ export const DEFAULT_CONFIG = Object.freeze({
 		imageTrimBytes: 24 * 1024 * 1024,
 		imageWarnCount: 40,
 		imageTrimCount: 100,
-		// A subagent hears the steer only through its parent's next turn (tens of seconds), so its warning starts earlier.
-		imageWarnChildBytes: 5 * 1024 * 1024,
-		imageWarnChildCount: 20,
+		// A Claude subagent's own warning line. In the child records of 10-03..11-11, the 22 Claude children that never reached
+		// the trim peaked at 6.2 MiB and 40 images, and the two that did crossed 8 MiB 2.6-2.9 min (48-49 images) before it.
+		imageWarnChildBytes: 8 * 1024 * 1024,
+		imageWarnChildCount: 50,
 		// What the image warning does: "steer" tells the session (a child through its parent) to crop, finish the current
 		// check and hand the rest of the screenshots to a fresh subtask, and at the trim level tells the parent to split
 		// the remaining image work; "notice" sends the one quiet notice; "off" sends nothing. Never cancels anything.
 		imageSteer: "steer",
+		// Only these providers are steered: Claude Code trims past 24 MiB and every rewrite pays the cache-write premium. Others
+		// (OpenAI has no write premium) are recorded and toasted only, because the parent turns a relay costs exceed the saving.
+		imageSteerProviders: ["anthropic-subscription"],
+		// One relay per parent at most every imageSteerBatchMs, carrying every child waiting for it, read at the parent's next
+		// turn without waking it. Only a Claude child at the trim level is sent at once (and may wake an idle parent).
+		imageSteerBatchMs: 30 * MIN,
 		burnPerHour: 2_000_000,
 		burnMultiple: 3,
 		resendCount: 50,

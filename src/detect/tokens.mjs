@@ -35,7 +35,16 @@ function overTrim(turn, cfg) {
 	return (turn.imageBytes ?? 0) >= cfg.imageTrimBytes || (turn.images ?? 0) >= cfg.imageTrimCount;
 }
 
-/** `trim`, `warn` or null: the size or the count, whichever reaches its threshold first. A subagent warns at its own, lower line. */
+/**
+ * The provider the session's requests go to: its last reply, else the model its task resolved to. Only
+ * anthropic-subscription (Claude Code) pays for a trimmed image twice (24 MiB trim + the cache-write premium), so only
+ * there does a steer save more than the parent turns it costs.
+ */
+export function providerOf(session) {
+	return session.lastAssistant?.provider ?? session.turns?.at(-1)?.provider ?? session.task?.model?.provider ?? null;
+}
+
+/** `trim`, `warn` or null: the size or the count, whichever reaches its threshold first. A Claude subagent warns at its own line. */
 function imageLevel(images, bytes, cfg, child = false) {
 	if (bytes >= cfg.imageTrimBytes || images >= cfg.imageTrimCount) return "trim";
 	const warnBytes = child ? cfg.imageWarnChildBytes : cfg.imageWarnBytes;
@@ -44,9 +53,9 @@ function imageLevel(images, bytes, cfg, child = false) {
 	return null;
 }
 
-/** What the image warning asks for (tokens.imageSteer): a steer, the one quiet notice, or nothing. */
-function imageRemedy(cfg) {
-	if (cfg.imageSteer === "off") return undefined;
+/** What the image warning asks for (tokens.imageSteer): a steer, the one quiet notice, or nothing (also for a provider outside imageSteerProviders: record and toast only). */
+function imageRemedy(cfg, steered) {
+	if (cfg.imageSteer === "off" || !steered) return undefined;
 	return { kind: cfg.imageSteer === "notice" ? "cache-notice" : "image-steer" };
 }
 
@@ -172,7 +181,9 @@ function cacheRewrite(world, session, cfg) {
 function imageLoad(session, cfg) {
 	const bytes = session.imageBytes ?? 0;
 	const images = session.images ?? 0;
-	const level = imageLevel(images, bytes, cfg, session.kind === "child");
+	const provider = providerOf(session);
+	const steered = (cfg.imageSteerProviders ?? []).includes(provider);
+	const level = imageLevel(images, bytes, cfg, session.kind === "child" && steered);
 	if (!level) return [];
 	const load = imageText(images, bytes, session.imagesPartial);
 	const limit = `24 MiB 또는 ${cfg.imageTrimCount}장`;
@@ -187,7 +198,7 @@ function imageLoad(session, cfg) {
 			detailKo: level === "trim"
 				? `세션 ${session.id}의 컨텍스트에 ${load}가 쌓여 잘림 기준(${limit})을 넘었습니다. 이제 이미지를 더 읽을 때마다 가장 오래된 이미지가 잘려 나가 캐시 전체를 다시 씁니다.`
 				: `세션 ${session.id}의 컨텍스트에 ${load}가 쌓였습니다. 이미지가 ${limit}을 넘으면 그때부터 이미지를 더 읽을 때마다 캐시 전체를 다시 씁니다.`,
-			data: { level, images, imageBytes: bytes, imagesPartial: Boolean(session.imagesPartial), warnBytes: cfg.imageWarnBytes, trimBytes: cfg.imageTrimBytes, warnCount: cfg.imageWarnCount, trimCount: cfg.imageTrimCount, remedy: imageRemedy(cfg), advice: REMEDY_KO },
+			data: { level, images, imageBytes: bytes, imagesPartial: Boolean(session.imagesPartial), warnBytes: cfg.imageWarnBytes, trimBytes: cfg.imageTrimBytes, warnCount: cfg.imageWarnCount, trimCount: cfg.imageTrimCount, provider, remedy: imageRemedy(cfg, steered), advice: REMEDY_KO },
 		}),
 	];
 }

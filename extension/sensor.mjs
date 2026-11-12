@@ -270,7 +270,11 @@ export default function omoHealthSensor(pi, options = {}) {
 
 	async function deliver(message) {
 		const payload = { customType: "omo-health", content: message.content, display: true, details: message.details ?? {} };
-		pi.sendMessage(payload, { deliverAs: ["steer", "followUp", "nextTurn"].includes(message.deliverAs) ? message.deliverAs : "followUp", triggerTurn: message.kind === "scope-check" ? false : Boolean(message.triggerTurn) });
+		// busyDeliverAs: a turn running right now takes the message at its next tool boundary (senpi joins a running turn only
+		// when triggerTurn is not false); otherwise the message's own delivery applies. A scope check never starts a turn.
+		const join = ["steer", "followUp"].includes(message.busyDeliverAs) && !isIdle();
+		const deliverAs = join ? message.busyDeliverAs : ["steer", "followUp", "nextTurn"].includes(message.deliverAs) ? message.deliverAs : "followUp";
+		pi.sendMessage(payload, { deliverAs, triggerTurn: join || (message.kind === "scope-check" ? false : Boolean(message.triggerTurn)) });
 	}
 
 	const inbox = safe("inbox", async () => {

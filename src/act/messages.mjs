@@ -66,8 +66,8 @@ export function composeRespawnNotice({ finding, sessionId, now, outcome, hold, t
 	return base({ kind: "self-notice", sessionId, now, deliverAs: "nextTurn", triggerTurn: false, content, details: { actionKind: "kill-respawner", incidentId: finding.fp, stormName: storm.name, respawnerPid: finding.data?.respawnerPid, hold: hold ?? null, tier: triage?.tier ?? null } });
 }
 
-function base({ kind, sessionId, now, deliverAs, triggerTurn, content, details }) {
-	return { id: newMessageId(now), kind, sessionId, createdMs: now, customType: "omo-health", deliverAs, triggerTurn, content: redact(content), details };
+function base({ kind, sessionId, now, deliverAs, triggerTurn, busyDeliverAs, content, details }) {
+	return { id: newMessageId(now), kind, sessionId, createdMs: now, customType: "omo-health", deliverAs, triggerTurn, ...(busyDeliverAs ? { busyDeliverAs } : {}), content: redact(content), details };
 }
 
 function commandOf(finding) {
@@ -448,43 +448,65 @@ export function composeWake({ finding, sessionId, now, reportPath }) {
 export function composeCacheNotice({ finding, sessionId, now, forward = false }) {
 	const who = forward ? `${childLabel(finding)}의 상태입니다. ` : "";
 	const content = `[omo-health] ${who}${finding.titleKo}. ${finding.detailKo}\n- 할 일: ${finding.data?.advice ?? ""}${forward ? " 이 서브에이전트에 그렇게 전하거나 작업을 나눠 다시 띄우세요." : ""}`;
-	return base({ kind: "self-notice", sessionId, now, deliverAs: "nextTurn", triggerTurn: false, content, details: { actionKind: "cache-notice", incidentId: finding.fp, findingKind: finding.kind, taskId: finding.subject?.taskId ?? null, images: finding.data?.images ?? null, imageBytes: finding.data?.imageBytes ?? null } });
+	return base({ kind: "self-notice", sessionId, now, ...NEXT_TURN, content, details: { actionKind: "cache-notice", incidentId: finding.fp, findingKind: finding.kind, taskId: finding.subject?.taskId ?? null, images: finding.data?.images ?? null, imageBytes: finding.data?.imageBytes ?? null } });
+}
+
+const imageLoadText = (d) => `이미지 ${d.images ?? 0}장${d.imagesPartial ? " 이상" : ""}, base64 ${Math.round(((d.imageBytes ?? 0) / 1048576) * 10) / 10} MiB`;
+
+/**
+ * Delivery that never starts a turn: senpi (agent-session _deliverCustomMessage) appends a followUp with triggerTurn false
+ * to an idle session at once and to a busy one after its run, so the model reads it at the next turn whatever starts it
+ * (a nextTurn message waits for a typed prompt, which a goal or DAG parent may never get). busyDeliverAs "steer" asks the
+ * sensor to join a turn that is running at delivery time instead (steer with triggerTurn true, at the next tool boundary).
+ */
+const NEXT_TURN = { deliverAs: "followUp", triggerTurn: false };
+
+/**
+ * D4 with tokens.imageSteer "steer" on a main session itself: what to do now, once per level. It joins a running turn at
+ * the next tool boundary and never wakes an idle session. It never cancels anything.
+ */
+export function composeImageSteer({ finding, sessionId, now }) {
+	const d = finding.data ?? {};
+	const level = d.level === "trim" ? "trim" : "warn";
+	const load = imageLoadText(d);
+	const limit = `24 MiB 또는 ${d.trimCount ?? 100}장`;
+	const content = level === "trim"
+		? `[omo-health] 이 세션 컨텍스트에 ${load}가 쌓여 잘림 기준(${limit})을 넘었습니다. 이미지를 더 읽을 때마다 캐시 전체를 다시 씁니다. 지금 확인을 마친 뒤 남은 스크린샷 작업은 나눠서 새 하위 작업(task)에 맡기고, 이 세션에서는 이미지를 더 읽지 마세요.`
+		: `[omo-health] 이 세션 컨텍스트에 ${load}가 쌓였습니다. ${limit}을 넘으면 이미지를 더 읽을 때마다 캐시 전체를 다시 씁니다. 지금부터 전체 크기 스크린샷을 그대로 읽지 말고 확인할 영역만 잘라 읽거나 절반 크기로 줄이세요. 같은 스크린샷은 다시 읽지 마세요. 지금 하던 확인은 마치고, 남은 스크린샷 작업은 새 하위 작업(task)에 넘기세요.`;
+	return base({
+		kind: "self-notice",
+		sessionId,
+		now,
+		...NEXT_TURN,
+		busyDeliverAs: "steer",
+		content,
+		details: { actionKind: "image-steer", level, incidentId: finding.fp, findingKind: finding.kind, taskId: null, images: d.images ?? null, imageBytes: d.imageBytes ?? null, forwardText: null },
+	});
 }
 
 /**
- * D4 with tokens.imageSteer "steer": what a session holding many images should do now, once per level. A main session
- * reads it at its next tool boundary (steer) or next turn when idle. A child has no sensor, so its parent gets it
- * (steer while the parent is mid-turn, followUp waking an idle parent): at `warn` with the sentence to pass on through task_send, at `trim` with the
- * request to split the remaining image work into a fresh child. It never cancels anything.
+ * D4 image steer for the Claude children of one parent, batched into one relay (a child has no sensor, so its parent
+ * passes it on). Each item is { taskId, level, images, imageBytes, imagesPartial, trimCount, fp }: at `warn` the sentence
+ * to forward through task_send, at `trim` the request to split the remaining image work into a fresh child. `wake` (a
+ * child at the trim level) joins a running parent turn or starts one; otherwise the parent reads it at its next turn.
  */
-export function composeImageSteer({ finding, sessionId, now, forward = false, idle = false }) {
-	const d = finding.data ?? {};
-	const level = d.level === "trim" ? "trim" : "warn";
-	const taskId = finding.subject?.taskId ?? null;
-	const load = `이미지 ${d.images ?? 0}장${d.imagesPartial ? " 이상" : ""}, base64 ${Math.round(((d.imageBytes ?? 0) / 1048576) * 10) / 10} MiB`;
-	const limit = `24 MiB 또는 ${d.trimCount ?? 100}장`;
-	const passOn = `omo-health: your context holds ${d.images ?? 0} images; past 24 MiB or ${d.trimCount ?? 100} each new image rewrites the whole prompt cache. Stop reading full-size screenshots: crop to what you check or halve the size, never re-read one. Finish this check, then report back so the rest goes to a fresh subtask.`;
-	let content;
-	if (!forward) {
-		content = level === "trim"
-			? `[omo-health] 이 세션 컨텍스트에 ${load}가 쌓여 잘림 기준(${limit})을 넘었습니다. 이미지를 더 읽을 때마다 캐시 전체를 다시 씁니다. 지금 확인을 마친 뒤 남은 스크린샷 작업은 나눠서 새 하위 작업(task)에 맡기고, 이 세션에서는 이미지를 더 읽지 마세요.`
-			: `[omo-health] 이 세션 컨텍스트에 ${load}가 쌓였습니다. ${limit}을 넘으면 이미지를 더 읽을 때마다 캐시 전체를 다시 씁니다. 지금부터 전체 크기 스크린샷을 그대로 읽지 말고 확인할 영역만 잘라 읽거나 절반 크기로 줄이세요. 같은 스크린샷은 다시 읽지 마세요. 지금 하던 확인은 마치고, 남은 스크린샷 작업은 새 하위 작업(task)에 넘기세요.`;
-	} else if (level === "trim") {
-		content = `[omo-health] 서브에이전트 ${taskId}의 컨텍스트에 ${load}가 쌓여 잘림 기준(${limit})을 넘었습니다. 이제 이미지를 더 읽을 때마다 캐시 전체를 다시 씁니다. 이 서브에이전트가 지금 확인을 마치면, 남은 이미지 작업은 나눠서 새 서브에이전트에 다시 맡기세요. ${taskId}에 이미지 작업을 이어서 시키지 마세요. omo-health는 아무것도 취소하지 않았습니다.`;
-	} else {
-		content = `[omo-health] 서브에이전트 ${taskId}의 컨텍스트에 ${load}가 쌓였습니다. ${limit}을 넘으면 이미지를 더 읽을 때마다 캐시 전체를 다시 씁니다. 서브에이전트는 omo-health 알림을 직접 받지 못하니, 지금 task_send(${taskId}, "...")로 다음을 전하세요:\n${passOn}`;
-	}
+export function composeImageSteerBatch({ items, sessionId, now, wake = false }) {
+	const lines = items.map((d) => {
+		const load = imageLoadText(d);
+		const limit = `24 MiB 또는 ${d.trimCount ?? 100}장`;
+		if (d.level === "trim") return `- ${d.taskId}: ${load}로 잘림 기준(${limit})을 넘었습니다. 지금 확인을 마치면 남은 이미지 작업은 나눠서 새 서브에이전트에 맡기고, ${d.taskId}에 이미지 작업을 이어서 시키지 마세요.`;
+		const passOn = `omo-health: your context holds ${d.images ?? 0} images; past 24 MiB or ${d.trimCount ?? 100} each new image rewrites the whole prompt cache. Stop reading full-size screenshots: crop to what you check or halve the size, never re-read one. Finish this check, then report back so the rest goes to a fresh subtask.`;
+		return `- ${d.taskId}: ${load}. 아직 돌고 있으면 task_send(${d.taskId}, "...")로 다음을 전하세요: ${passOn}`;
+	});
+	const content = `[omo-health] Claude 서브에이전트 ${items.length}개의 컨텍스트에 이미지가 쌓였습니다. 24 MiB 또는 100장을 넘으면 이미지를 더 읽을 때마다 캐시 전체를 다시 씁니다. 이미 끝난 서브에이전트는 건너뛰세요. omo-health는 아무것도 취소하지 않았습니다.\n${lines.join("\n")}`;
+	const first = items[0] ?? {};
 	return base({
-		kind: forward ? "relay" : "self-notice",
+		kind: "relay",
 		sessionId,
 		now,
-		// A busy session reads it at its next tool boundary (steer) instead of after its whole turn; an idle parent is woken.
-		// senpi (agent-session _deliverCustomMessage) joins a custom message to the running turn only when triggerTurn is
-		// not false: with false it is only written to the session, and the model does not see it until a later turn.
-		deliverAs: forward ? (idle ? "followUp" : "steer") : idle ? "nextTurn" : "steer",
-		triggerTurn: forward ? true : !idle,
+		...(wake ? { deliverAs: "followUp", triggerTurn: true, busyDeliverAs: "steer" } : NEXT_TURN),
 		content,
-		details: { actionKind: "image-steer", level, incidentId: finding.fp, findingKind: finding.kind, taskId, images: d.images ?? null, imageBytes: d.imageBytes ?? null, forwardText: forward && level === "warn" ? passOn : null },
+		details: { actionKind: "image-steer", level: items.some((d) => d.level === "trim") ? "trim" : "warn", incidentIds: items.map((d) => d.fp), taskIds: items.map((d) => d.taskId), taskId: first.taskId ?? null, images: first.images ?? null, imageBytes: first.imageBytes ?? null, wake },
 	});
 }
 
@@ -502,7 +524,7 @@ export function composeRevertNotice({ finding, sessionId, now, outcome }) {
 }
 
 /** A quiet scope reminder, to the session itself or forwarded through its parent. */
-export function composeScopeCheck({ finding, sessionId, now, forward = false, deliverAs = "steer", verdict }) {
+export function composeScopeCheck({ finding, sessionId, now, forward = false, verdict }) {
 	const { signal, metric, evidence, goal, lastUserText, lastUserMs } = finding.data;
 	const summary = {
 		churn: "반복 수정과 실패를 다시 점검하세요.",
@@ -532,7 +554,9 @@ export function composeScopeCheck({ finding, sessionId, now, forward = false, de
 		analystLine,
 		"Before your next step, reconsider once: (1) Is the current work required by that goal and request? (2) Is there a simpler path that satisfies it? (3) If you have been iterating without converging, stop iterating, choose the simplest acceptable option and continue, or tell the user what blocks you. Do not reply to this note; just adjust course.",
 	].filter((line) => line !== null).join("\n");
-	return base({ kind: "scope-check", sessionId, now, deliverAs, triggerTurn: false,
+	// It joins a turn that is running when it arrives (the model reads it at the next tool boundary) and never wakes an
+	// idle session, which reads it at its next turn of any kind.
+	return base({ kind: "scope-check", sessionId, now, ...NEXT_TURN, busyDeliverAs: "steer",
 		content: forward ? `Forward this to subagent ${finding.subject.taskId} with task_send:\n${note}` : note,
 		details: { kind: "scope-check", incidentId: finding.fp, subjectSessionId: finding.subject.sessionId, key: finding.subject.key, signal, metric, cause: verdict?.cause ?? null, confidence: verdict?.confidence ?? null } });
 }

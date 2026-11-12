@@ -130,14 +130,15 @@ test("D15 scope check routes main to self and child to parent with version, idle
 	const main = harness({ extraDetectors: [{ name: "align", ...align }], sensorVersion: "0.2.0", sensorIdle: false });
 	prime(main, "main");
 	await main.engine.tick();
-	assert.deepEqual(main.sent.map((m) => [m.kind, m.sessionId, m.deliverAs, m.triggerTurn]), [["scope-check", "p1", "steer", false]]);
+	// It joins the running turn through the sensor (busyDeliverAs) and never starts one by itself.
+	assert.deepEqual(main.sent.map((m) => [m.kind, m.sessionId, m.deliverAs, m.triggerTurn, m.busyDeliverAs]), [["scope-check", "p1", "followUp", false, "steer"]]);
 	assert.equal(main.toasts.length, 0);
 	const child = harness({ extraDetectors: [{ name: "align", ...align }], sensorVersion: "0.2.1" });
 	prime(child, "child");
 	await child.engine.tick();
 	assert.equal(child.sent.length, 1);
 	assert.equal(child.sent[0].sessionId, "p1");
-	assert.equal(child.sent[0].deliverAs, "nextTurn");
+	assert.equal(child.sent[0].deliverAs, "followUp", "an idle parent reads it at its next turn of any kind, not only after a typed prompt");
 	assert.match(child.sent[0].content, /^Forward this to subagent st_01a0ced9 with task_send:/);
 	assert.match(child.sent[0].content, /14 steps on 'Fix X' since \d\d:\d\dZ/);
 	assert.equal(child.toasts.length, 0);
