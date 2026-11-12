@@ -164,6 +164,46 @@ test("summarize takes the worst state and is unknown only when every window is u
 	assert.equal(summary.windows[0], ok);
 });
 
+test("short when the window is already used up, even with no burn data", () => {
+	const s = state({ samples: [reading(100, NOW - 30 * MIN)] });
+	assert.equal(s.burnPerHour, null);
+	assert.equal(s.projectedAtResetPercent, null);
+	assert.equal(s.freePercent, 0);
+	assert.equal(s.state, "short");
+});
+
+test("safe daily percent never goes negative past the reserve", () => {
+	const s = state({ samples: [reading(97, NOW - 30 * MIN)] });
+	assert.equal(s.reservePercent, RESERVE);
+	assert.equal(s.hoursLeft, 12);
+	assert.equal(s.safeDailyPercent, 0); // (100 - 12 - 97) / 0.5 would be -18
+	assert.equal(s.state, "tight"); // not used up yet; free 0 is below 5
+});
+
+test("stale beats a used-up reading: stale 100% is unknown", () => {
+	const s = state({ samples: [reading(100, NOW - 30 * MIN)], stale: true });
+	assert.equal(s.usedPercent, 100);
+	assert.equal(s.state, "unknown");
+	assert.equal(s.stale, true);
+});
+
+test("QA failure: claude:7d_fable at 100% reads short, not tight, with a zero daily allowance", () => {
+	const fable = windowState({
+		account: "anthropic-subscription/default",
+		window: { id: "claude:7d_fable", label: "7d", windowMinutes: 10080, scope: "fable" },
+		samples: [reading(100, NOW - 30 * MIN, NOW + 30 * MIN)],
+		calibration: CAL,
+		committedUsd: 0,
+		now: NOW,
+		cfg: CFG,
+		stale: false,
+	});
+	assert.equal(fable.scope, "fable");
+	assert.equal(fable.projectedAtResetPercent, null);
+	assert.equal(fable.state, "short");
+	assert.equal(fable.safeDailyPercent, 0);
+});
+
 test("QA failure: burn from fewer than 2 samples gives projected null and state is not short", () => {
 	const s = state({ samples: [reading(95, NOW - 30 * MIN)] });
 	assert.equal(s.burnPerHour, null);

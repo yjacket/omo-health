@@ -85,10 +85,14 @@ export function windowState({ account, window, samples, calibration, committedUs
 	const safeDailyPercent =
 		usedPercent === null || hoursLeft === null
 			? null
-			: (100 - reservePercent - usedPercent) / Math.max(hoursLeft / 24, 1 / 24);
+			: Math.max(0, (100 - reservePercent - usedPercent) / Math.max(hoursLeft / 24, 1 / 24));
 
+	// A window that is already used up reads short whatever the projection: with no burn data or a
+	// reset that already passed, the projection cannot see the exhaustion on its own.
+	// Stale/unknown still wins over everything (a stale 100% reading is not evidence).
 	let state;
 	if (stale === true || usedPercent === null) state = "unknown";
+	else if (usedPercent >= 100) state = "short";
 	else if (projectedAtResetPercent !== null && projectedAtResetPercent > 100) state = "short";
 	else if ((projectedAtResetPercent !== null && projectedAtResetPercent > 100 - reservePercent) || freePercent < 5) state = "tight";
 	else state = "ok";

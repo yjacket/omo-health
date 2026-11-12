@@ -33,6 +33,27 @@ const CALIBRATION_EVERY_MS = 10 * MIN;
 const PRUNE_EVERY_MS = HOUR;
 const RECENT_TAIL_BYTES = 512 * 1024;
 const LIVE = new Set(["tracking", "requested", "approved", "pending"]);
+// Same active statuses as src/detect/align.mjs GOAL_ACTIVE; audits are for goals still being worked on.
+const GOAL_ACTIVE = new Set(["active", "running", "in_progress", "pending"]);
+
+// Goal statuses that close a project (C-projects rule 1); every other unseen status reads as missing.
+const GOAL_TERMINAL = new Set(["complete", "completed", "replaced", "cleared", "cancelled"]);
+
+/**
+ * The goal as of this tick. Ingest reads the goal files of every session inside the backfill window, so a project
+ * without `info` belongs to a session that left the window or was deleted: it is no longer in progress (no request,
+ * checkpoint or audit), while a stored terminal status still lets rule 1 close it.
+ */
+function goalNowOf(info, project) {
+	if (info?.goal) return info.goal;
+	const stored = project.data?.goalStatus;
+	const terminal = typeof stored === "string" && GOAL_TERMINAL.has(stored.trim().toLowerCase());
+	return { status: terminal ? stored : "missing", completedMs: project.data?.goalCompletedMs ?? null };
+}
+
+function goalActive(status) {
+	return typeof status === "string" && GOAL_ACTIVE.has(status.trim().toLowerCase());
+}
 const AUDIT_DONE = new Set(["done", "failed", "timeout", "unavailable"]);
 
 function finite(value) {
@@ -134,6 +155,8 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 	let pruneMs = -Infinity;
 	const calibrations = new Map(); // `${account}|${windowId}` -> calibrate() result
 	const wouldActions = new Set(); // shadow: would-action events already recorded this process
+	const auditSkipped = new Set(); // project ids whose goal-not-active skip was already recorded this process
+	let ingestProgress = null;
 	let lastSnapshot = null;
 
 	const providersNow = () => {
@@ -169,9 +192,16 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 			store.appendEvent({ ms: now, ...event });
 			events.push(event);
 		};
+		// One skip per project, not one per tick: the goal stays inactive while its closeGrace drains.
+		const skipInactiveAudit = (projectId) => {
+			if (auditSkipped.has(projectId)) return;
+			auditSkipped.add(projectId);
+			appendEvent({ projectId, kind: "audit-skipped", data: { reason: "goal-not-active" } });
+		};
 
 		// 1. Ledger.
 		const ing = ingest.run();
+		ingestProgress = ing.progress ?? null;
 
 		// 2. Subscription windows; samples only from fresh, successful readings.
 		if (now - subsReadMs >= SUBSCRIPTION_EVERY_MS) {
@@ -202,6 +232,7 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 		// 4. Projects: register every goal seen inside the backfill window.
 		const graceMs = budget.closeGraceMs ?? DAY;
 		const goalById = new Map();
+		const registered = new Set();
 		for (const [sid, goals] of ing.goals) {
 			for (const goal of goals) {
 				const id = `${sid}:${goal.id}`;
@@ -209,6 +240,7 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 				const existing = store.getProject(id);
 				if (!existing) {
 					if (goal.createdMs < sinceSamples) continue;
+					registered.add(id);
 					store.upsertProject({
 						id,
 						sessionId: sid,
@@ -293,6 +325,7 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 			let project = original;
 			const spend = spends.get(project.id);
 			const info = goalById.get(project.id);
+			const goalNow = goalNowOf(info, project);
 			const objective = project.objective ?? "";
 
 			// Audit in flight: one poll per tick.
@@ -360,7 +393,7 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 			const blocks = ing.blocks.filter((b) => b.projectId === project.id).map((b) => ({ kind: b.kind, body: b.body }));
 			const out = evaluate({
 				project,
-				goal: goalForEvaluate(info?.goal ?? { status: project.data.goalStatus, completedMs: project.data.goalCompletedMs }),
+				goal: goalForEvaluate(goalNow),
 				spend: projectSpend,
 				blocks,
 				treasury,
@@ -402,10 +435,13 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 					appendEvent({ projectId: project.id, kind: "would-action", data: { type: action.type, actionKind: action.actionKind ?? null, reasons: action.reasons ?? null } });
 				}
 				if (reasons.length && auditCfg.enabled) {
-					const key = `${project.id}|would-audit|${reasons.join(",")}`;
-					if (!wouldActions.has(key)) {
-						wouldActions.add(key);
-						appendEvent({ projectId: project.id, kind: "would-action", data: { type: "audit", reasons } });
+					if (!goalActive(goalNow.status)) skipInactiveAudit(project.id);
+					else if (!registered.has(project.id)) {
+						const key = `${project.id}|would-audit|${reasons.join(",")}`;
+						if (!wouldActions.has(key)) {
+							wouldActions.add(key);
+							appendEvent({ projectId: project.id, kind: "would-action", data: { type: "audit", reasons } });
+						}
 					}
 				}
 				live[live.indexOf(original)] = { ...next, _ind: ind, _trig: trig };
@@ -418,8 +454,15 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 			}
 			if (next.status === "closed" && project.status !== "closed") appendEvent({ projectId: project.id, kind: "closed", data: { outcome: next.data.outcome ?? null, actualUsd: next.data.actualUsd ?? null } });
 
-			// Start an audit when a heavy trigger or a rule asks for one and the caps allow it.
-			if (reasons.length && auditCfg.enabled && next.status !== "closed") {
+			// Start an audit when a heavy trigger or a rule asks for one, the goal is still active and the caps allow it.
+			// A project first registered this tick only records its trigger: the audit gate runs from the next tick,
+			// so a goal that disappears between ticks never opens one. A non-active goal records one skip even when
+			// this same tick closed the project (cancelled, cleared, COMPLETED).
+			const goalIsActive = goalActive(goalNow.status);
+			if (reasons.length && auditCfg.enabled && !goalIsActive) {
+				// A completed, replaced, cancelled, cleared or missing goal is no work left to audit.
+				skipInactiveAudit(project.id);
+			} else if (reasons.length && auditCfg.enabled && next.status !== "closed" && !registered.has(project.id)) {
 				const audits = next.data.audits ?? [];
 				const last = audits.at(-1) ?? null;
 				const newEvidence = !last
@@ -516,6 +559,7 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 			v: 1,
 			updatedMs: now,
 			enabled: true,
+			ingest: ingestProgress ? { ...ingestProgress, updatedMs: now } : null,
 			treasury: { state: treasury.state, windows, external },
 			projects: projectRows,
 			audits: auditRows,

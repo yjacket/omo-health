@@ -418,6 +418,147 @@ test("(l) an unterminated line longer than the cap waits for its newline before 
 	assert.equal(c.store.getOffset(c.file).offset, fs.statSync(c.file).size);
 });
 
+
+test("(m) a completed goal inside closeGrace starts no audit; an active goal does", (t) => {
+	const completedMs = T0 - 14 * HOUR;
+	const transcript = (c) => {
+		const entries = [E.header(c.sid, c.cwd, T0 - 20 * HOUR)];
+		for (let i = 1; i <= 7; i++) entries.push(E.assistant({ ms: T0 - (21 - i) * HOUR, text: `QA round ${i} finished`, usage: usage(40 / 7) }));
+		return entries;
+	};
+
+	// A goal completed 14 h ago: still inside the 24 h closeGrace, 7 numbered rounds and $40 spent.
+	const done = setup(t);
+	const donePid = `${done.sid}:g1`;
+	done.writeGoal({ id: "g1", objective: "finished work", status: "completed", completedAt: secs(completedMs), createdAt: secs(T0 - 22 * HOUR), updatedAt: secs(completedMs) });
+	writeJsonl(done.file, transcript(done));
+	const doneRunner = createFakeRunner();
+	const doneOffice = done.office({ runner: doneRunner });
+	for (let i = 0; i < 3; i++) {
+		doneOffice.tick({ shadow: false });
+		done.clock.advance(MIN);
+	}
+	assert.equal(doneRunner.starts.length, 0, "a completed goal's heavy trigger starts nothing");
+	const doneEvents = done.store.events({ projectId: donePid, limit: 200 });
+	assert.ok(doneEvents.some((e) => e.kind === "trigger" && e.data.kind === "rounds" && e.data.heavy === true), "the heavy trigger really fires");
+	const skipped = doneEvents.filter((e) => e.kind === "audit-skipped");
+	assert.equal(skipped.length, 1, "one skip event across three ticks");
+	assert.equal(skipped[0].data.reason, "goal-not-active");
+
+	// Same rounds and spend, but the goal is active: exactly one audit starts.
+	const active = setup(t);
+	active.writeGoal({ id: "g1", objective: "work in progress", createdAt: secs(T0 - 22 * HOUR), updatedAt: secs(T0 - 22 * HOUR) });
+	writeJsonl(active.file, transcript(active));
+	const activeRunner = createFakeRunner({ outcomes: { "budget-audit": { status: "running" } } });
+	const activeOffice = active.office({ runner: activeRunner });
+	for (let i = 0; i < 3; i++) {
+		activeOffice.tick({ shadow: false });
+		active.clock.advance(MIN);
+	}
+	assert.equal(activeRunner.starts.length, 1, "the active goal gets one audit");
+	assert.equal(activeRunner.starts[0].kind, "budget-audit");
+	assert.equal(active.store.events({ projectId: `${active.sid}:g1`, limit: 100 }).filter((e) => e.kind === "audit-skipped").length, 0);
+});
+
+test("(o) a deleted goal file makes the project's goal missing: no later audit starts", (t) => {
+	const c = setup(t);
+	const pid = `${c.sid}:g1`;
+	c.writeGoal({ id: "g1", objective: "vanishing goal", createdAt: secs(T0 - 20 * HOUR), updatedAt: secs(T0 - 14 * HOUR) });
+	const entries = [E.header(c.sid, c.cwd, T0 - 20 * HOUR)];
+	for (let i = 1; i <= 7; i++) entries.push(E.assistant({ ms: T0 - (21 - i) * HOUR, text: `QA round ${i} finished`, usage: usage(40 / 7) }));
+	writeJsonl(c.file, entries);
+	const runner = createFakeRunner({ outcomes: { "budget-audit": { status: "running" } } });
+	const office = c.office({ runner });
+	office.tick({ shadow: false });
+	const startedBefore = c.store.events({ projectId: pid, limit: 200 }).filter((e) => e.kind === "audit-started").length;
+	assert.equal(runner.starts.length, startedBefore);
+	fs.rmSync(path.join(c.dir, "extensions", "goal", `${c.sid}.json`));
+	let out = null;
+	for (let i = 0; i < 3; i++) {
+		c.clock.advance(MIN);
+		out = office.tick({ shadow: false });
+	}
+	assert.equal(runner.starts.length, startedBefore, "no audit starts after the goal record disappears");
+	assert.equal(c.store.events({ projectId: pid, limit: 200 }).filter((e) => e.kind === "audit-started").length, startedBefore);
+	assert.equal(c.store.getProject(pid).data.goalStatus, "missing");
+	assert.equal(out.events.filter((e) => e.projectId === pid && e.kind === "audit-started").length, 0);
+});
+
+test("(q) a session that left the backfill window is no longer in progress: no audit even with its goal file gone", (t) => {
+	const c = setup(t);
+	const pid = `${c.sid}:g1`;
+	c.writeGoal({ id: "g1", objective: "aging goal", createdAt: secs(T0 - 20 * HOUR), updatedAt: secs(T0 - 14 * HOUR) });
+	const entries = [E.header(c.sid, c.cwd, T0 - 20 * HOUR)];
+	for (let i = 1; i <= 7; i++) entries.push(E.assistant({ ms: T0 - (21 - i) * HOUR, text: `QA round ${i} finished`, usage: usage(40 / 7) }));
+	writeJsonl(c.file, entries);
+	const runner = createFakeRunner({ outcomes: { "budget-audit": { status: "running" } } });
+	const office = c.office({ runner });
+	office.tick({ shadow: false });
+	const startedBefore = runner.starts.length;
+	// The transcript ages out of the backfill window and the goal file is removed: ingest no longer sees the session.
+	const old = (T0 - (c.config.budget.backfillDays + 1) * 24 * HOUR) / 1000;
+	fs.utimesSync(c.file, old, old);
+	fs.rmSync(path.join(c.dir, "extensions", "goal", `${c.sid}.json`));
+	for (let i = 0; i < 3; i++) {
+		c.clock.advance(MIN);
+		office.tick({ shadow: false });
+	}
+	assert.equal(runner.starts.length, startedBefore, "an unseen goal never opens an audit");
+	const events = c.store.events({ projectId: pid, limit: 200 });
+	assert.equal(events.filter((e) => e.kind === "audit-started").length, startedBefore);
+});
+
+test("(p) a cancelled goal's heavy trigger records one audit-skipped and starts no audit", (t) => {
+	const c = setup(t);
+	const pid = `${c.sid}:g1`;
+	c.writeGoal({ id: "g1", objective: "cancelled work", status: "cancelled", completedAt: secs(T0 - 14 * HOUR), createdAt: secs(T0 - 20 * HOUR), updatedAt: secs(T0 - 14 * HOUR) });
+	const entries = [E.header(c.sid, c.cwd, T0 - 20 * HOUR)];
+	for (let i = 1; i <= 7; i++) entries.push(E.assistant({ ms: T0 - (21 - i) * HOUR, text: `QA round ${i} finished`, usage: usage(40 / 7) }));
+	writeJsonl(c.file, entries);
+	const runner = createFakeRunner({ outcomes: { "budget-audit": { status: "running" } } });
+	const office = c.office({ runner });
+	for (let i = 0; i < 3; i++) {
+		office.tick({ shadow: false });
+		c.clock.advance(MIN);
+	}
+	assert.equal(runner.starts.length, 0, "a cancelled goal gets no audit even though it closes in the trigger tick");
+	const events = c.store.events({ projectId: pid, limit: 200 });
+	const skipped = events.filter((e) => e.kind === "audit-skipped" && e.data.reason === "goal-not-active");
+	assert.equal(skipped.length, 1, "one skip event across three ticks");
+	assert.ok(events.some((e) => e.kind === "trigger" && e.data.kind === "rounds" && e.data.heavy === true), "the heavy trigger really fires");
+	assert.equal(c.store.getProject(pid).status, "closed");
+});
+
+test("(n) the snapshot reports backfill progress until every byte of the window is read", (t) => {
+	const c = setup(t);
+	c.config.budget.ingestBytesPerTick = 1;
+	c.writeGoal({ id: "g1", objective: "progress", createdAt: secs(T0 - HOUR), updatedAt: secs(T0 - HOUR) });
+	writeJsonl(c.file, [
+		E.header(c.sid, c.cwd, T0 - HOUR),
+		spendEntry(T0 - 50 * MIN, 1, { id: "abab0001" }),
+		spendEntry(T0 - 40 * MIN, 2, { id: "abab0002" }),
+		spendEntry(T0 - 30 * MIN, 3, { id: "abab0003" }),
+	]);
+	const childFile = writeTask(c.cwd, { task_id: "t1", status: "completed", root_session_id: c.sid, parent_session_id: c.sid, child_session_id: "child-1", created_at: iso(T0 - 20 * MIN) }, [
+		E.header("child-1", c.cwd, T0 - 20 * MIN),
+		spendEntry(T0 - 10 * MIN, 1, { id: "abab0004" }),
+	]);
+	const total = fs.statSync(c.file).size + fs.statSync(childFile).size;
+	const office = c.office();
+	let out = office.tick({});
+	assert.equal(out.snapshot.ingest.totalBytes, total);
+	assert.equal(out.snapshot.ingest.files, 2);
+	assert.ok(out.snapshot.ingest.pendingBytes > 0, "a 1-byte cap cannot finish the window in one tick");
+	for (let i = 0; i < 40 && out.snapshot.ingest.pendingBytes > 0; i++) {
+		c.clock.advance(MIN);
+		out = office.tick({});
+	}
+	assert.equal(out.snapshot.ingest.pendingBytes, 0);
+	assert.equal(out.snapshot.ingest.pendingFiles, 0);
+	assert.equal(out.snapshot.ingest.totalBytes, total);
+	assert.equal(out.snapshot.ingest.updatedMs, c.clock.now());
+});
+
 test("disabled budget: tick returns the empty result and writes no snapshot", (t) => {
 	const c = setup(t);
 	c.config.budget.enabled = false;

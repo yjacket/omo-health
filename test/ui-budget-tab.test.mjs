@@ -276,11 +276,12 @@ const project = (o) => ({ id: "sid:goal", sessionId: "sid-0123456789", objective
 
 const audit = (o) => ({ auditId: "a1", projectId: OWNER_PROJECT, ms: NOW - 2 * HOUR, status: "done", model: "chatgpt-subscription/gpt-6-astra:high", assessment: "waste-likely", advice: "Rounds 6-8 repeat the QA rerun.\nSecond line.", costUsd: 1.84, ...o });
 
-function snapshot({ windows, projects, audits } = {}) {
+function snapshot({ windows, projects, audits, ingest } = {}) {
 	return {
 		v: 1,
 		updatedMs: NOW,
 		enabled: true,
+		ingest: ingest ?? null,
 		treasury: {
 			state: "short",
 			windows: windows ?? [
@@ -359,6 +360,21 @@ describe("dashboard budget tab", { timeout: 20_000 }, () => {
 		});
 		assert.equal(text(byClass(rows[1], "win__window")[0]), "7d fable");
 		assert.ok(chipText(page.doc.getElementById("budget-limits-body")).includes(`전체 ${labels.BUDGET_STATE_LABELS.short}`));
+	});
+
+	it("shows the backfill progress chip beside the treasury state while bytes are pending", async () => {
+		const page = await openPage(snapshot({ ingest: { totalBytes: 1000, pendingBytes: 600, files: 2, pendingFiles: 1, updatedMs: NOW } }));
+		const head = byClass(page.doc.getElementById("budget-limits-body"), "wrap-row")[0];
+		const chips = byClass(head, "chip");
+		assert.deepEqual(chips.map(text), [`전체 ${labels.BUDGET_STATE_LABELS.short}`, "수집 중 40%"]);
+		assert.equal(chips[1].className, "chip", "a neutral chip, like the other state chips without a tone");
+	});
+
+	it("shows no backfill progress chip when nothing is pending or the snapshot has no ingest", async () => {
+		for (const ingest of [{ totalBytes: 1000, pendingBytes: 0 }, null]) {
+			const page = await openPage(snapshot({ ingest }));
+			assert.equal(chipText(page.doc.getElementById("budget-limits-body")).some((c) => c.startsWith("수집 중")), false, JSON.stringify(ingest));
+		}
 	});
 
 	it("marks a stale window with an error as 모름, 오래됨 and 조회 실패, and a fresh one with none of them", async () => {

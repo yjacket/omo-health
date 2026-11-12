@@ -17,9 +17,19 @@ const DEFAULT_AUTO_CHANGE_PERCENT = 20;
 const DEFAULT_CLOSE_GRACE_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_OUTLIER_FACTOR = 1.5;
 
+// The same set src/detect/align.mjs uses: only a goal still in flight may be asked for a budget or
+// receive a spending checkpoint. A missing goal is not active.
+const GOAL_ACTIVE = new Set(["active", "running", "in_progress", "pending"]);
+
 const ESTIMATE_ALREADY_APPROVED_ERROR =
 	'project already has an approved budget: send kind="change" with reason, justification and alternatives';
 const ESTIMATE_PENDING_ERROR = "project is pending a decision";
+
+function goalIsActive(goal) {
+	if (!goal || typeof goal !== "object") return false;
+	const status = typeof goal.status === "string" ? goal.status.trim().toLowerCase() : "";
+	return GOAL_ACTIVE.has(status);
+}
 
 function budgetCfg(cfg) {
 	if (cfg && typeof cfg === "object" && cfg.budget && typeof cfg.budget === "object") return cfg.budget;
@@ -331,13 +341,14 @@ function applyOwnerCommands(ctx) {
 }
 
 // Rule 7: one checkpoint per revision at the configured percent and at 100%; both crossed in one
-// evaluation means only 100 is sent.
+// evaluation means only 100 is sent. Only an ACTIVE goal gets checkpoints; otherwise nothing is sent
+// and nothing is marked sent, so the checkpoint is not used up.
 function applyCheckpoint(ctx) {
 	const { project, now, cfg, actions } = ctx;
 	const data = dataOf(project);
 	const approvals = Array.isArray(data.approvals) ? data.approvals : [];
 	// Rule 7 is per revision and applies to any live project with an approved budget, whatever its status.
-	if (project.status === STATUS_CLOSED || approvals.length === 0) return;
+	if (!ctx.goalActive || project.status === STATUS_CLOSED || approvals.length === 0) return;
 	const approvedUsd = currentApprovedUsd(project, ctx.estimateAfterUsd);
 	if (!(approvedUsd > 0)) return;
 	const checkpoints = objectOf(data, "checkpoints");
@@ -397,14 +408,15 @@ export function evaluate({
 	const spentUsd = spendUsdOf(spend);
 	const byModel = byModelOf(spend);
 	const graceMs = num(budget.closeGraceMs, DEFAULT_CLOSE_GRACE_MS);
+	const goalActive = goalIsActive(goal);
 
 	// Rule 1.
 	if (closeIfFinished(next, goal, spentUsd, now, graceMs)) return { project: next, actions };
 
 	const estimateAfterUsd = num(budget.estimateAfterUsd, DEFAULT_ESTIMATE_AFTER_USD);
 
-	// Rule 2.
-	if (next.status === STATUS_TRACKING && !finite(data.requestSentMs) && spentUsd >= estimateAfterUsd) {
+	// Rule 2: only an ACTIVE goal is asked; an inactive goal keeps tracking spend and status.
+	if (goalActive && next.status === STATUS_TRACKING && !finite(data.requestSentMs) && spentUsd >= estimateAfterUsd) {
 		data.requestSentMs = now;
 		next.status = STATUS_REQUESTED;
 		actions.push(actionKindMessage("budget-request", next.sessionId, {
@@ -441,7 +453,7 @@ export function evaluate({
 	applyOwnerCommands({ project: next, ownerCommands, now, estimateAfterUsd, actions });
 
 	// Rule 7.
-	applyCheckpoint({ project: next, now, cfg: budget, spentUsd, estimateAfterUsd, actions });
+	applyCheckpoint({ project: next, now, cfg: budget, spentUsd, estimateAfterUsd, actions, goalActive });
 
 	return { project: next, actions };
 }

@@ -169,6 +169,37 @@ test("human budget marks a stale failed window 오래됨 조회 실패 and leave
 	}
 });
 
+test("status and human budget show backfill progress while ingest is pending", () => {
+	const root = sandbox({ seed: { ...SNAPSHOT, ingest: { totalBytes: 1000, pendingBytes: 600, files: 3, pendingFiles: 2, updatedMs: NOW } } });
+	try {
+		const report = JSON.parse(runCli(root, ["status", "--json"]));
+		assert.deepEqual(report.budget.ingest, { totalBytes: 1000, pendingBytes: 600, files: 3, pendingFiles: 2, updatedMs: NOW });
+		const out = runCli(root, ["budget"]);
+		assert.ok(out.includes("수집 중 40%"), out);
+		assert.equal(out.split("\n")[0].endsWith("수집 중 40%"), true, out);
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("human budget omits 수집 중 once ingest has nothing pending, and ingest is null without one", () => {
+	const root = sandbox({ seed: { ...SNAPSHOT, ingest: { totalBytes: 1000, pendingBytes: 0, files: 3, pendingFiles: 0, updatedMs: NOW } } });
+	try {
+		const out = runCli(root, ["budget"]);
+		assert.doesNotMatch(out, /수집 중/);
+		assert.deepEqual(JSON.parse(runCli(root, ["status", "--json"])).budget.ingest, { totalBytes: 1000, pendingBytes: 0, files: 3, pendingFiles: 0, updatedMs: NOW });
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+	const bare = sandbox({ seed: true });
+	try {
+		assert.equal(JSON.parse(runCli(bare, ["status", "--json"])).budget.ingest, null);
+		assert.doesNotMatch(runCli(bare, ["budget"]), /수집 중/);
+	} finally {
+		fs.rmSync(bare, { recursive: true, force: true });
+	}
+});
+
 test("no snapshot: budget is null and the human table says 기록 없음", () => {
 	const root = sandbox();
 	try {

@@ -130,14 +130,22 @@ function readGoalFiles(dir, sessionId) {
 /**
  * The goal list of one session: archived goals, the current goal, and goals the ledger already knows (a replaced
  * goal is overwritten in the goal file, so the stored project is the only memory of it). A goal that is neither
- * current nor completed ended when its successor was created (status `replaced`); a last goal that vanished from
- * a goal file that still exists was cleared (status `cleared`).
+ * current nor completed ended when its successor was created (status `replaced`); a known goal with no successor
+ * and no record on disk is `missing`: the goal file was deleted, or the goal id left the file and its history.
+ * A missing goal is never active; it gets no audit, budget request or checkpoint.
  */
 function mergeGoals({ files, known }) {
 	const byId = new Map();
+	const onDisk = new Set();
 	for (const goal of known) byId.set(goal.id, { ...goal });
-	for (const goal of files?.history ?? []) byId.set(goal.id, { ...goal });
-	if (files?.current) byId.set(files.current.id, { ...files.current });
+	for (const goal of files?.history ?? []) {
+		byId.set(goal.id, { ...goal });
+		onDisk.add(goal.id);
+	}
+	if (files?.current) {
+		byId.set(files.current.id, { ...files.current });
+		onDisk.add(files.current.id);
+	}
 	const goals = [...byId.values()].sort((a, b) => a.createdMs - b.createdMs || (a.id < b.id ? -1 : 1));
 	const currentId = files?.current?.id ?? null;
 	for (let i = 0; i < goals.length; i++) {
@@ -149,9 +157,8 @@ function mergeGoals({ files, known }) {
 		if (next) {
 			if (goal.completedMs === null) goal.completedMs = next.createdMs;
 			if (!doneStatus) goal.status = "replaced";
-		} else if (files?.exists && !doneStatus) {
-			goal.status = "cleared";
-			if (goal.completedMs === null) goal.completedMs = goal.updatedMs;
+		} else if (!onDisk.has(goal.id)) {
+			goal.status = "missing";
 		}
 	}
 	return goals;
@@ -302,16 +309,22 @@ export function createIngest({ paths, store, clock, config, readTaskStores }) {
 
 			// Bounded read: oldest pending first, complete lines only, offsets saved after each file.
 			const work = [];
+			const progress = { totalBytes: 0, pendingBytes: 0, files: 0, pendingFiles: 0 };
 			for (const item of pending) {
 				const stored = store.getOffset(item.file);
 				let offset = stored && stored.identity === item.identity ? stored.offset : 0;
 				if (offset > item.stat.size) offset = 0;
-				if (item.stat.size > offset) work.push({ ...item, offset });
-				else if (!stored || stored.identity !== item.identity || stored.offset !== offset) store.setOffset(item.file, item.identity, offset, now);
+				progress.files += 1;
+				progress.totalBytes += item.stat.size;
+				if (item.stat.size > offset) {
+					progress.pendingBytes += item.stat.size - offset;
+					progress.pendingFiles += 1;
+					work.push({ ...item, offset });
+				} else if (!stored || stored.identity !== item.identity || stored.offset !== offset) store.setOffset(item.file, item.identity, offset, now);
 			}
 			work.sort((a, b) => a.stat.mtimeMs - b.stat.mtimeMs || (a.file < b.file ? -1 : 1));
 
-			const result = { files: 0, bytes: 0, inserted: 0, goals, sessions, rounds: [], blocks: [], criteria: new Map() };
+			const result = { files: 0, bytes: 0, inserted: 0, progress, goals, sessions, rounds: [], blocks: [], criteria: new Map() };
 			for (const item of work) {
 				if (budgetBytes <= 0) break;
 				const length = Math.min(item.stat.size - item.offset, budgetBytes);

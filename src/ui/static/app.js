@@ -842,12 +842,19 @@
 		);
 	}
 
+	/** Backfill progress: a neutral chip beside the treasury state while the ledger has bytes left to read. */
+	function ingestChip(ingest) {
+		if (!ingest || !Number.isFinite(ingest.totalBytes) || ingest.totalBytes <= 0) return null;
+		if (!Number.isFinite(ingest.pendingBytes) || ingest.pendingBytes <= 0) return null;
+		return chip(`수집 중 ${Math.round((100 * (ingest.totalBytes - ingest.pendingBytes)) / ingest.totalBytes)}%`);
+	}
+
 	function renderLimits(b) {
 		const windows = listOf(b?.treasury?.windows);
 		for (const [account, count] of sentCoupons) if (windows.some((w) => w.account === account && w.coupons === count)) sentCoupons.delete(account);
 		if (!windows.length) return empty("기록 없음");
 		return [
-			el("div", { class: "wrap-row" }, chip(`전체 ${named(BUDGET_STATE_LABELS, b.treasury.state)}`, BUDGET_TONE[b.treasury.state]), el("span", { class: "meta", text: `${when(b.updatedMs)} 기준` })),
+			el("div", { class: "wrap-row" }, chip(`전체 ${named(BUDGET_STATE_LABELS, b.treasury.state)}`, BUDGET_TONE[b.treasury.state]), ingestChip(b.ingest), el("span", { class: "meta", text: `${when(b.updatedMs)} 기준` })),
 			el("ul", { class: "wins" }, windows.map(windowRow)),
 		];
 	}

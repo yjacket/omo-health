@@ -113,6 +113,7 @@ export function budgetStatus(snapshot) {
 		})),
 		projects: projects.map((p) => ({ id: p.id ?? null, objective: p.objective ?? null, status: p.status ?? null, spentUsd: p.spentUsd ?? null, approvedUsd: p.approvedUsd ?? null, pending: p.pending ?? null })),
 		pendingOwner: Array.isArray(snapshot.owner) ? snapshot.owner : [],
+		ingest: snapshot.ingest ?? null,
 	};
 }
 
@@ -127,7 +128,11 @@ const agoText = (ms, now) => (Number.isFinite(ms) ? `${Math.max(0, Math.round((n
 export function budgetTable(snapshot, now = Date.now()) {
 	if (!snapshot || typeof snapshot !== "object") return "예산 기록 없음";
 	const status = budgetStatus(snapshot);
-	const lines = [`예산 상태 ${BUDGET_STATE_KO[status.state] ?? status.state ?? "?"} · 갱신 ${agoText(status.updatedMs, now)}`];
+	let headline = `예산 상태 ${BUDGET_STATE_KO[status.state] ?? status.state ?? "?"} · 갱신 ${agoText(status.updatedMs, now)}`;
+	// Same backfill formula as the dashboard: covered share of the transcripts the ingest window covers.
+	const ing = status.ingest;
+	if (ing && ing.pendingBytes > 0 && ing.totalBytes > 0) headline += ` · 수집 중 ${Math.round((100 * (ing.totalBytes - ing.pendingBytes)) / ing.totalBytes)}%`;
+	const lines = [headline];
 	for (const w of status.windows) {
 		const parts = [
 			`${w.account ?? "?"} ${w.windowId ?? "?"} (${w.label ?? "-"})`,

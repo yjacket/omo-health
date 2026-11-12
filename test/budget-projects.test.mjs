@@ -10,6 +10,7 @@ const DAY = 24 * HOUR;
 const NOW = Date.UTC(2026, 10, 12, 9, 0, 0);
 const CFG = DEFAULT_CONFIG.budget;
 const REF = Object.freeze({ n: 0, p50: null, p80: null, p90: null, errorRatio: null, calibrated: false });
+const ACTIVE_GOAL = Object.freeze({ status: "active" });
 
 function project(over = {}) {
 	return {
@@ -108,11 +109,11 @@ function messages(actions, actionKind) {
 }
 
 test("rule 2: a tracking project is asked at $10 inclusive spend, never at $9.99", () => {
-	const low = evaluate({ project: project(), spend: 9.99, now: NOW, cfg: CFG });
+	const low = evaluate({ project: project(), goal: ACTIVE_GOAL, spend: 9.99, now: NOW, cfg: CFG });
 	assert.deepEqual(low.actions, []);
 	assert.equal(low.project.status, "tracking");
 
-	const high = evaluate({ project: project(), spend: 10, now: NOW, cfg: CFG });
+	const high = evaluate({ project: project(), goal: ACTIVE_GOAL, spend: 10, now: NOW, cfg: CFG });
 	assert.equal(high.project.status, "requested");
 	assert.equal(high.project.data.requestSentMs, NOW);
 	const [request] = messages(high.actions, "budget-request");
@@ -121,7 +122,7 @@ test("rule 2: a tracking project is asked at $10 inclusive spend, never at $9.99
 	assert.equal(request.data.sessionId, "sess-root");
 	assert.equal(request.data.spentAtEstimateUsd, 10);
 
-	const again = evaluate({ project: high.project, spend: 11, now: NOW + MIN, cfg: CFG });
+	const again = evaluate({ project: high.project, goal: ACTIVE_GOAL, spend: 11, now: NOW + MIN, cfg: CFG });
 	assert.deepEqual(again.actions, [], "one request per project");
 });
 
@@ -237,12 +238,12 @@ test("rule 7: a pending project with an approved budget still gets its 80 and 10
 			pending: { requestId: "chg-1", kind: "change", increaseUsd: 10, route: "owner", sinceMs: NOW - HOUR },
 		},
 	});
-	const at80 = evaluate({ project: pending, spend: 85, now: NOW, cfg: CFG });
+	const at80 = evaluate({ project: pending, goal: ACTIVE_GOAL, spend: 85, now: NOW, cfg: CFG });
 	const checkpoints80 = messages(at80.actions, "budget-checkpoint");
 	assert.equal(checkpoints80.length, 1);
 	assert.equal(checkpoints80[0].data.percent, 80);
 
-	const at100 = evaluate({ project: pending, spend: 100, now: NOW, cfg: CFG });
+	const at100 = evaluate({ project: pending, goal: ACTIVE_GOAL, spend: 100, now: NOW, cfg: CFG });
 	const checkpoints100 = messages(at100.actions, "budget-checkpoint");
 	assert.equal(checkpoints100.length, 1);
 	assert.equal(checkpoints100[0].data.percent, 100);
@@ -355,24 +356,84 @@ test("rule 6: an owner deny keeps the approved budget and records the denial", (
 });
 
 test("rule 7: 80 and 100 checkpoints are sent once per revision; both crossed at once means only 100", () => {
-	const at80 = evaluate({ project: approvedProject(100), spend: 85, now: NOW, cfg: CFG });
+	const at80 = evaluate({ project: approvedProject(100), goal: ACTIVE_GOAL, spend: 85, now: NOW, cfg: CFG });
 	const [checkpoint80] = messages(at80.actions, "budget-checkpoint");
 	assert.equal(checkpoint80.data.percent, 80);
 	assert.deepEqual(at80.project.data.checkpoints["1"], [80]);
 
-	const repeat = evaluate({ project: at80.project, spend: 85, now: NOW + MIN, cfg: CFG });
+	const repeat = evaluate({ project: at80.project, goal: ACTIVE_GOAL, spend: 85, now: NOW + MIN, cfg: CFG });
 	assert.deepEqual(messages(repeat.actions, "budget-checkpoint"), []);
 
-	const at100 = evaluate({ project: at80.project, spend: 100, now: NOW + 2 * MIN, cfg: CFG });
+	const at100 = evaluate({ project: at80.project, goal: ACTIVE_GOAL, spend: 100, now: NOW + 2 * MIN, cfg: CFG });
 	const [checkpoint100] = messages(at100.actions, "budget-checkpoint");
 	assert.equal(checkpoint100.data.percent, 100);
 	assert.deepEqual(at100.project.data.checkpoints["1"], [80, 100]);
 
-	const coalesced = evaluate({ project: approvedProject(100), spend: 100, now: NOW, cfg: CFG });
+	const coalesced = evaluate({ project: approvedProject(100), goal: ACTIVE_GOAL, spend: 100, now: NOW, cfg: CFG });
 	const checkpoints = messages(coalesced.actions, "budget-checkpoint");
 	assert.equal(checkpoints.length, 1);
 	assert.equal(checkpoints[0].data.percent, 100);
 	assert.deepEqual(coalesced.project.data.checkpoints["1"], [100]);
+});
+
+test("QA failure: a completed goal still inside its grace window is never asked for a budget", () => {
+	const goal = { status: "completed", closedMs: NOW };
+	const result = evaluate({ project: project(), goal, spend: 50, now: NOW + MIN, cfg: CFG });
+	assert.deepEqual(messages(result.actions, "budget-request"), [], "no budget-request");
+	assert.deepEqual(result.actions, [], "no action at all");
+	assert.equal(result.project.status, "tracking", "status keeps tracking");
+	assert.equal(result.project.data.requestSentMs, undefined, "the request is not used up");
+
+	// The same project asked once the goal is active gets its request.
+	const active = evaluate({ project: result.project, goal: ACTIVE_GOAL, spend: 50, now: NOW + 2 * MIN, cfg: CFG });
+	assert.equal(messages(active.actions, "budget-request").length, 1);
+	assert.equal(active.project.status, "requested");
+});
+
+test("QA failure: goal statuses outside the ACTIVE set send no request and no checkpoint, case-insensitively", () => {
+	for (const status of ["paused", "blocked", "Completed", "CANCELLED", "cleared", "replaced"]) {
+		const goal = { status, closedMs: NOW };
+		const result = evaluate({
+			project: approvedProject(100),
+			goal,
+			spend: 100,
+			now: NOW + MIN,
+			cfg: CFG,
+		});
+		assert.deepEqual(result.actions, [], `no action for a ${status} goal`);
+		assert.deepEqual(
+			result.project.data.checkpoints ?? {},
+			{},
+			`no checkpoint marked sent for a ${status} goal`,
+		);
+	}
+
+	for (const status of ["active", "RUNNING", "in_progress", "Pending"]) {
+		const goal = { status };
+		const tracking = evaluate({ project: project(), goal, spend: 50, now: NOW, cfg: CFG });
+		assert.equal(messages(tracking.actions, "budget-request").length, 1, `request for ${status}`);
+		const approved = evaluate({ project: approvedProject(100), goal, spend: 100, now: NOW, cfg: CFG });
+		assert.equal(messages(approved.actions, "budget-checkpoint").length, 1, `checkpoint for ${status}`);
+	}
+});
+
+test("qa behavior: a paused goal keeps tracking spend and sends no checkpoint even at 100%", () => {
+	const paused = { status: "paused" };
+	const result = evaluate({ project: approvedProject(100), goal: paused, spend: 100, now: NOW, cfg: CFG });
+	assert.deepEqual(result.actions, []);
+	assert.equal(result.project.status, "approved");
+	assert.deepEqual(result.project.data.checkpoints ?? {}, {});
+
+	const resumed = evaluate({ project: result.project, goal: ACTIVE_GOAL, spend: 100, now: NOW + MIN, cfg: CFG });
+	const [checkpoint] = messages(resumed.actions, "budget-checkpoint");
+	assert.equal(checkpoint?.data.percent, 100, "the checkpoint was not used up while paused");
+});
+
+test("complete/replaced goal inside grace: no checkpoint, no request, still no close", () => {
+	const goal = { status: "complete", closedMs: NOW };
+	const result = evaluate({ project: approvedProject(100), goal, spend: 100, now: NOW + MIN, cfg: CFG });
+	assert.deepEqual(result.actions, []);
+	assert.equal(result.project.status, "approved");
 });
 
 test("rule 1: a completed goal closes after the grace window and records the actual", () => {
