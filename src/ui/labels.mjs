@@ -185,7 +185,7 @@ export const TASK_STATUS_LABELS = Object.freeze({ running: "실행 중", queued:
 export const GOAL_STATUS_LABELS = Object.freeze({ active: "진행 중", complete: "완료", blocked: "막힘" });
 
 // Budget tab (src/budget/office.mjs snapshot). The page cannot import this module, so src/ui/static/app.js keeps a copy of
-// these six maps; test/ui-budget-tab.test.mjs renders every key through app.js and fails when the copies differ.
+// these eight maps; test/ui-budget-tab.test.mjs renders every key through app.js and fails when the copies differ.
 
 /** A subscription window's state (src/budget/treasury.mjs windowState). */
 export const BUDGET_STATE_LABELS = Object.freeze({ ok: "여유", tight: "빠듯", short: "부족", unknown: "모름" });
@@ -204,6 +204,12 @@ export const AUDIT_ASSESSMENT_LABELS = Object.freeze({ justified: "타당", "was
 
 /** An audit job without an opinion (src/budget/audit-job.mjs status). */
 export const AUDIT_STATUS_LABELS = Object.freeze({ running: "감사 중", done: "완료", failed: "실패", timeout: "시간 초과", unavailable: "모델 없음" });
+
+/** A crossed audit trigger (snapshot projects[].triggers kind; src/budget/metrics.mjs triggers and projects.mjs reasons). */
+export const BUDGET_TRIGGER_LABELS = Object.freeze({ rounds: "회차 반복", budget: "예산 초과", "after-accept": "충족 뒤 지출", descendants: "하위 작업 지출", "estimate-outlier": "견적 이탈", "change-review": "변경 검토" });
+
+/** Why an audit was deferred (snapshot projects[].auditDeferred reason). */
+export const BUDGET_AUDIT_DEFERRED_LABELS = Object.freeze({ "no-model": "쓸 모델 없음", "in-flight": "감사 진행 중", "project-day-cap": "프로젝트 하루 한도", "day-cap": "하루 한도", "min-gap": "간격 부족", "start-failed": "시작 실패" });
 
 const label = (table, key, fallback) => (typeof key === "string" && Object.hasOwn(table, key) ? table[key] : fallback);
 

@@ -11,7 +11,7 @@ import { readDecisions } from "../src/decisions.mjs";
 import { daemonState, runDaemon, VERSION } from "../src/daemon.mjs";
 import { launchDaemon } from "../src/launch.mjs";
 import { resolvePaths } from "../src/paths.mjs";
-import { incidentStateLabel } from "../src/ui/labels.mjs";
+import { BUDGET_AUDIT_DEFERRED_LABELS, BUDGET_TRIGGER_LABELS, incidentStateLabel } from "../src/ui/labels.mjs";
 import { ensureDir, listDirSafe, readJsonSafe, removeSafe } from "../src/util/fsx.mjs";
 import { kst } from "../src/util/time.mjs";
 
@@ -79,6 +79,11 @@ export function keepwarmStatus({ env = process.env, now = Date.now() } = {}) {
 /** Snapshot state labels for the CLI and the status JSON (same words as the dashboard chips). */
 export const BUDGET_STATE_KO = Object.freeze({ ok: "여유", tight: "빠듯", short: "부족", unknown: "모름" });
 
+/** Snapshot project triggers (src/budget/metrics.mjs kinds plus projects.mjs audit reasons); short labels like the dashboard. */
+
+
+const budgetLabel = (table, key) => (typeof key === "string" ? (table[key] ?? key) : "?");
+
 /**
  * Budget part of `status --json`: every IS-1 window field copied from the snapshot, plus the project
  * and owner-pending views. Null when the daemon has written no snapshot yet.
@@ -111,7 +116,16 @@ export function budgetStatus(snapshot) {
 			percentPerUsd: w.percentPerUsd ?? null,
 			coupons: w.coupons ?? 0,
 		})),
-		projects: projects.map((p) => ({ id: p.id ?? null, objective: p.objective ?? null, status: p.status ?? null, spentUsd: p.spentUsd ?? null, approvedUsd: p.approvedUsd ?? null, pending: p.pending ?? null })),
+		projects: projects.map((p) => ({
+			id: p.id ?? null,
+			objective: p.objective ?? null,
+			status: p.status ?? null,
+			spentUsd: p.spentUsd ?? null,
+			approvedUsd: p.approvedUsd ?? null,
+			pending: p.pending ?? null,
+			triggers: Array.isArray(p.triggers) ? p.triggers.map((t) => ({ kind: t?.kind ?? null, heavy: t?.heavy === true, detail: t?.detail ?? null, firstMs: t?.firstMs ?? null })) : [],
+			auditDeferred: p.auditDeferred && typeof p.auditDeferred === "object" ? { ms: p.auditDeferred.ms ?? null, reason: p.auditDeferred.reason ?? null } : null,
+		})),
 		pendingOwner: Array.isArray(snapshot.owner) ? snapshot.owner : [],
 		ingest: snapshot.ingest ?? null,
 	};
@@ -157,7 +171,10 @@ export function budgetTable(snapshot, now = Date.now()) {
 	if (!status.windows.length) lines.push("창 없음");
 	lines.push("", `프로젝트 ${status.projects.length}건`);
 	for (const p of status.projects) {
-		lines.push(`- ${p.objective || p.id} [${p.status}] 지출 ${usdText(p.spentUsd)} / 승인 ${usdText(p.approvedUsd)}${p.pending ? ` · 대기 ${p.pending.route ?? ""}`.trimEnd() : ""}`);
+		let line = `- ${p.objective || p.id} [${p.status}] 지출 ${usdText(p.spentUsd)} / 승인 ${usdText(p.approvedUsd)}${p.pending ? ` · 대기 ${p.pending.route ?? ""}`.trimEnd() : ""}`;
+		if (p.triggers.length) line += ` · 기준: ${p.triggers.map((t) => `${budgetLabel(BUDGET_TRIGGER_LABELS, t.kind)}${t.heavy ? "!" : ""}`).join(", ")}`;
+		if (p.auditDeferred) line += ` · 감사 미룸: ${budgetLabel(BUDGET_AUDIT_DEFERRED_LABELS, p.auditDeferred.reason)}`;
+		lines.push(line);
 	}
 	if (status.pendingOwner.length) {
 		lines.push("", `소유자 승인 대기 ${status.pendingOwner.length}건`);

@@ -529,6 +529,52 @@ test("(p) a cancelled goal's heavy trigger records one audit-skipped and starts 
 	assert.equal(c.store.getProject(pid).status, "closed");
 });
 
+test("(r) a light rounds crossing keeps its first tick time in the snapshot", (t) => {
+	const c = setup(t);
+	const pid = `${c.sid}:g1`;
+	c.writeGoal({ id: "g1", objective: "rounds in the snapshot", createdAt: secs(T0 - 2 * HOUR), updatedAt: secs(T0 - 2 * HOUR) });
+	const entries = [E.header(c.sid, c.cwd, T0 - 2 * HOUR)];
+	for (let i = 1; i <= 3; i++) entries.push(E.assistant({ ms: T0 - (4 - i) * 30 * MIN, usage: usage(1), text: `QA round ${i} finished` }));
+	writeJsonl(c.file, entries);
+	const office = c.office();
+	const first = office.tick({}).snapshot.projects.find((p) => p.id === pid);
+	const entry = first.triggers.find((t) => t.kind === "rounds");
+	assert.equal(entry.heavy, false);
+	assert.equal(entry.firstMs, T0);
+	assert.equal(first.auditDeferred, null);
+	c.clock.advance(MIN);
+	const second = office.tick({}).snapshot.projects.find((p) => p.id === pid);
+	assert.equal(second.triggers.find((t) => t.kind === "rounds").firstMs, T0, "the first sighting never moves");
+});
+
+test("(s) no logged-in model defers an audit visibly; a later audit clears the deferral", (t) => {
+	const c = setup(t);
+	const pid = `${c.sid}:g1`;
+	c.writeGoal({ id: "g1", objective: "heavy rounds without a model", createdAt: secs(T0 - 2 * HOUR), updatedAt: secs(T0 - 2 * HOUR) });
+	const entries = [E.header(c.sid, c.cwd, T0 - 2 * HOUR)];
+	for (let i = 1; i <= 7; i++) entries.push(E.assistant({ ms: T0 - (8 - i) * 10 * MIN, usage: usage(2), text: `QA round ${i} finished` }));
+	writeJsonl(c.file, entries);
+	const loggedIn = [];
+	const runner = createFakeRunner({ outcomes: { "budget-audit": { status: "running" } } });
+	const office = c.office({ runner, loggedIn });
+	office.tick({});
+	c.clock.advance(MIN);
+	let row = office.tick({}).snapshot.projects.find((p) => p.id === pid);
+	const roundsTrigger = row.triggers.find((t) => t.kind === "rounds");
+	assert.equal(roundsTrigger.heavy, true);
+	assert.equal(roundsTrigger.firstMs, T0);
+	assert.match(roundsTrigger.detail, /7 numbered rounds/);
+	assert.deepEqual(row.auditDeferred, { ms: T0 + MIN, reason: "no-model" });
+	assert.equal(c.store.getProject(pid).data.auditDeferredReason, "no-model");
+	assert.equal(runner.starts.length, 0);
+	loggedIn.push("chatgpt-subscription");
+	c.clock.advance(MIN);
+	row = office.tick({}).snapshot.projects.find((p) => p.id === pid);
+	assert.equal(runner.starts.length, 1, "the provider is available now");
+	assert.equal(row.lastAudit.status, "running");
+	assert.equal(row.auditDeferred, null, "a later audit clears the deferral");
+});
+
 test("(n) the snapshot reports backfill progress until every byte of the window is read", (t) => {
 	const c = setup(t);
 	c.config.budget.ingestBytesPerTick = 1;

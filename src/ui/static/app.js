@@ -20,7 +20,7 @@
 	const OUTCOME_TONE = { "goal-complete": "ok", answered: "ok", crash: "crit", failed: "crit", cancelled: "warn", released: "warn", closed: "idle", unknown: "idle" };
 	const ENDED_COLUMNS = [{ label: "끝난 시각", cls: "col-time" }, { label: "세션" }, { label: "결말", cls: "col-outcome" }, { label: "이유" }, { label: "자식 · 시간 · omo", cls: "col-wide" }];
 	const TABS = ["sessions", "ended", "admin", "budget"];
-	// Budget tab (src/budget/office.mjs snapshot). Copies of the six maps in src/ui/labels.mjs, which this page cannot import;
+	// Budget tab (src/budget/office.mjs snapshot). Copies of the eight maps in src/ui/labels.mjs, which this page cannot import;
 	// test/ui-budget-tab.test.mjs renders every key of those maps through this file and fails when the copies differ.
 	const BUDGET_STATE_LABELS = { ok: "여유", tight: "빠듯", short: "부족", unknown: "모름" };
 	const BUDGET_ACCOUNT_LABELS = { "anthropic-subscription/default": "Claude", "chatgpt-subscription/default": "Codex" };
@@ -28,6 +28,8 @@
 	const BUDGET_ROUTE_LABELS = { owner: "내 결정", auditor: "감사 검토" };
 	const AUDIT_ASSESSMENT_LABELS = { justified: "타당", "waste-likely": "낭비 의심", "insufficient-evidence": "근거 부족" };
 	const AUDIT_STATUS_LABELS = { running: "감사 중", done: "완료", failed: "실패", timeout: "시간 초과", unavailable: "모델 없음" };
+	const BUDGET_TRIGGER_LABELS = { rounds: "회차 반복", budget: "예산 초과", "after-accept": "충족 뒤 지출", descendants: "하위 작업 지출", "estimate-outlier": "견적 이탈", "change-review": "변경 검토" };
+	const BUDGET_AUDIT_DEFERRED_LABELS = { "no-model": "쓸 모델 없음", "in-flight": "감사 진행 중", "project-day-cap": "프로젝트 하루 한도", "day-cap": "하루 한도", "min-gap": "간격 부족", "start-failed": "시작 실패" };
 	const BUDGET_TONE = { ok: "ok", tight: "warn", short: "crit" };
 	const PROJECT_TONE = { requested: "info", approved: "ok", pending: "warn" };
 	const AUDIT_TONE = { justified: "ok", "waste-likely": "warn", "insufficient-evidence": "info", running: "info", failed: "crit", timeout: "warn", unavailable: "warn" };
@@ -859,6 +861,22 @@
 		];
 	}
 
+	/** Crossed triggers as chips (heavy warn, light neutral) and a deferred audit, each titled with its detail and KST time. */
+	function triggerSignals(p) {
+		const chips = listOf(p.triggers)
+			.filter((t) => t && typeof t === "object")
+			.map((t) => {
+				const title = [typeof t.detail === "string" && t.detail ? t.detail : null, Number.isFinite(t.firstMs) ? `${when(t.firstMs)} KST` : null].filter(Boolean).join(" · ");
+				return el("span", { class: t.heavy === true ? "chip chip--warn" : "chip", title: title || undefined, text: named(BUDGET_TRIGGER_LABELS, t.kind) });
+			});
+		const deferred = p.auditDeferred;
+		if (deferred && typeof deferred === "object") {
+			const title = Number.isFinite(deferred.ms) ? `${when(deferred.ms)} KST` : undefined;
+			chips.push(el("span", { class: "chip chip--warn", title, text: `감사 미룸: ${named(BUDGET_AUDIT_DEFERRED_LABELS, deferred.reason)}` }));
+		}
+		return chips.length ? el("div", { class: "wrap-row" }, chips) : null;
+	}
+
 	/** Who decides a pending request and the increase; an owner's request carries 승인/거절 until a snapshot shows the decision. */
 	function pendingCell(p) {
 		const pending = p.pending;
@@ -888,7 +906,7 @@
 			PROJECT_COLUMNS,
 			projects.map((p) => ({
 				cells: [
-					el("span", { class: "proj" }, el("span", { class: "proj__objective", text: p.objective || show(p.id) }), p.sessionId ? el("span", { class: "proj__meta", text: `세션 ${String(p.sessionId).slice(0, 8)}` }) : null),
+					el("span", { class: "proj" }, el("span", { class: "proj__objective", text: p.objective || show(p.id) }), p.sessionId ? el("span", { class: "proj__meta", text: `세션 ${String(p.sessionId).slice(0, 8)}` }) : null, triggerSignals(p)),
 					chip(named(BUDGET_PROJECT_STATUS_LABELS, p.status), PROJECT_TONE[p.status]),
 					el("span", { class: "money" }, el("span", { text: usd(p.spentUsd) }), el("span", { class: "money__split", text: `메인 ${usd(p.mainUsd)} · 서브 ${usd(p.childUsd)}` })),
 					p.approvedUsd > 0 ? usd(p.approvedUsd) : "-",

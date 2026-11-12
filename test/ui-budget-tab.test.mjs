@@ -19,7 +19,7 @@ const RESET = Date.parse("2026-11-17T12:00:00.000Z"); // 11-17 21:00 KST
 const CLAUDE = "anthropic-subscription/default";
 const CODEX = "chatgpt-subscription/default";
 const OWNER_PROJECT = "sid-owner:goal-1";
-const BUDGET_MAPS = ["BUDGET_STATE_LABELS", "BUDGET_ACCOUNT_LABELS", "BUDGET_PROJECT_STATUS_LABELS", "BUDGET_ROUTE_LABELS", "AUDIT_ASSESSMENT_LABELS", "AUDIT_STATUS_LABELS"];
+const BUDGET_MAPS = ["BUDGET_STATE_LABELS", "BUDGET_ACCOUNT_LABELS", "BUDGET_PROJECT_STATUS_LABELS", "BUDGET_ROUTE_LABELS", "AUDIT_ASSESSMENT_LABELS", "AUDIT_STATUS_LABELS", "BUDGET_TRIGGER_LABELS", "BUDGET_AUDIT_DEFERRED_LABELS"];
 
 /* ---------- fake DOM ---------- */
 
@@ -485,6 +485,72 @@ describe("dashboard budget tab", { timeout: 20_000 }, () => {
 		assert.equal(chipText(rows()[0]).includes("반영 대기"), false);
 		const top = await openPage(snapshot({ windows: [windowState({ coupons: 20 })] }));
 		assert.equal(buttonNamed(byClass(top.doc.getElementById("budget-limits-body"), "win")[0], "+").disabled, true, "no coupon above 20");
+	});
+
+	it("shows one chip per crossed trigger: light neutral, heavy warn, with detail and KST time in the title", async () => {
+		const page = await openPage(
+			snapshot({
+				projects: [
+					project({
+						triggers: [
+							{ kind: "rounds", heavy: false, detail: "3 numbered rounds, $4.00 since round 1", firstMs: NOW - 90 * MIN },
+							{ kind: "budget", heavy: true, detail: "95.0% of approved, forecast $40.00", firstMs: NOW - 30 * MIN },
+						],
+					}),
+				],
+			}),
+		);
+		const [row] = rowsOf(page, "budget-projects");
+		const chips = byClass(byClass(row, "wrap-row")[0], "chip");
+		assert.deepEqual(chips.map(text), [labels.BUDGET_TRIGGER_LABELS.rounds, labels.BUDGET_TRIGGER_LABELS.budget]);
+		assert.equal(chips[0].className, "chip", "a light crossing is neutral");
+		assert.equal(chips[1].className, "chip chip--warn", "a heavy crossing warns");
+		assert.equal(chips[0].getAttribute("title"), "3 numbered rounds, $4.00 since round 1 · 11-12 10:30 KST");
+		assert.equal(chips[1].getAttribute("title"), "95.0% of approved, forecast $40.00 · 11-12 11:30 KST");
+		assert.ok(chipText(row).includes(labels.BUDGET_PROJECT_STATUS_LABELS.approved), "the status chip is still there");
+	});
+
+	it("shows the deferred audit reason as 감사 미룸: <reason>", async () => {
+		const page = await openPage(snapshot({ projects: [project({ auditDeferred: { ms: NOW - 5 * MIN, reason: "no-model" } })] }));
+		const [row] = rowsOf(page, "budget-projects");
+		const [deferred] = byClass(row, "chip").filter((c) => text(c).startsWith("감사 미룸"));
+		assert.equal(text(deferred), `감사 미룸: ${labels.BUDGET_AUDIT_DEFERRED_LABELS["no-model"]}`);
+		assert.equal(deferred.className, "chip chip--warn");
+		assert.equal(deferred.getAttribute("title"), "11-12 11:55 KST");
+	});
+
+	it("shows no signal chip for an empty trigger list and no deferral", async () => {
+		const page = await openPage(snapshot({ projects: [project({ triggers: [], auditDeferred: null })] }));
+		const [row] = rowsOf(page, "budget-projects");
+		assert.equal(byClass(row, "wrap-row").length, 0);
+		assert.deepEqual(chipText(row), [labels.BUDGET_PROJECT_STATUS_LABELS.approved]);
+		assert.equal(text(row).includes("감사 미룸"), false);
+	});
+
+	it("renders every trigger and deferral label of labels.mjs unchanged (the page keeps its own copy)", async () => {
+		const kinds = Object.keys(labels.BUDGET_TRIGGER_LABELS);
+		const reasons = Object.keys(labels.BUDGET_AUDIT_DEFERRED_LABELS);
+		const page = await openPage(
+			snapshot({
+				projects: [
+					...kinds.map((kind, i) => project({ id: `t${i}`, triggers: [{ kind, heavy: i % 2 === 1, detail: "detail", firstMs: NOW }] })),
+					...reasons.map((reason, i) => project({ id: `d${i}`, auditDeferred: { ms: NOW, reason } })),
+				],
+			}),
+		);
+		const rows = rowsOf(page, "budget-projects");
+		const rendered = rows.flatMap((row) => byClass(row, "chip").map(text)).filter((t) => t.startsWith("감사 미룸") || !Object.values(labels.BUDGET_PROJECT_STATUS_LABELS).includes(t));
+		assert.deepEqual(rendered, [...Object.values(labels.BUDGET_TRIGGER_LABELS), ...reasons.map((reason) => `감사 미룸: ${labels.BUDGET_AUDIT_DEFERRED_LABELS[reason]}`)]);
+	});
+
+	it("labels every trigger kind and deferral reason the budget modules produce", () => {
+		const cover = (map, values, what) => {
+			assert.ok(values.length > 0, `${what}: the producer's values are found`);
+			for (const value of values) assert.ok(Object.hasOwn(labels[map], value), `${what} ${value}`);
+		};
+		cover("BUDGET_TRIGGER_LABELS", sourceLiterals("src/budget/metrics.mjs", /kind: "([a-z-]+)"/g), "trigger kind");
+		cover("BUDGET_TRIGGER_LABELS", sourceLiterals("src/budget/projects.mjs", /reasons: \["([a-z-]+)"\]/g), "audit reason");
+		cover("BUDGET_AUDIT_DEFERRED_LABELS", [...sourceLiterals("src/budget/metrics.mjs", /reason: "([a-z-]+)"/g), "no-model", "start-failed"], "deferral reason");
 	});
 
 	for (const [name, budget] of [

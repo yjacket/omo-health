@@ -498,8 +498,10 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 					}
 				} else if (!finite(next.data.auditDeferredMs) || now - next.data.auditDeferredMs >= (auditCfg.minGapMs ?? 6 * HOUR)) {
 					// Visible deferral, never a weak-model fallback.
+					const reason = allowed.allowed ? "no-model" : allowed.reason;
 					next.data.auditDeferredMs = now;
-					appendEvent({ projectId: project.id, kind: "audit-deferred", data: { reason: allowed.allowed ? "no-model" : allowed.reason, reasons } });
+					next.data.auditDeferredReason = reason;
+					appendEvent({ projectId: project.id, kind: "audit-deferred", data: { reason, reasons } });
 				}
 			}
 			store.upsertProject(next);
@@ -520,6 +522,21 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 			const estimate = (p.data.estimates ?? []).at(-1) ?? null;
 			const rounds = store.rounds(p.id);
 			const ind = p._ind ?? indicators({ project: p, rounds, spend, spendSince: (ms) => store.spend({ projectId: p.id, sinceMs: ms }).costUsd, criteria: null, now });
+			const marks = p.data.triggerMarks ?? {};
+			const details = new Map((p._trig ?? []).map((t) => [`${t.kind}:${t.heavy ? "heavy" : "light"}`, t.detail]));
+			const crossed = Object.entries(marks)
+				.filter(([, ms]) => finite(ms))
+				.map(([key, ms]) => {
+					const heavy = key.endsWith(":heavy");
+					const kind = key.slice(0, key.length - (heavy ? ":heavy" : ":light").length);
+					return { kind, heavy, detail: details.get(key) ?? null, firstMs: ms };
+				})
+				.sort((a, b) => a.firstMs - b.firstMs);
+			const deferredMs = finite(p.data.auditDeferredMs) ? p.data.auditDeferredMs : null;
+			const lastAuditMs = (p.data.audits ?? []).at(-1)?.ms ?? null;
+			const auditDeferred = deferredMs !== null && !(finite(lastAuditMs) && lastAuditMs >= deferredMs)
+				? { ms: deferredMs, reason: p.data.auditDeferredReason ?? null }
+				: null;
 			return {
 				id: p.id,
 				sessionId: p.sessionId,
@@ -536,7 +553,8 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 				reserveUsd: estimate?.adjusted?.reserveUsd ?? null,
 				pending: p.data.pending ?? null,
 				indicators: ind,
-				triggers: p._trig ?? [],
+				triggers: crossed,
+				auditDeferred,
 				lastAudit: (p.data.audits ?? []).at(-1) ?? null,
 				rounds,
 			};

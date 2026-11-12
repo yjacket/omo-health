@@ -131,7 +131,7 @@ test("status --json budget carries every IS-1 window field with the seeded value
 			percentPerUsd: WINDOW.percentPerUsd,
 			coupons: WINDOW.coupons,
 		});
-		assert.deepEqual(report.budget.projects, [{ id: "p1", objective: "예산 CLI 작업", status: "approved", spentUsd: 3.5, approvedUsd: 20, pending: null }]);
+		assert.deepEqual(report.budget.projects, [{ id: "p1", objective: "예산 CLI 작업", status: "approved", spentUsd: 3.5, approvedUsd: 20, pending: null, triggers: [], auditDeferred: null }]);
 		assert.deepEqual(report.budget.pendingOwner, SNAPSHOT.owner);
 	} finally {
 		fs.rmSync(root, { recursive: true, force: true });
@@ -197,6 +197,50 @@ test("human budget omits 수집 중 once ingest has nothing pending, and ingest 
 		assert.doesNotMatch(runCli(bare, ["budget"]), /수집 중/);
 	} finally {
 		fs.rmSync(bare, { recursive: true, force: true });
+	}
+});
+
+test("human budget shows trigger crossings with ! on heavy ones and the audit deferral", () => {
+	const triggers = [
+		{ kind: "rounds", heavy: false, detail: "4 numbered rounds, $12.00 since round 1", firstMs: 1_799_900_000_000 },
+		{ kind: "budget", heavy: true, detail: "120.0% of approved, forecast $24.00", firstMs: 1_799_950_000_000 },
+	];
+	const auditDeferred = { ms: 1_799_960_000_000, reason: "no-model" };
+	const project = { ...SNAPSHOT.projects[0], triggers, auditDeferred };
+	const root = sandbox({ seed: { ...SNAPSHOT, projects: [project] } });
+	try {
+		const out = runCli(root, ["budget"]);
+		assert.ok(out.includes("기준: 회차 반복, 예산 초과!"), out);
+		assert.ok(out.includes("감사 미룸: 쓸 모델 없음"), out);
+		assert.doesNotMatch(out, /회차 반복!/, out);
+		const report = JSON.parse(runCli(root, ["status", "--json"]));
+		assert.deepEqual(report.budget.projects[0].triggers, triggers);
+		assert.deepEqual(report.budget.projects[0].auditDeferred, auditDeferred);
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("human budget labels every trigger kind and deferral reason in Korean", () => {
+	const triggers = ["rounds", "budget", "after-accept", "descendants", "estimate-outlier"].map((kind, i) => ({ kind, heavy: kind === "descendants", detail: null, firstMs: 1_799_900_000_000 + i }));
+	const project = { ...SNAPSHOT.projects[0], triggers, auditDeferred: { ms: 1_799_960_000_000, reason: "day-cap" } };
+	const root = sandbox({ seed: { ...SNAPSHOT, projects: [project] } });
+	try {
+		const out = runCli(root, ["budget"]);
+		assert.ok(out.includes("기준: 회차 반복, 예산 초과, 충족 뒤 지출, 하위 작업 지출!, 견적 이탈"), out);
+		assert.ok(out.includes("감사 미룸: 하루 한도"), out);
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("human budget leaves a project without triggers or a deferral unmarked", () => {
+	const root = sandbox({ seed: true });
+	try {
+		const out = runCli(root, ["budget"]);
+		assert.doesNotMatch(out, /기준:|감사 미룸:/, out);
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
 	}
 });
 
