@@ -101,3 +101,25 @@ test("a model_change after the restart still switches the provider, durably", (t
 	ingest().run();
 	assert.deepEqual(rows().at(-1), { id: `${SID}:d`, provider: "chatgpt-subscription", cost: 5 });
 });
+
+test("a file that shrank in place is read again from 0 without the provider of its removed lines", (t) => {
+	const { file, ingest, rows } = setup(t);
+	ingest().run();
+	const before = fs.statSync(file).size;
+	// Same path and identity, shorter content with no model_change: the old provider describes discarded bytes.
+	const shrunk = fs.readFileSync(file, "utf8").split("\n")[0] + "\n" + JSON.stringify(usageEntry("g", T0 + 9 * MIN, 7)) + "\n";
+	fs.writeFileSync(file, shrunk);
+	assert.ok(fs.statSync(file).size < before, "the file really shrank below the stored offset");
+	ingest().run();
+	assert.deepEqual(rows().find((row) => row.id === `${SID}:g`), { id: `${SID}:g`, provider: null, cost: 7 }, "a restarted reader");
+});
+
+test("the same reader also drops the provider when its file shrinks", (t) => {
+	const { file, ingest, rows } = setup(t);
+	const reader = ingest();
+	reader.run();
+	const shrunk = fs.readFileSync(file, "utf8").split("\n")[0] + "\n" + JSON.stringify(usageEntry("h", T0 + 9 * MIN, 2)) + "\n";
+	fs.writeFileSync(file, shrunk);
+	reader.run();
+	assert.deepEqual(rows().find((row) => row.id === `${SID}:h`), { id: `${SID}:h`, provider: null, cost: 2 });
+});

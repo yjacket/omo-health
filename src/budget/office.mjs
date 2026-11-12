@@ -538,7 +538,9 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 					appendEvent({ projectId: project.id, kind: "message-expired", data: { messageId: entry.id, actionKind: entry.message?.details?.actionKind ?? null, reason } });
 				}
 				if (kept.length !== outbox.length) store.upsertProject({ ...project, data: { ...project.data, outbox: kept }, updatedMs: now });
-				pendingMessages.push(...kept.map((entry) => entry.message));
+				// Stamped with this tick's time: the inbox sweeps a file whose createdMs is 5 min old, so a notice retried after a
+				// longer wait would be swept the moment it is written. The id stays the same; only an undelivered attempt is retried.
+				pendingMessages.push(...kept.map((entry) => ({ ...entry.message, createdMs: now })));
 			}
 		}
 

@@ -171,3 +171,22 @@ test("(e) an outbox entry older than 7 days is dropped with one message-expired 
 	assert.equal(expired[0].data.messageId, first.messages[0].id);
 	assert.equal(expired[0].data.reason, "expired");
 });
+
+test("(f) a sensor that returns after more than five minutes still gets the request, not a swept file", async (t) => {
+	const h = setup(t);
+	seed(h);
+	const { engine } = h.makeEngine();
+	await engine.tick();
+	assert.equal(outbox(h).length, 1, "held while no sensor");
+	// Six minutes later the sensor is back: the inbox sweep (5 min) runs in the same tick as the delivery.
+	h.state.sensor = true;
+	h.clock.advance(6 * MIN);
+	await engine.tick();
+	const messages = inboxMessages(h.paths, SID);
+	assert.equal(messages.length, 1, "the delivered file is still in the inbox for the sensor");
+	assert.equal(messages[0].details.actionKind, "budget-request");
+	assert.equal(messages[0].createdMs, T0 + 6 * MIN, "the retried notice carries its delivery time");
+	assert.deepEqual(outbox(h), []);
+	const swept = path.join(h.paths.health.inboxDir, "_undelivered");
+	assert.equal(fs.existsSync(swept) ? fs.readdirSync(swept).length : 0, 0, "nothing was set aside");
+});

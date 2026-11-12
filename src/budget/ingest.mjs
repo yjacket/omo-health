@@ -316,8 +316,10 @@ export function createIngest({ paths, store, clock, config, readTaskStores }) {
 				let offset = sameIdentity ? stored.offset : 0;
 				if (offset > item.stat.size) offset = 0;
 				// The byte offset carries the provider context of the lines before it: a restarted reader resumes
-				// mid-transcript without re-reading the model_change that set it. A different file identity starts over.
-				if (!providers.has(item.file)) providers.set(item.file, sameIdentity ? stored.provider ?? null : null);
+				// mid-transcript without re-reading the model_change that set it. Only a resume at that stored offset keeps it;
+				// a different identity or a shrunk file is read again from 0 and starts with no provider.
+				const resumes = sameIdentity && offset > 0 && offset === stored.offset;
+				if (!providers.has(item.file) || offset === 0) providers.set(item.file, resumes ? stored.provider ?? null : null);
 				progress.files += 1;
 				progress.totalBytes += item.stat.size;
 				if (item.stat.size > offset) {
