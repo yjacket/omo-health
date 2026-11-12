@@ -1101,11 +1101,15 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 		watch?.capture(world);
 
 		// Budget messages (self-notice, next turn, never a wake) go to the project's root session through the same inbox
-		// delivery as a cache notice: selfOnly, so never rerouted or toasted.
+		// delivery as a cache notice: selfOnly, so never rerouted or toasted. The delivery report keeps every undelivered
+		// message in the office's durable outbox for the next tick (B3).
+		const budgetDeliveries = [];
 		for (const message of budgetMessages) {
 			const delivery = deliver(world, message.sessionId, message, null, null, { selfOnly: true });
+			budgetDeliveries.push({ messageId: message.id, delivered: delivery.delivered === true });
 			log?.info?.("budget_message", { sessionId: message.sessionId, actionKind: message.details?.actionKind, projectId: message.details?.projectId, delivered: delivery.delivered, via: delivery.via });
 		}
+		actors.budget?.delivered?.(budgetDeliveries);
 
 		// A broken session is excluded only from its failing detector; all other sessions remain supervised.
 		quarantinedSessions = quarantinedSessions.filter((q) => q.untilMs > now);

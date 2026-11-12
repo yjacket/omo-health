@@ -50,7 +50,7 @@ const MIGRATIONS = [
 	CREATE INDEX usage_events_project ON usage_events(project_id, ms);
 	CREATE INDEX usage_events_root ON usage_events(root_session_id, ms);
 	CREATE INDEX usage_events_ms ON usage_events(ms);
-	CREATE TABLE ingest_offsets (file TEXT PRIMARY KEY, identity TEXT NOT NULL, offset INTEGER NOT NULL, updated_ms INTEGER NOT NULL);
+	CREATE TABLE ingest_offsets (file TEXT PRIMARY KEY, identity TEXT NOT NULL, offset INTEGER NOT NULL, updated_ms INTEGER NOT NULL, provider TEXT);
 	CREATE TABLE quota_samples (account TEXT NOT NULL, window_id TEXT NOT NULL, updated_ms INTEGER NOT NULL, used_percent REAL NOT NULL,
 	  resets_at_ms INTEGER, window_minutes INTEGER, PRIMARY KEY (account, window_id, updated_ms));
 	CREATE TABLE budget_projects (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, goal_id TEXT NOT NULL, cwd TEXT, objective TEXT,

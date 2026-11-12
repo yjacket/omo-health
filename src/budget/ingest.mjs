@@ -227,7 +227,7 @@ function defaultReadTaskStores(paths) {
 export function createIngest({ paths, store, clock, config, readTaskStores }) {
 	const readStores = readTaskStores ?? defaultReadTaskStores(paths);
 	const headers = new Map(); // file -> {identity, header}
-	const providers = new Map(); // file -> latest model_change provider
+	const providers = new Map(); // file -> latest model_change provider (seeded from the stored offset)
 
 	function headerOf(file, identity) {
 		const cached = headers.get(file);
@@ -312,15 +312,19 @@ export function createIngest({ paths, store, clock, config, readTaskStores }) {
 			const progress = { totalBytes: 0, pendingBytes: 0, files: 0, pendingFiles: 0 };
 			for (const item of pending) {
 				const stored = store.getOffset(item.file);
-				let offset = stored && stored.identity === item.identity ? stored.offset : 0;
+				const sameIdentity = !!stored && stored.identity === item.identity;
+				let offset = sameIdentity ? stored.offset : 0;
 				if (offset > item.stat.size) offset = 0;
+				// The byte offset carries the provider context of the lines before it: a restarted reader resumes
+				// mid-transcript without re-reading the model_change that set it. A different file identity starts over.
+				if (!providers.has(item.file)) providers.set(item.file, sameIdentity ? stored.provider ?? null : null);
 				progress.files += 1;
 				progress.totalBytes += item.stat.size;
 				if (item.stat.size > offset) {
 					progress.pendingBytes += item.stat.size - offset;
 					progress.pendingFiles += 1;
 					work.push({ ...item, offset });
-				} else if (!stored || stored.identity !== item.identity || stored.offset !== offset) store.setOffset(item.file, item.identity, offset, now);
+				} else if (!stored || stored.identity !== item.identity || stored.offset !== offset) store.setOffset(item.file, item.identity, offset, now, providers.get(item.file) ?? null);
 			}
 			work.sort((a, b) => a.stat.mtimeMs - b.stat.mtimeMs || (a.file < b.file ? -1 : 1));
 
@@ -404,7 +408,7 @@ export function createIngest({ paths, store, clock, config, readTaskStores }) {
 					}
 				}
 				if (usage.length) result.inserted += store.insertUsage(usage);
-				store.setOffset(item.file, item.identity, item.offset + consumed, now);
+				store.setOffset(item.file, item.identity, item.offset + consumed, now, providers.get(item.file) ?? null);
 			}
 
 			// Acceptance criteria belong to the session's current goal.

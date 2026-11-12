@@ -213,3 +213,45 @@ test("content stays within 1600 characters with long inputs", () => {
 	const longOpinion = opinion({ objective: "y".repeat(4000), advice: "z".repeat(4000), findings: [{ pattern: "other", explanation: "w".repeat(4000) }] });
 	assert.ok(longOpinion.content.length <= 1600);
 });
+
+// Gate review B4: schema-valid but verbose opinion. The body is truncated first, the advisory sentence is kept.
+test("a long schema-valid audit opinion keeps the advisory sentence within 1600 characters", () => {
+	const message = composeAuditOpinion({
+		sessionId: "s",
+		now: 1794484800000,
+		projectId: "11111111-1111-1111-1111-111111111111:22222222-2222-2222-2222-222222222222",
+		objective: "x".repeat(120),
+		assessment: "waste-likely",
+		confidence: 0.8,
+		model: "chatgpt-subscription/gpt-6-astra:high",
+		findings: Array.from({ length: 3 }, () => ({
+			pattern: "repeated-qa-without-acceptance-gain",
+			explanation: "e".repeat(220),
+		})),
+		advice: "a".repeat(900),
+	});
+	assert.equal(message.content.length, 1600);
+	assert.ok(message.content.includes("This is an audit opinion, not an instruction; you decide."));
+	assert.ok(message.content.trimEnd().endsWith("Nothing was stopped or changed."));
+	assert.match(message.content, /waste-likely/);
+	assert.match(message.content, /Findings:/);
+});
+
+test("an audit opinion keeps its advisory sentence when redaction lengthens credential-shaped text", () => {
+	// Each 15-char sk-ant- token becomes the 17-char sk-ant-[REDACTED]; capping before redaction used to cut the sentence.
+	const tokens = Array.from({ length: 40 }, () => "sk-ant-aaaaaaaa").join(" ");
+	const message = composeAuditOpinion({
+		sessionId: SESSION,
+		now: NOW,
+		projectId: "11111111-1111-1111-1111-111111111111:22222222-2222-2222-2222-222222222222",
+		objective: "x".repeat(120),
+		assessment: "waste-likely",
+		confidence: 0.8,
+		model: "chatgpt-subscription/gpt-6-astra:high",
+		findings: Array.from({ length: 3 }, () => ({ pattern: "repeated-qa-without-acceptance-gain", explanation: "e".repeat(600) })),
+		advice: tokens,
+	});
+	assert.ok(message.content.length <= 1600, `${message.content.length} chars`);
+	assert.ok(message.content.endsWith("This is an audit opinion, not an instruction; you decide. Nothing was stopped or changed."));
+	assert.doesNotMatch(message.content, /sk-ant-a{8}/);
+});

@@ -1,3 +1,4 @@
+import { redact } from "../util/text.mjs";
 import { accountOf, windowApplies } from "./accounts.mjs";
 
 /**
@@ -17,6 +18,18 @@ function transaction(db, fn) {
 		db.exec("ROLLBACK");
 		throw error;
 	}
+}
+
+/** Every string in a JSON value is redacted before the row is written: a credential never reaches the DB. */
+export function redactDeep(value) {
+	if (typeof value === "string") return redact(value);
+	if (Array.isArray(value)) return value.map(redactDeep);
+	if (value && typeof value === "object") {
+		const out = {};
+		for (const [key, item] of Object.entries(value)) out[key] = redactDeep(item);
+		return out;
+	}
+	return value;
 }
 
 function projectFromRow(row) {
@@ -40,10 +53,11 @@ export function createBudgetStore(db) {
 		`INSERT OR IGNORE INTO usage_events (id, ms, session_id, root_session_id, project_id, task_id, source, provider, model,
 			input, output, cache_read, cache_write, cost, cost_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	);
-	const getOffsetStmt = db.prepare("SELECT identity, offset FROM ingest_offsets WHERE file = ?");
+	const getOffsetStmt = db.prepare("SELECT identity, offset, provider FROM ingest_offsets WHERE file = ?");
 	const setOffsetStmt = db.prepare(
-		`INSERT INTO ingest_offsets (file, identity, offset, updated_ms) VALUES (?, ?, ?, ?)
-		 ON CONFLICT(file) DO UPDATE SET identity = excluded.identity, offset = excluded.offset, updated_ms = excluded.updated_ms`,
+		`INSERT INTO ingest_offsets (file, identity, offset, updated_ms, provider) VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(file) DO UPDATE SET identity = excluded.identity, offset = excluded.offset, updated_ms = excluded.updated_ms,
+		   provider = excluded.provider`,
 	);
 	const insertQuotaStmt = db.prepare(
 		`INSERT OR IGNORE INTO quota_samples (account, window_id, updated_ms, used_percent, resets_at_ms, window_minutes)
@@ -97,11 +111,15 @@ export function createBudgetStore(db) {
 
 		getOffset(file) {
 			const row = getOffsetStmt.get(file);
-			return row ? { identity: row.identity, offset: row.offset } : null;
+			if (!row) return null;
+			const offset = { identity: row.identity, offset: row.offset };
+			// An offset written before the provider column existed has no attribution to restore.
+			if (row.provider != null) offset.provider = row.provider;
+			return offset;
 		},
 
-		setOffset(file, identity, offset, ms) {
-			setOffsetStmt.run(file, identity, offset, ms);
+		setOffset(file, identity, offset, ms, provider = null) {
+			setOffsetStmt.run(file, identity, offset, ms, provider ?? null);
 		},
 
 		/** INSERT OR IGNORE quota readings; the (account, window, updated_ms) key makes a re-read idempotent. */
@@ -197,11 +215,11 @@ export function createBudgetStore(db) {
 				record.sessionId,
 				record.goalId,
 				record.cwd ?? null,
-				record.objective ?? null,
+				record.objective == null ? null : redact(record.objective),
 				record.createdMs,
 				record.status,
 				record.revision,
-				JSON.stringify(record.data ?? {}),
+				JSON.stringify(redactDeep(record.data ?? {})),
 				record.closedMs ?? null,
 				record.updatedMs,
 			);
@@ -237,7 +255,7 @@ export function createBudgetStore(db) {
 		},
 
 		appendEvent({ ms, projectId, account, kind, data }) {
-			const result = appendEventStmt.run(ms, projectId ?? null, account ?? null, kind, JSON.stringify(data ?? {}));
+			const result = appendEventStmt.run(ms, projectId ?? null, account ?? null, kind, JSON.stringify(redactDeep(data ?? {})));
 			return Number(result.changes);
 		},
 

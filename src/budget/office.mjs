@@ -14,7 +14,7 @@ import {
 } from "../act/messages.mjs";
 import { readSubscriptionUsage } from "../collect/subscriptions.mjs";
 import { atomicWriteJson, readJsonSafe, removeSafe } from "../util/fsx.mjs";
-import { truncate } from "../util/text.mjs";
+import { redact, truncate } from "../util/text.mjs";
 import { buildBundle, chooseModel } from "./audit.mjs";
 import { pollAudit, startAudit } from "./audit-job.mjs";
 import { calibrate, epochs, externalPercent } from "./calibration.mjs";
@@ -23,7 +23,7 @@ import { referenceClass } from "./estimates.mjs";
 import { createIngest } from "./ingest.mjs";
 import { auditAllowed, indicators, triggers } from "./metrics.mjs";
 import { evaluate } from "./projects.mjs";
-import { createBudgetStore } from "./store.mjs";
+import { createBudgetStore, redactDeep } from "./store.mjs";
 import { capacityCheck, summarize, windowState } from "./treasury.mjs";
 
 const MIN = 60_000;
@@ -33,12 +33,19 @@ const SUBSCRIPTION_EVERY_MS = 60_000;
 const CALIBRATION_EVERY_MS = 10 * MIN;
 const PRUNE_EVERY_MS = HOUR;
 const RECENT_TAIL_BYTES = 512 * 1024;
+// A budget message waits in the project's outbox this long for a delivery report (B3).
+const OUTBOX_TTL_MS = 7 * DAY;
 const LIVE = new Set(["tracking", "requested", "approved", "pending"]);
 // Same active statuses as src/detect/align.mjs GOAL_ACTIVE; audits are for goals still being worked on.
 const GOAL_ACTIVE = new Set(["active", "running", "in_progress", "pending"]);
 
 // Goal statuses that close a project (C-projects rule 1); every other unseen status reads as missing.
 const GOAL_TERMINAL = new Set(["complete", "completed", "replaced", "cleared", "cancelled"]);
+
+/** An audit opinion copied from an in-memory poll has not passed through the store yet: redact every string in it. */
+function redactedAudit(audit) {
+	return audit?.opinion ? { ...audit, opinion: redactDeep(audit.opinion) } : audit;
+}
 
 /**
  * The goal as of this tick. Ingest reads the goal files of every session inside the backfill window, so a project
@@ -74,6 +81,7 @@ function emptyData() {
 		audits: [],
 		workClass: null,
 		outcome: null,
+		outbox: [],
 	};
 }
 
@@ -187,7 +195,6 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 		const budget = current?.budget;
 		if (!budget?.enabled) return { snapshot: null, messages: [], events: [] };
 		const now = clock.now();
-		const messages = [];
 		const events = [];
 		const appendEvent = (event) => {
 			store.appendEvent({ ms: now, ...event });
@@ -324,6 +331,7 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 		const auditCfg = budget.audit ?? {};
 		for (const original of live) {
 			let project = original;
+			const created = []; // budget messages composed this tick; they enter the durable outbox below
 			const spend = spends.get(project.id);
 			const info = goalById.get(project.id);
 			const goalNow = goalNowOf(info, project);
@@ -363,7 +371,7 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 						if (polled.status === "done") {
 							audit.opinion = polled.opinion;
 							auditResult = polled.opinion;
-							messages.push(composeAuditOpinion({
+							created.push(composeAuditOpinion({
 								sessionId: project.sessionId,
 								now,
 								projectId: project.id,
@@ -451,7 +459,7 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 
 			for (const action of out.actions) {
 				if (action.type === "event") appendEvent({ projectId: project.id, kind: action.kind, data: action.data });
-				else if (action.type === "message") messages.push(composeMessage(action, next, projectSpend, now));
+				else if (action.type === "message") created.push(composeMessage(action, next, projectSpend, now));
 			}
 			if (next.status === "closed" && project.status !== "closed") appendEvent({ projectId: project.id, kind: "closed", data: { outcome: next.data.outcome ?? null, actualUsd: next.data.actualUsd ?? null } });
 
@@ -504,10 +512,35 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 					appendEvent({ projectId: project.id, kind: "audit-deferred", data: { reason, reasons } });
 				}
 			}
+			// Every composed message waits here until the engine reports it delivered (B3): the same object and id are
+			// handed back on each tick, so a recipient without a fresh sensor is retried instead of losing the message.
+			const priorOutbox = next.data.outbox ?? project.data?.outbox ?? [];
+			next.data.outbox = [...priorOutbox, ...created.map((message) => ({ id: message.id, message, createdMs: message.createdMs ?? now }))];
 			store.upsertProject(next);
 			live[live.indexOf(original)] = { ...next, _ind: ind, _trig: trig };
 		}
 		for (const file of consumed) removeSafe(file);
+
+		// 7b. Outbox: drop expired entries and every entry of a closed project (one event each), then hand back every
+		// pending message. A message is never composed twice; the stored object is returned until acknowledge.
+		let pendingMessages = [];
+		if (!shadow) {
+			for (const project of store.listProjects()) {
+				const outbox = project.data?.outbox ?? [];
+				if (!outbox.length) continue;
+				const kept = [];
+				for (const entry of outbox) {
+					const reason = project.status === "closed" ? "closed" : now - entry.createdMs > OUTBOX_TTL_MS ? "expired" : null;
+					if (!reason) {
+						kept.push(entry);
+						continue;
+					}
+					appendEvent({ projectId: project.id, kind: "message-expired", data: { messageId: entry.id, actionKind: entry.message?.details?.actionKind ?? null, reason } });
+				}
+				if (kept.length !== outbox.length) store.upsertProject({ ...project, data: { ...project.data, outbox: kept }, updatedMs: now });
+				pendingMessages.push(...kept.map((entry) => entry.message));
+			}
+		}
 
 		if (now - pruneMs >= PRUNE_EVERY_MS) {
 			pruneMs = now;
@@ -540,7 +573,7 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 			return {
 				id: p.id,
 				sessionId: p.sessionId,
-				objective: truncate(p.objective ?? "", 120),
+				objective: truncate(redact(p.objective ?? ""), 120),
 				status: p.status,
 				revision: p.revision,
 				spentUsd: spend.costUsd,
@@ -555,12 +588,15 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 				indicators: ind,
 				triggers: crossed,
 				auditDeferred,
-				lastAudit: (p.data.audits ?? []).at(-1) ?? null,
+				lastAudit: redactedAudit((p.data.audits ?? []).at(-1) ?? null),
 				rounds,
 			};
 		});
 		const auditRows = shown
-			.flatMap((p) => (p.data.audits ?? []).map((a) => ({ auditId: a.auditId, projectId: p.id, ms: a.ms, status: a.status, model: a.model ?? null, assessment: a.opinion?.assessment ?? null, advice: a.opinion?.advice ?? null, costUsd: a.costUsd ?? null })))
+			.flatMap((p) => (p.data.audits ?? []).map((a) => {
+				const audit = redactedAudit(a);
+				return { auditId: a.auditId, projectId: p.id, ms: a.ms, status: a.status, model: a.model ?? null, assessment: audit?.opinion?.assessment ?? null, advice: audit?.opinion?.advice ?? null, costUsd: a.costUsd ?? null };
+			}))
 			.sort((a, b) => b.ms - a.ms)
 			.slice(0, 20);
 		const owner = shown
@@ -587,11 +623,23 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 		};
 		atomicWriteJson(paths.health.budgetSnapshotFile, snapshot);
 		lastSnapshot = snapshot;
-		return { snapshot, messages: shadow ? [] : messages, events };
+		return { snapshot, messages: shadow ? [] : pendingMessages, events };
 	}
 
 	return {
 		tick,
+		/** The engine's delivery report: delivered ids leave the outbox for good (B3). */
+		delivered(results = []) {
+			const ids = new Set(results.filter((result) => result?.delivered === true && result.messageId).map((result) => result.messageId));
+			if (!ids.size) return;
+			const now = clock.now();
+			for (const project of store.listProjects()) {
+				const outbox = project.data?.outbox ?? [];
+				const kept = outbox.filter((entry) => !ids.has(entry.id));
+				if (kept.length === outbox.length) continue;
+				store.upsertProject({ ...project, data: { ...project.data, outbox: kept }, updatedMs: now });
+			}
+		},
 		snapshot() {
 			return lastSnapshot ?? readJsonSafe(paths.health.budgetSnapshotFile) ?? null;
 		},

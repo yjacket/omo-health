@@ -1,10 +1,9 @@
 // Todo 14: one budget audit as a detached runner job. The runner knows nothing of the audit; the job's kind and
 // the parser it registered live in meta.json, so a daemon restarted while an audit ran finds `AUDIT_CONTRACT` through
 // `contracts[meta.kind]` (src/runner.mjs:85) and ends the job from its files alone.
-import fs from "node:fs";
 import path from "node:path";
 import { unavailableReason } from "../judge/analyst.mjs";
-import { atomicWriteJson, ensureDir, readJsonSafe } from "../util/fsx.mjs";
+import { atomicWriteFile, atomicWriteJson, ensureDir, readJsonSafe } from "../util/fsx.mjs";
 import { auditArgs, parseOutput, validateOpinion } from "./audit.mjs";
 
 /** The runner job kind every audit is started with. */
@@ -65,7 +64,7 @@ export function startAudit({ runner, paths, model, bundle, projectId, auditId, t
 	const dir = path.join(paths.health.jobsDir, jobId);
 	ensureDir(dir);
 	const bundleFile = path.join(dir, BUNDLE_FILE);
-	fs.writeFileSync(bundleFile, typeof bundle === "string" ? bundle : JSON.stringify(bundle ?? ""));
+	atomicWriteFile(bundleFile, typeof bundle === "string" ? bundle : JSON.stringify(bundle ?? ""));
 	// The audit's identity for a poll that only has the job directory (validateOpinion checks the answer against it).
 	atomicWriteJson(path.join(dir, META_FILE), { jobId, auditId: jobId, projectId, model });
 	const started = runner.start({

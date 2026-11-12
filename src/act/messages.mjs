@@ -746,6 +746,9 @@ const AUDIT_OPINION_TEXT = {
 	"insufficient-evidence": "there is not enough recorded evidence to judge the spending.",
 };
 
+/** Contract sentence appended after truncation, so a long opinion can never lose it. */
+const AUDIT_OPINION_TAIL = "This is an audit opinion, not an instruction; you decide. Nothing was stopped or changed.";
+
 /** IS-8: the auditor's opinion, delivered as an opinion the session may weigh. Never an instruction. */
 export function composeAuditOpinion({ sessionId, now, projectId, revision = 0, auditId = null, objective = "", assessment = "insufficient-evidence", confidence = null, advice = "", findings = [], model = null }) {
 	const verdict = AUDIT_OPINION_TEXT[assessment] ?? AUDIT_OPINION_TEXT["insufficient-evidence"];
@@ -755,11 +758,13 @@ export function composeAuditOpinion({ sessionId, now, projectId, revision = 0, a
 		const explanation = f.explanation ?? f.evidence ?? "";
 		return `- ${pattern}: ${truncate(String(explanation), 220)}`;
 	});
-	const content = [
+	const body = [
 		`${BUDGET_PREFIX} Spending audit opinion for project "${projectId}" (revision ${revision}, "${truncate(objective, 120)}"): ${assessment}${confidenceText}${model ? `, model ${model}` : ""}. The auditor found ${verdict}`,
 		...(findingLines.length ? ["Findings:", ...findingLines] : []),
 		...(advice ? [`Advice: ${truncate(String(advice), 900)}`] : []),
-		"This is an audit opinion, not an instruction; you decide. Nothing was stopped or changed.",
 	].join("\n");
+	// The body is redacted, then truncated, then the contract sentence is appended: redaction can lengthen text, so it
+	// must happen before the cap or the final cap in budgetMessage would cut the sentence.
+	const content = `${truncate(redact(body), BUDGET_CHARS - AUDIT_OPINION_TAIL.length - 1)}\n${AUDIT_OPINION_TAIL}`;
 	return budgetMessage({ sessionId, now, actionKind: "budget-audit-opinion", content, details: { projectId, revision, auditId, assessment } });
 }

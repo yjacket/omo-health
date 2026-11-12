@@ -1,5 +1,5 @@
 import { readJsonSafe } from "../util/fsx.mjs";
-import { truncate } from "../util/text.mjs";
+import { redact, truncate } from "../util/text.mjs";
 
 /** C-config `budget.staleMs`: a reading older than this is display-only evidence. */
 const DEFAULT_STALE_MS = 10 * 60_000;
@@ -67,7 +67,7 @@ export function readSubscriptionUsage(file, { now = Date.now(), staleMs = DEFAUL
 		// The producer's own sanitize drops entries without both timestamps.
 		if (updatedMs === null || nextMs === null) continue;
 		const errorText = text(raw.error);
-		const error = errorText === null ? null : truncate(errorText, ERROR_MAX);
+		const error = errorText === null ? null : truncate(redact(errorText), ERROR_MAX);
 		const pending = raw.pending === true;
 		const failed = error !== null;
 		const slash = account.indexOf("/");

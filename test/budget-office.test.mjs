@@ -140,7 +140,10 @@ test("(c)-(f), (h): request at $10, estimate -> decision, 100% checkpoint, chang
 	const step = (entries) => {
 		if (entries) appendJsonl(c.file, entries);
 		c.clock.advance(MIN);
-		return office.tick({ shadow: false });
+		const out = office.tick({ shadow: false });
+		// The engine reports delivery after each tick; without it the durable outbox keeps the message pending.
+		office.delivered(out.messages.map((message) => ({ messageId: message.id, delivered: true })));
+		return out;
 	};
 
 	assert.deepEqual(c.kinds(office.tick({}).messages), [], "$9.99 is below the estimate threshold");

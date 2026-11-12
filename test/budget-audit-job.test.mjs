@@ -1,5 +1,5 @@
 import "./helpers/tmp-root.mjs";
-import test from "node:test";
+import test, { mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -88,6 +88,26 @@ test("done: validated opinion and usage, with the guarded argv and the OMO comma
 	assert.deepEqual(out.opinion, OPINION);
 	assert.equal(out.usage.cost, 0.25);
 	assert.equal(out.usage.costStatus, "reported");
+});
+
+test("the bundle is persisted through fsx (temp file + rename), not written in place", () => {
+	const { runner, paths } = fakeAuditRunner({ [AUDIT_JOB_KIND]: { status: "running" } });
+	const written = [];
+	const original = fs.writeFileSync;
+	const spy = (file, ...rest) => {
+		written.push(String(file));
+		return original.call(fs, file, ...rest);
+	};
+	mock.method(fs, "writeFileSync", spy);
+	try {
+		startAudit({ runner, paths, model: MODEL, bundle: "# bundle\n", projectId: PROJECT, auditId: AUDIT, timeoutMs: 60_000 });
+	} finally {
+		mock.restoreAll();
+	}
+	const bundleFile = path.join(paths.health.jobsDir, AUDIT, "bundle.md");
+	assert.ok(written.length > 0, "startAudit writes the bundle");
+	assert.ok(!written.includes(bundleFile), "the bundle file is never written in place");
+	assert.equal(fs.readFileSync(bundleFile, "utf8"), "# bundle\n", "the bundle content still lands at bundleFile");
 });
 
 test("a runner still working keeps polling as running", () => {
