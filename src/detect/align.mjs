@@ -162,6 +162,8 @@ export function detect(world, memory = {}) {
 	const cfg = world.config.align;
 	if (!cfg?.enabled) return [];
 	const findings = [];
+	// With the budget auditor on, it owns long goals (IS-12: exactly one owner); D15 keeps long-run only without it.
+	const budgetOwnsLongRun = Boolean(world.config.budget?.enabled && world.config.budget?.audit?.enabled);
 	// The budget belongs to whoever receives the note: a child's note goes to its parent, so all children of a
 	// parent (and the parent itself) draw on one budget instead of one each.
 	const targetOf = (session) => (session.kind === "child" ? session.parentSessionId ?? session.id : session.id);
@@ -191,6 +193,7 @@ export function detect(world, memory = {}) {
 		const turn = latestTurn(session, humanInputs);
 		for (const { signal, metric, evidence, request } of signals(session, world.now, cfg, humanInputs, progressTimes)) {
 			if (emitted.has(target)) break;
+			if (signal === "long-run" && budgetOwnsLongRun) continue;
 			// An overstep belongs to one owner request; growth in mutations is the same request, not a new incident.
 			// A long run is reviewed again once longRun.everyMs has passed since its last review, whatever its metric.
 			const key = signal === "overstep"

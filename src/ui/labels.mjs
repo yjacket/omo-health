@@ -60,6 +60,10 @@ export const FINDING_LABELS = Object.freeze({
 	"refusal-orphan": "정책 거부로 목표 멈춤",
 	"park-due": "한도 대기 재개",
 	drift: "작업 범위 점검 신호",
+	"treasury-short": "예산 부족",
+	"treasury-tight": "예산 주의",
+	"owner-decision": "예산 결정 필요",
+	"audit-opinion": "예산 감사 의견",
 });
 
 export const ACTION_LABELS = Object.freeze({

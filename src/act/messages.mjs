@@ -533,6 +533,7 @@ export function composeScopeCheck({ finding, sessionId, now, forward = false, ve
 		reopened: "끝낸 할 일이 다시 열렸습니다. 원인을 다시 점검하세요.",
 		repeat: "거의 같은 단계를 반복하고 있는지 확인하세요.",
 		"after-complete": "완료 후 추가 작업이 필요한지 확인하세요.",
+		"long-run": "오래 이어진 작업이 목표에 수렴하고 있는지 확인하세요.",
 	}[signal];
 	const sentence = {
 		churn: `${metric} non-converging rounds or repeated checks`,
@@ -541,6 +542,7 @@ export function composeScopeCheck({ finding, sessionId, now, forward = false, ve
 		reopened: evidence,
 		repeat: evidence,
 		"after-complete": `${metric} mutations after goal completion`,
+		"long-run": evidence,
 	}[signal];
 	const evidenceLine = `omo-health scope check (${signal}): ${sentence}. Original goal: "${goal}".`;
 	const requestLine = typeof lastUserText === "string" && lastUserText.length > 0

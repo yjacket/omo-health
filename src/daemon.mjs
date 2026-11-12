@@ -23,6 +23,8 @@ import { createEngine, loadDetectors } from "./engine.mjs";
 import { createEvidence } from "./evidence.mjs";
 import { createAnalyst, parseAnalystOutput, unavailableReason } from "./judge/analyst.mjs";
 import { createRunner } from "./runner.mjs";
+import { AUDIT_CONTRACT, AUDIT_JOB_KIND } from "./budget/audit-job.mjs";
+import { createBudgetOffice } from "./budget/office.mjs";
 import { countTempFiles, createBaseline } from "./baseline.mjs";
 import { closeDb, createMaintainer, openDb } from "./db/db.mjs";
 import { gate } from "./judge/policy.mjs";
@@ -279,6 +281,9 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 		actors: {
 			// The category-lane analyst (omo -p): a runner job the engine polls; analyst.enabled switches it without a restart.
 			analyst: createAnalyst({ config, paths, clock, log, runner: createRunner({ paths, clock, contracts: { analyst: { parse: parseAnalystOutput, unavailableReason } } }) }),
+			// The budget office (C-office) on the same DB; its tick is a no-op while budget.enabled is off (hot reload). The
+			// kind-level audit contract lets a restarted daemon read an audit that finished while it was down. No DB, no office.
+			budget: db ? createBudgetOffice({ paths, db, clock, config, runner: createRunner({ paths, clock, contracts: { [AUDIT_JOB_KIND]: AUDIT_CONTRACT } }) }) : undefined,
 			evidence,
 			db,
 			// #55 C: this machine's usual rates per owner, saved in the DB's baseline_samples; deviations only ask for an earlier look.

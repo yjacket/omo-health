@@ -75,7 +75,7 @@ export function probeFile(file) {
 
 /** Every detector, in evaluation order (D1 first: it attributes processes for D2/D9). */
 export async function loadDetectors() {
-	const names = ["stall", "runaway", "respawn", "tokens", "tps", "provider", "omo-login", "config", "orphans", "monitor-orphans", "reflection-orphans", "crashes", "parks", "leftovers", "loops", "reload", "self", "offtrack", "align", "goal-liveness", "refusal", "boot-gap"];
+	const names = ["stall", "runaway", "respawn", "tokens", "tps", "provider", "omo-login", "config", "orphans", "monitor-orphans", "reflection-orphans", "crashes", "parks", "leftovers", "loops", "reload", "self", "offtrack", "align", "goal-liveness", "refusal", "budget", "boot-gap"];
 	const detectors = [];
 	for (const name of names) {
 		try {
@@ -1032,6 +1032,19 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 			paused,
 			mode: effectiveMode(),
 		};
+		// The budget office (C-office), once per tick before the detectors: D26 reads its snapshot. The daemon (or a test, a
+		// replay) injects it; without one this is a no-op. Shadow or paused: it computes but sends nothing and starts nothing.
+		let budgetSnapshot;
+		let budgetMessages = [];
+		if (actors.budget) {
+			try {
+				const out = actors.budget.tick({ world: { now, config }, shadow: effectiveMode() === "shadow" || Boolean(paused) });
+				budgetSnapshot = out?.snapshot ?? undefined;
+				budgetMessages = out?.messages ?? [];
+			} catch (error) {
+				failures.push(`budget:${error.message}`);
+			}
+		}
 		const manifestCache = new Map();
 		const goalStoreCache = new Map();
 		const workCache = new Map();
@@ -1074,6 +1087,7 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 			},
 			downtime: options.downtime,
 			liveness: options.liveness,
+			budget: budgetSnapshot,
 		});
 
 		// Without any process data (a replay fixture with no process table) a fresh sensor heartbeat is the only proof that
@@ -1085,6 +1099,13 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 		}
 
 		watch?.capture(world);
+
+		// Budget messages (self-notice, next turn, never a wake) go to the project's root session through the same inbox
+		// delivery as a cache notice: selfOnly, so never rerouted or toasted.
+		for (const message of budgetMessages) {
+			const delivery = deliver(world, message.sessionId, message, null, null, { selfOnly: true });
+			log?.info?.("budget_message", { sessionId: message.sessionId, actionKind: message.details?.actionKind, projectId: message.details?.projectId, delivered: delivery.delivered, via: delivery.via });
+		}
 
 		// A broken session is excluded only from its failing detector; all other sessions remain supervised.
 		quarantinedSessions = quarantinedSessions.filter((q) => q.untilMs > now);
@@ -1407,6 +1428,8 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 			open: findings.filter((f) => f.severity !== "info").map((f) => ({ fp: f.fp, detector: f.detector, kind: f.kind, cls: f.cls, severity: f.severity, titleKo: f.titleKo, sessionId: f.subject?.sessionId, taskId: f.subject?.taskId })),
 			// #55 C: how often deviations fire and deviation looks are paid for, and whether each metric is past its cold start.
 			...(actors.baseline ? { baseline: actors.baseline.summary(now) } : {}),
+			// Budget office summary (null while disabled or before its first snapshot); only a daemon with an office has the key.
+			...(actors.budget ? { budget: budgetSnapshot ? { state: budgetSnapshot.treasury?.state ?? "unknown", updatedMs: budgetSnapshot.updatedMs, windows: budgetSnapshot.treasury?.windows ?? [], projects: budgetSnapshot.projects?.length ?? 0, owner: budgetSnapshot.owner?.length ?? 0 } : null } : {}),
 			incidents: [...records.values()].filter((r) => now - r.firstSeenMs <= DAY_MS && (r.history.length || r.finding.severity !== "info")).map((r) => ({ fp: r.fp, titleKo: r.finding.titleKo, severity: r.finding.severity, firstSeenMs: r.firstSeenMs, resolvedMs: r.resolvedMs, state: r.state, reportPath: r.reportPath, actions: r.history.map((h) => `${h.kind}:${h.status}`) })),
 			// runningTasks: active subagents of a live host.
 			counts: { sessions: registry.sessions.size, tasks: registry.tasks.length, runningTasks: registry.tasks.filter((t) => t.active && world.liveHostPids.has(t.hostPid)).length, liveHosts: world.liveHostPids.size, sensors: sensors.size, findings: findings.length },
