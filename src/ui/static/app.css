@@ -1548,3 +1548,345 @@ a:hover {
 		color: var(--ink-2);
 	}
 }
+
+/* ---------- budget: one row per subscription window, then the project and audit tables ---------- */
+
+.wins {
+	display: flex;
+	flex-direction: column;
+	border-radius: var(--r-lg);
+	box-shadow: var(--shadow-ring);
+	min-inline-size: 0;
+}
+
+.win {
+	display: flex;
+	flex-direction: column;
+	gap: var(--s-2);
+	padding: var(--s-3) var(--s-4);
+	border-block-end: 1px solid var(--hairline);
+	min-inline-size: 0;
+}
+
+.win:last-child {
+	border-block-end: none;
+}
+
+.win__head {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: space-between;
+	gap: var(--s-2);
+}
+
+.win__name {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: var(--s-2);
+	min-inline-size: 0;
+}
+
+.win__account {
+	color: var(--ink);
+	font-weight: 600;
+}
+
+.win__window {
+	color: var(--ink-3);
+	font-family: var(--font-mono);
+	font-size: var(--t-mono);
+}
+
+.win__meter {
+	display: flex;
+	align-items: center;
+	gap: var(--s-3);
+	min-inline-size: 0;
+}
+
+/* The meter's colour is the window state's tone; used and committed share it, the reserve is the shaded end. */
+.meter {
+	display: block;
+	flex: 1 1 auto;
+	min-inline-size: 0;
+	block-size: 0.5rem;
+	border-radius: var(--r-full);
+	overflow: hidden;
+	color: var(--ink-4);
+}
+
+.meter--ok {
+	color: var(--ok);
+}
+.meter--warn {
+	color: var(--warn);
+}
+.meter--crit {
+	color: var(--crit);
+}
+
+.meter__track {
+	fill: var(--wash-2);
+}
+
+.meter__reserve {
+	fill: var(--wash-3);
+}
+
+.meter__used {
+	fill: currentColor;
+}
+
+.meter__committed {
+	fill: currentColor;
+	fill-opacity: 0.35;
+}
+
+.meter__projected {
+	stroke: var(--ink);
+	stroke-width: 2px;
+	vector-effect: non-scaling-stroke;
+}
+
+/* The same column tracks in every row, so a value lines up with the same value of the other windows. */
+.win__stats {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(7rem, 1fr));
+	gap: var(--s-1) var(--s-3);
+	align-items: baseline;
+}
+
+.win__foot {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: var(--s-1) var(--s-3);
+}
+
+.stat {
+	display: inline-flex;
+	align-items: baseline;
+	gap: var(--s-1);
+	min-inline-size: 0;
+	white-space: nowrap;
+}
+
+.stat--wide {
+	grid-column: span 2;
+}
+
+.stat__k {
+	color: var(--ink-3);
+	font-size: var(--t-caption);
+}
+
+.stat__v {
+	color: var(--ink);
+	font-weight: 500;
+	font-variant-numeric: tabular-nums;
+}
+
+.stat--used .stat__v {
+	font-size: var(--t-section);
+	font-weight: 600;
+	letter-spacing: -0.01em;
+}
+
+.stat--stale .stat__v {
+	color: var(--warn);
+}
+
+.coupons {
+	display: inline-flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: var(--s-2);
+	margin-inline-start: auto;
+}
+
+.stepper {
+	display: inline-flex;
+	gap: var(--s-1);
+}
+
+.btn--step {
+	min-block-size: 1.75rem;
+	min-inline-size: 1.75rem;
+	padding: 0;
+	line-height: 1;
+}
+
+.table--budget {
+	min-inline-size: 40rem;
+}
+
+.table--budget .col-chip,
+.table--budget .col-time,
+.table--audits .col-model {
+	white-space: nowrap;
+}
+
+.table--audits tbody .col-time {
+	color: var(--ink-2);
+	font-weight: 400;
+}
+
+.table--audits .col-advice {
+	min-inline-size: 14rem;
+}
+
+.proj,
+.money {
+	display: flex;
+	flex-direction: column;
+	gap: 0.125rem;
+	min-inline-size: 0;
+}
+
+.money {
+	align-items: flex-end;
+}
+
+.proj__objective {
+	color: var(--ink);
+	font-weight: 500;
+	overflow-wrap: anywhere;
+}
+
+.proj__meta,
+.money__split {
+	color: var(--ink-3);
+	font-family: var(--font-mono);
+	font-size: var(--t-mono);
+	font-weight: 400;
+}
+
+.pending {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: var(--s-2);
+}
+
+.pending__what {
+	display: inline-flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: var(--s-1) var(--s-2);
+}
+
+.audit__advice {
+	display: -webkit-box;
+	-webkit-box-orient: vertical;
+	-webkit-line-clamp: 2;
+	overflow: hidden;
+	color: var(--ink-2);
+	overflow-wrap: anywhere;
+}
+
+@media (max-width: 600px) {
+	.win {
+		padding: var(--s-3);
+	}
+
+	/* The budget tables become lists: line one is the row head (objective or time) and its chip, then one labelled value each. */
+	.table--budget {
+		min-inline-size: 0;
+	}
+
+	.table--budget thead {
+		display: none;
+	}
+
+	.table--budget,
+	.table--budget tbody {
+		display: block;
+	}
+
+	.table--budget tr {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		gap: var(--s-1) var(--s-3);
+		padding: var(--s-2) var(--s-3);
+		border-block-end: 1px solid var(--hairline);
+	}
+
+	.table--budget tr:last-child {
+		border-block-end: none;
+	}
+
+	.table--budget th,
+	.table--budget td {
+		display: block;
+		order: 4;
+		padding: 0;
+		border-block-end: none;
+		min-inline-size: 0;
+	}
+
+	/* A cell is its label and its value on one line. */
+	.table--budget td {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		column-gap: var(--s-1);
+	}
+
+	.table--budget .col-n {
+		text-align: start;
+	}
+
+	.table--budget tbody th {
+		order: 1;
+		flex: 1 1 0;
+	}
+
+	.table--budget .col-chip {
+		order: 2;
+	}
+
+	.table--budget tr::after {
+		content: "";
+		order: 3;
+		flex-basis: 100%;
+	}
+
+	.table--budget td[data-label]::before {
+		content: attr(data-label);
+		color: var(--ink-3);
+		font-size: var(--t-caption);
+		font-weight: 400;
+	}
+
+	.table--budget td.col-chip::before,
+	.table--budget td.col-advice::before {
+		content: none;
+	}
+
+	.table--projects td:nth-child(3),
+	.table--projects td:nth-child(6),
+	.table--audits td:nth-child(2),
+	.table--audits td:nth-child(4) {
+		flex-basis: 100%;
+	}
+
+	.audit__project {
+		flex: 1 1 0;
+		min-inline-size: 0;
+	}
+
+	.money {
+		display: inline-flex;
+		flex-direction: row;
+		flex-wrap: wrap;
+		align-items: baseline;
+		gap: var(--s-1) var(--s-2);
+	}
+
+	.pending {
+		margin-block-start: var(--s-1);
+	}
+}

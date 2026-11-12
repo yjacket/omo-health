@@ -71,6 +71,8 @@ export function loadUiInputs({ paths, env, now = Date.now() }) {
 		pidAlive: pidAlive(heartbeat?.pid),
 		pause: pauseState(paths, now),
 		global: readJsonSafe(path.join(paths.health.statusDir, "_global.json")) ?? null,
+		// Read-only: the budget office is the only writer of the snapshot.
+		budgetSnapshot: readJsonSafe(paths.health.budgetSnapshotFile) ?? null,
 		deaths: listDeathRecords(paths.health.deathsDir),
 		// Read-only: the engine is the only writer of the investigation files.
 		investigations: createInvestigations({ paths, clock: { now: () => now } }).list({ sinceMs: now - INVESTIGATION_WINDOW_MS, limit: INVESTIGATION_LIMIT }),
@@ -401,6 +403,11 @@ function section(build) {
 	}
 }
 
+/** The budget office's snapshot as written; null while the office has not written one yet. */
+export function buildBudget(inputs) {
+	return isRecord(inputs.budgetSnapshot) ? inputs.budgetSnapshot : null;
+}
+
 export function buildUiState(inputs) {
 	return {
 		generatedMs: inputs.now,
@@ -411,6 +418,7 @@ export function buildUiState(inputs) {
 		investigations: section(() => buildInvestigations(inputs)),
 		history: section(() => ({ ...buildHistory(inputs.decisions, inputs.now), readMs: inputs.decisionsReadMs })),
 		settings: section(() => buildSettings(inputs)),
+		budget: section(() => buildBudget(inputs)),
 	};
 }
 

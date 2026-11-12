@@ -69,6 +69,7 @@ node %USERPROFILE%/.omo-health/app/boot.mjs start
 | `doctor` | 필요한 것이 모두 갖춰졌는지 표로 점검 |
 | `scan` | 지난 로그·세션을 탐지기에 재생 (`--from ISO --to ISO [--json]`) |
 | `replay` | 픽스처 폴더를 가짜 시계로 엔진에 재생 (`<폴더> [--json]`) |
+| `budget` | 구독 창, 프로젝트 예산, 감사 보기 (`[--json]`) |
 
 설치 뒤에는 저장소 위치와 상관없는 안정된 경로로 같은 명령을 쓸 수 있습니다. 부트스트랩이 `current.json`이 가리키는 설치본을 실행합니다.
 
@@ -91,17 +92,18 @@ omo 세션 안에서는 하단 상태줄에 `헬스 ✓` 또는 경고가 보입
 
 명령은 주소를 출력하고 기본 브라우저를 연 뒤 바로 끝납니다. 서버는 뒤에서 따로 돌다가 30분 동안 요청이 없으면 스스로 닫힙니다. 페이지의 자동 새로 고침은 요청으로 세지 않으므로, 잊힌 탭이 서버를 붙잡지 않습니다. 브라우저가 안 열리면 출력된 주소를 직접 엽니다. `/health ui`는 브라우저가 열렸으면 주소(토큰 포함)를 화면에 남기지 않고 포트만 알려 주며, 안 열렸을 때만 주소를 보여 줍니다. `OMO_HEALTH_HOME`, `OMO_HEALTH_OMO_HOME`, `OMO_HEALTH_CLAUDE_HOME`(테스트·샌드박스용) 중 하나라도 있으면 브라우저를 열지 않고 주소만 출력합니다. `OMO_HEALTH_CONFIG`만 있을 때는 열립니다. `--no-open`은 브라우저를 열지 않고, `--json`은 주소와 브라우저를 열었는지(`opened`)를 한 줄 JSON으로 출력하며, `--idle-minutes N`은 유휴 종료 시간을 바꿉니다. 대시보드를 연 omo 세션이나 터미널을 닫으면 서버도 함께 닫힐 수 있습니다.
 
-탭은 세 개입니다.
+탭은 네 개입니다.
 - 세션 현황: 지금 돌고 있는 세션과 서브에이전트, 각자의 상태와 열린 문제.
 - 세션 기록: 끝난 세션의 기록(`sessions/ended-*.jsonl`).
 - 관리: 아래 항목과 제어.
+- 예산: 아래 "예산 관리"의 한도, 프로젝트, 감사 카드.
 
 관리 탭에 보이는 것:
 - 지금: 감시기 상태(실행 중, 응답 없음, 비정상 종료, 중지됨, 꺼짐), 일시정지, 모드, 세션·서브에이전트 수, 사람이 확인할 일, 열린 문제.
 - 작업 진단: 돌고 있는 서브에이전트나 세션을 골라 `diagnose`와 같은 진단(판정, 권고, 기다리는 호출, 프로세스, 감시기 조치)을 봅니다. 목록은 페이지를 열 때 읽고, 진단은 누를 때만 몇 초 동안 프로세스를 살펴봅니다.
 - 조사 목록: 최근 조사(아래 "조사 목록과 분석가")의 대상, 계기, 상태, 분석가 판정과 조치.
 - 최근 7일: 같은 종류를 한 줄로 묶어 개수와 일별 분포를 보여 주고, 펼치면 최근 예시 5건이 나옵니다. 조치는 결과별로 세고, 설정 변경도 보입니다.
-- 설정: 아래 스위치 9개의 파일 값과 감시기 적용값, 기본값과 다른 값, 설정 경고.
+- 설정: 아래 스위치 12개의 파일 값과 감시기 적용값, 기본값과 다른 값, 설정 경고.
 
 제어: 일시정지(15분, 1시간, 재개할 때까지)와 재개, 그리고 아래 스위치입니다. 모두 CLI와 같은 파일(`pause`, `config.json`)을 씁니다. 스위치를 기본값으로 돌리면 `config.json`에서 그 키를 지우고, 다른 키는 건드리지 않습니다.
 
@@ -115,6 +117,8 @@ omo 세션 안에서는 하단 상태줄에 `헬스 ✓` 또는 경고가 보입
 | `config.autoRevert` | 설정을 바꾼 직후 공급자 오류가 이어지면 `settings.json`을 직전 정상본으로 되돌림 |
 | `align.enabled` | 원래 요청에서 멀어진 세션에 범위를 다시 확인하라는 짧은 메시지 |
 | `analyst.enabled` | 멈춤 의심과 이상 신호를 분석가에게 물음. 끄면 멈춤 의심은 조사 목록에 남기만 하고 풀리지 않음 |
+| `budget.enabled` | 예산 관리: 구독 창 잔여량과 목표별 예산을 추적. 끄면 예산 계산과 알림이 모두 꺼짐 |
+| `budget.audit.enabled` | 지출 감사: 목표 지출이 기준을 넘으면 감사 모델이 남은 작업의 필요성을 판단 |
 | `footer.showAll` | 하단 상태줄에 모든 문제 표시 (끄면 서브에이전트 문제와 사람만 고칠 수 있는 문제만) |
 
 반영 시점:
@@ -291,7 +295,62 @@ omo -p --no-session -ne -ns -nc --no-tools --model <모델> --session-id <id> "<
 
 `long-run`은 오래 도는 goal 세션 검토입니다. 활성 goal이 있는 세션(메인과 서브에이전트)이 실제로 일한 시간(15분 넘게 쉰 구간 제외)이 6시간(`align.longRun.activeMs`)을 넘거나, 같은 단계가 숫자만 바뀌어 8라운드(`align.longRun.rounds`, 예: "회귀 점검 25 결과를 읽고 26차 QA를 시작") 반복되면 분석가에게 목표로 수렴하는지 묻습니다. 라운드 사이에 할 일이 끝나도 라운드는 계속 셉니다. 분석가는 위 넛지와 같은 근거 묶음(목표, 최근 요청, 최근 단계 30개, 열린 할 일)과 함께 활성 시간이나 라운드 번호를 받습니다. 정상이 아니라고 답할 때만 세션에 넛지를 보내고 Windows 알림을 한 번 띄웁니다. 정상이거나, 분석가가 꺼져 있거나 답하지 못하면 아무것도 보내지 않습니다. 세션마다 6시간(`align.longRun.everyMs`)에 한 번이고, 위의 하루 4번 한도 안에서 셉니다. 끄려면 `{"align": {"longRun": {"enabled": false}}}`로 설정합니다.
 
+`budget.enabled`와 `budget.audit.enabled`가 둘 다 켜져 있으면(기본값) 긴 goal 검토는 예산 감사가 맡고, D15는 `long-run`을 내지 않습니다. 둘 중 하나라도 끄면 D15가 다시 `long-run`을 냅니다.
+
 세션별 기록은 `~/.omo-health/alignment/<세션 id>.json`에 남습니다. 원래 목표, 최근 요청 10개, 열린 할 일, 보낸 넛지, 최근 단계 50개가 들어 있고 `/health`의 "원래 목표"와 `status --json`의 `alignment`가 이 파일을 읽습니다.
+
+## 예산 관리
+
+목표(goal) 세션의 구독 토큰 지출을 기록하고, 견적을 받아 승인하는 일을 한다. 기본으로 켜져 있고(`budget.enabled`), 어떤 예산 상태도 세션을 멈추거나 죽이거나 목표를 고치지 않는다. 초과 지출은 기록만 된다.
+
+세 역할이 나눠 맡는다.
+
+- 재정(데몬의 예산 사무소): 매 틱 세션 로그에서 지출을 장부(`omo-health.db`)에 옮기고, `subscription-usage.json`의 구독 창을 읽어 창마다 `budget.reservePercent` + `budget.auditReservePercent`를 비워 둘 수 있는지 계산한다. 규칙 안의 견적과 증액은 스스로 승인한다.
+- 감사: 지출이 의심스러울 때 분리된 작업으로 감사 모델(`budget.audit.models`)을 돌려 의견을 받는다. 의견은 세션에 참고로만 전달된다.
+- 주인(사용자): 규칙과 감사로 정할 수 없는 큰 증액을 직접 승인하거나 거절한다.
+
+### 견적 요청과 블록
+
+루트 목표 세션이 `budget.estimateAfterUsd`($10)를 쓰면 영어 알림(`self-notice`, 다음 턴)으로 견적을 한 번 요청한다. 세션은 다음 일반 답장 끝에 코드 펜스 밖에서 블록 하나를 붙인다. 요청 알림에 실리는 예시는 다음과 같다(프로젝트 id와 리비전은 채워진다).
+
+```
+<omo-budget kind="estimate">
+{"v":1,"requestId":"req-1","projectId":"<project>","baseRevision":0,"remainingUsd":{"p10":<p10>,"p50":<p50>,"p90":<p90>},"workClass":"mixed","basis":{"workUnits":[{"description":"<work unit>","count":<count>}],"assumptions":[]},"nextCheckpoint":"<next checkpoint>"}
+</omo-budget>
+```
+
+승인된 예산을 늘릴 때는 `kind="change"` 블록에 같은 필드와 `reason`, `justification`, `alternatives`를 더한다. `workClass`는 implementation, debugging, research, verification, documentation, mixed 중 하나, `reason`은 estimate-error, new-evidence, external-blocker, owner-scope-change, model-mix-change 중 하나다. 본문이 8192자를 넘거나 펜스 안에 있으면 블록이 아니다. 잘못된 블록에는 정정 알림이 프로젝트당 한 번 간다. 승인된 예산의 `budget.checkpointPercent`(80%)와 100%에서 체크포인트 알림이 리비전마다 한 번 간다. 서브에이전트 세션에는 아무것도 보내지 않는다.
+
+### D26 예산
+
+D26은 예산 사무소가 쓴 `budget/snapshot.json`만 읽는 조언용 탐지기다. `treasury-short`(창이 리셋 전에 예비분에 닿음, 경고), `treasury-tight`(예비분에 가까움, 정보), `owner-decision`(주인만 승인할 수 있는 증액, 경고), `audit-opinion`(감사가 낭비 가능성을 지적, 정보)을 낸다. 구독 값이 없거나 `budget.staleMs`보다 오래되면 아무것도 내지 않는다.
+
+### 설정 키
+
+| 키 | 기본값 | 뜻 |
+|---|---|---|
+| `budget.enabled` | true | 예산 관리 스위치 |
+| `budget.reservePercent` | 10 | 창마다 비워 두는 몫 |
+| `budget.auditReservePercent` | 2 | 창마다 감사용으로 남기는 몫 |
+| `budget.staleMs` | 10분 | 이보다 오래된 구독 값은 상태 모름 |
+| `budget.backfillDays` | 8 | 처음 장부를 채울 기간 |
+| `budget.ingestBytesPerTick` | 8 MiB | 틱당 읽는 로그 양 |
+| `budget.retentionDays` | 120 | 지출, 구독 표본 보관 기간 |
+| `budget.estimateAfterUsd` | 10 | 견적 요청을 보내는 누적 지출 |
+| `budget.checkpointPercent` | 80 | 체크포인트 알림 지점 |
+| `budget.autoApproveCyclePercent` | 10 | 창의 쓸 수 있는 몫 중 자동 승인 한도 |
+| `budget.autoApproveFreePercent` | 25 | 현재 남은 몫 중 자동 승인 한도 |
+| `budget.autoChangePercent` | 20 | 처음 승인 대비 누적 자동 증액 한도 |
+| `budget.ownerProjectPercent` | 25 | 넘으면 주인이 정하는 프로젝트 몫 |
+| `budget.burstFactor` | 1.25 | 몰아 쓰기 여유 배수 |
+| `budget.closeGraceMs` | 24시간 | 닫힌 뒤에도 늦은 서브에이전트 지출을 붙이는 기간 |
+| `budget.providerAliases` | `claude-sdk-oauth=anthropic-subscription` | 공급자 별칭 |
+| `budget.calibration.*` | | 구독 % 대비 달러 보정 조건 |
+| `budget.audit.enabled` | true | 지출 감사 스위치 |
+| `budget.audit.models` | | 감사 모델 목록 |
+| `budget.audit.perProjectDay`, `budget.audit.perDay`, `budget.audit.minGapMs`, `budget.audit.timeoutMs` | 2, 4, 6시간, 15분 | 감사 횟수와 간격 |
+
+`budget.enabled`와 `budget.audit.enabled`는 대시보드 스위치다. 대시보드 예산 탭은 한도, 프로젝트, 감사 카드를 보여 주고, 주인 결정이 필요한 증액은 그 자리에서 승인하거나 거절한다. CLI는 `omo-health budget [--json]`, `status --json`에서는 `budget` 필드다. 그림자 모드에서는 계산과 스냅숏만 하고 알림, 감사, 명령 처리는 하지 않는다.
 
 ## 새 설정 키
 
@@ -454,6 +513,9 @@ omo -p --no-session -ne -ns -nc --no-tools --model <모델> --session-id <id> "<
 | `snapshots/` | 증거 스냅샷. 7일, 200개까지 |
 | `inbox/` | 세션에 보낼 메시지 |
 | `receipts/` | 메시지 수신 확인 |
+| `budget/snapshot.json` | 예산 사무소의 스냅숏. D26, 대시보드, `budget` 명령이 읽음 |
+| `budget/coupons.json` | 예산 사무소가 발급한 쿠폰 기록 |
+| `budget/commands/` | 대시보드의 승인·거절 명령 대기열 |
 | `logs/daemon.log` | 감시기 자체 로그 |
 | `app/` | `boot.mjs`(부트스트랩), `current.json`(채널, 버전, sha, 경로), `releases/<버전>-<sha>/`(고정 설치본) |
 

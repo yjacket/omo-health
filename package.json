@@ -1,6 +1,6 @@
 {
   "name": "omo-health",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "External health check and care supervisor for omo/senpi sessions: keeps stalled subagent work moving and watches for anomalies.",
   "pi": {
     "extensions": ["extension/entry.ts"]

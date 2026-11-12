@@ -184,6 +184,27 @@ export const TASK_STATUS_LABELS = Object.freeze({ running: "실행 중", queued:
 /** A main session's goal status (SessionRow.goal.status, from the goal tool). */
 export const GOAL_STATUS_LABELS = Object.freeze({ active: "진행 중", complete: "완료", blocked: "막힘" });
 
+// Budget tab (src/budget/office.mjs snapshot). The page cannot import this module, so src/ui/static/app.js keeps a copy of
+// these six maps; test/ui-budget-tab.test.mjs renders every key through app.js and fails when the copies differ.
+
+/** A subscription window's state (src/budget/treasury.mjs windowState). */
+export const BUDGET_STATE_LABELS = Object.freeze({ ok: "여유", tight: "빠듯", short: "부족", unknown: "모름" });
+
+/** A subscription account (src/budget/accounts.mjs) by product name; other accounts show their id. */
+export const BUDGET_ACCOUNT_LABELS = Object.freeze({ "anthropic-subscription/default": "Claude", "chatgpt-subscription/default": "Codex" });
+
+/** A budget project's status (src/budget/projects.mjs). */
+export const BUDGET_PROJECT_STATUS_LABELS = Object.freeze({ tracking: "추적", requested: "견적 요청", approved: "승인", pending: "결정 대기", closed: "종료" });
+
+/** Who decides a pending budget request (project pending.route). */
+export const BUDGET_ROUTE_LABELS = Object.freeze({ owner: "내 결정", auditor: "감사 검토" });
+
+/** An audit opinion (src/budget/audit.mjs assessment). */
+export const AUDIT_ASSESSMENT_LABELS = Object.freeze({ justified: "타당", "waste-likely": "낭비 의심", "insufficient-evidence": "근거 부족" });
+
+/** An audit job without an opinion (src/budget/audit-job.mjs status). */
+export const AUDIT_STATUS_LABELS = Object.freeze({ running: "감사 중", done: "완료", failed: "실패", timeout: "시간 초과", unavailable: "모델 없음" });
+
 const label = (table, key, fallback) => (typeof key === "string" && Object.hasOwn(table, key) ? table[key] : fallback);
 
 export function findingLabel(detector, kind) {

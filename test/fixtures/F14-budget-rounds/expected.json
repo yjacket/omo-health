@@ -1,0 +1,29 @@
+{
+  "findings": [
+    {
+      "detector": "D26",
+      "kind": "audit-opinion"
+    }
+  ],
+  "actions": [
+    {
+      "kind": "budget-audit-start"
+    },
+    {
+      "kind": "budget-audit-end"
+    },
+    {
+      "kind": "message:self-notice",
+      "actionKind": "budget-request"
+    },
+    {
+      "kind": "message:self-notice",
+      "actionKind": "budget-audit-opinion"
+    }
+  ],
+  "forbiddenActions": [
+    "kill-pids",
+    "release-shell",
+    "detach-server"
+  ]
+}

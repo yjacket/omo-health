@@ -50,7 +50,7 @@ describe("ui model", () => {
 	it("returns every section without throwing for an empty home", () => {
 		const home = makeHome();
 		const state = uiState({ paths: home.paths, env: home.env, now: NOW });
-		assert.deepEqual(Object.keys(state), ["generatedMs", "version", "sessions", "ended", "overview", "investigations", "history", "settings"]);
+		assert.deepEqual(Object.keys(state), ["generatedMs", "version", "sessions", "ended", "overview", "investigations", "history", "settings", "budget"]);
 		for (const key of ["sessions", "ended", "overview", "investigations", "history", "settings"]) assert.equal(state[key].error, undefined, key);
 		assert.equal(state.history.total, 0);
 		assert.deepEqual(state.investigations.rows, []);

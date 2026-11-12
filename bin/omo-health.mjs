@@ -31,6 +31,7 @@ export const COMMANDS = {
 	diagnose: "before cancelling a subagent: what it waits on, CPU and children, last progress, verdict and advice; no model call (<task|session> [--json])",
 	report: "report a problem of a subagent or session to omo-health (<task|session> <text> [--json]); duplicates and floods are dropped",
 	ui: "open the local dashboard in the default browser and return (--no-open, --json, --idle-minutes N); the server exits after 30 idle minutes",
+	budget: "show subscription windows, project budgets and audits (--json)",
 };
 
 function arg(args, name, fallback) {
@@ -75,6 +76,91 @@ export function keepwarmStatus({ env = process.env, now = Date.now() } = {}) {
 	return { level: snap.level, text: snap.text, ts: snap.ts };
 }
 
+/** Snapshot state labels for the CLI and the status JSON (same words as the dashboard chips). */
+export const BUDGET_STATE_KO = Object.freeze({ ok: "여유", tight: "빠듯", short: "부족", unknown: "모름" });
+
+/**
+ * Budget part of `status --json`: every IS-1 window field copied from the snapshot, plus the project
+ * and owner-pending views. Null when the daemon has written no snapshot yet.
+ */
+export function budgetStatus(snapshot) {
+	if (!snapshot || typeof snapshot !== "object") return null;
+	const windows = Array.isArray(snapshot.treasury?.windows) ? snapshot.treasury.windows : [];
+	const projects = Array.isArray(snapshot.projects) ? snapshot.projects : [];
+	return {
+		state: snapshot.treasury?.state ?? null,
+		updatedMs: snapshot.updatedMs ?? null,
+		windows: windows.map((w) => ({
+			account: w.account ?? null,
+			windowId: w.windowId ?? null,
+			label: w.label ?? null,
+			usedPercent: w.usedPercent ?? null,
+			resetsAtMs: w.resetsAtMs ?? null,
+			hoursLeft: w.hoursLeft ?? null,
+			projectedAtResetPercent: w.projectedAtResetPercent ?? null,
+			reservePercent: w.reservePercent ?? null,
+			committedPercent: w.committedPercent ?? null,
+			freePercent: w.freePercent ?? null,
+			safeDailyPercent: w.safeDailyPercent ?? null,
+			state: w.state ?? null,
+			stale: w.stale === true,
+			updatedMs: w.updatedMs ?? null,
+			error: w.error ?? null,
+			calibrated: w.calibrated === true,
+			calibrationIntervals: w.calibrationIntervals ?? 0,
+			percentPerUsd: w.percentPerUsd ?? null,
+			coupons: w.coupons ?? 0,
+		})),
+		projects: projects.map((p) => ({ id: p.id ?? null, objective: p.objective ?? null, status: p.status ?? null, spentUsd: p.spentUsd ?? null, approvedUsd: p.approvedUsd ?? null, pending: p.pending ?? null })),
+		pendingOwner: Array.isArray(snapshot.owner) ? snapshot.owner : [],
+	};
+}
+
+const pctText = (v) => (Number.isFinite(v) ? `${Math.round(v * 10) / 10}%` : "-");
+const hoursText = (v) => (Number.isFinite(v) ? `${Math.round(v * 10) / 10}시간` : "-");
+const usdText = (v) => (Number.isFinite(v) ? `$${Math.round(v * 100) / 100}` : "-");
+/** `MM-DD HH:mm` in KST. */
+const resetText = (ms) => (Number.isFinite(ms) ? kst(ms).slice(5, 16) : "-");
+const agoText = (ms, now) => (Number.isFinite(ms) ? `${Math.max(0, Math.round((now - ms) / 60_000))}분 전` : "-");
+
+/** Compact Korean `budget` table: one line per window (IS-1 fields), then projects and owner-pending. */
+export function budgetTable(snapshot, now = Date.now()) {
+	if (!snapshot || typeof snapshot !== "object") return "예산 기록 없음";
+	const status = budgetStatus(snapshot);
+	const lines = [`예산 상태 ${BUDGET_STATE_KO[status.state] ?? status.state ?? "?"} · 갱신 ${agoText(status.updatedMs, now)}`];
+	for (const w of status.windows) {
+		const parts = [
+			`${w.account ?? "?"} ${w.windowId ?? "?"} (${w.label ?? "-"})`,
+			`사용 ${pctText(w.usedPercent)}`,
+			`리셋 ${resetText(w.resetsAtMs)}`,
+			`남은 시간 ${hoursText(w.hoursLeft)}`,
+			`예상 ${pctText(w.projectedAtResetPercent)}`,
+			`예비 ${pctText(w.reservePercent)}`,
+			`배정 ${Number.isFinite(w.committedPercent) ? pctText(w.committedPercent) : "미보정"}`,
+			`여유 ${pctText(w.freePercent)}`,
+			`하루 ${pctText(w.safeDailyPercent)}`,
+			`상태 ${BUDGET_STATE_KO[w.state] ?? w.state ?? "?"}`,
+			`갱신 ${agoText(w.updatedMs, now)}`,
+			`보정 ${w.calibrated ? `${w.calibrationIntervals}건` : "미보정"}`,
+			`리셋권 ${w.coupons}`,
+		];
+		// Same markers as the dashboard: a stale poll and a failed poll are not just 상태 모름.
+		if (w.stale) parts.push("오래됨");
+		if (w.error !== null) parts.push("조회 실패");
+		lines.push(parts.join(" · "));
+	}
+	if (!status.windows.length) lines.push("창 없음");
+	lines.push("", `프로젝트 ${status.projects.length}건`);
+	for (const p of status.projects) {
+		lines.push(`- ${p.objective || p.id} [${p.status}] 지출 ${usdText(p.spentUsd)} / 승인 ${usdText(p.approvedUsd)}${p.pending ? ` · 대기 ${p.pending.route ?? ""}`.trimEnd() : ""}`);
+	}
+	if (status.pendingOwner.length) {
+		lines.push("", `소유자 승인 대기 ${status.pendingOwner.length}건`);
+		for (const o of status.pendingOwner) lines.push(`- ${o.projectId} ${o.kind} ${usdText(o.increaseUsd)}${o.reason ? ` · ${o.reason}` : ""}`);
+	}
+	return lines.join("\n");
+}
+
 export function statusReport(paths, now = Date.now(), env = process.env) {
 	const state = daemonState(paths);
 	const global = readJsonSafe(path.join(paths.health.statusDir, "_global.json"));
@@ -112,6 +198,7 @@ export function statusReport(paths, now = Date.now(), env = process.env) {
 		recentActions: decisions.filter((d) => d.result === "execute" || d.result === "would").slice(-20).map((d) => ({ ts: d.ts, kind: d.action?.kind, result: d.result, cls: d.cls, fp: d.fp, outcome: d.outcome })),
 		keepwarm: keepwarmStatus({ env, now }),
 		alignment: readLedgers(paths, { now }).map((l) => ({ sessionId: l.sessionId, goal: l.goal, openCommitments: l.openCommitments, lastNudge: l.nudges?.at(-1) ?? null })),
+		budget: budgetStatus(readJsonSafe(paths.health.budgetSnapshotFile, null)),
 	};
 }
 
@@ -186,6 +273,11 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
 		case "status": {
 			const report = statusReport(paths, Date.now(), env);
 			console.log(args.includes("--json") ? JSON.stringify(report, null, 2) : printStatus(report));
+			return 0;
+		}
+		case "budget": {
+			const snapshot = readJsonSafe(paths.health.budgetSnapshotFile, null);
+			console.log(args.includes("--json") ? JSON.stringify(snapshot, null, 2) : budgetTable(snapshot));
 			return 0;
 		}
 		case "pause": {
