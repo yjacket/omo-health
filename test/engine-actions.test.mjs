@@ -200,79 +200,106 @@ test("a long-run review reaches the session and the owner only on a non-normal v
 	assert.equal(unanswered.toasts.filter((t) => t.tag?.startsWith("long-run-")).length, 0);
 });
 
-test("image steering (tokens.imageSteer steer): a child's parent is woken once to forward the steer, once more at the trim level to split the work", async () => {
-	const MIB = 1024 * 1024;
-	const c1 = { ...sessionState({ id: "c1", kind: "child", taskId: "st_c1", parentSessionId: "p1" }), images: 40, imageBytes: 17 * MIB };
-	const sessions = [sessionState({ id: "p1", kind: "main" }), c1];
+const CLAUDE = { lastAssistant: { provider: "anthropic-subscription" } };
+const GPT = { lastAssistant: { provider: "chatgpt-subscription" } };
+const MIB = 1024 * 1024;
+const imageChild = (id, images, imageBytes, who = CLAUDE) => ({ ...sessionState({ id, kind: "child", taskId: `st_${id}`, parentSessionId: "p1", ...who }), images, imageBytes });
+const d4Images = (world, memory) => tokens.detect(world, memory).filter((f) => f.kind === "image-load");
+const steerConfig = { tokens: { ...DEFAULT_CONFIG.tokens, imageSteer: "steer" } };
+const tickAt = async (h, sensors, ms) => {
+	h.clock.advance(ms);
+	for (const hb of sensors.values()) hb.ts = h.clock.now();
+	await h.engine.tick();
+};
+
+test("image steering: the Claude children of one parent share one relay per imageSteerBatchMs, read at the parent's next turn without waking it", async () => {
+	const c1 = imageChild("c1", 50, 9 * MIB);
+	const c2 = imageChild("c2", 55, 9 * MIB);
+	const c3 = imageChild("c3", 10, 1 * MIB);
+	const sessions = [sessionState({ id: "p1", kind: "main", ...CLAUDE }), c1, c2, c3];
 	const sensors = new Map([["p1", { sessionId: "p1", pid: 1, ts: T0, idle: true, sensorVersion: "0.8.0" }]]);
-	const d4 = (world, memory) => tokens.detect(world, memory).filter((f) => f.kind === "image-load");
-	const h = harness({ findings: d4, detectorName: "tokens", sensors, sessions, config: { tokens: { ...DEFAULT_CONFIG.tokens, imageSteer: "steer" } } });
+	const h = harness({ findings: d4Images, detectorName: "tokens", sensors, sessions, config: steerConfig });
 	await h.engine.tick();
-	assert.equal(h.sent.length, 1);
-	const [steer] = h.sent;
-	assert.equal(steer.sessionId, "p1", "a child has no sensor: its parent passes the steer on");
-	assert.equal(steer.details.actionKind, "image-steer");
-	assert.equal(steer.details.level, "warn");
-	assert.equal(steer.triggerTurn, true, "an idle parent is woken to forward it now, not after the child is done");
-	assert.equal(steer.deliverAs, "followUp");
-	assert.match(steer.content, /task_send\(st_c1/);
-	h.clock.advance(60_000);
-	sensors.get("p1").ts = h.clock.now();
-	await h.engine.tick();
-	assert.equal(h.sent.length, 1, "once per level");
-	c1.images = 60;
-	c1.imageBytes = 25 * MIB;
-	h.clock.advance(60_000);
-	sensors.get("p1").ts = h.clock.now();
-	await h.engine.tick();
-	assert.equal(h.sent.length, 2);
-	const trim = h.sent[1];
-	assert.equal(trim.sessionId, "p1");
-	assert.equal(trim.details.level, "trim");
-	assert.equal(trim.details.taskId, "st_c1");
-	h.clock.advance(60_000);
-	sensors.get("p1").ts = h.clock.now();
-	await h.engine.tick();
-	assert.equal(h.sent.length, 2);
+	assert.equal(h.sent.length, 0, "a warn waits one tick for the siblings that crossed with it");
+	await tickAt(h, sensors, 5_000);
+	assert.equal(h.sent.length, 1, "two children over the line in one tick: one relay");
+	const [first] = h.sent;
+	assert.equal(first.sessionId, "p1");
+	assert.equal(first.details.actionKind, "image-steer");
+	assert.deepEqual([...first.details.taskIds].sort(), ["st_c1", "st_c2"]);
+	assert.equal(first.triggerTurn, false, "an idle parent is not woken: it reads the relay at its next turn");
+	assert.equal(first.deliverAs, "followUp", "nextTurn would wait for a typed prompt, which a goal or DAG parent may never get");
+	assert.equal(first.busyDeliverAs, undefined, "a warn relay does not join a running parent turn either");
+	assert.match(first.content, /task_send\(st_c1/);
+	c3.images = 60;
+	await tickAt(h, sensors, 60_000);
+	assert.equal(h.sent.length, 1, "a third child inside the window waits for the next relay");
+	await tickAt(h, sensors, DEFAULT_CONFIG.tokens.imageSteerBatchMs - 65_000);
+	assert.equal(h.sent.length, 1, "still inside the window");
+	await tickAt(h, sensors, 5_000);
+	assert.equal(h.sent.length, 2, "the window has passed: the waiting child goes out");
+	assert.deepEqual(h.sent[1].details.taskIds, ["st_c3"]);
+	await tickAt(h, sensors, DEFAULT_CONFIG.tokens.imageSteerBatchMs);
+	assert.equal(h.sent.length, 2, "each child once per level");
 	assert.ok(h.sent.every((m) => m.kind !== "relay-cancel"), "steering never cancels work");
 });
 
-test("image steering reaches a busy parent at its next tool boundary (steer), not after its turn", async () => {
-	const MIB = 1024 * 1024;
-	const c1 = { ...sessionState({ id: "c1", kind: "child", taskId: "st_c1", parentSessionId: "p1" }), images: 45, imageBytes: 11 * MIB };
-	const sensors = new Map([["p1", { sessionId: "p1", pid: 1, ts: T0, idle: false, sensorVersion: "0.8.0" }]]);
-	const d4 = (world, memory) => tokens.detect(world, memory).filter((f) => f.kind === "image-load");
-	const h = harness({ findings: d4, detectorName: "tokens", sensors, sessions: [sessionState({ id: "p1", kind: "main" }), c1], config: { tokens: { ...DEFAULT_CONFIG.tokens, imageSteer: "steer" } } });
+test("image steering: a Claude child at the trim level goes out at once, may wake the parent, and carries every waiting child", async () => {
+	const c1 = imageChild("c1", 50, 9 * MIB);
+	const c2 = imageChild("c2", 10, 1 * MIB);
+	const sensors = new Map([["p1", { sessionId: "p1", pid: 1, ts: T0, idle: true, sensorVersion: "0.8.0" }]]);
+	const h = harness({ findings: d4Images, detectorName: "tokens", sensors, sessions: [sessionState({ id: "p1", kind: "main", ...CLAUDE }), c1, c2], config: steerConfig });
 	await h.engine.tick();
+	await tickAt(h, sensors, 5_000);
 	assert.equal(h.sent.length, 1);
-	assert.equal(h.sent[0].sessionId, "p1");
-	assert.equal(h.sent[0].deliverAs, "steer");
-	// senpi joins a custom message to the running turn (agent.steer) only when triggerTurn is not false;
-	// with false it is only written to the session and the model never sees it in that turn.
-	assert.equal(h.sent[0].triggerTurn, true);
-	assert.match(h.sent[0].content, /task_send\(st_c1/);
+	c2.images = 60;
+	await tickAt(h, sensors, 60_000);
+	assert.equal(h.sent.length, 1, "c2's warn waits for the window");
+	c1.imageBytes = 25 * MIB;
+	await tickAt(h, sensors, 60_000);
+	assert.equal(h.sent.length, 2, "the trim level does not wait");
+	const trim = h.sent[1];
+	assert.equal(trim.details.level, "trim");
+	assert.deepEqual([...trim.details.taskIds].sort(), ["st_c1", "st_c2"], "the waiting warn rides along");
+	assert.equal(trim.triggerTurn, true, "a Claude child past the trim rewrites its cache with the write premium on every image: worth a parent turn");
+	assert.equal(trim.busyDeliverAs, "steer", "a running parent takes it at its next tool boundary");
+	assert.match(trim.content, /새 서브에이전트에 맡기고/);
+	await tickAt(h, sensors, 60_000);
+	assert.equal(h.sent.length, 2, "c2 was carried by the trim relay");
 });
 
-test("image steering on a main session steers the session itself mid-turn; imageSteer off sends nothing", async () => {
-	const MIB = 1024 * 1024;
-	const main = { ...sessionState({ id: "m1", kind: "main" }), images: 85, imageBytes: 5 * MIB };
+test("image steering: a GPT child under a Claude parent gets no relay, only the record and one owner toast", async () => {
+	const sensors = new Map([["p1", { sessionId: "p1", pid: 1, ts: T0, idle: true, sensorVersion: "0.8.0" }]]);
+	const h = harness({ findings: d4Images, detectorName: "tokens", sensors, sessions: [sessionState({ id: "p1", kind: "main", ...CLAUDE }), imageChild("c1", 120, 30 * MIB, GPT)], config: steerConfig });
+	await h.engine.tick();
+	assert.equal(h.sent.length, 0, "no parent turn is spent on a child whose trims cost no write premium");
+	assert.equal(h.toasts.length, 1);
+	await tickAt(h, sensors, DEFAULT_CONFIG.tokens.imageSteerBatchMs);
+	assert.equal(h.sent.length, 0);
+	assert.equal(h.toasts.length, 1);
+});
+
+test("image steering on a Claude main session joins its running turn and never wakes it; imageSteer off sends nothing", async () => {
+	const main = { ...sessionState({ id: "m1", kind: "main", ...CLAUDE }), images: 85, imageBytes: 5 * MIB };
 	const sensors = new Map([["m1", { sessionId: "m1", pid: 1, ts: T0, idle: false, sensorVersion: "0.8.0" }]]);
-	const d4 = (world, memory) => tokens.detect(world, memory).filter((f) => f.kind === "image-load");
-	const h = harness({ findings: d4, detectorName: "tokens", sensors, sessions: [main], config: { tokens: { ...DEFAULT_CONFIG.tokens, imageSteer: "steer" } } });
+	const h = harness({ findings: d4Images, detectorName: "tokens", sensors, sessions: [main], config: steerConfig });
 	await h.engine.tick();
 	assert.equal(h.sent.length, 1);
 	assert.equal(h.sent[0].sessionId, "m1");
 	assert.equal(h.sent[0].details.actionKind, "image-steer");
-	assert.equal(h.sent[0].deliverAs, "steer", "a busy session reads it at its next tool boundary");
-	assert.equal(h.sent[0].triggerTurn, true, "a steer with triggerTurn false never reaches the running turn");
-	const off = harness({ findings: d4, detectorName: "tokens", sensors, sessions: [{ ...main }], config: { tokens: { ...DEFAULT_CONFIG.tokens, imageSteer: "off" } } });
+	assert.equal(h.sent[0].busyDeliverAs, "steer", "a busy session reads it at its next tool boundary");
+	assert.deepEqual([h.sent[0].deliverAs, h.sent[0].triggerTurn], ["followUp", false], "an idle one reads it at its next turn");
+	const off = harness({ findings: d4Images, detectorName: "tokens", sensors, sessions: [{ ...main }], config: { tokens: { ...DEFAULT_CONFIG.tokens, imageSteer: "off" } } });
 	await off.engine.tick();
 	assert.equal(off.sent.length, 0);
+	const gpt = harness({ findings: d4Images, detectorName: "tokens", sensors, sessions: [{ ...main, ...GPT }], config: steerConfig });
+	await gpt.engine.tick();
+	assert.equal(gpt.sent.length, 0, "a GPT main session is recorded only");
 });
 
 test("imageSteer notice: a D4 image-load notice goes once to a child's parent with the remedy, plus one owner toast; none below the threshold", async () => {
 	const MIB = 1024 * 1024;
-	const child = (id, images, imageBytes) => ({ ...sessionState({ id, kind: "child", taskId: `st_${id}`, parentSessionId: "p1" }), images, imageBytes });
+	const child = (id, images, imageBytes) => imageChild(id, images, imageBytes);
 	const sessions = [sessionState({ id: "p1", kind: "main" }), child("c1", 70, 17 * MIB), child("c2", 15, 4 * MIB)];
 	const sensors = new Map([["p1", { sessionId: "p1", pid: 1, ts: T0, idle: true, sensorVersion: "0.8.0" }]]);
 	const d4 = (world, memory) => tokens.detect(world, memory).filter((f) => f.kind === "image-load");

@@ -62,18 +62,16 @@ test("wake, nudge and relay-cancel always carry their machine fields", () => {
 	assert.equal(cancel.details.toolCallId, "toolu_grep");
 });
 
-test("scope check is redacted, quiet and forwardable", () => {
+test("scope check is redacted, never starts a turn, joins a running one, and is forwardable", () => {
 	const finding = makeFinding({ detector: "D15", kind: "drift", cls: "overstep", subject: { sessionId: "c1", taskId: "st_1", key: "align:c1:overstep:0" }, data: { signal: "overstep", metric: 1, goal: "answer the question", lastUserText: "why sk-ant-oat01-abcdefghijklmnop?" } });
 	const own = composeScopeCheck({ finding, sessionId: "c1", now: T });
 	assert.match(own.content, /^\[omo-health 범위 점검\]/);
 	assert.match(own.content, /Original goal: "answer the question"/);
 	assert.equal(own.content.includes("abcdefghijklmnop"), false);
-	assert.equal(own.triggerTurn, false);
-	assert.equal(own.deliverAs, "steer");
-	const forwarded = composeScopeCheck({ finding, sessionId: "p1", now: T, forward: true, deliverAs: "nextTurn" });
+	assert.deepEqual([own.deliverAs, own.triggerTurn, own.busyDeliverAs], ["followUp", false, "steer"]);
+	const forwarded = composeScopeCheck({ finding, sessionId: "p1", now: T, forward: true });
 	assert.match(forwarded.content, /^Forward this to subagent st_1 with task_send:/);
-	assert.equal(forwarded.deliverAs, "nextTurn");
-	assert.equal(forwarded.triggerTurn, false);
+	assert.deepEqual([forwarded.deliverAs, forwarded.triggerTurn, forwarded.busyDeliverAs], ["followUp", false, "steer"]);
 });
 
 test("goal wake lists its evidence and the analyst's answer, then the workflow advice", () => {

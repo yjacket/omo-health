@@ -220,8 +220,11 @@ test("cache-rewrite: a rewrite after the cache TTL is not counted, and an old ep
 	assert.equal(ofKind(detect(old, {}), "cache-rewrite").length, 0);
 });
 
+const CLAUDE = { lastAssistant: { provider: "anthropic-subscription" } };
+const GPT = { lastAssistant: { provider: "chatgpt-subscription" } };
+
 test("image-load: warns at imageWarnBytes or imageWarnCount and not just below, and asks for the steer", () => {
-	const at = (images, imageBytes) => ofKind(detect(makeWorld({ now: NOW, sessions: [{ ...sessionState({ id: "i" }), images, imageBytes }] }), {}), "image-load");
+	const at = (images, imageBytes) => ofKind(detect(makeWorld({ now: NOW, sessions: [{ ...sessionState({ id: "i", ...CLAUDE }), images, imageBytes }] }), {}), "image-load");
 	const [warn] = at(30, 10 * MIB);
 	assert.equal(warn.humanNeeded, true);
 	assert.deepEqual(warn.data.remedy, { kind: "image-steer" });
@@ -230,19 +233,33 @@ test("image-load: warns at imageWarnBytes or imageWarnCount and not just below, 
 	assert.match(at(130, 25 * MIB)[0].detailKo, /잘림 기준\(24 MiB 또는 100장\)을 넘었습니다/);
 	assert.equal(at(40, 0).length, 1);
 	assert.equal(at(39, 0).length, 0);
-	const quiet = (imageSteer) => ofKind(detect(makeWorld({ now: NOW, config: { tokens: { imageSteer } }, sessions: [{ ...sessionState({ id: "i" }), images: 30, imageBytes: 12 * MIB }] }), {}), "image-load")[0].data.remedy;
+	const quiet = (imageSteer) => ofKind(detect(makeWorld({ now: NOW, config: { tokens: { imageSteer } }, sessions: [{ ...sessionState({ id: "i", ...CLAUDE }), images: 30, imageBytes: 12 * MIB }] }), {}), "image-load")[0].data.remedy;
 	assert.deepEqual(quiet("notice"), { kind: "cache-notice" });
 	assert.equal(quiet("off"), undefined);
 });
 
-test("image-load: a subagent warns earlier (imageWarnChildBytes / imageWarnChildCount) than a main session", () => {
-	const of = (kind, images, imageBytes, config) => ofKind(detect(makeWorld({ now: NOW, config, sessions: [{ ...sessionState({ id: "i", kind, taskId: kind === "child" ? "st_i" : undefined, parentSessionId: kind === "child" ? "p" : undefined }), images, imageBytes }] }), {}), "image-load");
-	// The steer reaches a subagent only through its parent's next turn, so it starts before the main-session line.
-	assert.equal(of("child", 20, 1 * MIB)[0]?.data.level, "warn");
-	assert.equal(of("child", 12, 5 * MIB)[0]?.data.level, "warn");
-	assert.equal(of("child", 19, 5 * MIB - 1).length, 0);
-	assert.equal(of("main", 20, 5 * MIB).length, 0, "a main session keeps imageWarnBytes / imageWarnCount");
-	assert.equal(of("child", 12, 5 * MIB, { tokens: { imageWarnChildBytes: 8 * MIB } }).length, 0, "the child line is a setting");
+test("image-load: only an anthropic-subscription session is steered; another provider is recorded with the owner toast only", () => {
+	const at = (who, extra = {}) => ofKind(detect(makeWorld({ now: NOW, sessions: [{ ...sessionState({ id: "i", ...who, ...extra }), images: 60, imageBytes: 25 * MIB }] }), {}), "image-load")[0];
+	assert.deepEqual(at(CLAUDE).data.remedy, { kind: "image-steer" });
+	const gpt = at(GPT);
+	assert.equal(gpt.data.remedy, undefined, "OpenAI has no cache-write premium: a steer would cost more parent turns than it saves");
+	assert.equal(gpt.humanNeeded, true, "still recorded and toasted");
+	assert.equal(gpt.data.provider, "chatgpt-subscription");
+	// A child that has not answered yet is known by the model its task resolved to.
+	assert.deepEqual(at({}, { kind: "child", taskId: "st_i", parentSessionId: "p", task: { model: { provider: "anthropic-subscription" } } }).data.remedy, { kind: "image-steer" });
+	assert.equal(at({}).data.remedy, undefined, "no provider known: not steered");
+});
+
+test("image-load: a Claude subagent warns at its own line (imageWarnChildBytes / imageWarnChildCount); other subagents keep the main line", () => {
+	const of = (kind, images, imageBytes, config, who = CLAUDE) => ofKind(detect(makeWorld({ now: NOW, config, sessions: [{ ...sessionState({ id: "i", kind, taskId: kind === "child" ? "st_i" : undefined, parentSessionId: kind === "child" ? "p" : undefined, ...who }), images, imageBytes }] }), {}), "image-load");
+	// From the child records: Claude children that never reached the trim peaked at 6.2 MiB / 40 images.
+	assert.equal(of("child", 40, 6.2 * MIB).length, 0);
+	assert.equal(of("child", 50, 1 * MIB)[0]?.data.level, "warn");
+	assert.equal(of("child", 12, 8 * MIB)[0]?.data.level, "warn");
+	assert.equal(of("child", 49, 8 * MIB - 1).length, 0);
+	assert.equal(of("main", 39, 9 * MIB).length, 0, "a main session keeps imageWarnBytes / imageWarnCount");
+	assert.equal(of("child", 39, 9 * MIB, undefined, GPT).length, 0, "a GPT child is held to the main line");
+	assert.equal(of("child", 12, 8 * MIB, { tokens: { imageWarnChildBytes: 9 * MIB } }).length, 0, "the child line is a setting");
 	assert.equal(of("child", 60, 24 * MIB)[0]?.data.level, "trim", "the trim level is the same for both");
 });
 

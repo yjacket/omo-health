@@ -397,6 +397,27 @@ test("scope-check preserves steer and nextTurn but never triggers a turn even fo
 	assert.equal(ctx.aborted, 0);
 });
 
+test("busyDeliverAs joins a turn running at delivery time (triggerTurn true) and otherwise keeps the message's own delivery", async () => {
+	// senpi joins a custom message to a running turn only when triggerTurn is not false (agent-session _deliverCustomMessage);
+	// a scope check with triggerTurn false mid-turn waited for the next turn, after the work it was meant to redirect.
+	const s = setup({ daemonTs: (c) => c });
+	const { ctx } = fakeCtx({ idle: false });
+	await s.fp.emit("session_start", ctx);
+	const dir = path.join(s.home, "inbox", "s-1");
+	fs.mkdirSync(dir, { recursive: true });
+	const write = (id, kind, extra) => fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify({ id, kind, content: id, deliverAs: "followUp", triggerTurn: false, busyDeliverAs: "steer", ...extra }));
+	write("1-scope", "scope-check");
+	write("2-relay", "relay");
+	await s.handle.__test.inbox();
+	assert.deepEqual(s.fp.sent.map((item) => item.opts), [{ deliverAs: "steer", triggerTurn: true }, { deliverAs: "steer", triggerTurn: true }]);
+	ctx.idleValue = true;
+	write("3-scope", "scope-check", { triggerTurn: true });
+	write("4-relay", "relay");
+	write("5-wake", "relay", { triggerTurn: true });
+	await s.handle.__test.inbox();
+	assert.deepEqual(s.fp.sent.slice(2).map((item) => item.opts), [{ deliverAs: "followUp", triggerTurn: false }, { deliverAs: "followUp", triggerTurn: false }, { deliverAs: "followUp", triggerTurn: true }], "idle: a scope check never starts a turn; a relay keeps its own trigger");
+});
+
 test("abort-continue aborts a running turn and resumes only once idle", async () => {
 	const s = setup({ daemonTs: (c) => c });
 	const { ctx } = fakeCtx({ idle: false });
