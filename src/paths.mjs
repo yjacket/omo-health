@@ -34,6 +34,8 @@ export function resolvePaths(env = process.env) {
 		sessionsDir: path.join(agentDir, "sessions"),
 		settingsFile: path.join(agentDir, "settings.json"),
 		authFile: path.join(agentDir, "auth.json"),
+		/** senpi's subscription usage cache (read-only; C-paths). */
+		subscriptionUsageFile: path.join(agentDir, "subscription-usage.json"),
 		extensionsDir: path.join(agentDir, "extensions"),
 		omoJsonc: path.join(omoHome, "omo.jsonc"),
 		claudeProjectsDir: path.join(claudeHome, "projects"),
@@ -86,6 +88,11 @@ export function resolvePaths(env = process.env) {
 			bootGapsDir: path.join(healthHome, "boot-gaps"),
 			/** omo login ledger: per-slot last login times derived from auth.json (D25). */
 			omoLoginFile: path.join(healthHome, "omo-login.json"),
+			/** Budget domain: snapshot, coupons and the dashboard's command queue. */
+			budgetDir: path.join(healthHome, "budget"),
+			budgetCommandsDir: path.join(healthHome, "budget", "commands"),
+			budgetSnapshotFile: path.join(healthHome, "budget", "snapshot.json"),
+			budgetCouponsFile: path.join(healthHome, "budget", "coupons.json"),
 		},
 	};
 }

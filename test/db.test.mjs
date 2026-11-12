@@ -37,7 +37,7 @@ test("migrate is idempotent and leaves the schema at the latest version", (t) =>
 	assert.equal(migrate(db), SCHEMA_VERSION);
 	assert.equal(migrate(db), SCHEMA_VERSION);
 	const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all().map((row) => row.name);
-	assert.deepEqual(tables, ["baseline_samples", "lineages", "tool_calls"]);
+	assert.deepEqual(tables, ["baseline_samples", "budget_events", "budget_projects", "budget_rounds", "ingest_offsets", "lineages", "quota_samples", "sqlite_sequence", "tool_calls", "usage_events"]);
 	assert.equal(db.prepare("PRAGMA journal_mode").get().journal_mode, "wal");
 	closeDb(db);
 	const again = open(t, paths);

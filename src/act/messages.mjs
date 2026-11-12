@@ -595,3 +595,169 @@ export function composeAbortContinue({ finding, sessionId, now }) {
 	const content = `[omo-health] 모델 응답이 ${formatDuration(finding.data?.idleMs ?? 0)} 동안 아무 이벤트 없이 멈춰 있어 중단 후 다시 이어갑니다. 직전 작업을 계속하세요.`;
 	return base({ kind: "abort-continue", sessionId, now, deliverAs: "followUp", triggerTurn: true, content, details: { incidentId: finding.fp } });
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Budget messages (#16, plan todo 13): English, `self-notice` on the root session's next turn, never a wake-up and
+// never an action. Delivered by the budget office (src/budget/office.mjs); each composer takes the office's plain data
+// and returns the message `base()` builds for every other self-notice.
+// ---------------------------------------------------------------------------------------------------------------
+
+const BUDGET_CHARS = 1600;
+const BUDGET_PREFIX = "[omo-health budget]";
+
+function budgetUsd(value) {
+	const n = Number(value);
+	return `$${(Number.isFinite(n) ? n : 0).toFixed(2)}`;
+}
+
+function budgetCount(value) {
+	const n = Number(value);
+	return Number.isFinite(n) ? String(Math.round(n * 10) / 10) : "?";
+}
+
+/** One common shape: `self-notice`, next turn, no wake-up, redacted, capped at 1600 characters. */
+function budgetMessage({ sessionId, now, actionKind, content, details }) {
+	return base({
+		kind: "self-notice",
+		sessionId,
+		now,
+		deliverAs: "nextTurn",
+		triggerTurn: false,
+		content: truncate(redact(content), BUDGET_CHARS),
+		details: { actionKind, ...details },
+	});
+}
+
+/** The reference class line (C-estimates.referenceClass): n, percentiles, historical error ratio, cold start. */
+function budgetReferenceLine(reference = {}) {
+	const n = Number(reference.n ?? 0);
+	if (!n) return "no closed-goal reference class yet (cold start, ratio 1.0).";
+	const ratio = Number(reference.errorRatio);
+	const parts = [`n=${n}`, `P50 ${budgetUsd(reference.p50)}`, `P80 ${budgetUsd(reference.p80)}`, `P90 ${budgetUsd(reference.p90)}`];
+	return `reference class ${parts.join(", ")}${Number.isFinite(ratio) ? `; historical error ratio ${ratio.toFixed(2)}` : ""}${reference.calibrated ? "" : " (cold start)"}.`;
+}
+
+/** One treasury line (C-treasury states), at most three windows. */
+function budgetTreasuryLine(treasury) {
+	if (!treasury || typeof treasury !== "object") return null;
+	const windows = (treasury.windows ?? []).slice(0, 3).map((w) => {
+		const id = w.windowId ?? w.id ?? w.account ?? "window";
+		const used = w.usedPercent === null || w.usedPercent === undefined ? "?" : budgetCount(w.usedPercent);
+		const free = w.freePercent === null || w.freePercent === undefined ? "?" : budgetCount(w.freePercent);
+		return `${id} ${used}% used, ${free}% free, ${w.state ?? "unknown"}`;
+	});
+	const overall = treasury.state ? ` (overall ${treasury.state})` : "";
+	return `subscription windows: ${windows.join("; ") || "unknown"}${overall}.`;
+}
+
+/** The example estimate block: project id and revision are filled, the numbers are the reporter's to replace. */
+function budgetExampleBlock({ projectId, revision }) {
+	return [
+		`<omo-budget kind="estimate">`,
+		`{"v":1,"requestId":"req-1","projectId":${JSON.stringify(String(projectId))},"baseRevision":${Number(revision) || 0},` +
+			`"remainingUsd":{"p10":<p10>,"p50":<p50>,"p90":<p90>},"workClass":"mixed",` +
+			`"basis":{"workUnits":[{"description":"<work unit>","count":<count>}],"assumptions":[]},` +
+			`"nextCheckpoint":"<next checkpoint>"}`,
+		`</omo-budget>`,
+	].join("\n");
+}
+
+/**
+ * IS-4 / rule 2: the one estimate request a goal gets. Carries the inclusive spend, the reference class and the
+ * treasury state, plus an example block (project id and revision filled) to place at the end of the next reply.
+ */
+export function composeBudgetRequest({ sessionId, now, projectId, revision = 0, objective = "", spend = {}, reference = {}, treasury = null }) {
+	const spent = spend.costUsd ?? spend.spentUsd ?? 0;
+	const treasuryLine = budgetTreasuryLine(treasury);
+	const content = [
+		`${BUDGET_PREFIX} Goal "${truncate(objective, 120)}" (project ${projectId}, revision ${revision}) has spent ${budgetUsd(spent)} so far (main ${budgetUsd(spend.mainUsd ?? 0)}, subagents ${budgetUsd(spend.childUsd ?? 0)}) and needs your estimate. This is a request, not a stop: keep working.`,
+		`- ${budgetReferenceLine(reference)}`,
+		...(treasuryLine ? [`- ${treasuryLine}`] : []),
+		"Reply in English with one budget block at the end of your next ordinary reply (not inside a code fence), replacing the <...> placeholders with your own numbers:",
+		budgetExampleBlock({ projectId, revision }),
+		`The block must carry project "${projectId}" and baseRevision ${revision}; remainingUsd means the remaining work from now for you and your subagents. If that reply has no valid block, one correction note follows.`,
+	].join("\n");
+	return budgetMessage({
+		sessionId,
+		now,
+		actionKind: "budget-request",
+		content,
+		details: { projectId, revision, spendUsd: spent, referenceN: Number(reference.n ?? 0), treasuryState: treasury?.state ?? null },
+	});
+}
+
+/** Rule 3: the single correction note a project gets for a malformed, stale or wrong-kind block. */
+export function composeBudgetCorrection({ sessionId, now, projectId, revision = 0, errors = [] }) {
+	const list = (errors ?? []).slice(0, 6).map((error) => `- ${truncate(String(error), 200)}`);
+	const content = [
+		`${BUDGET_PREFIX} The budget block for project "${projectId}" (revision ${revision}) was rejected. This is the only correction note for this project.`,
+		...(list.length ? list : ["- the block was missing or not valid JSON"]),
+		"Send the corrected block at the end of your next ordinary reply. While the project has no approved budget, send kind=\"estimate\"; after one, a raise must be kind=\"change\" with reason, justification and alternatives.",
+	].join("\n");
+	return budgetMessage({ sessionId, now, actionKind: "budget-correction", content, details: { projectId, revision, errors: list.length } });
+}
+
+const BUDGET_DECISION_TEXT = {
+	approved: (a) => `approved ${budgetUsd(a.approvedUsd)}${a.increaseUsd > 0 ? ` (an increase of ${budgetUsd(a.increaseUsd)})` : ""}${a.by ? ` by ${a.by}` : ""}. Keep working; the approved budget is now recorded.`,
+	"pending-owner": (a) => `the request for ${budgetUsd(a.approvedUsd)} is waiting for the owner's decision in the dashboard. Work continues meanwhile; the overdraw is only recorded.`,
+	"pending-auditor": () => "the request is waiting for the spending auditor's review. Work continues meanwhile; the overdraw is only recorded.",
+	denied: (a) => `the owner denied the request. The approved budget stays at ${budgetUsd(a.approvedUsd)}; the overdraw is recorded and work is not stopped. Reduce scope or finish what the accepted budget covers.`,
+};
+
+/** Rules 3-6: the decision on an estimate or change request (approved, routed, or denied). */
+export function composeBudgetDecision({ sessionId, now, projectId, revision = 0, objective = "", decision = "approved", approvedUsd = 0, increaseUsd = 0, by = null, basis = "", windows = [], denied = false }) {
+	const kind = denied ? "denied" : BUDGET_DECISION_TEXT[decision] ? decision : "approved";
+	const a = { approvedUsd, increaseUsd, by };
+	const windowLine = (windows ?? []).slice(0, 3).map((w) => {
+		const id = w.windowId ?? w.id ?? "window";
+		const required = w.requiredPercent ?? null;
+		return `${id} ${required === null ? "uncalibrated" : `${budgetCount(required)}%`}`;
+	}).join(", ");
+	const content = [
+		`${BUDGET_PREFIX} Budget decision for project "${projectId}" (revision ${revision}, "${truncate(objective, 120)}"): ${BUDGET_DECISION_TEXT[kind](a)}`,
+		...(basis ? [`- basis: ${truncate(String(basis), 200)}`] : []),
+		...(windowLine ? [`- windows: ${windowLine}`] : []),
+	].join("\n");
+	return budgetMessage({ sessionId, now, actionKind: "budget-decision", content, details: { projectId, revision, decision: kind, approvedUsd, increaseUsd, by } });
+}
+
+/** Rule 7: the 80% / 100% checkpoint, once per revision. Records overdraw; never stops the work. */
+export function composeBudgetCheckpoint({ sessionId, now, projectId, revision = 0, objective = "", checkpoint = 80, spentUsd = 0, approvedUsd = 0, mainUsd = null, childUsd = null }) {
+	const percent = checkpoint >= 100 ? 100 : 80;
+	const share = Number.isFinite(mainUsd) || Number.isFinite(childUsd) ? ` (main ${budgetUsd(mainUsd ?? 0)}, subagents ${budgetUsd(childUsd ?? 0)})` : "";
+	const where = `project "${projectId}" (revision ${revision}, "${truncate(objective, 120)}")`;
+	const content = percent >= 100
+		? [
+			`${BUDGET_PREFIX} The approved budget for ${where} is fully spent: ${budgetUsd(spentUsd)} of ${budgetUsd(approvedUsd)}${share}. Work is not stopped and the overdraw is recorded.`,
+			"If the work needs more than the remaining estimate, send a kind=\"change\" block with reason, justification and alternatives at the end of your next ordinary reply.",
+		].join("\n")
+		: [
+			`${BUDGET_PREFIX} Budget checkpoint for ${where}: ${budgetUsd(spentUsd)} of the ${budgetUsd(approvedUsd)} approved budget is spent${share}. Work continues.`,
+			"If the remaining work no longer fits the approved budget, send a kind=\"change\" block with reason, justification and alternatives at the end of your next ordinary reply.",
+		].join("\n");
+	return budgetMessage({ sessionId, now, actionKind: "budget-checkpoint", content, details: { projectId, revision, checkpoint: percent, spentUsd, approvedUsd } });
+}
+
+const AUDIT_OPINION_TEXT = {
+	"waste-likely": "the recorded spending looks wasteful against the goal's acceptance criteria.",
+	justified: "the recorded spending is justified by the goal's remaining work.",
+	"insufficient-evidence": "there is not enough recorded evidence to judge the spending.",
+};
+
+/** IS-8: the auditor's opinion, delivered as an opinion the session may weigh. Never an instruction. */
+export function composeAuditOpinion({ sessionId, now, projectId, revision = 0, auditId = null, objective = "", assessment = "insufficient-evidence", confidence = null, advice = "", findings = [], model = null }) {
+	const verdict = AUDIT_OPINION_TEXT[assessment] ?? AUDIT_OPINION_TEXT["insufficient-evidence"];
+	const confidenceText = Number.isFinite(Number(confidence)) ? `, confidence ${Number(confidence).toFixed(2)}` : "";
+	const findingLines = (findings ?? []).slice(0, 3).map((f) => {
+		const pattern = f.pattern ?? "other";
+		const explanation = f.explanation ?? f.evidence ?? "";
+		return `- ${pattern}: ${truncate(String(explanation), 220)}`;
+	});
+	const content = [
+		`${BUDGET_PREFIX} Spending audit opinion for project "${projectId}" (revision ${revision}, "${truncate(objective, 120)}"): ${assessment}${confidenceText}${model ? `, model ${model}` : ""}. The auditor found ${verdict}`,
+		...(findingLines.length ? ["Findings:", ...findingLines] : []),
+		...(advice ? [`Advice: ${truncate(String(advice), 900)}`] : []),
+		"This is an audit opinion, not an instruction; you decide. Nothing was stopped or changed.",
+	].join("\n");
+	return budgetMessage({ sessionId, now, actionKind: "budget-audit-opinion", content, details: { projectId, revision, auditId, assessment } });
+}

@@ -44,6 +44,19 @@ const MIGRATIONS = [
 		value REAL NOT NULL
 	);
 	CREATE INDEX baseline_samples_metric_t ON baseline_samples (metric, t);`,
+	`CREATE TABLE usage_events (id TEXT PRIMARY KEY, ms INTEGER NOT NULL, session_id TEXT NOT NULL, root_session_id TEXT NOT NULL,
+	  project_id TEXT, task_id TEXT, source TEXT NOT NULL, provider TEXT, model TEXT, input INTEGER NOT NULL, output INTEGER NOT NULL,
+	  cache_read INTEGER NOT NULL, cache_write INTEGER NOT NULL, cost REAL, cost_status TEXT NOT NULL);
+	CREATE INDEX usage_events_project ON usage_events(project_id, ms);
+	CREATE INDEX usage_events_root ON usage_events(root_session_id, ms);
+	CREATE INDEX usage_events_ms ON usage_events(ms);
+	CREATE TABLE ingest_offsets (file TEXT PRIMARY KEY, identity TEXT NOT NULL, offset INTEGER NOT NULL, updated_ms INTEGER NOT NULL);
+	CREATE TABLE quota_samples (account TEXT NOT NULL, window_id TEXT NOT NULL, updated_ms INTEGER NOT NULL, used_percent REAL NOT NULL,
+	  resets_at_ms INTEGER, window_minutes INTEGER, PRIMARY KEY (account, window_id, updated_ms));
+	CREATE TABLE budget_projects (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, goal_id TEXT NOT NULL, cwd TEXT, objective TEXT,
+	  created_ms INTEGER NOT NULL, status TEXT NOT NULL, revision INTEGER NOT NULL, data TEXT NOT NULL, closed_ms INTEGER, updated_ms INTEGER NOT NULL);
+	CREATE TABLE budget_rounds (project_id TEXT NOT NULL, round INTEGER NOT NULL, first_ms INTEGER NOT NULL, PRIMARY KEY (project_id, round));
+	CREATE TABLE budget_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, ms INTEGER NOT NULL, project_id TEXT, account TEXT, kind TEXT NOT NULL, data TEXT NOT NULL);`,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
