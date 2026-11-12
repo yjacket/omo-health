@@ -3,6 +3,7 @@
 // write the snapshot, and hand back composed budget messages for the engine to deliver. Shadow mode computes and
 // writes the snapshot but sends nothing, starts no audit, consumes no command and keeps project state unchanged
 // (would-actions become events). The office never imports the engine.
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import {
 	composeAuditOpinion,
@@ -13,7 +14,7 @@ import {
 } from "../act/messages.mjs";
 import { readSubscriptionUsage } from "../collect/subscriptions.mjs";
 import { atomicWriteJson, readJsonSafe, removeSafe } from "../util/fsx.mjs";
-import { sha1, truncate } from "../util/text.mjs";
+import { truncate } from "../util/text.mjs";
 import { buildBundle, chooseModel } from "./audit.mjs";
 import { pollAudit, startAudit } from "./audit-job.mjs";
 import { calibrate, epochs, externalPercent } from "./calibration.mjs";
@@ -472,7 +473,7 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 				const allowed = auditAllowed({ project: next, history: auditHistory(), now, cfg: budget, newEvidence });
 				const model = allowed.allowed ? chooseModel({ models: auditCfg.models, loggedIn: providersNow(), accountState }) : null;
 				if (allowed.allowed && model) {
-					const auditId = `budget-${sha1(project.id).slice(0, 10)}-${now}`;
+					const auditId = `budget-${createHash("sha256").update(project.id).digest("hex").slice(0, 10)}-${now}`;
 					const recent = recentOf(ing.sessions.get(project.sessionId)?.file);
 					const roundTable = rounds.map((r, i) => ({ round: r.round, firstMs: r.firstMs, costUsd: store.spend({ projectId: project.id, sinceMs: r.firstMs, untilMs: rounds[i + 1]?.firstMs }).costUsd }));
 					const bundle = buildBundle({
