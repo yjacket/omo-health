@@ -22,47 +22,37 @@ const CFG = {
 	},
 };
 
-// KST (UTC+9) timestamp, as the measured findings table is written.
+// Synthetic timestamps in KST (UTC+9).
 function kst(day, hour, minute) {
 	return Date.UTC(2026, 10, day, hour - 9, minute);
 }
 
-// hwp-birsom measured table: first appearance of each numbered round (KST) and the
-// cumulative main-session USD at that moment.
-const HWP = [
-	[2, kst(5, 13, 21), 65],
-	[1, kst(5, 14, 36), 69],
-	[4, kst(5, 21, 17), 87],
-	[6, kst(5, 23, 43), 91],
-	[7, kst(6, 3, 8), 94],
-	[8, kst(6, 5, 29), 100],
-	[9, kst(6, 7, 44), 104],
-	[10, kst(6, 10, 11), 111],
-	[11, kst(6, 12, 40), 115],
-	[12, kst(6, 15, 10), 119],
-	[19, kst(7, 6, 22), 147],
-	[20, kst(10, 23, 9), 156],
-	[30, kst(12, 7, 38), 201],
-	[35, kst(12, 17, 44), 225],
+// Synthetic first appearances and cumulative costs: numbering is deliberately
+// non-contiguous and out of order, so distinct rounds must be counted.
+const ROUND_SERIES = [
+	[3, kst(1, 8, 0), 12],
+	[1, kst(1, 9, 0), 16],
+	[5, kst(1, 10, 0), 23],
+	[8, kst(1, 11, 0), 29],
 ];
 
-function hwpRounds(count) {
-	return HWP.slice(0, count).map(([round, firstMs]) => ({ round, firstMs }));
+function syntheticRounds(count) {
+	return ROUND_SERIES.slice(0, count).map(([round, firstMs]) => ({ round, firstMs }));
 }
 
-// Cumulative main-session USD at `ms`: the measured total of the latest round seen so far.
-function hwpCumulative(ms) {
+// Cumulative main-session USD at `ms`: the latest synthetic round seen so far.
+function cumulativeCost(ms) {
 	let costUsd = 0;
-	for (const [, firstMs, cumulative] of HWP) {
+	for (const [, firstMs, cumulative] of ROUND_SERIES) {
 		if (firstMs <= ms) costUsd = cumulative;
 	}
 	return costUsd;
 }
 
 // spendSince(ms) means spend after `ms`; bound it to the moment being inspected.
-function hwpSpendSinceAt(nowMs) {
-	const total = hwpCumulative(nowMs);
-	return (ms) => ({ costUsd: total - hwpCumulative(ms) });
+function spendSinceAt(nowMs) {
+	const total = cumulativeCost(nowMs);
+	return (ms) => ({ costUsd: total - cumulativeCost(ms) });
 }
 
 function projectWith({ approvedUsd = 0, adjusted = null } = {}) {
@@ -73,18 +63,18 @@ function projectWith({ approvedUsd = 0, adjusted = null } = {}) {
 	return { id: "p1", data };
 }
 
-test("hwp-birsom: first heavy rounds trigger at the 4th distinct round (round 6, $91)", () => {
-	const spend = { costUsd: 87, childUsd: 0 };
+test("synthetic rounds: first heavy trigger at the 4th distinct round, above the cost threshold", () => {
+	const spend = { costUsd: 23, childUsd: 0 };
 	const three = indicators({
 		project: projectWith(),
-		rounds: hwpRounds(3),
+		rounds: syntheticRounds(3),
 		spend,
-		spendSince: hwpSpendSinceAt(kst(5, 21, 17)),
-		now: kst(5, 21, 17),
+		spendSince: spendSinceAt(kst(1, 10, 0)),
+		now: kst(1, 10, 0),
 	});
 	assert.equal(three.roundsCount, 3);
-	assert.equal(three.firstRoundMs, kst(5, 13, 21));
-	assert.equal(three.roundsCostUsd, 87 - 65);
+	assert.equal(three.firstRoundMs, kst(1, 8, 0));
+	assert.equal(three.roundsCostUsd, 11);
 	const light = triggers(three, CFG);
 	assert.equal(light.length, 1);
 	assert.equal(light[0].kind, "rounds");
@@ -92,16 +82,16 @@ test("hwp-birsom: first heavy rounds trigger at the 4th distinct round (round 6,
 
 	const four = indicators({
 		project: projectWith(),
-		rounds: hwpRounds(4),
-		spend: { costUsd: 91, childUsd: 0 },
-		spendSince: hwpSpendSinceAt(kst(5, 23, 43)),
-		now: kst(5, 23, 43),
+		rounds: syntheticRounds(4),
+		spend: { costUsd: 29, childUsd: 0 },
+		spendSince: spendSinceAt(kst(1, 11, 0)),
+		now: kst(1, 11, 0),
 	});
 	assert.equal(four.roundsCount, 4);
-	assert.equal(four.firstRoundMs, kst(5, 13, 21));
-	assert.equal(hwpCumulative(kst(5, 23, 43)), 91);
-	assert.equal(four.roundsCostUsd, 91 - 65);
-	assert.match(triggers(four, CFG)[0].detail, /\$26\.00 since round 1/);
+	assert.equal(four.firstRoundMs, kst(1, 8, 0));
+	assert.equal(cumulativeCost(kst(1, 11, 0)), 29);
+	assert.equal(four.roundsCostUsd, 17);
+	assert.match(triggers(four, CFG)[0].detail, /\$17\.00 since round 1/);
 	const heavy = triggers(four, CFG);
 	assert.equal(heavy.length, 1);
 	assert.equal(heavy[0].kind, "rounds");
@@ -110,10 +100,10 @@ test("hwp-birsom: first heavy rounds trigger at the 4th distinct round (round 6,
 	// 4 rounds before the cost threshold are still light.
 	const cheap = indicators({
 		project: projectWith(),
-		rounds: hwpRounds(4),
+		rounds: syntheticRounds(4),
 		spend,
 		spendSince: () => 9,
-		now: kst(5, 23, 43),
+		now: kst(1, 11, 0),
 	});
 	assert.equal(triggers(cheap, CFG)[0].heavy, false);
 });

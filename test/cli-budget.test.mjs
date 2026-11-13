@@ -169,12 +169,12 @@ test("human budget shows the newest denial's reason with the dashboard labels", 
 });
 
 test("human budget marks a staged approval with its next checkpoint", () => {
-	const project = { ...SNAPSHOT.projects[0], stage: { nextCheckpoint: "HWP round 4 acceptance" } };
+	const project = { ...SNAPSHOT.projects[0], stage: { nextCheckpoint: "Export round 4 acceptance" } };
 	const root = sandbox({ seed: { ...SNAPSHOT, projects: [project] } });
 	try {
 		const out = runCli(root, ["budget"]);
-		assert.ok(out.includes("단계 승인: HWP round 4 acceptance"), out);
-		assert.deepEqual(JSON.parse(runCli(root, ["status", "--json"])).budget.projects[0].stage, { nextCheckpoint: "HWP round 4 acceptance" });
+		assert.ok(out.includes("단계 승인: Export round 4 acceptance"), out);
+		assert.deepEqual(JSON.parse(runCli(root, ["status", "--json"])).budget.projects[0].stage, { nextCheckpoint: "Export round 4 acceptance" });
 	} finally {
 		fs.rmSync(root, { recursive: true, force: true });
 	}

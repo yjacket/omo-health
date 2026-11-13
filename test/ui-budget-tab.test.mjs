@@ -293,7 +293,7 @@ function snapshot({ windows, projects, audits, ingest, events } = {}) {
 			external: {},
 		},
 		projects: projects ?? [
-			project({ id: STAGED_PROJECT, sessionId: "01a1a72c-8292", objective: "HWP QA", status: "approved", revision: 2, spentUsd: 41.5, mainUsd: 18.2, childUsd: 23.3, estimate: { p10: 8, p50: 14, p90: 25 }, stage: { nextCheckpoint: "HWP round 4 acceptance" } }),
+			project({ id: STAGED_PROJECT, sessionId: "sid-staged", objective: "Export QA", status: "approved", revision: 2, spentUsd: 41.5, mainUsd: 18.2, childUsd: 23.3, estimate: { p10: 8, p50: 14, p90: 25 }, stage: { nextCheckpoint: "Export round 4 acceptance" } }),
 			project({ id: DENIED_PROJECT, sessionId: "sid-denied", objective: "denied change", status: "approved" }),
 		],
 		audits: audits ?? [audit({})],
@@ -398,7 +398,7 @@ describe("dashboard budget tab", { timeout: 20_000 }, () => {
 				windows: Object.keys(labels.BUDGET_STATE_LABELS).map((state, i) => windowState({ state, account: accounts[i % accounts.length], windowId: `w${i}` })),
 				projects: [
 					...statuses.map((status, i) => project({ id: `p${i}`, status })),
-					project({ id: "stage", stage: { nextCheckpoint: "HWP round 4 acceptance" } }),
+					project({ id: "stage", stage: { nextCheckpoint: "Export round 4 acceptance" } }),
 					...denialReasons.map((reason, i) => project({ id: `d${i}`, status: "approved" })),
 				],
 				audits: [...assessed.map((assessment, i) => audit({ auditId: `a${i}`, assessment })), ...unassessed.map((status, i) => audit({ auditId: `s${i}`, status, assessment: null }))],
@@ -413,7 +413,7 @@ describe("dashboard budget tab", { timeout: 20_000 }, () => {
 		statuses.forEach((status, i) => assert.equal(chipText(projectRows[i])[0], labels.BUDGET_PROJECT_STATUS_LABELS[status], status));
 		const staged = byClass(projectRows[statuses.length], "chip").find((c) => text(c) === labels.BUDGET_STAGE_LABEL);
 		assert.ok(staged, "the staged chip is rendered");
-		assert.equal(staged.getAttribute("title"), "다음 점검: HWP round 4 acceptance");
+		assert.equal(staged.getAttribute("title"), "다음 점검: Export round 4 acceptance");
 		denialReasons.forEach((reason, i) => assert.equal(chipText(projectRows[statuses.length + 1 + i]).at(-1), labels.BUDGET_DENIAL_LABELS[reason], reason));
 		const auditRows = rowsOf(page, "budget-audits");
 		assert.deepEqual(
@@ -441,8 +441,8 @@ describe("dashboard budget tab", { timeout: 20_000 }, () => {
 		const page = await openPage(snapshot());
 		const [staged, denied] = rowsOf(page, "budget-projects");
 		const stagedText = text(staged);
-		for (const part of ["HWP QA", "$41.50", "메인 $18.20 · 서브 $23.30", "$30.00", "$14.00", labels.BUDGET_STAGE_LABEL]) assert.ok(stagedText.includes(part), `"${part}" in "${stagedText}"`);
-		assert.equal(byClass(staged, "chip").find((c) => text(c) === labels.BUDGET_STAGE_LABEL).getAttribute("title"), "다음 점검: HWP round 4 acceptance");
+		for (const part of ["Export QA", "$41.50", "메인 $18.20 · 서브 $23.30", "$30.00", "$14.00", labels.BUDGET_STAGE_LABEL]) assert.ok(stagedText.includes(part), `"${part}" in "${stagedText}"`);
+		assert.equal(byClass(staged, "chip").find((c) => text(c) === labels.BUDGET_STAGE_LABEL).getAttribute("title"), "다음 점검: Export round 4 acceptance");
 		assert.equal(buttonNamed(staged, "승인"), undefined);
 		assert.equal(buttonNamed(staged, "거절"), undefined);
 		assert.deepEqual(chipText(denied), [labels.BUDGET_PROJECT_STATUS_LABELS.approved, labels.BUDGET_DENIAL_LABELS["cumulative-cap"]]);
@@ -451,7 +451,7 @@ describe("dashboard budget tab", { timeout: 20_000 }, () => {
 			descendants(row)
 				.filter((n) => n.localName === "th" || n.localName === "td")
 				.map(text),
-			["11-12 10:00", "HWP QA", labels.AUDIT_ASSESSMENT_LABELS["waste-likely"], "Rounds 6-8 repeat the QA rerun.", "gpt-6-astra:high", "$1.84"],
+			["11-12 10:00", "Export QA", labels.AUDIT_ASSESSMENT_LABELS["waste-likely"], "Rounds 6-8 repeat the QA rerun.", "gpt-6-astra:high", "$1.84"],
 		);
 	});
 
