@@ -11,7 +11,7 @@ import { readDecisions } from "../src/decisions.mjs";
 import { daemonState, runDaemon, VERSION } from "../src/daemon.mjs";
 import { launchDaemon } from "../src/launch.mjs";
 import { resolvePaths } from "../src/paths.mjs";
-import { BUDGET_AUDIT_DEFERRED_LABELS, BUDGET_TRIGGER_LABELS, incidentStateLabel } from "../src/ui/labels.mjs";
+import { BUDGET_AUDIT_DEFERRED_LABELS, BUDGET_DENIAL_LABELS, BUDGET_TRIGGER_LABELS, incidentStateLabel } from "../src/ui/labels.mjs";
 import { ensureDir, listDirSafe, readJsonSafe, removeSafe } from "../src/util/fsx.mjs";
 import { kst } from "../src/util/time.mjs";
 
@@ -86,7 +86,8 @@ const budgetLabel = (table, key) => (typeof key === "string" ? (table[key] ?? ke
 
 /**
  * Budget part of `status --json`: every IS-1 window field copied from the snapshot, plus the project
- * and owner-pending views. Null when the daemon has written no snapshot yet.
+ * view. Null when the daemon has written no snapshot yet. Nothing waits for a human: there is no
+ * owner-pending list.
  */
 export function budgetStatus(snapshot) {
 	if (!snapshot || typeof snapshot !== "object") return null;
@@ -126,7 +127,6 @@ export function budgetStatus(snapshot) {
 			triggers: Array.isArray(p.triggers) ? p.triggers.map((t) => ({ kind: t?.kind ?? null, heavy: t?.heavy === true, detail: t?.detail ?? null, firstMs: t?.firstMs ?? null })) : [],
 			auditDeferred: p.auditDeferred && typeof p.auditDeferred === "object" ? { ms: p.auditDeferred.ms ?? null, reason: p.auditDeferred.reason ?? null } : null,
 		})),
-		pendingOwner: Array.isArray(snapshot.owner) ? snapshot.owner : [],
 		ingest: snapshot.ingest ?? null,
 	};
 }
@@ -138,7 +138,18 @@ const usdText = (v) => (Number.isFinite(v) ? `$${Math.round(v * 100) / 100}` : "
 const resetText = (ms) => (Number.isFinite(ms) ? kst(ms).slice(5, 16) : "-");
 const agoText = (ms, now) => (Number.isFinite(ms) ? `${Math.max(0, Math.round((now - ms) / 60_000))}분 전` : "-");
 
-/** Compact Korean `budget` table: one line per window (IS-1 fields), then projects and owner-pending. */
+/** The newest denial per project from the snapshot events (denied data.reason, or auditor-denied when absent). */
+function deniedReasons(events) {
+	const out = new Map();
+	for (const event of Array.isArray(events) ? events : []) {
+		if (event?.kind !== "denied" || typeof event.projectId !== "string" || out.has(event.projectId)) continue;
+		const reason = typeof event.data?.reason === "string" && event.data.reason ? event.data.reason : "auditor-denied";
+		out.set(event.projectId, reason);
+	}
+	return out;
+}
+
+/** Compact Korean `budget` table: one line per window (IS-1 fields), then projects with pending and denial state. */
 export function budgetTable(snapshot, now = Date.now()) {
 	if (!snapshot || typeof snapshot !== "object") return "예산 기록 없음";
 	const status = budgetStatus(snapshot);
@@ -170,15 +181,13 @@ export function budgetTable(snapshot, now = Date.now()) {
 	}
 	if (!status.windows.length) lines.push("창 없음");
 	lines.push("", `프로젝트 ${status.projects.length}건`);
+	const denials = deniedReasons(snapshot.events);
 	for (const p of status.projects) {
 		let line = `- ${p.objective || p.id} [${p.status}] 지출 ${usdText(p.spentUsd)} / 승인 ${usdText(p.approvedUsd)}${p.pending ? ` · 대기 ${p.pending.route ?? ""}`.trimEnd() : ""}`;
 		if (p.triggers.length) line += ` · 기준: ${p.triggers.map((t) => `${budgetLabel(BUDGET_TRIGGER_LABELS, t.kind)}${t.heavy ? "!" : ""}`).join(", ")}`;
 		if (p.auditDeferred) line += ` · 감사 미룸: ${budgetLabel(BUDGET_AUDIT_DEFERRED_LABELS, p.auditDeferred.reason)}`;
+		if (denials.has(p.id)) line += ` · 거절: ${budgetLabel(BUDGET_DENIAL_LABELS, denials.get(p.id))}`;
 		lines.push(line);
-	}
-	if (status.pendingOwner.length) {
-		lines.push("", `소유자 승인 대기 ${status.pendingOwner.length}건`);
-		for (const o of status.pendingOwner) lines.push(`- ${o.projectId} ${o.kind} ${usdText(o.increaseUsd)}${o.reason ? ` · ${o.reason}` : ""}`);
 	}
 	return lines.join("\n");
 }

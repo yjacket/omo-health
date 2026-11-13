@@ -20,12 +20,13 @@
 	const OUTCOME_TONE = { "goal-complete": "ok", answered: "ok", crash: "crit", failed: "crit", cancelled: "warn", released: "warn", closed: "idle", unknown: "idle" };
 	const ENDED_COLUMNS = [{ label: "끝난 시각", cls: "col-time" }, { label: "세션" }, { label: "결말", cls: "col-outcome" }, { label: "이유" }, { label: "자식 · 시간 · omo", cls: "col-wide" }];
 	const TABS = ["sessions", "ended", "admin", "budget"];
-	// Budget tab (src/budget/office.mjs snapshot). Copies of the eight maps in src/ui/labels.mjs, which this page cannot import;
+	// Budget tab (src/budget/office.mjs snapshot). Copies of the nine maps in src/ui/labels.mjs, which this page cannot import;
 	// test/ui-budget-tab.test.mjs renders every key of those maps through this file and fails when the copies differ.
 	const BUDGET_STATE_LABELS = { ok: "여유", tight: "빠듯", short: "부족", unknown: "모름" };
 	const BUDGET_ACCOUNT_LABELS = { "anthropic-subscription/default": "Claude", "chatgpt-subscription/default": "Codex" };
 	const BUDGET_PROJECT_STATUS_LABELS = { tracking: "추적", requested: "견적 요청", approved: "승인", pending: "결정 대기", closed: "종료" };
-	const BUDGET_ROUTE_LABELS = { owner: "내 결정", auditor: "감사 검토" };
+	const BUDGET_ROUTE_LABELS = { auditor: "감사 대기" };
+	const BUDGET_DENIAL_LABELS = { "insufficient-capacity": "여유 부족", "audit-unavailable": "감사 불가", "auditor-denied": "감사 거절" };
 	const AUDIT_ASSESSMENT_LABELS = { justified: "타당", "waste-likely": "낭비 의심", "insufficient-evidence": "근거 부족" };
 	const AUDIT_STATUS_LABELS = { running: "감사 중", done: "완료", failed: "실패", timeout: "시간 초과", unavailable: "모델 없음" };
 	const BUDGET_TRIGGER_LABELS = { rounds: "회차 반복", budget: "예산 초과", "after-accept": "충족 뒤 지출", descendants: "하위 작업 지출", "estimate-outlier": "견적 이탈", "change-review": "변경 검토" };
@@ -53,7 +54,6 @@
 	let nowMs = Date.now();
 	let tab = "sessions";
 	// Budget clicks the daemon has not applied yet (it drains the command queue each tick): marked until a snapshot shows them.
-	const sentDecisions = new Map();
 	const sentCoupons = new Map();
 
 	function append(node, children) {
@@ -877,29 +877,24 @@
 		return chips.length ? el("div", { class: "wrap-row" }, chips) : null;
 	}
 
-	/** Who decides a pending request and the increase; an owner's request carries 승인/거절 until a snapshot shows the decision. */
-	function pendingCell(p) {
+	/** The pending route, or why the last change was denied; no one approves from the page. */
+	function pendingCell(p, denials) {
 		const pending = p.pending;
-		if (!pending || typeof pending !== "object") return "-";
-		const what = el("span", { class: "pending__what" }, el("span", { text: named(BUDGET_ROUTE_LABELS, pending.route) }), Number.isFinite(pending.increaseUsd) ? [" ", el("span", { class: "num", text: `+${usd(pending.increaseUsd)}` })] : null);
-		if (pending.route !== "owner") return what;
-		const key = `${p.id} ${pending.requestId}`;
-		const group = `decide:${key}`;
-		if (sentDecisions.has(key)) return el("div", { class: "pending" }, what, chip(sentDecisions.get(key) ? "승인 보냄" : "거절 보냄", "info"));
-		const decide = (approve) => post("/api/budget/decide", { projectId: p.id, requestId: pending.requestId, approve }, group, () => sentDecisions.set(key, approve));
-		return el(
-			"div",
-			{ class: "pending" },
-			what,
-			el("div", { class: "wrap-row" }, button("승인", { group, key: `${group}:approve`, primary: true, onclick: () => decide(true) }), button("거절", { group, key: `${group}:deny`, onclick: () => decide(false) })),
-			errorSlot(group),
-		);
+		if (pending && typeof pending === "object") {
+			return el("span", { class: "pending__what" }, el("span", { text: named(BUDGET_ROUTE_LABELS, pending.route) }), Number.isFinite(pending.increaseUsd) ? [" ", el("span", { class: "num", text: `+${usd(pending.increaseUsd)}` })] : null);
+		}
+		const denial = denials.get(p.id);
+		if (!denial) return "-";
+		return chip(named(BUDGET_DENIAL_LABELS, denial.reason ?? "auditor-denied"), "warn");
 	}
 
 	function renderProjects(b) {
 		const projects = listOf(b?.projects);
-		const waiting = new Set(projects.filter((p) => p.pending?.route === "owner").map((p) => `${p.id} ${p.pending.requestId}`));
-		for (const key of sentDecisions.keys()) if (!waiting.has(key)) sentDecisions.delete(key);
+		const denials = new Map();
+		for (const event of listOf(b?.events)) {
+			if (event?.kind !== "denied" || typeof event.projectId !== "string" || denials.has(event.projectId)) continue;
+			denials.set(event.projectId, event.data && typeof event.data === "object" ? event.data : {});
+		}
 		if (!projects.length) return empty("기록 없음");
 		return table(
 			"table--budget table--projects",
@@ -911,7 +906,7 @@
 					el("span", { class: "money" }, el("span", { text: usd(p.spentUsd) }), el("span", { class: "money__split", text: `메인 ${usd(p.mainUsd)} · 서브 ${usd(p.childUsd)}` })),
 					p.approvedUsd > 0 ? usd(p.approvedUsd) : "-",
 					usd(p.estimate?.p50),
-					pendingCell(p),
+					pendingCell(p, denials),
 				],
 			})),
 		);

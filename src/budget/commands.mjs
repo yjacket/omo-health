@@ -1,24 +1,25 @@
 import path from "node:path";
-import { atomicWriteJson, listDirSafe, readJsonSafe } from "../util/fsx.mjs";
+import { atomicWriteJson, listDirSafe, readJsonSafe, removeSafe } from "../util/fsx.mjs";
 
 /**
- * Owner command queue (plan C-commands, todo 8). The dashboard is the only writer; the daemon's budget office drains the
- * queue every tick. One JSON file per command in `paths.health.budgetCommandsDir`, named `<ms>-<rand>.json`, written
- * atomically so a reader never sees a partial file.
+ * Dashboard command queue (plan C-commands, todo 8). The dashboard is the only writer; the daemon's budget office
+ * drains the queue every tick. One JSON file per command in `paths.health.budgetCommandsDir`, named
+ * `<ms>-<rand>.json`, written atomically so a reader never sees a partial file.
  *
- * Command kinds (exact keys, unknown keys rejected):
- *   {kind: "decide", projectId, requestId, approve: boolean}
+ * No human approves a budget: there is no decide command. Only bookkeeping remains (exact keys, unknown keys
+ * rejected):
  *   {kind: "coupons", account, count: 0..20}
  *
  * `readCommands` returns `[{file, cmd}]` ordered by file name (the leading `ms` keeps writes in time order), where
- * `file` is the absolute path the daemon deletes after applying the command. A file that does not parse yet (a
- * half-written or truncated one) is skipped and left on disk for the next read - the writer replaces it atomically.
+ * `file` is the absolute path the daemon deletes after applying the command. A leftover `decide` file from an older
+ * dashboard is deleted without effect. A file that does not parse yet (a half-written or truncated one) is skipped
+ * and left on disk for the next read - the writer replaces it atomically.
  */
 
 const KEYS = Object.freeze({
-	decide: Object.freeze(["kind", "projectId", "requestId", "approve"]),
 	coupons: Object.freeze(["kind", "account", "count"]),
 });
+const RETIRED = new Set(["decide"]);
 
 const isText = (value) => typeof value === "string" && value.trim().length > 0;
 
@@ -33,12 +34,6 @@ function validate(cmd) {
 	if (!allowed) fail(`unknown kind ${JSON.stringify(cmd.kind)}`);
 	for (const key of Object.keys(cmd)) {
 		if (!allowed.includes(key)) fail(`unknown key ${JSON.stringify(key)} for kind ${cmd.kind}`);
-	}
-	if (cmd.kind === "decide") {
-		if (!isText(cmd.projectId)) fail("decide needs a non-empty projectId");
-		if (!isText(cmd.requestId)) fail("decide needs a non-empty requestId");
-		if (typeof cmd.approve !== "boolean") fail("decide needs approve: boolean");
-		return cmd;
 	}
 	if (!isText(cmd.account)) fail("coupons needs a non-empty account");
 	if (!Number.isInteger(cmd.count) || cmd.count < 0 || cmd.count > 20) fail("coupons needs count: integer 0..20");
@@ -55,7 +50,10 @@ export function writeCommand(paths, cmd, { now = Date.now() } = {}) {
 	return file;
 }
 
-/** Daemon side: every complete command file, ordered by file name; unparsable files are skipped and left in place. */
+/**
+ * Daemon side: every complete command file, ordered by file name; unparsable files are skipped and left in place.
+ * A retired `decide` file has no effect and is deleted here so it cannot pile up.
+ */
 export function readCommands(paths) {
 	const dir = paths.health.budgetCommandsDir;
 	const names = listDirSafe(dir)
@@ -66,6 +64,10 @@ export function readCommands(paths) {
 		const file = path.join(dir, name);
 		const cmd = readJsonSafe(file);
 		if (!cmd || typeof cmd !== "object" || Array.isArray(cmd)) continue;
+		if (RETIRED.has(cmd.kind)) {
+			removeSafe(file);
+			continue;
+		}
 		out.push({ file, cmd });
 	}
 	return out;

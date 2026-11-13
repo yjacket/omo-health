@@ -12,7 +12,7 @@ export const MAX_RECENT_STEP_CHARS = 300;
 /** User requests included in the bundle. */
 export const MAX_USER_REQUESTS = 3;
 
-/** The owner-approved question every audit answers. */
+/** The question every audit answers. */
 export const AUDIT_QUESTION = [
 	"Which remaining activities are necessary for the required acceptance criteria?",
 	"Does the additional main and subagent spend buy new acceptance evidence, or does it repeat checking, reporting, or minor corrections?",

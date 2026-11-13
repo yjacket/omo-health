@@ -301,13 +301,12 @@ omo -p --no-session -ne -ns -nc --no-tools --model <모델> --session-id <id> "<
 
 ## 예산 관리
 
-목표(goal) 세션의 구독 토큰 지출을 기록하고, 견적을 받아 승인하는 일을 합니다. 기본으로 켜져 있고(`budget.enabled`), 어떤 예산 상태도 세션을 멈추거나 죽이거나 목표를 고치지 않습니다. 초과 지출은 기록만 됩니다.
+목표(goal) 세션의 구독 토큰 지출을 기록하고, 견적과 증액을 규칙과 감사로 승인하거나 거절합니다. 기본으로 켜져 있고(`budget.enabled`), 어떤 예산 상태도 세션을 멈추거나 죽이거나 목표를 고치지 않습니다. 초과 지출은 기록만 됩니다.
 
-세 역할이 나눠 맡습니다.
+사람이 승인하는 단계는 없습니다. 규칙과 감사가 나눠 맡습니다.
 
-- 재정(데몬의 예산 사무소): 매 틱 세션 로그에서 지출을 장부(`omo-health.db`)에 옮기고, `subscription-usage.json`의 구독 창을 읽어 창마다 `budget.reservePercent` + `budget.auditReservePercent`를 비워 둘 수 있는지 계산합니다. 규칙 안의 견적과 증액은 스스로 승인합니다.
-- 감사: 지출이 의심스러울 때 분리된 작업으로 감사 모델(`budget.audit.models`)을 돌려 의견을 받습니다. 의견은 세션에 참고로만 전달됩니다.
-- 주인(사용자): 규칙과 감사로 정할 수 없는 큰 증액을 직접 승인하거나 거절합니다.
+- 재정(데몬의 예산 사무소): 매 틱 세션 로그에서 지출을 장부(`omo-health.db`)에 옮기고, `subscription-usage.json`의 구독 창을 읽어 창마다 `budget.reservePercent` + `budget.auditReservePercent`를 비워 둘 수 있는지 계산합니다. 규칙 안의 작은 견적과 증액은 스스로 승인합니다.
+- 감사: 규칙으로 정할 수 없는 큰 증액이면 모든 가용 창에 여유가 있을 때 분리된 작업으로 감사 모델(`budget.audit.models`)을 돌립니다. 감사가 증액을 지지하면 `auditor`가 승인하고, 그 밖의 답이면 감사의 이유를 적어 `auditor`가 거절합니다. 여유가 없으면 `rule`이 `insufficient-capacity`로 거절하고 결정 메시지에 가장 이른 리셋 시각을 적어 그 뒤에 다시 요청하라고 안내합니다. 감사 모델이 없어 감사를 돌릴 수 없으면 `rule`이 `audit-unavailable`로 거절합니다.
 
 설치 직후 감시기는 최근 `budget.backfillDays`(8일) 동안의 대화 기록을 읽어 장부를 채우고, 그동안 대시보드와 CLI에 `수집 중 n%`를 보여 줍니다. 견적 요청, 체크포인트, 감사는 진행 중인 목표에만 적용되고, 이미 끝난 목표에는 적용되지 않습니다.
 
@@ -325,7 +324,7 @@ omo -p --no-session -ne -ns -nc --no-tools --model <모델> --session-id <id> "<
 
 ### D26 예산
 
-D26은 예산 사무소가 쓴 `budget/snapshot.json`만 읽는 조언용 탐지기입니다. `treasury-short`(창이 리셋 전에 예비분에 닿음, 경고), `treasury-tight`(예비분에 가까움, 정보), `owner-decision`(주인만 승인할 수 있는 증액, 경고), `audit-opinion`(감사가 낭비 가능성을 지적, 정보)을 냅니다. 구독 값이 없거나 `budget.staleMs`보다 오래되면 아무것도 내지 않습니다.
+D26은 예산 사무소가 쓴 `budget/snapshot.json`만 읽는 조언용 탐지기입니다. `treasury-short`(창이 리셋 전에 예비분에 닿음, 경고), `treasury-tight`(예비분에 가까움, 정보), `audit-opinion`(감사가 낭비 가능성을 지적, 정보)을 냅니다. 구독 값이 없거나 `budget.staleMs`보다 오래되면 아무것도 내지 않습니다.
 
 ### 설정 키
 
@@ -343,7 +342,7 @@ D26은 예산 사무소가 쓴 `budget/snapshot.json`만 읽는 조언용 탐지
 | `budget.autoApproveCyclePercent` | 10 | 창의 쓸 수 있는 몫 중 자동 승인 한도 |
 | `budget.autoApproveFreePercent` | 25 | 현재 남은 몫 중 자동 승인 한도 |
 | `budget.autoChangePercent` | 20 | 처음 승인 대비 누적 자동 증액 한도 |
-| `budget.ownerProjectPercent` | 25 | 넘으면 주인이 정하는 프로젝트 몫 |
+| `budget.ownerProjectPercent` | 25 | 넘으면 감사가 정하는 프로젝트 몫 |
 | `budget.burstFactor` | 1.25 | 몰아 쓰기 여유 배수 |
 | `budget.closeGraceMs` | 24시간 | 닫힌 뒤에도 늦은 서브에이전트 지출을 붙이는 기간 |
 | `budget.providerAliases` | `claude-sdk-oauth=anthropic-subscription` | 공급자 별칭 |
@@ -352,7 +351,7 @@ D26은 예산 사무소가 쓴 `budget/snapshot.json`만 읽는 조언용 탐지
 | `budget.audit.models` | | 감사 모델 목록 |
 | `budget.audit.perProjectDay`, `budget.audit.perDay`, `budget.audit.minGapMs`, `budget.audit.timeoutMs` | 2, 4, 6시간, 15분 | 감사 횟수와 간격 |
 
-`budget.enabled`와 `budget.audit.enabled`는 대시보드 스위치입니다. 대시보드 예산 탭은 한도, 프로젝트, 감사 카드를 보여 주고, 주인 결정이 필요한 증액은 그 자리에서 승인하거나 거절합니다. CLI는 `omo-health budget [--json]`, `status --json`에서는 `budget` 필드입니다. 그림자 모드에서는 계산과 스냅숏만 하고 알림, 감사, 명령 처리는 하지 않습니다.
+`budget.enabled`와 `budget.audit.enabled`는 대시보드 스위치입니다. 대시보드 예산 탭은 한도, 프로젝트, 감사 카드를 보여 주고, 증액은 화면이 아니라 규칙과 감사가 정합니다. 쿠폰 명령은 장부 기록이며 승인이 아닙니다. CLI는 `omo-health budget [--json]`, `status --json`에서는 `budget` 필드입니다. 그림자 모드에서는 계산과 스냅숏만 하고 알림, 감사, 명령 처리는 하지 않습니다.
 
 ## 새 설정 키
 
@@ -517,7 +516,7 @@ D26은 예산 사무소가 쓴 `budget/snapshot.json`만 읽는 조언용 탐지
 | `receipts/` | 메시지 수신 확인 |
 | `budget/snapshot.json` | 예산 사무소의 스냅숏. D26, 대시보드, `budget` 명령이 읽음 |
 | `budget/coupons.json` | 예산 사무소가 발급한 쿠폰 기록 |
-| `budget/commands/` | 대시보드의 승인·거절 명령 대기열 |
+| `budget/commands/` | 대시보드가 남기는 예산 명령 대기열(쿠폰 기록) |
 | `logs/daemon.log` | 감시기 자체 로그 |
 | `app/` | `boot.mjs`(부트스트랩), `current.json`(채널, 버전, sha, 경로), `releases/<버전>-<sha>/`(고정 설치본) |
 

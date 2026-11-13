@@ -44,7 +44,6 @@ const world = (budgetSnapshot, now = NOW) => ({ now, budget: budgetSnapshot });
 function fullSnapshot() {
 	return snapshot({
 		treasury: { state: "short", windows: [windowEntry()] },
-		owner: [{ projectId: "p1", requestId: "req1", kind: "increase", increaseUsd: 42.5, reason: "new-evidence", sinceMs: NOW - 1000 }],
 		audits: [
 			{
 				auditId: "aud1",
@@ -65,18 +64,13 @@ const byKind = (findings) => new Map(findings.map((finding) => [finding.kind, fi
 
 test("each kind keeps its severity, human flag and subject key across ticks", () => {
 	const first = byKind(budget.detect(world(fullSnapshot())));
-	assert.deepEqual([...first.keys()].sort(), ["audit-opinion", "owner-decision", "treasury-short"]);
+	assert.deepEqual([...first.keys()].sort(), ["audit-opinion", "treasury-short"]);
 
 	const short = first.get("treasury-short");
 	assert.equal(short.detector, "D26");
 	assert.equal(short.severity, "warn");
 	assert.equal(short.humanNeeded, true);
 	assert.equal(short.subject.key, `budget:short:anthropic-subscription/default:claude:7d_opus:${RESET}`);
-
-	const owner = first.get("owner-decision");
-	assert.equal(owner.severity, "warn");
-	assert.equal(owner.humanNeeded, true);
-	assert.equal(owner.subject.key, "budget:owner:p1:req1");
 
 	const audit = first.get("audit-opinion");
 	assert.equal(audit.severity, "info");
@@ -85,6 +79,16 @@ test("each kind keeps its severity, human flag and subject key across ticks", ()
 
 	const second = byKind(budget.detect(world(fullSnapshot(), LATER)));
 	for (const [kind, finding] of first) assert.equal(second.get(kind).fp, finding.fp, `${kind} keeps one fp across ticks`);
+});
+
+test("an owner request needs no human and emits nothing", () => {
+	// Nothing is approved by a human: an increase is settled by the auditor or the rules,
+	// so a leftover owner entry in the snapshot must not surface as a finding.
+	const withOwner = snapshot({
+		owner: [{ projectId: "p1", requestId: "req1", kind: "increase", increaseUsd: 42.5, reason: "new-evidence", sinceMs: NOW - 1000 }],
+	});
+	assert.deepEqual(budget.detect(world(withOwner)), []);
+	assert.equal(budget.detect(world(fullSnapshot())).some((finding) => finding.kind === "owner-decision"), false);
 });
 
 test("a tight window is info and not a human action", () => {

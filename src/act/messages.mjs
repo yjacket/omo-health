@@ -701,14 +701,14 @@ export function composeBudgetCorrection({ sessionId, now, projectId, revision = 
 
 const BUDGET_DECISION_TEXT = {
 	approved: (a) => `approved ${budgetUsd(a.approvedUsd)}${a.increaseUsd > 0 ? ` (an increase of ${budgetUsd(a.increaseUsd)})` : ""}${a.by ? ` by ${a.by}` : ""}. Keep working; the approved budget is now recorded.`,
-	"pending-owner": (a) => `the request for ${budgetUsd(a.approvedUsd)} is waiting for the owner's decision in the dashboard. Work continues meanwhile; the overdraw is only recorded.`,
 	"pending-auditor": () => "the request is waiting for the spending auditor's review. Work continues meanwhile; the overdraw is only recorded.",
-	denied: (a) => `the owner denied the request. The approved budget stays at ${budgetUsd(a.approvedUsd)}; the overdraw is recorded and work is not stopped. Reduce scope or finish what the accepted budget covers.`,
+	denied: (a) => `the request was denied${a.by === "auditor" ? " by the spending auditor" : " by the budget rules"}. The approved budget stays at ${budgetUsd(a.approvedUsd)}; the overdraw is recorded and work is not stopped. Reduce scope or finish what the accepted budget covers.`,
 };
 
 /** Rules 3-6: the decision on an estimate or change request (approved, routed, or denied). */
-export function composeBudgetDecision({ sessionId, now, projectId, revision = 0, objective = "", decision = "approved", approvedUsd = 0, increaseUsd = 0, by = null, basis = "", windows = [], denied = false }) {
+export function composeBudgetDecision({ sessionId, now, projectId, revision = 0, objective = "", decision = "approved", approvedUsd = 0, increaseUsd = 0, by = null, basis = "", windows = [], denied = false, reason = null, resetAtMs = null }) {
 	const kind = denied ? "denied" : BUDGET_DECISION_TEXT[decision] ? decision : "approved";
+	const resetIso = Number.isFinite(resetAtMs) ? new Date(resetAtMs).toISOString() : null;
 	const a = { approvedUsd, increaseUsd, by };
 	const windowLine = (windows ?? []).slice(0, 3).map((w) => {
 		const id = w.windowId ?? w.id ?? "window";
@@ -717,10 +717,11 @@ export function composeBudgetDecision({ sessionId, now, projectId, revision = 0,
 	}).join(", ");
 	const content = [
 		`${BUDGET_PREFIX} Budget decision for project "${projectId}" (revision ${revision}, "${truncate(objective, 120)}"): ${BUDGET_DECISION_TEXT[kind](a)}`,
+		...(reason ? [`- reason: ${reason}${resetIso ? `; request again after ${resetIso}` : ""}`] : []),
 		...(basis ? [`- basis: ${truncate(String(basis), 200)}`] : []),
 		...(windowLine ? [`- windows: ${windowLine}`] : []),
 	].join("\n");
-	return budgetMessage({ sessionId, now, actionKind: "budget-decision", content, details: { projectId, revision, decision: kind, approvedUsd, increaseUsd, by } });
+	return budgetMessage({ sessionId, now, actionKind: "budget-decision", content, details: { projectId, revision, decision: kind, approvedUsd, increaseUsd, by, reason: reason ?? null, resetAtMs: Number.isFinite(resetAtMs) ? resetAtMs : null } });
 }
 
 /** Rule 7: the 80% / 100% checkpoint, once per revision. Records overdraw; never stops the work. */

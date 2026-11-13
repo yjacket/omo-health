@@ -19,7 +19,6 @@ const SNAPSHOT = {
 	treasury: { state: "tight", windows: [{ account: "anthropic-subscription/default", windowId: "claude:7d", usedPercent: 70 }] },
 	projects: [{ id: "sid:goal", sessionId: "sid", objective: "ship it", status: "approved", revision: 1 }],
 	audits: [],
-	owner: [],
 	events: [],
 };
 
@@ -90,34 +89,16 @@ describe("ui budget", { timeout: 20_000 }, () => {
 		});
 	});
 
-	describe("POST /api/budget/decide", () => {
-		it("writes exactly one decide command file", async () => {
+	describe("removed decide route", () => {
+		it("answers 404 like any unknown route and writes nothing", async () => {
 			clock = NOW + 5_000;
 			const res = await postJson("/api/budget/decide", { projectId: "sid:goal", requestId: "req-1", approve: true });
-			assert.equal(res.status, 200);
-			assert.deepEqual(res.body, { ok: true });
-			const files = commandFiles();
-			assert.equal(files.length, 1);
-			assert.match(files[0], new RegExp(`^${clock}-[a-z0-9]{6}\\.json$`));
-			const [command] = readCommands(paths);
-			assert.deepEqual(command.cmd, { kind: "decide", projectId: "sid:goal", requestId: "req-1", approve: true });
-		});
-
-		it("rejects a body that is not the exact decide shape with 400 and writes nothing", async () => {
-			const bad = [
-				{},
-				{ projectId: "sid:goal", requestId: "req-1" },
-				{ projectId: "", requestId: "req-1", approve: true },
-				{ projectId: "sid:goal", requestId: "req-1", approve: "yes" },
-				{ projectId: "sid:goal", requestId: "req-1", approve: true, extra: 1 },
-				{ kind: "coupons", account: "anthropic-subscription/default", count: 1, projectId: "sid:goal", requestId: "req-1", approve: true },
-			];
-			for (const body of bad) {
-				const res = await postJson("/api/budget/decide", body);
-				assert.equal(res.status, 400, JSON.stringify(body));
-				assert.deepEqual(res.body, { error: "invalid" });
-			}
+			assert.equal(res.status, 404);
+			assert.deepEqual(res.body, { error: "not-found" });
 			assert.deepEqual(commandFiles(), []);
+			const get = await request({ target: "/api/budget/decide" });
+			assert.equal(get.status, 404);
+			assert.deepEqual(get.body, { error: "not-found" });
 		});
 	});
 
@@ -151,23 +132,19 @@ describe("ui budget", { timeout: 20_000 }, () => {
 	});
 
 	describe("methods and auth", () => {
-		it("answers GET on both POST routes with 405", async () => {
-			for (const target of ["/api/budget/decide", "/api/budget/coupons"]) {
-				const res = await request({ target });
-				assert.equal(res.status, 405, target);
-				assert.deepEqual(res.body, { error: "method-not-allowed" });
-				assert.equal(res.headers.allow, "GET, POST");
-			}
+		it("answers GET on the remaining POST route with 405", async () => {
+			const target = "/api/budget/coupons";
+			const res = await request({ target });
+			assert.equal(res.status, 405, target);
+			assert.deepEqual(res.body, { error: "method-not-allowed" });
+			assert.equal(res.headers.allow, "GET, POST");
 		});
 
 		it("rejects a missing token exactly like the existing POST routes", async () => {
 			const existing = await postJson("/api/switch", { key: "mode", value: "shadow" }, { token: null });
 			assert.equal(existing.status, 401);
 			assert.deepEqual(existing.body, { error: "unauthorized" });
-			for (const [target, body] of [
-				["/api/budget/decide", { projectId: "sid:goal", requestId: "req-1", approve: true }],
-				["/api/budget/coupons", { account: "anthropic-subscription/default", count: 1 }],
-			]) {
+			for (const [target, body] of [["/api/budget/coupons", { account: "anthropic-subscription/default", count: 1 }]]) {
 				const res = await postJson(target, body, { token: null });
 				assert.equal(res.status, existing.status, target);
 				assert.deepEqual(res.body, existing.body, target);

@@ -1,6 +1,6 @@
 // C-projects: the project lifecycle and approval rules. Pure: the caller supplies the project record,
-// the goal, inclusive spend, new blocks, treasury state, a capacity function, the reference class,
-// owner commands and any audit result. Nothing here reads the clock, the config file, or the store.
+// the goal, inclusive spend, new blocks, treasury state, a capacity function, the reference class and
+// any audit result. Nothing here reads the clock, the config file, or the store. No human approves.
 
 import { adjust } from "./estimates.mjs";
 import { validateBlock } from "./protocol.mjs";
@@ -96,7 +96,59 @@ function safeCapacity(capacity, reserveUsd, byModel) {
 	};
 }
 
-function decisionData(project, requestId, status, approvedUsd, by, basis, perWindow) {
+// No human approves anything: an increase may only go to the auditor while every applicable window
+// still has room (no short window, required within that window's free capacity). The binding window's
+// reset time comes from the capacity entry or the treasury reading, whichever carries it.
+function capacityAffordability(check, treasury) {
+	const windows = Array.isArray(treasury?.windows) ? treasury.windows : [];
+	const windowOf = (windowId) =>
+		windows.find((entry) => entry && typeof entry === "object" && entry.windowId === windowId) ?? null;
+	const blocked = [];
+	for (const entry of Array.isArray(check?.perWindow) ? check.perWindow : []) {
+		if (!entry || typeof entry !== "object") continue;
+		const running = windowOf(entry.windowId);
+		const state = typeof entry.state === "string" ? entry.state : running?.state ?? null;
+		const required = finite(entry.requiredPercent) ? entry.requiredPercent : null;
+		const free = finite(entry.freePercent) ? entry.freePercent : null;
+		// A zero requirement means the window applies to none of the spend (capacityCheck's share 0).
+		const applicable = required === null || required > 0;
+		const short = state === "short" && applicable;
+		const overFree = required !== null && (free === null || required > free);
+		if (!short && !overFree) continue;
+		const resetsAtMs = finite(entry.resetsAtMs)
+			? entry.resetsAtMs
+			: finite(running?.resetsAtMs)
+				? running.resetsAtMs
+				: null;
+		blocked.push({ windowId: entry.windowId ?? null, resetsAtMs });
+	}
+	if (blocked.length === 0) return { fits: true, binding: null };
+	blocked.sort((a, b) => (a.resetsAtMs ?? Infinity) - (b.resetsAtMs ?? Infinity));
+	return { fits: false, binding: blocked[0] };
+}
+
+// A denial keeps the previously approved amount and leaves the project working: status returns to
+// approved, or requested when nothing was ever approved. One budget-decision message is sent.
+function denyProject(project, ctx, { requestId, increaseUsd, by, basis, reason, resetAtMs }) {
+	const data = dataOf(project);
+	const approvedUsd = currentApprovedUsd(project, ctx.estimateAfterUsd);
+	project.status = listOf(data, "approvals").length > 0 ? STATUS_APPROVED : STATUS_REQUESTED;
+	data.pending = null;
+	ctx.actions.push({
+		type: "event",
+		kind: "denied",
+		data: { projectId: project.id, requestId: requestId ?? null, increaseUsd, reason },
+	});
+	ctx.actions.push(
+		actionKindMessage(
+			"budget-decision",
+			project.sessionId,
+			decisionData(project, requestId, "denied", approvedUsd, by, basis, [], { reason, resetAtMs }),
+		),
+	);
+}
+
+function decisionData(project, requestId, status, approvedUsd, by, basis, perWindow, extra = null) {
 	return {
 		projectId: project.id,
 		revision: project.revision,
@@ -105,6 +157,8 @@ function decisionData(project, requestId, status, approvedUsd, by, basis, perWin
 		approvedUsd,
 		by: by ?? null,
 		basis: basis ?? null,
+		reason: extra?.reason ?? null,
+		resetAtMs: extra?.resetAtMs ?? null,
 		perWindow: perWindow ?? [],
 		calibrated: (perWindow ?? []).some((entry) => entry && finite(entry.requiredPercent)),
 	};
@@ -206,20 +260,34 @@ function applyBlock(ctx) {
 		estimates.push({ requestId: value.requestId, ms: now, kind: "estimate", raw: value, adjusted });
 		const requestedUsd = Math.max(currentApprovedUsd(project, ctx.estimateAfterUsd), adjusted.reserveUsd);
 		const check = safeCapacity(capacity, adjusted.reserveUsd, byModel);
+		const afford = capacityAffordability(check, ctx.treasury);
+		const increaseUsd = Math.max(0, requestedUsd - currentApprovedUsd(project, ctx.estimateAfterUsd));
+		if (!afford.fits) {
+			denyProject(project, ctx, {
+				requestId: value.requestId,
+				increaseUsd,
+				by: "rule",
+				basis: adjusted.basis,
+				reason: "insufficient-capacity",
+				resetAtMs: afford.binding?.resetsAtMs ?? null,
+			});
+			return;
+		}
 		if (check.ownerLevel) {
 			project.status = STATUS_PENDING;
 			data.pending = {
 				requestId: value.requestId,
 				kind: "estimate",
-				increaseUsd: Math.max(0, requestedUsd - currentApprovedUsd(project, ctx.estimateAfterUsd)),
-				route: "owner",
+				increaseUsd,
+				route: "auditor",
 				sinceMs: now,
 			};
+			actions.push({ type: "audit", reasons: ["change-review"] });
 			actions.push(
 				actionKindMessage(
 					"budget-decision",
 					project.sessionId,
-					decisionData(project, value.requestId, "pending-owner", currentApprovedUsd(project, ctx.estimateAfterUsd), null, adjusted.basis, check.perWindow),
+					decisionData(project, value.requestId, "pending-auditor", currentApprovedUsd(project, ctx.estimateAfterUsd), null, adjusted.basis, check.perWindow),
 				),
 			);
 			return;
@@ -244,6 +312,18 @@ function applyBlock(ctx) {
 	const increaseUsd = Math.max(0, adjusted.reserveUsd - before);
 	listOf(data, "estimates").push({ requestId: value.requestId, ms: now, kind: "change", raw: value, adjusted });
 	const check = safeCapacity(capacity, adjusted.reserveUsd, byModel);
+	const afford = capacityAffordability(check, ctx.treasury);
+	if (!afford.fits) {
+		denyProject(project, ctx, {
+			requestId: value.requestId,
+			increaseUsd,
+			by: "rule",
+			basis: adjusted.basis,
+			reason: "insufficient-capacity",
+			resetAtMs: afford.binding?.resetsAtMs ?? null,
+		});
+		return;
+	}
 	const original = num(data.originalApprovedUsd, ctx.estimateAfterUsd);
 	const cumulative = num(data.autoIncreasesUsd, 0) + increaseUsd;
 	if (cumulative <= (num(cfg?.autoChangePercent, DEFAULT_AUTO_CHANGE_PERCENT) / 100) * original && check.fits && !check.ownerLevel) {
@@ -257,12 +337,6 @@ function applyBlock(ctx) {
 		});
 		data.autoIncreasesUsd = cumulative;
 		actions.push(actionKindMessage("budget-decision", project.sessionId, decisionData(project, value.requestId, "approved", approvedUsd, "rule", adjusted.basis, check.perWindow)));
-		return;
-	}
-	if (check.ownerLevel) {
-		project.status = STATUS_PENDING;
-		data.pending = { requestId: value.requestId, kind: "change", increaseUsd, route: "owner", sinceMs: now };
-		actions.push(actionKindMessage("budget-decision", project.sessionId, decisionData(project, value.requestId, "pending-owner", before, null, adjusted.basis, check.perWindow)));
 		return;
 	}
 	project.status = STATUS_PENDING;
@@ -285,59 +359,62 @@ function parseBlock(block) {
 	}
 }
 
-// Rule 5: an auditor support verdict approves the pending change unless the treasury is owner-level now.
+// Rule 5: there is no owner. An auditor support verdict approves the pending request; any other
+// assessment denies it with the auditor's reason. No capable model means a rule denial.
 function applyAuditResult(ctx) {
 	const { project, auditResult, now, capacity, byModel, actions } = ctx;
 	const data = dataOf(project);
 	const pending = data.pending;
 	if (!pending || pending.route !== "auditor" || !auditResult || typeof auditResult !== "object") return;
-	const support =
-		auditResult.assessment === "justified" && auditResult.allocationOpinion?.assessment === "support";
-	const before = currentApprovedUsd(project, ctx.estimateAfterUsd);
-	const check = safeCapacity(capacity, before + num(pending.increaseUsd, 0), byModel);
-	if (!support || check.ownerLevel) {
-		pending.route = "owner";
-		actions.push(actionKindMessage("budget-decision", project.sessionId, decisionData(project, pending.requestId, "pending-owner", before, null, null, check.perWindow)));
+	const increaseUsd = num(pending.increaseUsd, 0);
+	if (auditResult.status === "unavailable") {
+		denyProject(project, ctx, {
+			requestId: pending.requestId,
+			increaseUsd,
+			by: "rule",
+			basis: null,
+			reason: "audit-unavailable",
+			resetAtMs: null,
+		});
 		return;
 	}
-	const approvedUsd = before + num(pending.increaseUsd, 0);
+	const opinionReason = typeof auditResult.allocationOpinion?.reason === "string" ? auditResult.allocationOpinion.reason : "";
+	const support =
+		auditResult.assessment === "justified" && auditResult.allocationOpinion?.assessment === "support";
+	if (!support) {
+		denyProject(project, ctx, {
+			requestId: pending.requestId,
+			increaseUsd,
+			by: "auditor",
+			basis: opinionReason,
+			reason: null,
+			resetAtMs: null,
+		});
+		return;
+	}
+	const before = currentApprovedUsd(project, ctx.estimateAfterUsd);
+	const check = safeCapacity(capacity, before + increaseUsd, byModel);
+	const afford = capacityAffordability(check, ctx.treasury);
+	if (!afford.fits) {
+		denyProject(project, ctx, {
+			requestId: pending.requestId,
+			increaseUsd,
+			by: "rule",
+			basis: opinionReason,
+			reason: "insufficient-capacity",
+			resetAtMs: afford.binding?.resetsAtMs ?? null,
+		});
+		return;
+	}
+	const approvedUsd = before + increaseUsd;
 	approveProject(project, {
 		requestId: pending.requestId,
 		approvedUsd,
 		by: "auditor",
-		basis: auditResult.allocationOpinion?.reason ?? "",
+		basis: opinionReason,
 		now,
 	});
-	actions.push(actionKindMessage("budget-decision", project.sessionId, decisionData(project, pending.requestId, "approved", approvedUsd, "auditor", auditResult.allocationOpinion?.reason ?? "", check.perWindow)));
-}
-
-// Rule 6: an owner approve/deny command settles a matching pending request.
-function applyOwnerCommands(ctx) {
-	const { project, ownerCommands, now, actions } = ctx;
-	const data = dataOf(project);
-	const pending = data.pending;
-	if (!pending || !Array.isArray(ownerCommands)) return;
-	const command = ownerCommands.find(
-		(entry) => entry && entry.projectId === project.id && entry.requestId === pending.requestId,
-	);
-	if (!command) return;
-	const approvedBefore = currentApprovedUsd(project, ctx.estimateAfterUsd);
-	if (command.approve === true) {
-		const approvedUsd = approvedBefore + num(pending.increaseUsd, 0);
-		approveProject(project, {
-			requestId: pending.requestId,
-			approvedUsd,
-			by: "owner",
-			basis: command.basis ?? "",
-			now,
-		});
-		actions.push(actionKindMessage("budget-decision", project.sessionId, decisionData(project, pending.requestId, "approved", approvedUsd, "owner", command.basis ?? "", [])));
-		return;
-	}
-	project.status = STATUS_APPROVED;
-	data.pending = null;
-	actions.push({ type: "event", kind: "denied", data: { projectId: project.id, requestId: pending.requestId } });
-	actions.push(actionKindMessage("budget-decision", project.sessionId, decisionData(project, pending.requestId, "denied", approvedBefore, null, null, [])));
+	actions.push(actionKindMessage("budget-decision", project.sessionId, decisionData(project, pending.requestId, "approved", approvedUsd, "auditor", opinionReason, check.perWindow)));
 }
 
 // Rule 7: one checkpoint per revision at the configured percent and at 100%; both crossed in one
@@ -382,8 +459,7 @@ function applyCheckpoint(ctx) {
  * @param {object|null} input.treasury treasury reading forwarded to the request message
  * @param {(reserveUsd:number, byModel:object)=>{fits:boolean, ownerLevel:boolean, perWindow:Array}} input.capacity
  * @param {{n:number, p50:number, p80:number, p90:number, errorRatio:number|null, calibrated:boolean}} input.ref
- * @param {Array<{projectId:string, requestId:string, approve:boolean, basis?:string}>} input.ownerCommands
- * @param {object|null} input.auditResult parsed audit opinion
+ * @param {object|null} input.auditResult parsed audit opinion; `{status:"unavailable"}` means no capable model
  * @param {number} input.now
  * @param {object} input.cfg budget config (or the whole config)
  * @returns {{project: object, actions: Array<object>}}
@@ -396,7 +472,6 @@ export function evaluate({
 	treasury = null,
 	capacity = null,
 	ref = { n: 0, p50: null, p80: null, p90: null, errorRatio: null, calibrated: false },
-	ownerCommands = [],
 	auditResult = null,
 	now,
 	cfg = {},
@@ -442,15 +517,13 @@ export function evaluate({
 			byModel,
 			spentUsd,
 			estimateAfterUsd,
+			treasury,
 			actions,
 		});
 	}
 
 	// Rule 5.
-	applyAuditResult({ project: next, auditResult, now, capacity, byModel, actions });
-
-	// Rule 6.
-	applyOwnerCommands({ project: next, ownerCommands, now, estimateAfterUsd, actions });
+	applyAuditResult({ project: next, auditResult, now, capacity, byModel, actions, treasury, estimateAfterUsd });
 
 	// Rule 7.
 	applyCheckpoint({ project: next, now, cfg: budget, spentUsd, estimateAfterUsd, actions, goalActive });

@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
-import { writeCommand } from "../src/budget/commands.mjs";
 import { createBudgetOffice } from "../src/budget/office.mjs";
 import { createBudgetStore } from "../src/budget/store.mjs";
 import { DEFAULT_CONFIG } from "../src/config.mjs";
@@ -129,7 +128,7 @@ test("(b) the second tick reads only the appended lines (stored offset)", (t) =>
 	assert.equal(c.store.getOffset(c.file).offset, fs.statSync(c.file).size);
 });
 
-test("(c)-(f), (h): request at $10, estimate -> decision, 100% checkpoint, change -> audit -> owner -> decision, restart re-sends nothing", (t) => {
+test("(c)-(f), (h): request at $10, estimate -> decision, 100% checkpoint, change -> auditor denies, restart re-sends nothing", (t) => {
 	const c = setup(t);
 	const pid = `${c.sid}:g1`;
 	c.writeGoal({ id: "g1", objective: "deliver the office", createdAt: secs(T0 - 2 * HOUR), updatedAt: secs(T0 - 2 * HOUR) });
@@ -200,23 +199,27 @@ test("(c)-(f), (h): request at $10, estimate -> decision, 100% checkpoint, chang
 	out = step();
 	assert.deepEqual(c.kinds(out.messages).sort(), ["budget-audit-opinion", "budget-decision"]);
 	assert.match(out.messages.find((m) => m.details.actionKind === "budget-audit-opinion").content, /not an instruction/);
-	assert.equal(out.messages.find((m) => m.details.actionKind === "budget-decision").details.decision, "pending-owner");
+	const denied = out.messages.find((m) => m.details.actionKind === "budget-decision");
+	assert.equal(denied.details.decision, "denied");
+	assert.equal(denied.details.by, "auditor");
+	assert.match(denied.content, /a cheaper path keeps every criterion/, "the opinion's reason is the denial basis");
 	assert.equal(runner.starts.length, 1, "no second audit while the caps hold");
 	assert.equal(c.store.spend({ projectId: pid }).auditUsd, 0.4, "the audit's own cost is ledgered as audit usage");
-	assert.equal(out.snapshot.owner.length, 1);
-	assert.equal(out.snapshot.owner[0].requestId, "chg-1");
+	assert.equal(out.snapshot.owner, undefined, "there is no owner queue in the snapshot");
 	assert.equal(out.snapshot.audits[0].assessment, "waste-likely");
-
-	const cmdFile = writeCommand(c.paths, { kind: "decide", projectId: pid, requestId: "chg-1", approve: true }, { now: c.clock.now() });
-	out = step();
-	assert.deepEqual(c.kinds(out.messages), ["budget-decision"]);
-	assert.equal(out.messages[0].details.decision, "approved");
-	assert.equal(out.messages[0].details.by, "owner");
-	assert.equal(fs.existsSync(cmdFile), false, "an applied command file is deleted");
 	project = c.store.getProject(pid);
-	assert.equal(project.revision, 2);
-	assert.equal(project.status, "approved");
+	assert.equal(project.status, "approved", "a denial keeps the approved budget");
 	assert.equal(project.data.pending, null);
+	assert.equal(project.revision, 1, "a denial never bumps the revision");
+
+	// A leftover decide file from an older dashboard has no effect and is deleted.
+	fs.mkdirSync(c.paths.health.budgetCommandsDir, { recursive: true });
+	const leftover = path.join(c.paths.health.budgetCommandsDir, `${c.clock.now()}-olddec.json`);
+	fs.writeFileSync(leftover, JSON.stringify({ kind: "decide", projectId: pid, requestId: "chg-1", approve: true }));
+	out = step();
+	assert.deepEqual(c.kinds(out.messages), []);
+	assert.equal(fs.existsSync(leftover), false, "the retired decide file is removed");
+	assert.equal(c.store.getProject(pid).status, "approved");
 
 	// (h) restart: a new office on the same db re-sends nothing and starts no audit.
 	const restarted = c.office({ runner: createFakeRunner() });
@@ -337,13 +340,14 @@ test("an empty byModel takes the root session's latest model, so capacity is nev
 	assert.equal(w.calibrated, true);
 	assert.equal(w.state, "ok");
 	assert.equal(c.store.spend({ projectId: pid }).costUsd, 0);
-	// reserve $8 x share 1 x 3 %/USD = 24% > 25% of 88% usable => owner decides (an empty mix would have read 0% and approved).
+	// reserve $8 x share 1 x 3 %/USD = 24% > 25% of 88% usable => the auditor decides (an empty mix would have read 0% and approved).
 	assert.deepEqual(c.kinds(out.messages), ["budget-decision"]);
-	assert.equal(out.messages[0].details.decision, "pending-owner");
+	assert.equal(out.messages[0].details.decision, "pending-auditor");
 	const project = c.store.getProject(pid);
 	assert.equal(project.status, "pending");
 	assert.equal(project.data.approvals.length, 0);
-	assert.equal(out.snapshot.owner[0].projectId, pid);
+	assert.equal(project.data.pending.route, "auditor");
+	assert.equal(out.snapshot.owner, undefined, "there is no owner queue in the snapshot");
 });
 
 test("(qa) a replaced transcript (new file identity) is re-read from 0 without duplicating usage rows", (t) => {
@@ -576,6 +580,42 @@ test("(s) no logged-in model defers an audit visibly; a later audit clears the d
 	assert.equal(runner.starts.length, 1, "the provider is available now");
 	assert.equal(row.lastAudit.status, "running");
 	assert.equal(row.auditDeferred, null, "a later audit clears the deferral");
+});
+
+test("(t) a change with no capable model is denied by rule as audit-unavailable, never held for a human", (t) => {
+	const c = setup(t);
+	const pid = `${c.sid}:g1`;
+	c.writeGoal({ id: "g1", objective: "no auditor available", createdAt: secs(T0 - 2 * HOUR), updatedAt: secs(T0 - 2 * HOUR) });
+	writeJsonl(c.file, [E.header(c.sid, c.cwd, T0 - 2 * HOUR), spendEntry(T0 - HOUR, 12)]);
+	const runner = createFakeRunner({ outcomes: { "budget-audit": { status: "running" } } });
+	const office = c.office({ runner, loggedIn: [] });
+	const step = (entries) => {
+		if (entries) appendJsonl(c.file, entries);
+		c.clock.advance(MIN);
+		const out = office.tick({ shadow: false });
+		office.delivered(out.messages.map((message) => ({ messageId: message.id, delivered: true })));
+		return out;
+	};
+
+	let out = step();
+	assert.deepEqual(c.kinds(out.messages), ["budget-request"]);
+	out = step([E.assistant({ ms: T0 - 50 * MIN, usage: usage(0), text: estimateBlock({ projectId: pid, revision: 0 }) })]);
+	assert.equal(out.messages[0].details.decision, "approved");
+
+	out = step([E.assistant({ ms: T0 - 40 * MIN, usage: usage(0), text: changeBlock({ projectId: pid, revision: 1 }) })]);
+	assert.deepEqual(c.kinds(out.messages), ["budget-decision"], "one denial, no pending-auditor message");
+	assert.equal(out.messages[0].details.decision, "denied");
+	assert.equal(out.messages[0].details.by, "rule");
+	assert.match(out.messages[0].content, /reason: audit-unavailable/);
+	assert.equal(out.messages[0].details.reason, "audit-unavailable");
+	assert.equal(runner.starts.length, 0, "no audit runs without a capable model");
+	const events = c.store.events({ projectId: pid, limit: 100 });
+	assert.ok(events.some((e) => e.kind === "audit-deferred" && e.data.reason === "no-model"));
+	assert.equal(events.filter((e) => e.kind === "audit-started").length, 0);
+	const project = c.store.getProject(pid);
+	assert.equal(project.status, "approved", "the denial keeps the approved budget");
+	assert.equal(project.data.pending, null);
+	assert.equal(project.revision, 1);
 });
 
 test("(n) the snapshot reports backfill progress until every byte of the window is read", (t) => {

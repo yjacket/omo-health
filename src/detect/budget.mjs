@@ -8,14 +8,13 @@ import { makeFinding } from "./finding.mjs";
  * Findings:
  *   treasury-short  warn, human needed - a window reaches its reserve by reset
  *   treasury-tight  info               - a window is close to the reserve
- *   owner-decision  warn, human needed - an increase only the owner can approve
  *   audit-opinion   info               - the auditor judged spend waste-likely
+ * Nothing needs a human: there is no owner route.
  * An unknown or stale reading emits nothing: the snapshot has no basis yet.
  */
 export const id = "D26";
 
 const pct = (value) => (Number.isFinite(value) ? `${Math.round(value * 10) / 10}%` : "?");
-const usd = (value) => (Number.isFinite(value) ? `$${Math.round(value * 100) / 100}` : "?");
 const hours = (value) => (Number.isFinite(value) ? `${Math.round(value * 10) / 10}시간` : "?");
 
 function windowFinding(window) {
@@ -80,35 +79,6 @@ function windowFinding(window) {
         return null;
 }
 
-function ownerFinding(owner) {
-        const projectId = String(owner.projectId ?? "");
-        const requestId = String(owner.requestId ?? "");
-        if (!projectId || !requestId) return null;
-        return makeFinding({
-                detector: id,
-                kind: "owner-decision",
-                severity: "warn",
-                humanNeeded: true,
-                subject: { key: `budget:owner:${projectId}:${requestId}` },
-                evidence: [
-                        `project:${projectId}`,
-                        `request:${requestId}`,
-                        `kind:${owner.kind ?? "increase"}`,
-                        `increaseUsd:${owner.increaseUsd ?? "?"}`,
-                ],
-                titleKo: `예산 결정 필요: ${projectId} 증액 ${usd(owner.increaseUsd)}`,
-                detailKo: `프로젝트 ${projectId}가 예산 증액 ${usd(owner.increaseUsd)}을 요청했습니다(사유: ${owner.reason ?? "없음"}). 자동 승인 한도를 넘어 소유자 결정이 필요합니다.`,
-                data: {
-                        projectId,
-                        requestId,
-                        changeKind: owner.kind ?? null,
-                        increaseUsd: owner.increaseUsd ?? null,
-                        reason: owner.reason ?? null,
-                        sinceMs: owner.sinceMs ?? null,
-                },
-        });
-}
-
 function auditFinding(audit) {
         if (audit.assessment !== "waste-likely") return null;
         const auditId = String(audit.auditId ?? "");
@@ -145,10 +115,6 @@ export function detect(world) {
         const out = [];
         for (const window of budget.treasury?.windows ?? []) {
                 const finding = windowFinding(window ?? {});
-                if (finding) out.push(finding);
-        }
-        for (const owner of budget.owner ?? []) {
-                const finding = ownerFinding(owner ?? {});
                 if (finding) out.push(finding);
         }
         for (const audit of budget.audits ?? []) {

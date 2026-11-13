@@ -18,8 +18,9 @@ const HOUR = 60 * MIN;
 const RESET = Date.parse("2026-11-17T12:00:00.000Z"); // 11-17 21:00 KST
 const CLAUDE = "anthropic-subscription/default";
 const CODEX = "chatgpt-subscription/default";
-const OWNER_PROJECT = "sid-owner:goal-1";
-const BUDGET_MAPS = ["BUDGET_STATE_LABELS", "BUDGET_ACCOUNT_LABELS", "BUDGET_PROJECT_STATUS_LABELS", "BUDGET_ROUTE_LABELS", "AUDIT_ASSESSMENT_LABELS", "AUDIT_STATUS_LABELS", "BUDGET_TRIGGER_LABELS", "BUDGET_AUDIT_DEFERRED_LABELS"];
+const PENDING_PROJECT = "sid-main:goal-1";
+const DENIED_PROJECT = "sid-denied:goal-1";
+const BUDGET_MAPS = ["BUDGET_STATE_LABELS", "BUDGET_ACCOUNT_LABELS", "BUDGET_PROJECT_STATUS_LABELS", "BUDGET_ROUTE_LABELS", "AUDIT_ASSESSMENT_LABELS", "AUDIT_STATUS_LABELS", "BUDGET_TRIGGER_LABELS", "BUDGET_AUDIT_DEFERRED_LABELS", "BUDGET_DENIAL_LABELS"];
 
 /* ---------- fake DOM ---------- */
 
@@ -274,9 +275,9 @@ const windowState = (o) => ({
 
 const project = (o) => ({ id: "sid:goal", sessionId: "sid-0123456789", objective: "objective", status: "approved", revision: 1, spentUsd: 12.4, mainUsd: 9.1, childUsd: 3.3, auditUsd: 0, missing: 0, approvedUsd: 30, estimate: { p10: 9, p50: 12, p90: 20 }, reserveUsd: 30, pending: null, indicators: null, triggers: [], lastAudit: null, rounds: [], ...o });
 
-const audit = (o) => ({ auditId: "a1", projectId: OWNER_PROJECT, ms: NOW - 2 * HOUR, status: "done", model: "chatgpt-subscription/gpt-6-astra:high", assessment: "waste-likely", advice: "Rounds 6-8 repeat the QA rerun.\nSecond line.", costUsd: 1.84, ...o });
+const audit = (o) => ({ auditId: "a1", projectId: PENDING_PROJECT, ms: NOW - 2 * HOUR, status: "done", model: "chatgpt-subscription/gpt-6-astra:high", assessment: "waste-likely", advice: "Rounds 6-8 repeat the QA rerun.\nSecond line.", costUsd: 1.84, ...o });
 
-function snapshot({ windows, projects, audits, ingest } = {}) {
+function snapshot({ windows, projects, audits, ingest, events } = {}) {
 	return {
 		v: 1,
 		updatedMs: NOW,
@@ -292,12 +293,11 @@ function snapshot({ windows, projects, audits, ingest } = {}) {
 			external: {},
 		},
 		projects: projects ?? [
-			project({ id: OWNER_PROJECT, sessionId: "01a1a72c-8292", objective: "HWP QA", status: "pending", revision: 2, spentUsd: 41.5, mainUsd: 18.2, childUsd: 23.3, estimate: { p10: 8, p50: 14, p90: 25 }, pending: { requestId: "chg-2", kind: "change", increaseUsd: 15, route: "owner", sinceMs: NOW - 20 * MIN } }),
-			project({ id: "sid-audit:goal-1", status: "pending", pending: { requestId: "chg-1", kind: "change", increaseUsd: 8, route: "auditor", sinceMs: NOW - 5 * MIN } }),
+			project({ id: PENDING_PROJECT, sessionId: "01a1a72c-8292", objective: "HWP QA", status: "pending", revision: 2, spentUsd: 41.5, mainUsd: 18.2, childUsd: 23.3, estimate: { p10: 8, p50: 14, p90: 25 }, pending: { requestId: "chg-2", kind: "change", increaseUsd: 15, route: "auditor", sinceMs: NOW - 20 * MIN } }),
+			project({ id: DENIED_PROJECT, sessionId: "sid-denied", objective: "denied change", status: "approved" }),
 		],
 		audits: audits ?? [audit({})],
-		owner: [],
-		events: [],
+		events: events ?? [{ seq: 2, ms: NOW - 10 * MIN, projectId: DENIED_PROJECT, account: null, kind: "denied", data: { projectId: DENIED_PROJECT, requestId: "chg-3", increaseUsd: 8, reason: null } }],
 	};
 }
 
@@ -389,6 +389,8 @@ describe("dashboard budget tab", { timeout: 20_000 }, () => {
 
 	it("renders every budget label of labels.mjs unchanged (the page keeps its own copy)", async () => {
 		const statuses = Object.keys(labels.BUDGET_PROJECT_STATUS_LABELS);
+		const routes = Object.keys(labels.BUDGET_ROUTE_LABELS);
+		const denialReasons = Object.keys(labels.BUDGET_DENIAL_LABELS);
 		const assessed = Object.keys(labels.AUDIT_ASSESSMENT_LABELS);
 		const unassessed = Object.keys(labels.AUDIT_STATUS_LABELS);
 		const accounts = Object.keys(labels.BUDGET_ACCOUNT_LABELS);
@@ -397,9 +399,11 @@ describe("dashboard budget tab", { timeout: 20_000 }, () => {
 				windows: Object.keys(labels.BUDGET_STATE_LABELS).map((state, i) => windowState({ state, account: accounts[i % accounts.length], windowId: `w${i}` })),
 				projects: [
 					...statuses.map((status, i) => project({ id: `p${i}`, status })),
-					...Object.keys(labels.BUDGET_ROUTE_LABELS).map((route, i) => project({ id: `r${i}`, status: "pending", pending: { requestId: `q${i}`, kind: "change", increaseUsd: 5, route, sinceMs: NOW } })),
+					...routes.map((route, i) => project({ id: `r${i}`, status: "pending", pending: { requestId: `q${i}`, kind: "change", increaseUsd: 5, route, sinceMs: NOW } })),
+					...denialReasons.map((reason, i) => project({ id: `d${i}`, status: "approved" })),
 				],
 				audits: [...assessed.map((assessment, i) => audit({ auditId: `a${i}`, assessment })), ...unassessed.map((status, i) => audit({ auditId: `s${i}`, status, assessment: null }))],
+				events: denialReasons.map((reason, i) => ({ seq: i + 1, ms: NOW, projectId: `d${i}`, account: null, kind: "denied", data: { projectId: `d${i}`, requestId: `q${i}`, increaseUsd: 5, reason: reason === "auditor-denied" ? null : reason } })),
 			}),
 		);
 		const limits = page.doc.getElementById("budget-limits-body");
@@ -408,7 +412,8 @@ describe("dashboard budget tab", { timeout: 20_000 }, () => {
 		assert.deepEqual(byClass(limits, "win__account").map(text), Object.keys(labels.BUDGET_STATE_LABELS).map((_, i) => labels.BUDGET_ACCOUNT_LABELS[accounts[i % accounts.length]]));
 		const projectRows = rowsOf(page, "budget-projects");
 		statuses.forEach((status, i) => assert.equal(chipText(projectRows[i])[0], labels.BUDGET_PROJECT_STATUS_LABELS[status], status));
-		Object.values(labels.BUDGET_ROUTE_LABELS).forEach((label, i) => assert.ok(text(projectRows[statuses.length + i]).includes(`${label} +$5.00`), label));
+		routes.forEach((route, i) => assert.ok(text(projectRows[statuses.length + i]).includes(`${labels.BUDGET_ROUTE_LABELS[route]} +$5.00`), route));
+		denialReasons.forEach((reason, i) => assert.equal(chipText(projectRows[statuses.length + routes.length + i]).at(-1), labels.BUDGET_DENIAL_LABELS[reason], reason));
 		const auditRows = rowsOf(page, "budget-audits");
 		assert.deepEqual(
 			auditRows.map((row) => chipText(row)[0]),
@@ -416,6 +421,7 @@ describe("dashboard budget tab", { timeout: 20_000 }, () => {
 		);
 		const appJs = fs.readFileSync(path.join(STATIC, "app.js"), "utf8");
 		for (const name of BUDGET_MAPS) assert.equal((appJs.match(new RegExp(`const ${name} = `, "g")) ?? []).length, 1, name);
+		assert.equal(Object.hasOwn(labels.BUDGET_ROUTE_LABELS, "owner"), false);
 	});
 
 	it("labels every state, status, route, assessment and audit status the budget modules produce", () => {
@@ -430,13 +436,14 @@ describe("dashboard budget tab", { timeout: 20_000 }, () => {
 		cover("AUDIT_STATUS_LABELS", sourceLiterals("src/budget/audit-job.mjs", /status: "([a-z-]+)"/g), "audit status");
 	});
 
-	it("shows spent (main/sub), approved, estimate p50 and pending per project, and the audit row's time, project, advice line, model and cost", async () => {
+	it("shows spent (main/sub), approved, estimate p50 and the pending route per project, and the audit row's time, project, advice line, model and cost", async () => {
 		const page = await openPage(snapshot());
-		const [owner, auditor] = rowsOf(page, "budget-projects");
-		const ownerText = text(owner);
-		for (const part of ["HWP QA", "$41.50", "메인 $18.20 · 서브 $23.30", "$30.00", "$14.00", "+$15.00"]) assert.ok(ownerText.includes(part), `"${part}" in "${ownerText}"`);
-		assert.ok(buttonNamed(owner, "승인") && buttonNamed(owner, "거절"), "an owner's request carries 승인 and 거절");
-		assert.equal(buttonNamed(auditor, "승인"), undefined, "a request waiting for the auditor has no owner buttons");
+		const [pending, denied] = rowsOf(page, "budget-projects");
+		const pendingText = text(pending);
+		for (const part of ["HWP QA", "$41.50", "메인 $18.20 · 서브 $23.30", "$30.00", "$14.00", "+$15.00", labels.BUDGET_ROUTE_LABELS.auditor]) assert.ok(pendingText.includes(part), `"${part}" in "${pendingText}"`);
+		assert.equal(buttonNamed(pending, "승인"), undefined);
+		assert.equal(buttonNamed(pending, "거절"), undefined);
+		assert.deepEqual(chipText(denied), [labels.BUDGET_PROJECT_STATUS_LABELS.approved, labels.BUDGET_DENIAL_LABELS["auditor-denied"]]);
 		const [row] = rowsOf(page, "budget-audits");
 		assert.deepEqual(
 			descendants(row)
@@ -446,22 +453,34 @@ describe("dashboard budget tab", { timeout: 20_000 }, () => {
 		);
 	});
 
-	it("posts 승인, shows it as sent, and clears the pending state with the next snapshot", async () => {
+	it("renders no approval buttons anywhere and no decide request", async () => {
 		const page = await openPage(snapshot());
-		await page.after(() => buttonNamed(rowsOf(page, "budget-projects")[0], "승인").click());
-		assert.deepEqual(page.posts, [{ url: "/api/budget/decide", body: { projectId: OWNER_PROJECT, requestId: "chg-2", approve: true } }]);
-		let owner = rowsOf(page, "budget-projects")[0];
-		assert.ok(chipText(owner).includes("승인 보냄"), "sent until the daemon applies it");
-		assert.equal(buttonNamed(owner, "승인"), undefined);
-		const next = snapshot();
-		next.projects[0] = { ...next.projects[0], status: "approved", revision: 3, approvedUsd: 45, pending: null };
-		page.state = uiState(next);
-		await page.after(() => page.autoRefresh());
-		owner = rowsOf(page, "budget-projects")[0];
-		assert.deepEqual(chipText(owner), [labels.BUDGET_PROJECT_STATUS_LABELS.approved]);
-		assert.ok(text(owner).includes("$45.00"));
-		assert.equal(buttonNamed(owner, "승인"), undefined);
-		assert.equal(page.posts.length, 1);
+		const body = page.doc.getElementById("budget-projects-body");
+		assert.equal(descendants(body).filter((n) => n.localName === "button").length, 0);
+		assert.equal(page.posts.length, 0);
+		const appJs = fs.readFileSync(path.join(STATIC, "app.js"), "utf8");
+		assert.equal(appJs.includes("/api/budget/decide"), false);
+		assert.equal(appJs.includes("승인 보냄"), false);
+	});
+
+	it("shows the latest denied change as 여유 부족, 감사 불가 or 감사 거절", async () => {
+		const page = await openPage(
+			snapshot({
+				projects: [project({ id: "cap" }), project({ id: "model" }), project({ id: "auditor" })],
+				events: [
+					{ seq: 4, ms: NOW - MIN, projectId: "cap", account: null, kind: "denied", data: { projectId: "cap", requestId: "r2", increaseUsd: 9, reason: "insufficient-capacity" } },
+					{ seq: 3, ms: NOW - 2 * MIN, projectId: "cap", account: null, kind: "denied", data: { projectId: "cap", requestId: "r1", increaseUsd: 3, reason: null } },
+					{ seq: 2, ms: NOW - 3 * MIN, projectId: "model", account: null, kind: "denied", data: { projectId: "model", requestId: "r3", increaseUsd: 5, reason: "audit-unavailable" } },
+					{ seq: 1, ms: NOW - 4 * MIN, projectId: "auditor", account: null, kind: "denied", data: { projectId: "auditor", requestId: "r4", increaseUsd: 2, reason: null } },
+				],
+			}),
+		);
+		const rows = rowsOf(page, "budget-projects");
+		assert.deepEqual(
+			rows.map((row) => chipText(row).at(-1)),
+			[labels.BUDGET_DENIAL_LABELS["insufficient-capacity"], labels.BUDGET_DENIAL_LABELS["audit-unavailable"], labels.BUDGET_DENIAL_LABELS["auditor-denied"]],
+		);
+		assert.equal(text(rows[0]).includes("감사 거절"), false, "the newest denial wins");
 	});
 
 	it("steps the account's reset coupons with -/+ within 0..20", async () => {

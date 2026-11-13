@@ -62,7 +62,6 @@ export const FINDING_LABELS = Object.freeze({
 	drift: "작업 범위 점검 신호",
 	"treasury-short": "예산 부족",
 	"treasury-tight": "예산 주의",
-	"owner-decision": "예산 결정 필요",
 	"audit-opinion": "예산 감사 의견",
 });
 
@@ -196,8 +195,11 @@ export const BUDGET_ACCOUNT_LABELS = Object.freeze({ "anthropic-subscription/def
 /** A budget project's status (src/budget/projects.mjs). */
 export const BUDGET_PROJECT_STATUS_LABELS = Object.freeze({ tracking: "추적", requested: "견적 요청", approved: "승인", pending: "결정 대기", closed: "종료" });
 
-/** Who decides a pending budget request (project pending.route). */
-export const BUDGET_ROUTE_LABELS = Object.freeze({ owner: "내 결정", auditor: "감사 검토" });
+/** Who decides a pending budget request (project pending.route): only the auditor, never a human. */
+export const BUDGET_ROUTE_LABELS = Object.freeze({ auditor: "감사 대기" });
+
+/** Why a change was denied (snapshot events kind `denied`, data.reason; `auditor-denied` when the auditor said no). */
+export const BUDGET_DENIAL_LABELS = Object.freeze({ "insufficient-capacity": "여유 부족", "audit-unavailable": "감사 불가", "auditor-denied": "감사 거절" });
 
 /** An audit opinion (src/budget/audit.mjs assessment). */
 export const AUDIT_ASSESSMENT_LABELS = Object.freeze({ justified: "타당", "waste-likely": "낭비 의심", "insufficient-evidence": "근거 부족" });

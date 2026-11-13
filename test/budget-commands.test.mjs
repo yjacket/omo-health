@@ -21,22 +21,22 @@ const filesIn = (dir) => (fs.existsSync(dir) ? fs.readdirSync(dir).sort() : []);
 
 test("write/read round trip keeps the command and names the file <ms>-<rand>.json", (t) => {
 	const { paths, dir } = sandbox(t);
-	const decide = { kind: "decide", projectId: "sess:goal", requestId: "req-1", approve: true };
 	const coupons = { kind: "coupons", account: "anthropic-subscription/default", count: 20 };
+	const other = { kind: "coupons", account: "chatgpt-subscription/default", count: 3 };
 
-	const first = writeCommand(paths, decide, { now: T });
-	const second = writeCommand(paths, coupons, { now: T + 1 });
+	const first = writeCommand(paths, coupons, { now: T });
+	const second = writeCommand(paths, other, { now: T + 1 });
 
 	assert.equal(path.dirname(first), dir);
 	assert.equal(path.dirname(second), dir);
 	assert.match(path.basename(first), NAME);
 	assert.match(path.basename(second), NAME);
-	assert.deepEqual(JSON.parse(fs.readFileSync(first, "utf8")), decide);
-	assert.deepEqual(JSON.parse(fs.readFileSync(second, "utf8")), coupons);
+	assert.deepEqual(JSON.parse(fs.readFileSync(first, "utf8")), coupons);
+	assert.deepEqual(JSON.parse(fs.readFileSync(second, "utf8")), other);
 
 	const read = readCommands(paths);
 	assert.equal(read.length, 2);
-	assert.deepEqual(read.map((entry) => entry.cmd), [decide, coupons]);
+	assert.deepEqual(read.map((entry) => entry.cmd), [coupons, other]);
 	assert.deepEqual(read.map((entry) => entry.file), [first, second].sort((a, b) => (path.basename(a) < path.basename(b) ? -1 : 1)));
 });
 
@@ -45,10 +45,9 @@ test("invalid commands are rejected before anything is written", (t) => {
 	const bad = [
 		{ kind: "coupons", account: "anthropic-subscription/default", count: 21 },
 		{ kind: "coupons", account: "anthropic-subscription/default", count: -1 },
-		{ kind: "decide", projectId: "p", requestId: "r" },
-		{ kind: "decide", projectId: "p", requestId: "r", approve: "yes" },
-		{ kind: "decide", projectId: "", requestId: "r", approve: true },
-		{ kind: "decide", projectId: "p", requestId: "r", approve: true, note: "extra" },
+		{ kind: "coupons", account: "", count: 1 },
+		{ kind: "coupons", account: "anthropic-subscription/default", count: 1, note: "extra" },
+		{ kind: "decide", projectId: "p", requestId: "r", approve: true },
 		{ kind: "other", projectId: "p" },
 		null,
 	];
@@ -80,9 +79,9 @@ test("readCommands returns commands ordered by file name", (t) => {
 test("a half-written file is skipped and left for the next read (QA failure)", (t) => {
 	const { paths, dir } = sandbox(t);
 	fs.mkdirSync(dir, { recursive: true });
-	const complete = writeCommand(paths, { kind: "decide", projectId: "p", requestId: "r", approve: false }, { now: T });
+	const complete = writeCommand(paths, { kind: "coupons", account: "anthropic-subscription/default", count: 3 }, { now: T });
 	const half = path.join(dir, `${T + 1}-half00.json`);
-	const body = JSON.stringify({ kind: "coupons", account: "anthropic-subscription/default", count: 3 });
+	const body = JSON.stringify({ kind: "coupons", account: "chatgpt-subscription/default", count: 4 });
 	fs.writeFileSync(half, body.slice(0, body.length - 1)); // no closing brace
 
 	const first = readCommands(paths);
@@ -93,7 +92,20 @@ test("a half-written file is skipped and left for the next read (QA failure)", (
 	const second = readCommands(paths);
 	assert.deepEqual(second.map((entry) => entry.file), [complete, half].sort((a, b) => (path.basename(a) < path.basename(b) ? -1 : 1)));
 	assert.deepEqual(second.map((entry) => entry.cmd), [
-		{ kind: "decide", projectId: "p", requestId: "r", approve: false },
 		{ kind: "coupons", account: "anthropic-subscription/default", count: 3 },
+		{ kind: "coupons", account: "chatgpt-subscription/default", count: 4 },
 	]);
+});
+
+test("a leftover decide file from an older dashboard is ignored and deleted without effect", (t) => {
+	const { paths, dir } = sandbox(t);
+	fs.mkdirSync(dir, { recursive: true });
+	const leftover = path.join(dir, `${T}-olddec.json`);
+	fs.writeFileSync(leftover, JSON.stringify({ kind: "decide", projectId: "p", requestId: "r", approve: true }));
+	const coupons = writeCommand(paths, { kind: "coupons", account: "anthropic-subscription/default", count: 2 }, { now: T + 1 });
+
+	const read = readCommands(paths);
+	assert.deepEqual(read.map((entry) => entry.file), [coupons], "no decide command is handed to the daemon");
+	assert.equal(fs.existsSync(leftover), false, "the retired file is removed");
+	assert.equal(fs.existsSync(coupons), true, "a real command is left for the daemon to apply");
 });

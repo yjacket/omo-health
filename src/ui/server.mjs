@@ -32,7 +32,6 @@ const API_ROUTES = Object.freeze({
 	"/api/pause": "POST",
 	"/api/resume": "POST",
 	"/api/switch": "POST",
-	"/api/budget/decide": "POST",
 	"/api/budget/coupons": "POST",
 	"/api/diagnose": "GET",
 });
@@ -78,12 +77,6 @@ function runAction(paths, route, body, nowMs) {
 			if (result.ok) return [200, { ok: true, value: result.value, isDefault: result.isDefault }];
 			const payload = result.message === undefined ? { error: result.reason } : { error: result.reason, message: result.message };
 			return [SWITCH_STATUS[result.reason] ?? 500, payload];
-		}
-		case "/api/budget/decide": {
-			if (!hasExactKeys(body, ["projectId", "requestId", "approve"])) throw BUDGET_BAD_BODY();
-			if (!isText(body.projectId) || !isText(body.requestId) || typeof body.approve !== "boolean") throw BUDGET_BAD_BODY();
-			writeCommand(paths, { kind: "decide", projectId: body.projectId, requestId: body.requestId, approve: body.approve }, { now: nowMs });
-			return [200, { ok: true }];
 		}
 		case "/api/budget/coupons": {
 			if (!hasExactKeys(body, ["account", "count"])) throw BUDGET_BAD_BODY();

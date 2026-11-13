@@ -242,6 +242,15 @@ describe("ui model", () => {
 		});
 	});
 
+	it("passes the budget office snapshot through, with denial events and no owner list", () => {
+		const home = makeHome();
+		const snap = { v: 1, updatedMs: NOW, enabled: true, treasury: { state: "ok", windows: [] }, projects: [{ id: "p", pending: null }], audits: [], events: [{ seq: 1, ms: NOW, projectId: "p", account: null, kind: "denied", data: { projectId: "p", requestId: "r", increaseUsd: 5, reason: "insufficient-capacity" } }] };
+		write(home.paths.health.budgetSnapshotFile, snap);
+		const state = uiState({ paths: home.paths, env: home.env, now: NOW });
+		assert.deepEqual(state.budget, snap);
+		assert.equal(Object.hasOwn(state.budget, "owner"), false);
+	});
+
 	it("surfaces the most recent death record in the overview", () => {
 		const home = makeHome();
 		write(path.join(home.paths.health.deathsDir, "old.json"), { kind: "hung", atMs: NOW - 1000 });

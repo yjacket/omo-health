@@ -132,21 +132,40 @@ test("status --json budget carries every IS-1 window field with the seeded value
 			coupons: WINDOW.coupons,
 		});
 		assert.deepEqual(report.budget.projects, [{ id: "p1", objective: "예산 CLI 작업", status: "approved", spentUsd: 3.5, approvedUsd: 20, pending: null, triggers: [], auditDeferred: null }]);
-		assert.deepEqual(report.budget.pendingOwner, SNAPSHOT.owner);
+		// No human approves a budget: the snapshot's owner list never reaches the status JSON.
+		assert.equal(Object.hasOwn(report.budget, "pendingOwner"), false);
 	} finally {
 		fs.rmSync(root, { recursive: true, force: true });
 	}
 });
 
-test("human budget table prints every IS-1 field label, projects and owner-pending", () => {
+test("human budget table prints every IS-1 field label and the projects, with no owner-pending line", () => {
 	const root = sandbox({ seed: true });
 	try {
 		const out = runCli(root, ["budget"]);
 		for (const label of HUMAN_LABELS) assert.ok(out.includes(label), `missing label ${label}\n${out}`);
 		assert.match(out, /프로젝트 1건/);
-		assert.match(out, /소유자 승인 대기 1건/);
+		assert.doesNotMatch(out, /소유자 승인 대기/);
 	} finally {
 		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("human budget shows the newest denial's reason with the dashboard labels", () => {
+	const denyEvent = (seq, reason) => ({ seq, ms: NOW - (10 - seq), projectId: "p1", account: null, kind: "denied", data: { projectId: "p1", requestId: `r${seq}`, increaseUsd: 5, reason } });
+	const root = sandbox({ seed: { ...SNAPSHOT, events: [denyEvent(3, "insufficient-capacity"), denyEvent(2, "audit-unavailable")] } });
+	try {
+		const out = runCli(root, ["budget"]);
+		assert.ok(out.includes("거절: 여유 부족"), out);
+		assert.doesNotMatch(out, /감사 불가/, out);
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+	const auditor = sandbox({ seed: { ...SNAPSHOT, events: [denyEvent(1, null)] } });
+	try {
+		assert.ok(runCli(auditor, ["budget"]).includes("거절: 감사 거절"));
+	} finally {
+		fs.rmSync(auditor, { recursive: true, force: true });
 	}
 });
 

@@ -167,15 +167,23 @@ test("the decision states the outcome, amount, basis and per-window cost", () =>
 	assert.match(approved.content, /claude:7d 12%, codex:primary uncalibrated/);
 	assert.equal(approved.details.decision, "approved");
 
-	const pending = decision({ decision: "pending-owner", increaseUsd: 12, by: null });
-	assert.match(pending.content, /waiting for the owner's decision/);
-	assert.match(pending.content, /not stopped|only recorded/);
-	assert.equal(pending.details.decision, "pending-owner");
+	const pending = decision({ decision: "pending-auditor", increaseUsd: 12, by: null });
+	assert.match(pending.content, /waiting for the spending auditor's review/);
+	assert.equal(pending.details.decision, "pending-auditor");
 
-	const denied = decision({ denied: true, approvedUsd: 30 });
-	assert.match(denied.content, /denied/);
+	const resetAtMs = Date.UTC(2026, 10, 17, 12, 0, 0);
+	const denied = decision({ denied: true, approvedUsd: 30, by: "rule", reason: "insufficient-capacity", resetAtMs });
+	assert.match(denied.content, /denied by the budget rules/);
 	assert.match(denied.content, /\$30\.00/);
 	assert.match(denied.content, /work is not stopped/);
+	assert.match(denied.content, /reason: insufficient-capacity; request again after 2026-11-17T12:00:00\.000Z/);
+	assert.equal(denied.details.reason, "insufficient-capacity");
+	assert.equal(denied.details.resetAtMs, resetAtMs);
+	assert.doesNotMatch(denied.content, /owner/i);
+
+	const byAuditor = decision({ denied: true, approvedUsd: 30, by: "auditor", basis: "the extra rounds repeat QA without new evidence" });
+	assert.match(byAuditor.content, /denied by the spending auditor/);
+	assert.match(byAuditor.content, /basis: the extra rounds repeat QA/);
 });
 
 test("checkpoints at 80 and 100 percent record spend without stopping work", () => {
