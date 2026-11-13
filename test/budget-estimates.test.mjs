@@ -3,11 +3,11 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { adjust, referenceClass } from "../src/budget/estimates.mjs";
 
-function project(id, actualUsd, { status = "closed", workClass = "implementation", estimates = [] } = {}) {
+function project(id, actualUsd, { status = "closed", workClass = "implementation", estimates = [], audits = [] } = {}) {
 	return {
 		id,
 		status,
-		data: { workClass, outcome: status === "closed" ? "complete" : "cancelled", estimates },
+		data: { workClass, outcome: status === "closed" ? "complete" : "cancelled", estimates, audits },
 		actualUsd,
 	};
 }
@@ -106,6 +106,57 @@ test("adjust of zeros returns the spent amount as both p50 and reserve", () => {
 	const out = adjust({ p50: 0, p90: 0 }, ref, 7);
 	assert.equal(out.p50Usd, 7);
 	assert.equal(out.reserveUsd, 7);
+});
+
+test("a project whose latest audit opinion is waste-likely leaves the reference class", () => {
+	const audits = [{ auditId: "a1", status: "done", opinion: { assessment: "waste-likely" } }];
+	const all = [...projects([10, 20, 30, 40, 50]), project("w", 1000, { audits })];
+	const ref = referenceClass(all);
+	assert.equal(ref.n, 5);
+	assert.equal(ref.p50, 30);
+	assert.equal(ref.p90, 46);
+	assert.equal(referenceClass(all).errorRatio, referenceClass(projects([10, 20, 30, 40, 50])).errorRatio);
+});
+
+test("projects without audits and with justified or insufficient-evidence opinions stay in", () => {
+	const noAudits = projects([10, 20]);
+	const justified = [project("j", 30, { audits: [{ auditId: "a1", status: "done", opinion: { assessment: "justified" } }] })];
+	const unsure = [project("u", 40, { audits: [{ auditId: "a1", status: "done", opinion: { assessment: "insufficient-evidence" } }] })];
+	const ref = referenceClass([...noAudits, ...justified, ...unsure]);
+	assert.equal(ref.n, 4);
+	assert.equal(ref.p50, 25);
+});
+
+test("the last opinion wins and opinion-less audits after it do not resurrect a waste-likely verdict", () => {
+	const wasWasteThenJustified = [
+		project("a", 10, { audits: [
+			{ auditId: "a1", status: "done", opinion: { assessment: "waste-likely" } },
+			{ auditId: "a2", status: "done", opinion: { assessment: "justified" } },
+		] }),
+		project("b", 20, { audits: [
+			{ auditId: "a1", status: "done", opinion: { assessment: "justified" } },
+			{ auditId: "a2", status: "done", opinion: { assessment: "waste-likely" } },
+			{ auditId: "a3", status: "running" },
+		] }),
+	];
+	const ref = referenceClass(wasWasteThenJustified);
+	assert.equal(ref.n, 1);
+	assert.equal(ref.p50, 10);
+});
+
+test("errorRatio uses the same filtered set as the percentiles", () => {
+	const rows = [20, 20, 40, 60, 80].map((actual, index) =>
+		project("r" + index, actual, { estimates: [estimate(10, 20, 10)] }),
+	);
+	const waste = [{ auditId: "a1", status: "done", opinion: { assessment: "waste-likely" } }];
+	const outlier = project("x", 200, { estimates: [estimate(10, 20, 10)], audits: waste });
+	const ref = referenceClass([...rows, outlier]);
+	assert.equal(ref.n, 5);
+	assert.equal(ref.errorRatio, 2);
+
+	const kept = referenceClass([...rows, { ...outlier, data: { ...outlier.data, audits: [] } }]);
+	assert.equal(kept.n, 6);
+	assert.equal(kept.errorRatio, 2.5);
 });
 
 test("an empty reference class is a cold start with no percentiles", () => {

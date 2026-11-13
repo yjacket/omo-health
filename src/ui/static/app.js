@@ -20,13 +20,13 @@
 	const OUTCOME_TONE = { "goal-complete": "ok", answered: "ok", crash: "crit", failed: "crit", cancelled: "warn", released: "warn", closed: "idle", unknown: "idle" };
 	const ENDED_COLUMNS = [{ label: "끝난 시각", cls: "col-time" }, { label: "세션" }, { label: "결말", cls: "col-outcome" }, { label: "이유" }, { label: "자식 · 시간 · omo", cls: "col-wide" }];
 	const TABS = ["sessions", "ended", "admin", "budget"];
-	// Budget tab (src/budget/office.mjs snapshot). Copies of the nine maps in src/ui/labels.mjs, which this page cannot import;
+	// Budget tab (src/budget/office.mjs snapshot). Copies of the eight maps in src/ui/labels.mjs, which this page cannot import;
 	// test/ui-budget-tab.test.mjs renders every key of those maps through this file and fails when the copies differ.
 	const BUDGET_STATE_LABELS = { ok: "여유", tight: "빠듯", short: "부족", unknown: "모름" };
 	const BUDGET_ACCOUNT_LABELS = { "anthropic-subscription/default": "Claude", "chatgpt-subscription/default": "Codex" };
 	const BUDGET_PROJECT_STATUS_LABELS = { tracking: "추적", requested: "견적 요청", approved: "승인", pending: "결정 대기", closed: "종료" };
-	const BUDGET_ROUTE_LABELS = { auditor: "감사 대기" };
-	const BUDGET_DENIAL_LABELS = { "insufficient-capacity": "여유 부족", "audit-unavailable": "감사 불가", "auditor-denied": "감사 거절" };
+	const BUDGET_STAGE_LABEL = "단계 승인";
+	const BUDGET_DENIAL_LABELS = { "insufficient-capacity": "여유 부족", "cumulative-cap": "누적 상한", "no-progress-evidence": "진척 증거 없음" };
 	const AUDIT_ASSESSMENT_LABELS = { justified: "타당", "waste-likely": "낭비 의심", "insufficient-evidence": "근거 부족" };
 	const AUDIT_STATUS_LABELS = { running: "감사 중", done: "완료", failed: "실패", timeout: "시간 초과", unavailable: "모델 없음" };
 	const BUDGET_TRIGGER_LABELS = { rounds: "회차 반복", budget: "예산 초과", "after-accept": "충족 뒤 지출", descendants: "하위 작업 지출", "estimate-outlier": "견적 이탈", "change-review": "변경 검토" };
@@ -34,7 +34,7 @@
 	const BUDGET_TONE = { ok: "ok", tight: "warn", short: "crit" };
 	const PROJECT_TONE = { requested: "info", approved: "ok", pending: "warn" };
 	const AUDIT_TONE = { justified: "ok", "waste-likely": "warn", "insufficient-evidence": "info", running: "info", failed: "crit", timeout: "warn", unavailable: "warn" };
-	const PROJECT_COLUMNS = [{ label: "목표" }, { label: "상태", cls: "col-chip" }, { label: "지출", num: true }, { label: "승인", num: true }, { label: "견적 p50", num: true }, { label: "대기" }];
+	const PROJECT_COLUMNS = [{ label: "목표" }, { label: "상태", cls: "col-chip" }, { label: "지출", num: true }, { label: "승인", num: true }, { label: "견적 p50", num: true }, { label: "결과" }];
 	const AUDIT_COLUMNS = [{ label: "시각", cls: "col-time" }, { label: "프로젝트" }, { label: "판정", cls: "col-chip" }, { label: "조언", cls: "col-advice" }, { label: "모델", cls: "col-model" }, { label: "비용", num: true }];
 	const COUPON_MAX = 20;
 
@@ -877,15 +877,15 @@
 		return chips.length ? el("div", { class: "wrap-row" }, chips) : null;
 	}
 
-	/** The pending route, or why the last change was denied; no one approves from the page. */
-	function pendingCell(p, denials) {
-		const pending = p.pending;
-		if (pending && typeof pending === "object") {
-			return el("span", { class: "pending__what" }, el("span", { text: named(BUDGET_ROUTE_LABELS, pending.route) }), Number.isFinite(pending.increaseUsd) ? [" ", el("span", { class: "num", text: `+${usd(pending.increaseUsd)}` })] : null);
+	/** A staged approval's neutral chip, or why the last change was denied; the treasury decides, never an audit. */
+	function resultCell(p, denials) {
+		if (p.stage && typeof p.stage === "object") {
+			const next = typeof p.stage.nextCheckpoint === "string" && p.stage.nextCheckpoint ? p.stage.nextCheckpoint : null;
+			return el("span", { class: "chip", title: next ? `다음 점검: ${next}` : undefined, text: BUDGET_STAGE_LABEL });
 		}
 		const denial = denials.get(p.id);
-		if (!denial) return "-";
-		return chip(named(BUDGET_DENIAL_LABELS, denial.reason ?? "auditor-denied"), "warn");
+		if (!denial || typeof denial.reason !== "string" || !denial.reason) return "-";
+		return chip(named(BUDGET_DENIAL_LABELS, denial.reason), "warn");
 	}
 
 	function renderProjects(b) {
@@ -906,7 +906,7 @@
 					el("span", { class: "money" }, el("span", { text: usd(p.spentUsd) }), el("span", { class: "money__split", text: `메인 ${usd(p.mainUsd)} · 서브 ${usd(p.childUsd)}` })),
 					p.approvedUsd > 0 ? usd(p.approvedUsd) : "-",
 					usd(p.estimate?.p50),
-					pendingCell(p, denials),
+					resultCell(p, denials),
 				],
 			})),
 		);

@@ -94,7 +94,7 @@ test("capacityCheck fits inside both auto-approve bands", () => {
 	const states = [state({ samples: [reading(70, NOW - 30 * MIN)], calibration: FLAT })];
 	const check = capacityCheck({ states, reserveUsd: 2, byModel: { "claude-opus-5-5:high": 10 }, cfg: CFG });
 	assert.equal(check.fits, true);
-	assert.equal(check.ownerLevel, false);
+	assert.equal(check.large, false);
 	assert.equal(check.perWindow[0].requiredPercent, 2);
 	assert.equal(check.perWindow[0].usablePercent, 88);
 	assert.equal(check.perWindow[0].freePercent, 18);
@@ -105,14 +105,14 @@ test("capacityCheck: between the auto and owner bands is not a fit but not owner
 	const check = capacityCheck({ states, reserveUsd: 10, byModel: { "claude-opus-5-5:high": 10 }, cfg: CFG });
 	assert.equal(check.perWindow[0].requiredPercent, 10);
 	assert.equal(check.fits, false); // 10 > 10% of 88 usable
-	assert.equal(check.ownerLevel, false); // 10 <= 25% of 88 and <= 18 free
+	assert.equal(check.large, false); // 10 <= 25% of 88 and <= 18 free
 });
 
 test("capacityCheck: owner level above 25% of usable or above free, and on an applicable short window", () => {
 	const states = [state({ samples: [reading(70, NOW - 30 * MIN)], calibration: FLAT })];
 	const owner = capacityCheck({ states, reserveUsd: 30, byModel: { "claude-opus-5-5:high": 10 }, cfg: CFG });
 	assert.equal(owner.perWindow[0].requiredPercent, 30);
-	assert.equal(owner.ownerLevel, true);
+	assert.equal(owner.large, true);
 	assert.equal(owner.fits, false);
 
 	const short = state({ samples: [reading(80, NOW - 2 * HOUR), reading(90, NOW)] });
@@ -123,7 +123,7 @@ test("capacityCheck: owner level above 25% of usable or above free, and on an ap
 		byModel: { "claude-opus-5-5:high": 5 },
 		cfg: CFG,
 	});
-	assert.equal(byShort.ownerLevel, true);
+	assert.equal(byShort.large, true);
 });
 
 test("capacityCheck: a scoped window requires only the share of models it applies to", () => {

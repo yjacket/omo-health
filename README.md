@@ -301,12 +301,13 @@ omo -p --no-session -ne -ns -nc --no-tools --model <모델> --session-id <id> "<
 
 ## 예산 관리
 
-목표(goal) 세션의 구독 토큰 지출을 기록하고, 견적과 증액을 규칙과 감사로 승인하거나 거절합니다. 기본으로 켜져 있고(`budget.enabled`), 어떤 예산 상태도 세션을 멈추거나 죽이거나 목표를 고치지 않습니다. 초과 지출은 기록만 됩니다.
+목표(goal) 세션의 구독 토큰 지출을 기록하고, 견적과 증액을 규칙으로 승인하거나 거절합니다. 기본으로 켜져 있고(`budget.enabled`), 어떤 예산 상태도 세션을 멈추거나 죽이거나 목표를 고치지 않습니다. 초과 지출은 기록만 됩니다.
 
-사람이 승인하는 단계는 없습니다. 규칙과 감사가 나눠 맡습니다.
+사람이 승인하는 단계는 없습니다. 재정이 규칙으로 승인하고, 감사는 승인 관계 밖에서 따로 판단합니다.
 
-- 재정(데몬의 예산 사무소): 매 틱 세션 로그에서 지출을 장부(`omo-health.db`)에 옮기고, `subscription-usage.json`의 구독 창을 읽어 창마다 `budget.reservePercent` + `budget.auditReservePercent`를 비워 둘 수 있는지 계산합니다. 규칙 안의 작은 견적과 증액은 스스로 승인합니다.
-- 감사: 규칙으로 정할 수 없는 큰 증액이면 모든 가용 창에 여유가 있을 때 분리된 작업으로 감사 모델(`budget.audit.models`)을 돌립니다. 감사가 증액을 지지하면 `auditor`가 승인하고, 그 밖의 답이면 감사의 이유를 적어 `auditor`가 거절합니다. 여유가 없으면 `rule`이 `insufficient-capacity`로 거절하고 결정 메시지에 가장 이른 리셋 시각을 적어 그 뒤에 다시 요청하라고 안내합니다. 감사 모델이 없어 감사를 돌릴 수 없으면 `rule`이 `audit-unavailable`로 거절합니다.
+- 세션: 예산이 필요하면 `estimate`나 `change` 블록 하나를 답장 끝에 붙입니다.
+- 재정(데몬의 예산 사무소): 매 틱 세션 로그에서 지출을 장부(`omo-health.db`)에 옮기고, `subscription-usage.json`의 구독 창을 읽어 창마다 `budget.reservePercent` + `budget.auditReservePercent`를 비워 둘 수 있는지 계산합니다. 승인과 거절은 재정만 합니다. 처음 승인 대비 누적으로 `budget.autoChangePercent`(20%) 이내인 작은 증액은 요청한 금액 그대로 승인합니다. 그 밖의 큰 증액은 `progress`(마지막 승인 뒤 끝낸 확인 가능한 결과 1-5개)가 없으면 `no-progress-evidence`로 거절하고, 있으면 지금까지 쓴 금액에 남은 작업의 중앙값(p50)을 더한 만큼, 한 단계만 승인합니다(`staged: true`, `nextCheckpoint`). 그 단계 총액이 처음 승인 금액보다 `budget.maxChangePercent`(100%) 넘게 많으면(기본값이면 처음 승인의 2배 초과) `cumulative-cap`으로 거절하고, 여유가 없으면 `insufficient-capacity`로 거절하며 결정 메시지에 가장 이른 리셋 시각을 적어 그 뒤에 다시 요청하라고 안내합니다. 큰 첫 견적도 같은 방식으로 한 단계만 승인합니다.
+- 감사: 승인 관계 밖의 제삼자입니다. 큰 견적과 큰 증액마다 감사 모델(`budget.audit.models`)로 감사를 따로 엽니다. 감사 결과는 승인이나 거절에 쓰이지 않고 세션 알림, 대시보드, 앞으로의 견적 보정에만 쓰입니다. 마지막 감사 의견이 `waste-likely`인 끝난 프로젝트는 견적 기준 집단에서 빠집니다.
 
 설치 직후 감시기는 최근 `budget.backfillDays`(8일) 동안의 대화 기록을 읽어 장부를 채우고, 그동안 대시보드와 CLI에 `수집 중 n%`를 보여 줍니다. 견적 요청, 체크포인트, 감사는 진행 중인 목표에만 적용되고, 이미 끝난 목표에는 적용되지 않습니다.
 
@@ -320,7 +321,7 @@ omo -p --no-session -ne -ns -nc --no-tools --model <모델> --session-id <id> "<
 </omo-budget>
 ```
 
-승인된 예산을 늘릴 때는 `kind="change"` 블록에 같은 필드와 `reason`, `justification`, `alternatives`를 더합니다. `workClass`는 implementation, debugging, research, verification, documentation, mixed 중 하나, `reason`은 estimate-error, new-evidence, external-blocker, owner-scope-change, model-mix-change 중 하나입니다. 본문이 8192자를 넘거나 펜스 안에 있으면 블록이 아닙니다. 잘못된 블록에는 정정 알림이 프로젝트당 한 번 갑니다. 승인된 예산의 `budget.checkpointPercent`(80%)와 100%에서 체크포인트 알림이 리비전마다 한 번 갑니다. 서브에이전트 세션에는 아무것도 보내지 않습니다.
+승인된 예산을 늘릴 때는 `kind="change"` 블록에 같은 필드와 `reason`, `justification`, `alternatives`, `progress`를 더합니다. `progress`는 마지막 승인 뒤 끝낸 확인 가능한 결과 1-5개이고, 큰 증액은 이것이 없으면 거절됩니다. `workClass`는 implementation, debugging, research, verification, documentation, mixed 중 하나, `reason`은 estimate-error, new-evidence, external-blocker, owner-scope-change, model-mix-change 중 하나입니다. 본문이 8192자를 넘거나 펜스 안에 있으면 블록이 아닙니다. 잘못된 블록에는 정정 알림이 프로젝트당 한 번 갑니다. 승인된 예산의 `budget.checkpointPercent`(80%)와 100%에서 체크포인트 알림이 리비전마다 한 번 갑니다. 서브에이전트 세션에는 아무것도 보내지 않습니다.
 
 ### D26 예산
 
@@ -342,7 +343,8 @@ D26은 예산 사무소가 쓴 `budget/snapshot.json`만 읽는 조언용 탐지
 | `budget.autoApproveCyclePercent` | 10 | 창의 쓸 수 있는 몫 중 자동 승인 한도 |
 | `budget.autoApproveFreePercent` | 25 | 현재 남은 몫 중 자동 승인 한도 |
 | `budget.autoChangePercent` | 20 | 처음 승인 대비 누적 자동 증액 한도 |
-| `budget.ownerProjectPercent` | 25 | 넘으면 감사가 정하는 프로젝트 몫 |
+| `budget.maxChangePercent` | 100 | 처음 승인 대비 큰 증액 단계의 상한 |
+| `budget.ownerProjectPercent` | 25 | 쓸 수 있는 몫 중 이 비율을 넘는 요청은 큰 요청 |
 | `budget.burstFactor` | 1.25 | 몰아 쓰기 여유 배수 |
 | `budget.closeGraceMs` | 24시간 | 닫힌 뒤에도 늦은 서브에이전트 지출을 붙이는 기간 |
 | `budget.providerAliases` | `claude-sdk-oauth=anthropic-subscription` | 공급자 별칭 |
@@ -351,7 +353,7 @@ D26은 예산 사무소가 쓴 `budget/snapshot.json`만 읽는 조언용 탐지
 | `budget.audit.models` | | 감사 모델 목록 |
 | `budget.audit.perProjectDay`, `budget.audit.perDay`, `budget.audit.minGapMs`, `budget.audit.timeoutMs` | 2, 4, 6시간, 15분 | 감사 횟수와 간격 |
 
-`budget.enabled`와 `budget.audit.enabled`는 대시보드 스위치입니다. 대시보드 예산 탭은 한도, 프로젝트, 감사 카드를 보여 주고, 증액은 화면이 아니라 규칙과 감사가 정합니다. 쿠폰 명령은 장부 기록이며 승인이 아닙니다. CLI는 `omo-health budget [--json]`, `status --json`에서는 `budget` 필드입니다. 그림자 모드에서는 계산과 스냅숏만 하고 알림, 감사, 명령 처리는 하지 않습니다.
+`budget.enabled`와 `budget.audit.enabled`는 대시보드 스위치입니다. 대시보드 예산 탭은 한도, 프로젝트, 감사 카드를 보여 주고, 증액은 화면이 아니라 규칙이 정합니다. 쿠폰 명령은 장부 기록이며 승인이 아닙니다. CLI는 `omo-health budget [--json]`, `status --json`에서는 `budget` 필드입니다. 그림자 모드에서는 계산과 스냅숏만 하고 알림, 감사, 명령 처리는 하지 않습니다.
 
 ## 새 설정 키
 

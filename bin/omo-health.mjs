@@ -11,7 +11,7 @@ import { readDecisions } from "../src/decisions.mjs";
 import { daemonState, runDaemon, VERSION } from "../src/daemon.mjs";
 import { launchDaemon } from "../src/launch.mjs";
 import { resolvePaths } from "../src/paths.mjs";
-import { BUDGET_AUDIT_DEFERRED_LABELS, BUDGET_DENIAL_LABELS, BUDGET_TRIGGER_LABELS, incidentStateLabel } from "../src/ui/labels.mjs";
+import { BUDGET_AUDIT_DEFERRED_LABELS, BUDGET_DENIAL_LABELS, BUDGET_STAGE_LABEL, BUDGET_TRIGGER_LABELS, incidentStateLabel } from "../src/ui/labels.mjs";
 import { ensureDir, listDirSafe, readJsonSafe, removeSafe } from "../src/util/fsx.mjs";
 import { kst } from "../src/util/time.mjs";
 
@@ -123,7 +123,7 @@ export function budgetStatus(snapshot) {
 			status: p.status ?? null,
 			spentUsd: p.spentUsd ?? null,
 			approvedUsd: p.approvedUsd ?? null,
-			pending: p.pending ?? null,
+			stage: p.stage && typeof p.stage === "object" ? { nextCheckpoint: p.stage.nextCheckpoint ?? null } : null,
 			triggers: Array.isArray(p.triggers) ? p.triggers.map((t) => ({ kind: t?.kind ?? null, heavy: t?.heavy === true, detail: t?.detail ?? null, firstMs: t?.firstMs ?? null })) : [],
 			auditDeferred: p.auditDeferred && typeof p.auditDeferred === "object" ? { ms: p.auditDeferred.ms ?? null, reason: p.auditDeferred.reason ?? null } : null,
 		})),
@@ -138,18 +138,18 @@ const usdText = (v) => (Number.isFinite(v) ? `$${Math.round(v * 100) / 100}` : "
 const resetText = (ms) => (Number.isFinite(ms) ? kst(ms).slice(5, 16) : "-");
 const agoText = (ms, now) => (Number.isFinite(ms) ? `${Math.max(0, Math.round((now - ms) / 60_000))}분 전` : "-");
 
-/** The newest denial per project from the snapshot events (denied data.reason, or auditor-denied when absent). */
+/** The newest denial per project from the snapshot events (denied data.reason); a reasonless event is ignored. */
 function deniedReasons(events) {
 	const out = new Map();
 	for (const event of Array.isArray(events) ? events : []) {
 		if (event?.kind !== "denied" || typeof event.projectId !== "string" || out.has(event.projectId)) continue;
-		const reason = typeof event.data?.reason === "string" && event.data.reason ? event.data.reason : "auditor-denied";
-		out.set(event.projectId, reason);
+		const reason = typeof event.data?.reason === "string" && event.data.reason ? event.data.reason : null;
+		if (reason) out.set(event.projectId, reason);
 	}
 	return out;
 }
 
-/** Compact Korean `budget` table: one line per window (IS-1 fields), then projects with pending and denial state. */
+/** Compact Korean `budget` table: one line per window (IS-1 fields), then projects with staged and denial state. */
 export function budgetTable(snapshot, now = Date.now()) {
 	if (!snapshot || typeof snapshot !== "object") return "예산 기록 없음";
 	const status = budgetStatus(snapshot);
@@ -183,7 +183,8 @@ export function budgetTable(snapshot, now = Date.now()) {
 	lines.push("", `프로젝트 ${status.projects.length}건`);
 	const denials = deniedReasons(snapshot.events);
 	for (const p of status.projects) {
-		let line = `- ${p.objective || p.id} [${p.status}] 지출 ${usdText(p.spentUsd)} / 승인 ${usdText(p.approvedUsd)}${p.pending ? ` · 대기 ${p.pending.route ?? ""}`.trimEnd() : ""}`;
+		let line = `- ${p.objective || p.id} [${p.status}] 지출 ${usdText(p.spentUsd)} / 승인 ${usdText(p.approvedUsd)}`;
+		if (p.stage) line += ` · ${BUDGET_STAGE_LABEL}${p.stage.nextCheckpoint ? `: ${p.stage.nextCheckpoint}` : ""}`;
 		if (p.triggers.length) line += ` · 기준: ${p.triggers.map((t) => `${budgetLabel(BUDGET_TRIGGER_LABELS, t.kind)}${t.heavy ? "!" : ""}`).join(", ")}`;
 		if (p.auditDeferred) line += ` · 감사 미룸: ${budgetLabel(BUDGET_AUDIT_DEFERRED_LABELS, p.auditDeferred.reason)}`;
 		if (denials.has(p.id)) line += ` · 거절: ${budgetLabel(BUDGET_DENIAL_LABELS, denials.get(p.id))}`;

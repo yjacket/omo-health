@@ -64,6 +64,38 @@ test("valid change passes", () => {
 	assertOk(validateBlock("change", change(), CTX));
 });
 
+test("a change with progress exposes the trimmed items", () => {
+	const result = validateBlock(
+		"change",
+		change({ progress: ["  parser test passes on the new entry point  ", "second entry point ported"] }),
+		CTX,
+	);
+	assertOk(result);
+	assert.deepEqual(result.value.progress, ["parser test passes on the new entry point", "second entry point ported"]);
+});
+
+test("a change without progress exposes null", () => {
+	const result = validateBlock("change", change(), CTX);
+	assertOk(result);
+	assert.equal(result.value.progress, null);
+});
+
+test("progress rejects more than five items", () => {
+	const progress = Array.from({ length: 6 }, (_, i) => `checkpoint ${i} finished and verified`);
+	assertErrors(validateBlock("change", change({ progress }), CTX), /progress/);
+});
+
+test("progress rejects an item shorter than ten characters after trim", () => {
+	assertErrors(validateBlock("change", change({ progress: ["  done  "] }), CTX), /progress\[0\]/);
+});
+
+test("an estimate block rejects progress as an unknown key", () => {
+	assertErrors(
+		validateBlock("estimate", estimate({ progress: ["parser test passes on the new entry point"] }), CTX),
+		/unknown key "progress"/,
+	);
+});
+
 test("unknown keys are rejected at the root and at every nested level", () => {
 	assertErrors(validateBlock("estimate", { ...estimate(), extra: 1 }, CTX), /unknown key "extra"/);
 	assertErrors(

@@ -18,9 +18,9 @@ const HOUR = 60 * MIN;
 const RESET = Date.parse("2026-11-17T12:00:00.000Z"); // 11-17 21:00 KST
 const CLAUDE = "anthropic-subscription/default";
 const CODEX = "chatgpt-subscription/default";
-const PENDING_PROJECT = "sid-main:goal-1";
+const STAGED_PROJECT = "sid-main:goal-1";
 const DENIED_PROJECT = "sid-denied:goal-1";
-const BUDGET_MAPS = ["BUDGET_STATE_LABELS", "BUDGET_ACCOUNT_LABELS", "BUDGET_PROJECT_STATUS_LABELS", "BUDGET_ROUTE_LABELS", "AUDIT_ASSESSMENT_LABELS", "AUDIT_STATUS_LABELS", "BUDGET_TRIGGER_LABELS", "BUDGET_AUDIT_DEFERRED_LABELS", "BUDGET_DENIAL_LABELS"];
+const BUDGET_MAPS = ["BUDGET_STATE_LABELS", "BUDGET_ACCOUNT_LABELS", "BUDGET_PROJECT_STATUS_LABELS", "AUDIT_ASSESSMENT_LABELS", "AUDIT_STATUS_LABELS", "BUDGET_TRIGGER_LABELS", "BUDGET_AUDIT_DEFERRED_LABELS", "BUDGET_DENIAL_LABELS"];
 
 /* ---------- fake DOM ---------- */
 
@@ -273,9 +273,9 @@ const windowState = (o) => ({
 	...o,
 });
 
-const project = (o) => ({ id: "sid:goal", sessionId: "sid-0123456789", objective: "objective", status: "approved", revision: 1, spentUsd: 12.4, mainUsd: 9.1, childUsd: 3.3, auditUsd: 0, missing: 0, approvedUsd: 30, estimate: { p10: 9, p50: 12, p90: 20 }, reserveUsd: 30, pending: null, indicators: null, triggers: [], lastAudit: null, rounds: [], ...o });
+const project = (o) => ({ id: "sid:goal", sessionId: "sid-0123456789", objective: "objective", status: "approved", revision: 1, spentUsd: 12.4, mainUsd: 9.1, childUsd: 3.3, auditUsd: 0, missing: 0, approvedUsd: 30, estimate: { p10: 9, p50: 12, p90: 20 }, reserveUsd: 30, stage: null, indicators: null, triggers: [], lastAudit: null, rounds: [], ...o });
 
-const audit = (o) => ({ auditId: "a1", projectId: PENDING_PROJECT, ms: NOW - 2 * HOUR, status: "done", model: "chatgpt-subscription/gpt-6-astra:high", assessment: "waste-likely", advice: "Rounds 6-8 repeat the QA rerun.\nSecond line.", costUsd: 1.84, ...o });
+const audit = (o) => ({ auditId: "a1", projectId: STAGED_PROJECT, ms: NOW - 2 * HOUR, status: "done", model: "chatgpt-subscription/gpt-6-astra:high", assessment: "waste-likely", advice: "Rounds 6-8 repeat the QA rerun.\nSecond line.", costUsd: 1.84, ...o });
 
 function snapshot({ windows, projects, audits, ingest, events } = {}) {
 	return {
@@ -293,11 +293,11 @@ function snapshot({ windows, projects, audits, ingest, events } = {}) {
 			external: {},
 		},
 		projects: projects ?? [
-			project({ id: PENDING_PROJECT, sessionId: "01a1a72c-8292", objective: "HWP QA", status: "pending", revision: 2, spentUsd: 41.5, mainUsd: 18.2, childUsd: 23.3, estimate: { p10: 8, p50: 14, p90: 25 }, pending: { requestId: "chg-2", kind: "change", increaseUsd: 15, route: "auditor", sinceMs: NOW - 20 * MIN } }),
+			project({ id: STAGED_PROJECT, sessionId: "01a1a72c-8292", objective: "HWP QA", status: "approved", revision: 2, spentUsd: 41.5, mainUsd: 18.2, childUsd: 23.3, estimate: { p10: 8, p50: 14, p90: 25 }, stage: { nextCheckpoint: "HWP round 4 acceptance" } }),
 			project({ id: DENIED_PROJECT, sessionId: "sid-denied", objective: "denied change", status: "approved" }),
 		],
 		audits: audits ?? [audit({})],
-		events: events ?? [{ seq: 2, ms: NOW - 10 * MIN, projectId: DENIED_PROJECT, account: null, kind: "denied", data: { projectId: DENIED_PROJECT, requestId: "chg-3", increaseUsd: 8, reason: null } }],
+		events: events ?? [{ seq: 2, ms: NOW - 10 * MIN, projectId: DENIED_PROJECT, account: null, kind: "denied", data: { projectId: DENIED_PROJECT, requestId: "chg-3", increaseUsd: 8, reason: "cumulative-cap" } }],
 	};
 }
 
@@ -389,7 +389,6 @@ describe("dashboard budget tab", { timeout: 20_000 }, () => {
 
 	it("renders every budget label of labels.mjs unchanged (the page keeps its own copy)", async () => {
 		const statuses = Object.keys(labels.BUDGET_PROJECT_STATUS_LABELS);
-		const routes = Object.keys(labels.BUDGET_ROUTE_LABELS);
 		const denialReasons = Object.keys(labels.BUDGET_DENIAL_LABELS);
 		const assessed = Object.keys(labels.AUDIT_ASSESSMENT_LABELS);
 		const unassessed = Object.keys(labels.AUDIT_STATUS_LABELS);
@@ -399,11 +398,11 @@ describe("dashboard budget tab", { timeout: 20_000 }, () => {
 				windows: Object.keys(labels.BUDGET_STATE_LABELS).map((state, i) => windowState({ state, account: accounts[i % accounts.length], windowId: `w${i}` })),
 				projects: [
 					...statuses.map((status, i) => project({ id: `p${i}`, status })),
-					...routes.map((route, i) => project({ id: `r${i}`, status: "pending", pending: { requestId: `q${i}`, kind: "change", increaseUsd: 5, route, sinceMs: NOW } })),
+					project({ id: "stage", stage: { nextCheckpoint: "HWP round 4 acceptance" } }),
 					...denialReasons.map((reason, i) => project({ id: `d${i}`, status: "approved" })),
 				],
 				audits: [...assessed.map((assessment, i) => audit({ auditId: `a${i}`, assessment })), ...unassessed.map((status, i) => audit({ auditId: `s${i}`, status, assessment: null }))],
-				events: denialReasons.map((reason, i) => ({ seq: i + 1, ms: NOW, projectId: `d${i}`, account: null, kind: "denied", data: { projectId: `d${i}`, requestId: `q${i}`, increaseUsd: 5, reason: reason === "auditor-denied" ? null : reason } })),
+				events: denialReasons.map((reason, i) => ({ seq: i + 1, ms: NOW, projectId: `d${i}`, account: null, kind: "denied", data: { projectId: `d${i}`, requestId: `q${i}`, increaseUsd: 5, reason } })),
 			}),
 		);
 		const limits = page.doc.getElementById("budget-limits-body");
@@ -412,8 +411,10 @@ describe("dashboard budget tab", { timeout: 20_000 }, () => {
 		assert.deepEqual(byClass(limits, "win__account").map(text), Object.keys(labels.BUDGET_STATE_LABELS).map((_, i) => labels.BUDGET_ACCOUNT_LABELS[accounts[i % accounts.length]]));
 		const projectRows = rowsOf(page, "budget-projects");
 		statuses.forEach((status, i) => assert.equal(chipText(projectRows[i])[0], labels.BUDGET_PROJECT_STATUS_LABELS[status], status));
-		routes.forEach((route, i) => assert.ok(text(projectRows[statuses.length + i]).includes(`${labels.BUDGET_ROUTE_LABELS[route]} +$5.00`), route));
-		denialReasons.forEach((reason, i) => assert.equal(chipText(projectRows[statuses.length + routes.length + i]).at(-1), labels.BUDGET_DENIAL_LABELS[reason], reason));
+		const staged = byClass(projectRows[statuses.length], "chip").find((c) => text(c) === labels.BUDGET_STAGE_LABEL);
+		assert.ok(staged, "the staged chip is rendered");
+		assert.equal(staged.getAttribute("title"), "다음 점검: HWP round 4 acceptance");
+		denialReasons.forEach((reason, i) => assert.equal(chipText(projectRows[statuses.length + 1 + i]).at(-1), labels.BUDGET_DENIAL_LABELS[reason], reason));
 		const auditRows = rowsOf(page, "budget-audits");
 		assert.deepEqual(
 			auditRows.map((row) => chipText(row)[0]),
@@ -421,29 +422,30 @@ describe("dashboard budget tab", { timeout: 20_000 }, () => {
 		);
 		const appJs = fs.readFileSync(path.join(STATIC, "app.js"), "utf8");
 		for (const name of BUDGET_MAPS) assert.equal((appJs.match(new RegExp(`const ${name} = `, "g")) ?? []).length, 1, name);
-		assert.equal(Object.hasOwn(labels.BUDGET_ROUTE_LABELS, "owner"), false);
+		assert.equal((appJs.match(/const BUDGET_STAGE_LABEL = /g) ?? []).length, 1);
 	});
 
-	it("labels every state, status, route, assessment and audit status the budget modules produce", () => {
+	it("labels every state, status, denial reason, assessment and audit status the budget modules produce", () => {
 		const cover = (map, values, what) => {
 			assert.ok(values.length > 0, `${what}: the producer's values are found`);
 			for (const value of values) assert.ok(Object.hasOwn(labels[map], value), `${what} ${value}`);
 		};
 		cover("BUDGET_STATE_LABELS", sourceLiterals("src/budget/treasury.mjs", /state = "([a-z-]+)"/g), "window state");
 		cover("BUDGET_PROJECT_STATUS_LABELS", sourceLiterals("src/budget/projects.mjs", /const STATUS_[A-Z]+ = "([a-z-]+)"/g), "project status");
-		cover("BUDGET_ROUTE_LABELS", sourceLiterals("src/budget/projects.mjs", /route: "([a-z-]+)"/g), "pending route");
+		cover("BUDGET_DENIAL_LABELS", sourceLiterals("src/budget/projects.mjs", /reason: "([a-z-]+)"/g), "denial reason");
 		cover("AUDIT_ASSESSMENT_LABELS", JSON.parse(`[${sourceLiterals("src/budget/audit.mjs", /const ASSESSMENTS = Object\.freeze\(\[([^\]]+)\]\)/g)[0]}]`), "assessment");
 		cover("AUDIT_STATUS_LABELS", sourceLiterals("src/budget/audit-job.mjs", /status: "([a-z-]+)"/g), "audit status");
 	});
 
-	it("shows spent (main/sub), approved, estimate p50 and the pending route per project, and the audit row's time, project, advice line, model and cost", async () => {
+	it("shows spent (main/sub), approved, estimate p50 and the staged chip per project, and the audit row's time, project, advice line, model and cost", async () => {
 		const page = await openPage(snapshot());
-		const [pending, denied] = rowsOf(page, "budget-projects");
-		const pendingText = text(pending);
-		for (const part of ["HWP QA", "$41.50", "메인 $18.20 · 서브 $23.30", "$30.00", "$14.00", "+$15.00", labels.BUDGET_ROUTE_LABELS.auditor]) assert.ok(pendingText.includes(part), `"${part}" in "${pendingText}"`);
-		assert.equal(buttonNamed(pending, "승인"), undefined);
-		assert.equal(buttonNamed(pending, "거절"), undefined);
-		assert.deepEqual(chipText(denied), [labels.BUDGET_PROJECT_STATUS_LABELS.approved, labels.BUDGET_DENIAL_LABELS["auditor-denied"]]);
+		const [staged, denied] = rowsOf(page, "budget-projects");
+		const stagedText = text(staged);
+		for (const part of ["HWP QA", "$41.50", "메인 $18.20 · 서브 $23.30", "$30.00", "$14.00", labels.BUDGET_STAGE_LABEL]) assert.ok(stagedText.includes(part), `"${part}" in "${stagedText}"`);
+		assert.equal(byClass(staged, "chip").find((c) => text(c) === labels.BUDGET_STAGE_LABEL).getAttribute("title"), "다음 점검: HWP round 4 acceptance");
+		assert.equal(buttonNamed(staged, "승인"), undefined);
+		assert.equal(buttonNamed(staged, "거절"), undefined);
+		assert.deepEqual(chipText(denied), [labels.BUDGET_PROJECT_STATUS_LABELS.approved, labels.BUDGET_DENIAL_LABELS["cumulative-cap"]]);
 		const [row] = rowsOf(page, "budget-audits");
 		assert.deepEqual(
 			descendants(row)
@@ -463,24 +465,25 @@ describe("dashboard budget tab", { timeout: 20_000 }, () => {
 		assert.equal(appJs.includes("승인 보냄"), false);
 	});
 
-	it("shows the latest denied change as 여유 부족, 감사 불가 or 감사 거절", async () => {
+	it("shows the latest denied change as 여유 부족, 누적 상한 or 진척 증거 없음", async () => {
 		const page = await openPage(
 			snapshot({
-				projects: [project({ id: "cap" }), project({ id: "model" }), project({ id: "auditor" })],
+				projects: [project({ id: "cap" }), project({ id: "cumulative" }), project({ id: "progress" })],
 				events: [
-					{ seq: 4, ms: NOW - MIN, projectId: "cap", account: null, kind: "denied", data: { projectId: "cap", requestId: "r2", increaseUsd: 9, reason: "insufficient-capacity" } },
-					{ seq: 3, ms: NOW - 2 * MIN, projectId: "cap", account: null, kind: "denied", data: { projectId: "cap", requestId: "r1", increaseUsd: 3, reason: null } },
-					{ seq: 2, ms: NOW - 3 * MIN, projectId: "model", account: null, kind: "denied", data: { projectId: "model", requestId: "r3", increaseUsd: 5, reason: "audit-unavailable" } },
-					{ seq: 1, ms: NOW - 4 * MIN, projectId: "auditor", account: null, kind: "denied", data: { projectId: "auditor", requestId: "r4", increaseUsd: 2, reason: null } },
+					{ seq: 5, ms: NOW - MIN, projectId: "cap", account: null, kind: "denied", data: { projectId: "cap", requestId: "r2", increaseUsd: 9, reason: "insufficient-capacity" } },
+					{ seq: 4, ms: NOW - 2 * MIN, projectId: "cap", account: null, kind: "denied", data: { projectId: "cap", requestId: "r1", increaseUsd: 3, reason: "cumulative-cap" } },
+					{ seq: 3, ms: NOW - 3 * MIN, projectId: "cumulative", account: null, kind: "denied", data: { projectId: "cumulative", requestId: "r3", increaseUsd: 5, reason: "cumulative-cap" } },
+					{ seq: 2, ms: NOW - 4 * MIN, projectId: "progress", account: null, kind: "denied", data: { projectId: "progress", requestId: "r4", increaseUsd: 2, reason: "no-progress-evidence" } },
 				],
 			}),
 		);
 		const rows = rowsOf(page, "budget-projects");
 		assert.deepEqual(
 			rows.map((row) => chipText(row).at(-1)),
-			[labels.BUDGET_DENIAL_LABELS["insufficient-capacity"], labels.BUDGET_DENIAL_LABELS["audit-unavailable"], labels.BUDGET_DENIAL_LABELS["auditor-denied"]],
+			[labels.BUDGET_DENIAL_LABELS["insufficient-capacity"], labels.BUDGET_DENIAL_LABELS["cumulative-cap"], labels.BUDGET_DENIAL_LABELS["no-progress-evidence"]],
 		);
-		assert.equal(text(rows[0]).includes("감사 거절"), false, "the newest denial wins");
+		assert.equal(text(rows[0]).includes(labels.BUDGET_DENIAL_LABELS["cumulative-cap"]), false, "the newest denial wins");
+		assert.equal(text(page.doc.getElementById("budget-projects-body")).includes("감사 거절"), false, "removed auditor denials are gone");
 	});
 
 	it("steps the account's reset coupons with -/+ within 0..20", async () => {

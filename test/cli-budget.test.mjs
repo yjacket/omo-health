@@ -61,9 +61,8 @@ const SNAPSHOT = {
 	updatedMs: NOW,
 	enabled: true,
 	treasury: { state: "tight", windows: [WINDOW], external: { "claude:7d": null } },
-	projects: [{ id: "p1", sessionId: "s1", objective: "예산 CLI 작업", status: "approved", revision: 1, spentUsd: 3.5, mainUsd: 2, childUsd: 1.5, auditUsd: 0, missing: 0, approvedUsd: 20, estimate: null, reserveUsd: 25, pending: null, indicators: {}, triggers: [], lastAudit: null, rounds: 0 }],
+	projects: [{ id: "p1", sessionId: "s1", objective: "예산 CLI 작업", status: "approved", revision: 1, spentUsd: 3.5, mainUsd: 2, childUsd: 1.5, auditUsd: 0, missing: 0, approvedUsd: 20, estimate: null, reserveUsd: 25, stage: null, indicators: {}, triggers: [], lastAudit: null, rounds: 0 }],
 	audits: [],
-	owner: [{ projectId: "p1", requestId: "r1", kind: "estimate", increaseUsd: 5, reason: "more work", sinceMs: 1 }],
 	events: [],
 };
 
@@ -131,7 +130,7 @@ test("status --json budget carries every IS-1 window field with the seeded value
 			percentPerUsd: WINDOW.percentPerUsd,
 			coupons: WINDOW.coupons,
 		});
-		assert.deepEqual(report.budget.projects, [{ id: "p1", objective: "예산 CLI 작업", status: "approved", spentUsd: 3.5, approvedUsd: 20, pending: null, triggers: [], auditDeferred: null }]);
+		assert.deepEqual(report.budget.projects, [{ id: "p1", objective: "예산 CLI 작업", status: "approved", spentUsd: 3.5, approvedUsd: 20, stage: null, triggers: [], auditDeferred: null }]);
 		// No human approves a budget: the snapshot's owner list never reaches the status JSON.
 		assert.equal(Object.hasOwn(report.budget, "pendingOwner"), false);
 	} finally {
@@ -153,19 +152,31 @@ test("human budget table prints every IS-1 field label and the projects, with no
 
 test("human budget shows the newest denial's reason with the dashboard labels", () => {
 	const denyEvent = (seq, reason) => ({ seq, ms: NOW - (10 - seq), projectId: "p1", account: null, kind: "denied", data: { projectId: "p1", requestId: `r${seq}`, increaseUsd: 5, reason } });
-	const root = sandbox({ seed: { ...SNAPSHOT, events: [denyEvent(3, "insufficient-capacity"), denyEvent(2, "audit-unavailable")] } });
+	const root = sandbox({ seed: { ...SNAPSHOT, events: [denyEvent(3, "insufficient-capacity"), denyEvent(2, "cumulative-cap")] } });
 	try {
 		const out = runCli(root, ["budget"]);
 		assert.ok(out.includes("거절: 여유 부족"), out);
-		assert.doesNotMatch(out, /감사 불가/, out);
+		assert.doesNotMatch(out, /누적 상한|감사 불가|감사 거절/, out);
 	} finally {
 		fs.rmSync(root, { recursive: true, force: true });
 	}
-	const auditor = sandbox({ seed: { ...SNAPSHOT, events: [denyEvent(1, null)] } });
+	const progress = sandbox({ seed: { ...SNAPSHOT, events: [denyEvent(1, "no-progress-evidence")] } });
 	try {
-		assert.ok(runCli(auditor, ["budget"]).includes("거절: 감사 거절"));
+		assert.ok(runCli(progress, ["budget"]).includes("거절: 진척 증거 없음"));
 	} finally {
-		fs.rmSync(auditor, { recursive: true, force: true });
+		fs.rmSync(progress, { recursive: true, force: true });
+	}
+});
+
+test("human budget marks a staged approval with its next checkpoint", () => {
+	const project = { ...SNAPSHOT.projects[0], stage: { nextCheckpoint: "HWP round 4 acceptance" } };
+	const root = sandbox({ seed: { ...SNAPSHOT, projects: [project] } });
+	try {
+		const out = runCli(root, ["budget"]);
+		assert.ok(out.includes("단계 승인: HWP round 4 acceptance"), out);
+		assert.deepEqual(JSON.parse(runCli(root, ["status", "--json"])).budget.projects[0].stage, { nextCheckpoint: "HWP round 4 acceptance" });
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
 	}
 });
 

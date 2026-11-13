@@ -195,11 +195,11 @@ export const BUDGET_ACCOUNT_LABELS = Object.freeze({ "anthropic-subscription/def
 /** A budget project's status (src/budget/projects.mjs). */
 export const BUDGET_PROJECT_STATUS_LABELS = Object.freeze({ tracking: "추적", requested: "견적 요청", approved: "승인", pending: "결정 대기", closed: "종료" });
 
-/** Who decides a pending budget request (project pending.route): only the auditor, never a human. */
-export const BUDGET_ROUTE_LABELS = Object.freeze({ auditor: "감사 대기" });
+/** A staged approval's chip (snapshot projects[].stage): the treasury approved up to the next checkpoint. */
+export const BUDGET_STAGE_LABEL = "단계 승인";
 
-/** Why a change was denied (snapshot events kind `denied`, data.reason; `auditor-denied` when the auditor said no). */
-export const BUDGET_DENIAL_LABELS = Object.freeze({ "insufficient-capacity": "여유 부족", "audit-unavailable": "감사 불가", "auditor-denied": "감사 거절" });
+/** Why a change was denied (snapshot events kind `denied`, data.reason); the treasury decides, never an audit. */
+export const BUDGET_DENIAL_LABELS = Object.freeze({ "insufficient-capacity": "여유 부족", "cumulative-cap": "누적 상한", "no-progress-evidence": "진척 증거 없음" });
 
 /** An audit opinion (src/budget/audit.mjs assessment). */
 export const AUDIT_ASSESSMENT_LABELS = Object.freeze({ justified: "타당", "waste-likely": "낭비 의심", "insufficient-evidence": "근거 부족" });

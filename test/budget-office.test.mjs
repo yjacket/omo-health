@@ -34,7 +34,7 @@ function estimateBlock({ projectId, revision, requestId = "est-1", p10 = 2, p50 
 	return `Progress noted.\n<omo-budget kind="estimate">\n${JSON.stringify(body)}\n</omo-budget>`;
 }
 
-function changeBlock({ projectId, revision, requestId = "chg-1", p10 = 10, p50 = 20, p90 = 30 }) {
+function changeBlock({ projectId, revision, requestId = "chg-1", p10 = 10, p50 = 20, p90 = 30, progress = ["wired the second integration adapter"] }) {
 	const body = {
 		v: 1,
 		requestId,
@@ -44,6 +44,7 @@ function changeBlock({ projectId, revision, requestId = "chg-1", p10 = 10, p50 =
 		workClass: "implementation",
 		basis: { workUnits: [{ description: "extra integration work", count: 2 }], assumptions: ["same model mix"] },
 		nextCheckpoint: "integration done",
+		progress,
 		reason: "new-evidence",
 		justification: "The integration surfaced two failure paths the first estimate did not cover at all.",
 		alternatives: [{ description: "ship without the retry path", remainingUsd: { p10: 5, p50: 8, p90: 12 }, tradeoff: "retry gap" }],
@@ -63,6 +64,9 @@ function setup(t, { sid = SID } = {}) {
 	t.after(() => db.close());
 	const clock = createFakeClock(T0);
 	const config = structuredClone(DEFAULT_CONFIG);
+	// Room for one staged large raise on top of the original approval (the default 100% cap is exercised by
+	// test/budget-projects.test.mjs); this test is about who decides, not about the cap.
+	config.budget.maxChangePercent = 300;
 	const ctx = {
 		root,
 		paths,
@@ -128,7 +132,7 @@ test("(b) the second tick reads only the appended lines (stored offset)", (t) =>
 	assert.equal(c.store.getOffset(c.file).offset, fs.statSync(c.file).size);
 });
 
-test("(c)-(f), (h): request at $10, estimate -> decision, 100% checkpoint, change -> auditor denies, restart re-sends nothing", (t) => {
+test("(c)-(f), (h): request at $10, estimate -> decision, 100% checkpoint, staged rule raise + independent audit, restart re-sends nothing", (t) => {
 	const c = setup(t);
 	const pid = `${c.sid}:g1`;
 	c.writeGoal({ id: "g1", objective: "deliver the office", createdAt: secs(T0 - 2 * HOUR), updatedAt: secs(T0 - 2 * HOUR) });
@@ -169,17 +173,29 @@ test("(c)-(f), (h): request at $10, estimate -> decision, 100% checkpoint, chang
 	assert.equal(out.messages[0].details.checkpoint, 100);
 	assert.deepEqual(c.kinds(step().messages), []);
 
-	// (f) a change over the auto limit goes to the auditor; the audit runs as a runner job.
+	// (f) a large change with progress is approved staged by rule in the same tick; the change review audit
+	// starts independently and can never alter the decision.
 	out = step([E.assistant({ ms: T0 - 20 * MIN, usage: usage(0), text: changeBlock({ projectId: pid, revision: 1 }) })]);
 	assert.deepEqual(c.kinds(out.messages), ["budget-decision"]);
-	assert.equal(out.messages[0].details.decision, "pending-auditor");
-	assert.equal(runner.starts.length, 1);
+	assert.equal(out.messages[0].details.decision, "approved");
+	assert.equal(out.messages[0].details.by, "rule");
+	assert.equal(out.messages[0].details.staged, true);
+	assert.equal(out.messages[0].details.nextCheckpoint, "integration done");
+	assert.match(out.messages[0].content, /funds the work up to the next checkpoint "integration done"/);
+	assert.equal(runner.starts.length, 1, "the change review starts one audit");
 	assert.equal(runner.starts[0].kind, "budget-audit");
 	assert.ok(runner.starts[0].args.includes("--no-tools"));
 	const auditId = runner.starts[0].jobId;
 	project = c.store.getProject(pid);
-	assert.equal(project.status, "pending");
-	assert.equal(project.data.pending.route, "auditor");
+	assert.equal(project.status, "approved");
+	assert.equal(project.data.pending, null);
+	assert.equal(project.revision, 2);
+	assert.equal(project.data.approvals.at(-1).staged, true);
+	assert.equal(project.data.approvals.at(-1).nextCheckpoint, "integration done");
+	const approvedAfterChange = project.data.approvals.at(-1).approvedUsd;
+	// The adjusted p50 already includes the 19.01 spent: the stage funds 19.01 + 20 up to the next checkpoint.
+	assert.ok(Math.abs(approvedAfterChange - 39.01) < 1e-9, `staged ${approvedAfterChange}`);
+	assert.deepEqual(out.snapshot.projects.find((p) => p.id === pid).stage, { nextCheckpoint: "integration done" });
 
 	const opinion = {
 		v: 1,
@@ -197,20 +213,17 @@ test("(c)-(f), (h): request at $10, estimate -> decision, 100% checkpoint, chang
 		stdout: `${JSON.stringify({ type: "message_end", message: { role: "assistant", model: "gpt-6-astra", content: [{ type: "text", text: JSON.stringify(opinion) }], usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: { total: 0.4 } } } })}\n`,
 	});
 	out = step();
-	assert.deepEqual(c.kinds(out.messages).sort(), ["budget-audit-opinion", "budget-decision"]);
-	assert.match(out.messages.find((m) => m.details.actionKind === "budget-audit-opinion").content, /not an instruction/);
-	const denied = out.messages.find((m) => m.details.actionKind === "budget-decision");
-	assert.equal(denied.details.decision, "denied");
-	assert.equal(denied.details.by, "auditor");
-	assert.match(denied.content, /a cheaper path keeps every criterion/, "the opinion's reason is the denial basis");
+	assert.deepEqual(c.kinds(out.messages), ["budget-audit-opinion"], "the opinion is delivered, no decision follows");
+	assert.match(out.messages[0].content, /not an instruction/);
+	project = c.store.getProject(pid);
+	assert.equal(project.status, "approved");
+	assert.equal(project.data.approvals.at(-1).approvedUsd, approvedAfterChange, "an opinion never changes the approved budget");
+	assert.equal(project.revision, 2, "an opinion never bumps the revision");
 	assert.equal(runner.starts.length, 1, "no second audit while the caps hold");
 	assert.equal(c.store.spend({ projectId: pid }).auditUsd, 0.4, "the audit's own cost is ledgered as audit usage");
 	assert.equal(out.snapshot.owner, undefined, "there is no owner queue in the snapshot");
 	assert.equal(out.snapshot.audits[0].assessment, "waste-likely");
-	project = c.store.getProject(pid);
-	assert.equal(project.status, "approved", "a denial keeps the approved budget");
-	assert.equal(project.data.pending, null);
-	assert.equal(project.revision, 1, "a denial never bumps the revision");
+	assert.deepEqual(out.snapshot.projects.find((p) => p.id === pid).stage, { nextCheckpoint: "integration done" });
 
 	// A leftover decide file from an older dashboard has no effect and is deleted.
 	fs.mkdirSync(c.paths.health.budgetCommandsDir, { recursive: true });
@@ -340,13 +353,18 @@ test("an empty byModel takes the root session's latest model, so capacity is nev
 	assert.equal(w.calibrated, true);
 	assert.equal(w.state, "ok");
 	assert.equal(c.store.spend({ projectId: pid }).costUsd, 0);
-	// reserve $8 x share 1 x 3 %/USD = 24% > 25% of 88% usable => the auditor decides (an empty mix would have read 0% and approved).
+	// reserve $8 x share 1 x 3 %/USD = 24% of the window, over the 8.8% auto band: the treasury denies by rule
+	// (an empty mix would have read 0% and approved, so the latest model really was used).
 	assert.deepEqual(c.kinds(out.messages), ["budget-decision"]);
-	assert.equal(out.messages[0].details.decision, "pending-auditor");
+	assert.equal(out.messages[0].details.decision, "denied");
+	assert.equal(out.messages[0].details.by, "rule");
+	assert.equal(out.messages[0].details.reason, "insufficient-capacity");
+	assert.equal(out.messages[0].details.resetAtMs, null, "the window still has free capacity, so no reset binds");
 	const project = c.store.getProject(pid);
-	assert.equal(project.status, "pending");
+	assert.equal(project.status, "requested");
 	assert.equal(project.data.approvals.length, 0);
-	assert.equal(project.data.pending.route, "auditor");
+	assert.equal(project.data.pending, null);
+	assert.equal(project.revision, 0);
 	assert.equal(out.snapshot.owner, undefined, "there is no owner queue in the snapshot");
 });
 
@@ -582,7 +600,7 @@ test("(s) no logged-in model defers an audit visibly; a later audit clears the d
 	assert.equal(row.auditDeferred, null, "a later audit clears the deferral");
 });
 
-test("(t) a change with no capable model is denied by rule as audit-unavailable, never held for a human", (t) => {
+test("(t) a large change with no capable model is still decided by rule and the audit is deferred (no-model)", (t) => {
 	const c = setup(t);
 	const pid = `${c.sid}:g1`;
 	c.writeGoal({ id: "g1", objective: "no auditor available", createdAt: secs(T0 - 2 * HOUR), updatedAt: secs(T0 - 2 * HOUR) });
@@ -603,19 +621,23 @@ test("(t) a change with no capable model is denied by rule as audit-unavailable,
 	assert.equal(out.messages[0].details.decision, "approved");
 
 	out = step([E.assistant({ ms: T0 - 40 * MIN, usage: usage(0), text: changeBlock({ projectId: pid, revision: 1 }) })]);
-	assert.deepEqual(c.kinds(out.messages), ["budget-decision"], "one denial, no pending-auditor message");
-	assert.equal(out.messages[0].details.decision, "denied");
+	assert.deepEqual(c.kinds(out.messages), ["budget-decision"], "the raise is decided in this same tick");
+	assert.equal(out.messages[0].details.decision, "approved");
 	assert.equal(out.messages[0].details.by, "rule");
-	assert.match(out.messages[0].content, /reason: audit-unavailable/);
-	assert.equal(out.messages[0].details.reason, "audit-unavailable");
+	assert.equal(out.messages[0].details.staged, true);
+	assert.equal(out.messages[0].details.nextCheckpoint, "integration done");
 	assert.equal(runner.starts.length, 0, "no audit runs without a capable model");
 	const events = c.store.events({ projectId: pid, limit: 100 });
 	assert.ok(events.some((e) => e.kind === "audit-deferred" && e.data.reason === "no-model"));
 	assert.equal(events.filter((e) => e.kind === "audit-started").length, 0);
 	const project = c.store.getProject(pid);
-	assert.equal(project.status, "approved", "the denial keeps the approved budget");
+	assert.equal(project.status, "approved");
 	assert.equal(project.data.pending, null);
-	assert.equal(project.revision, 1);
+	assert.equal(project.revision, 2);
+	assert.equal(project.data.approvals.at(-1).staged, true);
+	assert.ok(Math.abs(project.data.approvals.at(-1).approvedUsd - 32) < 1e-9, "the adjusted p50: 12 spent + 20 remaining median");
+	assert.deepEqual(out.snapshot.projects.find((p) => p.id === pid).stage, { nextCheckpoint: "integration done" });
+	assert.deepEqual(out.snapshot.projects.find((p) => p.id === pid).auditDeferred.reason, "no-model");
 });
 
 test("(n) the snapshot reports backfill progress until every byte of the window is read", (t) => {

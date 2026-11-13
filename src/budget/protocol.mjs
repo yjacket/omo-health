@@ -23,7 +23,11 @@ export const CHANGE_REASONS = Object.freeze([
 
 const BLOCK_KINDS = new Set(["estimate", "change"]);
 const ESTIMATE_KEYS = ["v", "requestId", "projectId", "baseRevision", "remainingUsd", "workClass", "basis", "nextCheckpoint"];
-const CHANGE_KEYS = [...ESTIMATE_KEYS, "reason", "justification", "alternatives"];
+const CHANGE_REQUIRED_KEYS = [...ESTIMATE_KEYS, "reason", "justification", "alternatives"];
+const CHANGE_KEYS = [...CHANGE_REQUIRED_KEYS, "progress"];
+const PROGRESS_MIN_CHARS = 10;
+const PROGRESS_MAX_CHARS = 200;
+const PROGRESS_MAX_ITEMS = 5;
 const QUANTILE_KEYS = ["p10", "p50", "p90"];
 const BASIS_KEYS = ["workUnits", "assumptions"];
 const WORK_UNIT_KEYS = ["description", "count"];
@@ -188,6 +192,30 @@ function checkChangeFields(errors, obj) {
 			checkString(errors, `${label}.tradeoff`, alt.tradeoff, 200);
 		}
 	}
+
+	if ("progress" in obj) checkProgress(errors, obj.progress);
+}
+
+// optional on change blocks: 1-5 strings, each 10-200 characters after trim.
+function checkProgress(errors, value) {
+	if (!Array.isArray(value)) {
+		errors.push("progress must be an array of 1-5 strings");
+		return;
+	}
+	if (value.length < 1 || value.length > PROGRESS_MAX_ITEMS) {
+		errors.push(`progress must be an array of 1-${PROGRESS_MAX_ITEMS} items`);
+	}
+	for (let i = 0; i < value.length; i += 1) {
+		const item = value[i];
+		if (typeof item !== "string") {
+			errors.push(`progress[${i}] must be a string`);
+			continue;
+		}
+		const trimmed = item.trim();
+		if (trimmed.length < PROGRESS_MIN_CHARS || trimmed.length > PROGRESS_MAX_CHARS) {
+			errors.push(`progress[${i}] must be ${PROGRESS_MIN_CHARS}-${PROGRESS_MAX_CHARS} characters after trim`);
+		}
+	}
 }
 
 /**
@@ -207,7 +235,7 @@ export function validateBlock(kind, obj, { projectId, revision } = {}) {
 	}
 
 	pushUnknownKeys(errors, obj, kind === "change" ? CHANGE_KEYS : ESTIMATE_KEYS, "");
-	const required = kind === "change" ? CHANGE_KEYS : ESTIMATE_KEYS;
+	const required = kind === "change" ? CHANGE_REQUIRED_KEYS : ESTIMATE_KEYS;
 	for (const key of required) {
 		if (!(key in obj)) errors.push(`${key} is required`);
 	}
@@ -226,5 +254,10 @@ export function validateBlock(kind, obj, { projectId, revision } = {}) {
 	checkEstimateFields(errors, obj);
 	if (kind === "change") checkChangeFields(errors, obj);
 
-	return errors.length === 0 ? { ok: true, value: obj } : { ok: false, errors };
+	if (errors.length > 0) return { ok: false, errors };
+	if (kind === "change") {
+		const progress = Array.isArray(obj.progress) ? obj.progress.map((item) => item.trim()) : null;
+		return { ok: true, value: { ...obj, progress } };
+	}
+	return { ok: true, value: obj };
 }

@@ -1,7 +1,8 @@
 // C-office: the budget office. One tick = ingest the ledger, read the subscription windows, recompute calibration and
 // treasury states, drain dashboard commands, evaluate every live project (C-projects), start and poll audits (todo 14),
-// write the snapshot, and hand back composed budget messages for the engine to deliver. No human approves a budget:
-// an increase goes to the auditor when capacity fits, and a rule denial when it does not or no audit can run.
+// write the snapshot, and hand back composed budget messages for the engine to deliver. The treasury alone decides,
+// by rules (Structure A): the auditor is a third party outside the request/approval relation, so no audit result ever
+// enters a decision. Audits are independent triggers whose opinions go to the session and the snapshot.
 // Shadow mode computes and writes the snapshot but sends nothing, starts no audit, consumes no command and keeps
 // project state unchanged (would-actions become events). The office never imports the engine.
 import { createHash } from "node:crypto";
@@ -63,8 +64,6 @@ function goalNowOf(info, project) {
 function goalActive(status) {
 	return typeof status === "string" && GOAL_ACTIVE.has(status.trim().toLowerCase());
 }
-const AUDIT_DONE = new Set(["done", "failed", "timeout", "unavailable"]);
-
 function finite(value) {
 	return typeof value === "number" && Number.isFinite(value);
 }
@@ -337,8 +336,7 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 			const goalNow = goalNowOf(info, project);
 			const objective = project.objective ?? "";
 
-			// Audit in flight: one poll per tick.
-			let auditResult = null;
+			// Audit in flight: one poll per tick. Its opinion is delivered and recorded, never used to decide.
 			if (!shadow) {
 				const audits = project.data.audits ?? [];
 				const running = audits.find((a) => a.status === "running");
@@ -370,7 +368,6 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 						} else audit.costStatus = "missing";
 						if (polled.status === "done") {
 							audit.opinion = polled.opinion;
-							auditResult = polled.opinion;
 							created.push(composeAuditOpinion({
 								sessionId: project.sessionId,
 								now,
@@ -385,9 +382,8 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 								model: running.model,
 							}));
 						} else {
+							// No verdict: the audit ends without an opinion; no decision was waiting for it.
 							audit.reason = polled.reason ?? null;
-							// No verdict: the pending request is denied by the auditor's absence, never held for a human.
-							auditResult = { assessment: "insufficient-evidence", allocationOpinion: { assessment: "insufficient-evidence", reason: `audit ${polled.status}` } };
 						}
 						appendEvent({ projectId: project.id, kind: `audit-${polled.status}`, data: { auditId: running.auditId, assessment: audit.opinion?.assessment ?? null } });
 						project = { ...project, data: { ...project.data, audits: audits.map((a) => (a.auditId === running.auditId ? audit : a)) } };
@@ -400,14 +396,7 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 			const workClass = project.data.workClass ?? undefined;
 			const ref = referenceClass(closed, { workClass });
 			const blocks = ing.blocks.filter((b) => b.projectId === project.id).map((b) => ({ kind: b.kind, body: b.body }));
-			// A pending auditor with no capable model recorded at or after the request cannot be audited: rule denial.
-			const runningAudit = (project.data.audits ?? []).some((a) => a.status === "running");
-			if (!auditResult && !shadow && !runningAudit && project.data.pending?.route === "auditor"
-				&& project.data.auditDeferredReason === "no-model" && finite(project.data.auditDeferredMs)
-				&& project.data.auditDeferredMs >= (project.data.pending.sinceMs ?? 0)) {
-				auditResult = { status: "unavailable" };
-			}
-			let out = evaluate({
+			const out = evaluate({
 				project,
 				goal: goalForEvaluate(goalNow),
 				spend: projectSpend,
@@ -415,7 +404,6 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 				treasury,
 				capacity: (reserveUsd) => capacity(projectSpend.byModel)(reserveUsd),
 				ref,
-				auditResult,
 				now,
 				cfg: budget,
 			});
@@ -499,7 +487,6 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 					try {
 						startAudit({ runner, paths, model, bundle, projectId: project.id, auditId, timeoutMs: auditCfg.timeoutMs });
 						next.data.audits = [...audits, { auditId, ms: now, status: "running", model, triggers: reasons, costUsd: null, costStatus: null, spentUsd: projectSpend.costUsd, roundsCount: rounds.length }];
-						if (next.data.pending?.route === "auditor") next.data.pending = { ...next.data.pending, auditId };
 						appendEvent({ projectId: project.id, kind: "audit-started", data: { auditId, model, reasons } });
 					} catch (error) {
 						appendEvent({ projectId: project.id, kind: "audit-deferred", data: { reason: "start-failed", detail: truncate(error.message, 200), reasons } });
@@ -510,22 +497,6 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 					next.data.auditDeferredMs = now;
 					next.data.auditDeferredReason = reason;
 					appendEvent({ projectId: project.id, kind: "audit-deferred", data: { reason, reasons } });
-					// No capable model: a request waiting for the auditor is denied by rule in this same tick.
-					if (reason === "no-model" && next.data.pending?.route === "auditor") {
-						out = evaluate({
-							project: next,
-							goal: goalForEvaluate(goalNow),
-							spend: projectSpend,
-							blocks: [],
-							treasury,
-							capacity: (reserveUsd) => capacity(projectSpend.byModel)(reserveUsd),
-							ref,
-							auditResult: { status: "unavailable" },
-							now,
-							cfg: budget,
-						});
-						next = out.project;
-					}
 				}
 			}
 			for (const action of out.actions) {
@@ -576,6 +547,9 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 		const projectRows = shown.map((p) => {
 			const spend = spends.get(p.id) ?? spendOf(p);
 			const estimate = (p.data.estimates ?? []).at(-1) ?? null;
+			const latestApproval = (p.data.approvals ?? []).at(-1) ?? null;
+			// The latest approval's stage: a staged grant funds up to the checkpoint it names.
+			const stage = latestApproval?.staged === true ? { nextCheckpoint: latestApproval.nextCheckpoint ?? null } : null;
 			const rounds = store.rounds(p.id);
 			const ind = p._ind ?? indicators({ project: p, rounds, spend, spendSince: (ms) => store.spend({ projectId: p.id, sinceMs: ms }).costUsd, criteria: null, now });
 			const marks = p.data.triggerMarks ?? {};
@@ -607,6 +581,7 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 				approvedUsd: approvedOf(p),
 				estimate: estimate?.raw?.remainingUsd ? { p10: estimate.raw.remainingUsd.p10, p50: estimate.raw.remainingUsd.p50, p90: estimate.raw.remainingUsd.p90 } : null,
 				reserveUsd: estimate?.adjusted?.reserveUsd ?? null,
+				stage,
 				pending: p.data.pending ?? null,
 				indicators: ind,
 				triggers: crossed,
@@ -682,12 +657,13 @@ function composeMessage(action, project, spend, now) {
 				decision: d.status,
 				approvedUsd: d.approvedUsd,
 				increaseUsd: d.status === "approved" ? 0 : pending?.increaseUsd ?? 0,
-				by: d.by,
 				basis: d.basis ?? "",
 				windows: d.perWindow ?? [],
 				denied: d.status === "denied",
 				reason: typeof d.reason === "string" && d.reason ? d.reason : null,
 				resetAtMs: finite(d.resetAtMs) ? d.resetAtMs : null,
+				staged: d.staged === true,
+				nextCheckpoint: d.nextCheckpoint ?? null,
 			});
 		}
 	}

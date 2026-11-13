@@ -32,7 +32,7 @@ function project(over = {}) {
 function capacity(over = {}) {
 	return () => ({
 		fits: true,
-		ownerLevel: false,
+		large: false,
 		perWindow: [{ windowId: "claude:7d", requiredPercent: 4, freePercent: 60, usablePercent: 88 }],
 		...over,
 	});
@@ -68,6 +68,7 @@ function changeBlock({
 	p10 = 3,
 	p50 = 4,
 	p90 = 4,
+	progress = null,
 } = {}) {
 	return {
 		kind: "change",
@@ -85,6 +86,7 @@ function changeBlock({
 			alternatives: [
 				{ description: "skip the second adapter", remainingUsd: { p10: 0, p50: 0, p90: 0 }, tradeoff: "one region unsafe" },
 			],
+			...(progress ? { progress } : {}),
 		}),
 	};
 }
@@ -185,24 +187,32 @@ test("rule 3: an approved $30 project sending a valid-looking estimate gets a ch
 	assert.equal(result.project.data.originalApprovedUsd, 30);
 });
 
-test("rule 3: an owner-level estimate with free capacity goes to the auditor, not the owner", () => {
+test("rule 3: a large initial estimate is staged at the adjusted p50 (spend so far + remaining median) with the checkpoint and one change review", () => {
 	const result = evaluate({
 		project: project({ status: "requested", data: { requestSentMs: NOW - MIN } }),
+		spend: 12,
 		blocks: [estimateBlock()],
-		capacity: capacity({ ownerLevel: true }),
+		capacity: capacity({ large: true }),
 		now: NOW,
 		cfg: CFG,
 	});
-	assert.equal(result.project.status, "pending");
-	assert.equal(result.project.data.pending.route, "auditor");
-	assert.equal(result.project.data.pending.kind, "estimate");
-	assert.equal(result.project.data.pending.increaseUsd, 6);
-	assert.equal(result.project.data.approvals.length, 0);
-	const audit = result.actions.find((action) => action.type === "audit");
-	assert.deepEqual(audit.reasons, ["change-review"]);
-	const [decision] = messages(result.actions, "budget-decision");
-	assert.equal(decision.data.status, "pending-auditor");
-	assert.equal(decision.data.approvedUsd, 10, "the implicit allowance stays in force while the auditor looks");
+	assert.equal(result.project.status, "approved");
+	assert.equal(result.project.revision, 1);
+	const approval = result.project.data.approvals[0];
+	assert.equal(approval.approvedUsd, 22, "the adjusted p50 (12 spent + 10 remaining median)");
+	assert.equal(approval.by, "rule");
+	assert.equal(approval.staged, true);
+	assert.equal(approval.nextCheckpoint, "after the handler tests pass");
+	assert.equal(result.project.data.originalApprovedUsd, 22);
+	const audits = result.actions.filter((action) => action.type === "audit");
+	assert.equal(audits.length, 1);
+	assert.deepEqual(audits[0].reasons, ["change-review"]);
+	const decisions = messages(result.actions, "budget-decision");
+	assert.equal(decisions.length, 1);
+	assert.equal(decisions[0].data.status, "approved");
+	assert.equal(decisions[0].data.approvedUsd, 22);
+	assert.equal(decisions[0].data.staged, true);
+	assert.equal(decisions[0].data.nextCheckpoint, "after the handler tests pass");
 });
 
 test("rule 3: an estimate that does not fit capacity is denied by rule and returns to requested", () => {
@@ -211,7 +221,7 @@ test("rule 3: an estimate that does not fit capacity is denied by rule and retur
 		blocks: [estimateBlock()],
 		capacity: capacity({
 			fits: false,
-			ownerLevel: true,
+			large: true,
 			perWindow: [{ windowId: "claude:7d", requiredPercent: 120, freePercent: 10, usablePercent: 88, resetsAtMs: NOW + DAY }],
 		}),
 		now: NOW,
@@ -228,34 +238,6 @@ test("rule 3: an estimate that does not fit capacity is denied by rule and retur
 	assert.equal(decisions[0].data.reason, "insufficient-capacity");
 	assert.equal(decisions[0].data.resetAtMs, NOW + DAY);
 	assert.equal(decisions[0].data.approvedUsd, 10, "the implicit allowance stays in force");
-});
-
-test("rule 3: an estimate sent while the auditor decision is pending is corrected and leaves the pending request untouched", () => {
-	const pending = project({
-		status: "pending",
-		revision: 0,
-		data: {
-			requestSentMs: NOW - HOUR,
-			estimates: [{ requestId: "req-aud", ms: NOW - HOUR, kind: "estimate", raw: {}, adjusted: { reserveUsd: 112 } }],
-			approvals: [],
-			pending: { requestId: "req-aud", kind: "estimate", increaseUsd: 102, route: "auditor", sinceMs: NOW - HOUR },
-		},
-	});
-	const result = evaluate({
-		project: pending,
-		blocks: [estimateBlock({ requestId: "req-sneak", baseRevision: 0, p50: 100, p90: 120 })],
-		capacity: capacity(),
-		now: NOW,
-		cfg: CFG,
-	});
-	const corrections = messages(result.actions, "budget-correction");
-	assert.equal(corrections.length, 1);
-	assert.ok(corrections[0].data.errors.includes("project is pending a decision"));
-	assert.equal(result.project.status, "pending");
-	assert.deepEqual(result.project.data.pending, pending.data.pending);
-	assert.equal(result.project.data.approvals.length, 0, "no approval is pushed");
-	assert.deepEqual(result.project.data.estimates.map((entry) => entry.requestId), ["req-aud"]);
-	assert.deepEqual(messages(result.actions, "budget-decision"), []);
 });
 
 test("rule 7: a pending project with an approved budget still gets its 80 and 100 checkpoints", () => {
@@ -278,150 +260,79 @@ test("rule 7: a pending project with an approved budget still gets its 80 and 10
 	assert.deepEqual(at100.project.data.checkpoints["2"], [100]);
 });
 
-test("rule 4: two small changes whose cumulative increase passes 20% go to the auditor", () => {
-	const first = evaluate({
+test("rule 4: a small raise keeps the old path", () => {
+	const result = evaluate({
 		project: approvedProject(30),
 		spend: 30,
-		blocks: [changeBlock({ requestId: "chg-a", baseRevision: 1, p50: 4, p90: 4 })],
-		capacity: capacity(),
-		now: NOW,
-		cfg: CFG,
-	});
-	assert.equal(first.project.status, "approved");
-	assert.equal(first.project.revision, 2);
-	assert.equal(first.project.data.approvals.at(-1).approvedUsd, 34);
-	assert.equal(first.project.data.autoIncreasesUsd, 4);
-
-	const second = evaluate({
-		project: first.project,
-		spend: 34,
-		blocks: [changeBlock({ requestId: "chg-b", baseRevision: 2, p50: 4, p90: 4 })],
-		capacity: capacity(),
-		now: NOW + MIN,
-		cfg: CFG,
-	});
-	assert.equal(second.project.status, "pending");
-	assert.deepEqual(second.project.data.pending, {
-		requestId: "chg-b",
-		kind: "change",
-		increaseUsd: 4,
-		route: "auditor",
-		sinceMs: NOW + MIN,
-	});
-	assert.equal(second.project.data.approvals.length, 2, "the cumulative limit blocks auto approval");
-	const audit = second.actions.find((action) => action.type === "audit");
-	assert.deepEqual(audit.reasons, ["change-review"]);
-});
-
-test("rule 5: an auditor support verdict approves the pending change by auditor", () => {
-	const base = approvedProject(30, {
-		status: "pending",
-		revision: 2,
-		data: {
-			pending: { requestId: "chg-aud", kind: "change", increaseUsd: 10, route: "auditor", sinceMs: NOW - MIN },
-			estimates: [{ requestId: "chg-aud", ms: NOW - MIN, kind: "change", raw: {}, adjusted: { reserveUsd: 40 } }],
-		},
-	});
-	const result = evaluate({
-		project: base,
-		auditResult: { assessment: "justified", allocationOpinion: { assessment: "support", reason: "new acceptance evidence" } },
+		blocks: [changeBlock({ requestId: "chg-small", baseRevision: 1, p50: 4, p90: 4 })],
 		capacity: capacity(),
 		now: NOW,
 		cfg: CFG,
 	});
 	assert.equal(result.project.status, "approved");
-	assert.equal(result.project.data.pending, null);
-	assert.equal(result.project.revision, 3);
-	assert.equal(result.project.data.approvals.at(-1).by, "auditor");
-	assert.equal(result.project.data.approvals.at(-1).approvedUsd, 40);
+	assert.equal(result.project.revision, 2);
+	const approval = result.project.data.approvals.at(-1);
+	assert.equal(approval.approvedUsd, 34);
+	assert.equal(approval.by, "rule");
+	assert.equal(approval.staged, undefined);
+	assert.equal(result.project.data.autoIncreasesUsd, 4);
+	assert.equal(result.actions.some((action) => action.type === "audit"), false);
 	const [decision] = messages(result.actions, "budget-decision");
 	assert.equal(decision.data.status, "approved");
-	assert.equal(decision.data.approvedUsd, 40);
+	assert.equal(decision.data.staged, false);
+	assert.equal(decision.data.nextCheckpoint, null);
 });
 
-test("rule 5: the auditor approving an owner-level request approves it when capacity has room", () => {
-	const base = approvedProject(30, {
-		status: "pending",
-		revision: 2,
-		data: {
-			pending: { requestId: "chg-aud", kind: "change", increaseUsd: 10, route: "auditor", sinceMs: NOW - MIN },
-		},
-	});
+test("rule 4: a large raise without progress is denied no-progress-evidence", () => {
 	const result = evaluate({
-		project: base,
-		auditResult: { assessment: "justified", allocationOpinion: { assessment: "support", reason: "new acceptance evidence" } },
-		capacity: capacity({ ownerLevel: true }),
-		now: NOW,
-		cfg: CFG,
-	});
-	assert.equal(result.project.status, "approved");
-	assert.equal(result.project.data.pending, null);
-	assert.equal(result.project.data.approvals.length, 2);
-	assert.equal(result.project.data.approvals.at(-1).by, "auditor");
-	assert.equal(result.project.data.approvals.at(-1).approvedUsd, 40);
-});
-
-test("rule 5: an auditor revise denies the pending change by auditor with the opinion's reason", () => {
-	const base = approvedProject(30, {
-		status: "pending",
-		revision: 2,
-		data: {
-			pending: { requestId: "chg-rev", kind: "change", increaseUsd: 10, route: "auditor", sinceMs: NOW - MIN },
-		},
-	});
-	const result = evaluate({
-		project: base,
-		auditResult: { assessment: "justified", allocationOpinion: { assessment: "revise", reason: "the extra round repeats checks already covered" } },
+		project: approvedProject(30),
+		spend: 30,
+		blocks: [changeBlock({ requestId: "chg-noprog", baseRevision: 1, p50: 20, p90: 20 })],
 		capacity: capacity(),
 		now: NOW,
 		cfg: CFG,
 	});
 	assert.equal(result.project.status, "approved");
-	assert.equal(result.project.data.pending, null);
 	assert.equal(result.project.data.approvals.length, 1);
 	assert.equal(result.project.data.approvals[0].approvedUsd, 30);
-	const [decision] = messages(result.actions, "budget-decision");
-	assert.equal(messages(result.actions, "budget-decision").length, 1);
-	assert.equal(decision.data.status, "denied");
-	assert.equal(decision.data.by, "auditor");
-	assert.equal(decision.data.basis, "the extra round repeats checks already covered");
-	assert.equal(decision.data.approvedUsd, 30);
+	const decisions = messages(result.actions, "budget-decision");
+	assert.equal(decisions.length, 1);
+	assert.equal(decisions[0].data.status, "denied");
+	assert.equal(decisions[0].data.by, "rule");
+	assert.equal(decisions[0].data.reason, "no-progress-evidence");
+	const audits = result.actions.filter((action) => action.type === "audit");
+	assert.equal(audits.length, 1);
+	assert.deepEqual(audits[0].reasons, ["change-review"]);
 });
 
-test("rule 5: an audit that could not run is a rule denial with audit-unavailable", () => {
-	const base = approvedProject(30, {
-		status: "pending",
-		revision: 2,
-		data: {
-			pending: { requestId: "chg-unavail", kind: "change", increaseUsd: 10, route: "auditor", sinceMs: NOW - MIN },
-		},
-	});
+test("rule 4: a stage over the cumulative cap is denied cumulative-cap", () => {
 	const result = evaluate({
-		project: base,
-		auditResult: { status: "unavailable", reason: "no capable model" },
+		project: approvedProject(30),
+		spend: 30,
+		// Stage = 30 spent + 35 remaining median = 65 > 30 * (1 + 100%) = 60.
+		blocks: [changeBlock({ requestId: "chg-cap", baseRevision: 1, p50: 35, p90: 35, progress: ["wired the second adapter"] })],
 		capacity: capacity(),
 		now: NOW,
 		cfg: CFG,
 	});
 	assert.equal(result.project.status, "approved");
-	assert.equal(result.project.data.pending, null);
 	assert.equal(result.project.data.approvals.length, 1);
 	const [decision] = messages(result.actions, "budget-decision");
 	assert.equal(decision.data.status, "denied");
 	assert.equal(decision.data.by, "rule");
-	assert.equal(decision.data.reason, "audit-unavailable");
-	assert.equal(decision.data.approvedUsd, 30);
+	assert.equal(decision.data.reason, "cumulative-cap");
+	assert.equal(decision.data.resetAtMs, null);
 });
 
-test("rule 4: a change that does not fit capacity is denied by rule with the earliest binding reset", () => {
+test("rule 4: a stage that does not fit capacity is denied with the earliest binding reset", () => {
 	const earlyReset = NOW + 2 * DAY;
 	const result = evaluate({
-		project: approvedProject(30),
-		spend: 30,
-		blocks: [changeBlock({ requestId: "chg-cap", baseRevision: 1, p50: 10, p90: 10 })],
+		project: approvedProject(100),
+		spend: 40,
+		blocks: [changeBlock({ requestId: "chg-capfit", baseRevision: 1, p50: 30, p90: 30, progress: ["wired the second adapter"] })],
 		capacity: capacity({
 			fits: false,
-			ownerLevel: true,
+			large: true,
 			perWindow: [
 				{ windowId: "claude:7d", requiredPercent: 40, freePercent: 60, usablePercent: 88, resetsAtMs: NOW + 5 * DAY },
 				{ windowId: "codex:primary", requiredPercent: 120, freePercent: 10, usablePercent: 88, resetsAtMs: earlyReset },
@@ -431,28 +342,73 @@ test("rule 4: a change that does not fit capacity is denied by rule with the ear
 		cfg: CFG,
 	});
 	assert.equal(result.project.status, "approved");
-	assert.equal(result.project.data.pending, null);
 	assert.equal(result.project.data.approvals.length, 1);
-	assert.equal(result.project.data.approvals[0].approvedUsd, 30);
-	assert.equal(result.project.data.estimates.at(-1).requestId, "chg-cap");
-	const decisions = messages(result.actions, "budget-decision");
-	assert.equal(decisions.length, 1);
-	assert.equal(decisions[0].data.status, "denied");
-	assert.equal(decisions[0].data.by, "rule");
-	assert.equal(decisions[0].data.reason, "insufficient-capacity");
-	assert.equal(decisions[0].data.resetAtMs, earlyReset);
-	assert.equal(decisions[0].data.approvedUsd, 30);
+	const [decision] = messages(result.actions, "budget-decision");
+	assert.equal(decision.data.status, "denied");
+	assert.equal(decision.data.by, "rule");
+	assert.equal(decision.data.reason, "insufficient-capacity");
+	assert.equal(decision.data.resetAtMs, earlyReset);
+	assert.equal(decision.data.approvedUsd, 100);
+});
+
+test("rule 4: a large raise is staged at the adjusted p50 (spend so far + remaining median) with the checkpoint and one change review", () => {
+	const result = evaluate({
+		project: approvedProject(100),
+		spend: 40,
+		blocks: [changeBlock({ requestId: "chg-stage", baseRevision: 1, p50: 100, p90: 100, progress: ["wired the second adapter"] })],
+		capacity: capacity(),
+		now: NOW,
+		cfg: CFG,
+	});
+	assert.equal(result.project.status, "approved");
+	assert.equal(result.project.revision, 2);
+	const approval = result.project.data.approvals.at(-1);
+	assert.equal(approval.approvedUsd, 140, "the adjusted p50, which already includes the 40 spent");
+	assert.equal(approval.by, "rule");
+	assert.equal(approval.staged, true);
+	assert.equal(approval.nextCheckpoint, "after integration");
+	assert.equal(result.project.data.pending, null);
+	const audits = result.actions.filter((action) => action.type === "audit");
+	assert.equal(audits.length, 1);
+	assert.deepEqual(audits[0].reasons, ["change-review"]);
+	const [decision] = messages(result.actions, "budget-decision");
+	assert.equal(decision.data.status, "approved");
+	assert.equal(decision.data.approvedUsd, 140);
+	assert.equal(decision.data.staged, true);
+	assert.equal(decision.data.nextCheckpoint, "after integration");
+});
+
+test("evaluate never reads an audit result: a legacy pending raise is left untouched", () => {
+	const pending = approvedProject(30, {
+		status: "pending",
+		revision: 2,
+		data: {
+			pending: { requestId: "chg-aud", kind: "change", increaseUsd: 10, route: "auditor", sinceMs: NOW - MIN },
+			estimates: [{ requestId: "chg-aud", ms: NOW - MIN, kind: "change", raw: {}, adjusted: { reserveUsd: 40 } }],
+		},
+	});
+	const result = evaluate({
+		project: pending,
+		auditResult: { assessment: "justified", allocationOpinion: { assessment: "support", reason: "new acceptance evidence" } },
+		capacity: capacity(),
+		now: NOW,
+		cfg: CFG,
+	});
+	assert.deepEqual(result.actions, []);
+	assert.equal(result.project.status, "pending");
+	assert.deepEqual(result.project.data.pending, pending.data.pending);
+	assert.equal(result.project.data.approvals.length, 1);
 });
 
 test("rule 4: a short treasury window blocks without a per-window reset and falls back to the treasury", () => {
 	const reset = NOW + 3 * DAY;
 	const result = evaluate({
-		project: approvedProject(30),
-		spend: 30,
-		blocks: [changeBlock({ requestId: "chg-short", baseRevision: 1 })],
+		project: approvedProject(100),
+		spend: 40,
+		blocks: [changeBlock({ requestId: "chg-short", baseRevision: 1, p50: 30, p90: 30, progress: ["wired the second adapter"] })],
 		capacity: capacity({
 			fits: false,
-			ownerLevel: true,
+			large: true,
 			perWindow: [{ windowId: "claude:7d", requiredPercent: 30, freePercent: 60, usablePercent: 88 }],
 		}),
 		treasury: { state: "short", windows: [{ windowId: "claude:7d", state: "short", resetsAtMs: reset }] },

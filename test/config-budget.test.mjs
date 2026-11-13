@@ -36,6 +36,8 @@ test("budget defaults match C-config exactly", () => {
 		autoApproveCyclePercent: 10,
 		autoApproveFreePercent: 25,
 		autoChangePercent: 20,
+		// A staged change may grow the original approval by at most this percent.
+		maxChangePercent: 100,
 		ownerProjectPercent: 25,
 		burstFactor: 1.25,
 		closeGraceMs: 24 * H,

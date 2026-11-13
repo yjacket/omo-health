@@ -152,7 +152,7 @@ export function capacityCheck({ states, reserveUsd, byModel, cfg } = {}) {
 
 	const list = Array.isArray(states) ? states : [];
 	let fits = true;
-	let ownerLevel = false;
+	let large = false;
 	const perWindow = [];
 	for (const state of list) {
 		const { share, applicable } = shareFor(state, byModel);
@@ -163,11 +163,11 @@ export function capacityCheck({ states, reserveUsd, byModel, cfg } = {}) {
 			const withinCycle = requiredPercent <= cycleLimit;
 			const withinFree = freePercent !== null && requiredPercent <= (freeLimitPercent / 100) * freePercent;
 			if (!withinCycle || !withinFree) fits = false;
-			if (requiredPercent > ownerLimit) ownerLevel = true;
-			if (freePercent === null || requiredPercent > freePercent) ownerLevel = true;
+			if (requiredPercent > ownerLimit) large = true;
+			if (freePercent === null || requiredPercent > freePercent) large = true;
 		}
-		if (applicable && state.state === "short") ownerLevel = true;
+		if (applicable && state.state === "short") large = true;
 		perWindow.push({ windowId: state.windowId, requiredPercent, freePercent, usablePercent });
 	}
-	return { fits, ownerLevel, perWindow };
+	return { fits, large, perWindow };
 }

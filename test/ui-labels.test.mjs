@@ -34,8 +34,9 @@ test("detector severities have labels", () => {
 
 test("the budget tab has no owner route and no owner-decision finding label", () => {
 	assert.equal(Object.hasOwn(labels.FINDING_LABELS, "owner-decision"), false);
-	assert.deepEqual(labels.BUDGET_ROUTE_LABELS, { auditor: "감사 대기" });
-	assert.deepEqual(labels.BUDGET_DENIAL_LABELS, { "insufficient-capacity": "여유 부족", "audit-unavailable": "감사 불가", "auditor-denied": "감사 거절" });
+	assert.equal(Object.hasOwn(labels, "BUDGET_ROUTE_LABELS"), false);
+	assert.deepEqual(labels.BUDGET_DENIAL_LABELS, { "insufficient-capacity": "여유 부족", "cumulative-cap": "누적 상한", "no-progress-evidence": "진척 증거 없음" });
+	assert.equal(labels.BUDGET_STAGE_LABEL, "단계 승인");
 });
 
 test("unknown labels use fallbacks without throwing", () => {

@@ -26,6 +26,11 @@ test("every budget.* key named in the README and CHANGELOG exists in DEFAULT_CON
 	assert.ok(SWITCH_KEYS.includes("budget.audit.enabled"));
 });
 
+test("the README documents the cumulative cap key", () => {
+	assert.match(read("README.md"), /\| `budget\.maxChangePercent` \| 100 \|/);
+	assert.equal(DEFAULT_CONFIG.budget.maxChangePercent, 100);
+});
+
 test("the README estimate example matches the block the request message carries", () => {
 	const messages = read("src/act/messages.mjs");
 	assert.match(messages, /\{"v":1,"requestId":"req-1","projectId":/);

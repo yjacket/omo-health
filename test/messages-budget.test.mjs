@@ -98,6 +98,18 @@ const CASES = [
 	["opinion", "budget-audit-opinion", opinion],
 ];
 
+/** The raise template line these messages carry: the estimate fields plus reason, justification, alternatives and progress. */
+function changeTemplate(message) {
+	const line = message.content.split("\n").find((l) => l.startsWith('{"reason":'));
+	assert.ok(line, "raise template line");
+	return JSON.parse(line
+		.replace("<estimate-error|new-evidence|external-blocker|owner-scope-change|model-mix-change>", "new-evidence")
+		.replace("<why more is needed>", "the approved budget does not cover the remaining verification work")
+		.replace("<remainingUsd>", '{"p10":5,"p50":10,"p90":20}')
+		.replace("<alt>", "smaller scope")
+		.replace("<cost>", "less coverage"));
+}
+
 test("every budget composer is a redacted English self-notice for the next turn", () => {
 	for (const [name, actionKind, make] of CASES) {
 		const message = make();
@@ -142,6 +154,22 @@ test("the request carries spend, reference class, treasury state and a fillable 
 	const validated = validateBlock("estimate", parsed, { projectId: PROJECT, revision: 3 });
 	assert.deepEqual(validated.errors ?? [], []);
 	assert.equal(validated.ok, true);
+
+	// The same message carries the raise template; the estimate fields plus it make a valid change block.
+	const change = validateBlock("change", { ...parsed, ...changeTemplate(message) }, { projectId: PROJECT, revision: 3 });
+	assert.deepEqual(change.errors ?? [], []);
+	assert.equal(change.ok, true);
+	assert.deepEqual(change.value.progress, ["<verifiable result finished since the last approval>"]);
+});
+
+test("the request, correction and checkpoint describe the raise template and its progress evidence", () => {
+	const templates = [request(), correction(), checkpoint(), checkpoint({ checkpoint: 100, spentUsd: 31 })];
+	for (const message of templates) {
+		assert.match(message.content, /"progress":\["<verifiable result finished since the last approval>"\]/);
+		assert.match(message.content, /Raises above 20% of the original approval need progress evidence and are funded one stage \(the median of the remaining work\) at a time\./);
+		assert.equal(changeTemplate(message).reason, "new-evidence");
+		assert.equal(changeTemplate(message).progress.length, 1);
+	}
 });
 
 test("the request block keeps the current revision when it is 0", () => {
@@ -162,14 +190,21 @@ test("the correction lists its errors and limits the project to one correction n
 
 test("the decision states the outcome, amount, basis and per-window cost", () => {
 	const approved = decision();
-	assert.match(approved.content, /approved \$30\.00 by rule/);
+	assert.match(approved.content, /approved \$30\.00 by the budget rules/);
+	assert.equal(approved.details.by, "rule");
+	assert.doesNotMatch(decision({ by: "auditor" }).content, /auditor/);
 	assert.match(approved.content, /basis: n=7 reference class/);
 	assert.match(approved.content, /claude:7d 12%, codex:primary uncalibrated/);
 	assert.equal(approved.details.decision, "approved");
+	assert.equal(approved.details.staged, false);
+	assert.equal(approved.details.nextCheckpoint, null);
+	assert.doesNotMatch(approved.content, /next checkpoint/);
 
-	const pending = decision({ decision: "pending-auditor", increaseUsd: 12, by: null });
-	assert.match(pending.content, /waiting for the spending auditor's review/);
-	assert.equal(pending.details.decision, "pending-auditor");
+	const staged = decision({ approvedUsd: 61, increaseUsd: 31, staged: true, nextCheckpoint: "the ledger test passes" });
+	assert.match(staged.content, /This funds the work up to the next checkpoint "the ledger test passes"; when you reach it, send a kind="change" block with progress evidence for the next stage\./);
+	assert.equal(staged.details.staged, true);
+	assert.equal(staged.details.nextCheckpoint, "the ledger test passes");
+	assert.match(staged.content, /approved \$61\.00 \(an increase of \$31\.00\) by the budget rules/);
 
 	const resetAtMs = Date.UTC(2026, 10, 17, 12, 0, 0);
 	const denied = decision({ denied: true, approvedUsd: 30, by: "rule", reason: "insufficient-capacity", resetAtMs });
@@ -181,8 +216,10 @@ test("the decision states the outcome, amount, basis and per-window cost", () =>
 	assert.equal(denied.details.resetAtMs, resetAtMs);
 	assert.doesNotMatch(denied.content, /owner/i);
 
+	// The auditor never approves or denies: no audit result enters a decision.
 	const byAuditor = decision({ denied: true, approvedUsd: 30, by: "auditor", basis: "the extra rounds repeat QA without new evidence" });
-	assert.match(byAuditor.content, /denied by the spending auditor/);
+	assert.match(byAuditor.content, /denied by the budget rules/);
+	assert.doesNotMatch(byAuditor.content, /spending auditor|by auditor/);
 	assert.match(byAuditor.content, /basis: the extra rounds repeat QA/);
 });
 

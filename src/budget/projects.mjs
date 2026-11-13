@@ -1,6 +1,6 @@
 // C-projects: the project lifecycle and approval rules. Pure: the caller supplies the project record,
-// the goal, inclusive spend, new blocks, treasury state, a capacity function, the reference class and
-// any audit result. Nothing here reads the clock, the config file, or the store. No human approves.
+// the goal, inclusive spend, new blocks, treasury state, a capacity function and the reference class.
+// Nothing here reads the clock, the config file, the store, or an audit result. No human approves.
 
 import { adjust } from "./estimates.mjs";
 import { validateBlock } from "./protocol.mjs";
@@ -14,6 +14,7 @@ const STATUS_CLOSED = "closed";
 const DEFAULT_ESTIMATE_AFTER_USD = 10;
 const DEFAULT_CHECKPOINT_PERCENT = 80;
 const DEFAULT_AUTO_CHANGE_PERCENT = 20;
+const DEFAULT_MAX_CHANGE_PERCENT = 100;
 const DEFAULT_CLOSE_GRACE_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_OUTLIER_FACTOR = 1.5;
 
@@ -87,11 +88,11 @@ function currentApprovedUsd(project, implicitUsd) {
 }
 
 function safeCapacity(capacity, reserveUsd, byModel) {
-	if (typeof capacity !== "function") return { fits: true, ownerLevel: false, perWindow: [] };
+	if (typeof capacity !== "function") return { fits: true, large: false, perWindow: [] };
 	const result = capacity(reserveUsd, byModel);
 	return {
 		fits: result?.fits !== false,
-		ownerLevel: result?.ownerLevel === true,
+		large: result?.large === true,
 		perWindow: Array.isArray(result?.perWindow) ? result.perWindow : [],
 	};
 }
@@ -159,25 +160,32 @@ function decisionData(project, requestId, status, approvedUsd, by, basis, perWin
 		basis: basis ?? null,
 		reason: extra?.reason ?? null,
 		resetAtMs: extra?.resetAtMs ?? null,
+		staged: extra?.staged === true,
+		nextCheckpoint: extra?.nextCheckpoint ?? null,
 		perWindow: perWindow ?? [],
 		calibrated: (perWindow ?? []).some((entry) => entry && finite(entry.requiredPercent)),
 	};
 }
 
-function approveProject(project, { requestId, approvedUsd, by, basis, now }) {
+function approveProject(project, { requestId, approvedUsd, by, basis, staged = false, nextCheckpoint = null, now }) {
 	const data = dataOf(project);
 	const approvals = listOf(data, "approvals");
 	const original = data.originalApprovedUsd;
 	project.revision = num(project.revision, 0) + 1;
 	project.status = STATUS_APPROVED;
 	project.data.pending = null;
-	approvals.push({
+	const entry = {
 		revision: project.revision,
 		ms: now,
 		approvedUsd,
 		by,
 		basis: basis ?? "",
-	});
+	};
+	if (staged) {
+		entry.staged = true;
+		entry.nextCheckpoint = nextCheckpoint ?? null;
+	}
+	approvals.push(entry);
 	if (!finite(original)) data.originalApprovedUsd = approvedUsd;
 }
 
@@ -262,7 +270,7 @@ function applyBlock(ctx) {
 		const check = safeCapacity(capacity, adjusted.reserveUsd, byModel);
 		const afford = capacityAffordability(check, ctx.treasury);
 		const increaseUsd = Math.max(0, requestedUsd - currentApprovedUsd(project, ctx.estimateAfterUsd));
-		if (!afford.fits) {
+		if (!afford.fits || !check.fits) {
 			denyProject(project, ctx, {
 				requestId: value.requestId,
 				increaseUsd,
@@ -273,21 +281,26 @@ function applyBlock(ctx) {
 			});
 			return;
 		}
-		if (check.ownerLevel) {
-			project.status = STATUS_PENDING;
-			data.pending = {
-				requestId: value.requestId,
-				kind: "estimate",
-				increaseUsd,
-				route: "auditor",
-				sinceMs: now,
-			};
+		if (check.large) {
+			// A large first estimate is staged at the median of the remaining work. The change review is
+			// an independent audit trigger and never gates the decision.
+			// adjust() returns p50 inclusive of the spend so far: spent + the median of the remaining work.
+			const stagedUsd = adjusted.p50Usd;
 			actions.push({ type: "audit", reasons: ["change-review"] });
+			approveProject(project, {
+				requestId: value.requestId,
+				approvedUsd: stagedUsd,
+				by: "rule",
+				basis: adjusted.basis,
+				staged: true,
+				nextCheckpoint: value.nextCheckpoint,
+				now,
+			});
 			actions.push(
 				actionKindMessage(
 					"budget-decision",
 					project.sessionId,
-					decisionData(project, value.requestId, "pending-auditor", currentApprovedUsd(project, ctx.estimateAfterUsd), null, adjusted.basis, check.perWindow),
+					decisionData(project, value.requestId, "approved", stagedUsd, "rule", adjusted.basis, check.perWindow, { staged: true, nextCheckpoint: value.nextCheckpoint }),
 				),
 			);
 			return;
@@ -307,26 +320,16 @@ function applyBlock(ctx) {
 		return;
 	}
 
-	// Rule 4: a change raises the current budget by the difference to the adjusted reserve.
+	// Rule 4: a small cumulative raise keeps the old path; every other change is staged at the median
+	// of the remaining work. The auditor is outside the approval relation and never gates a decision.
 	const before = currentApprovedUsd(project, ctx.estimateAfterUsd);
 	const increaseUsd = Math.max(0, adjusted.reserveUsd - before);
 	listOf(data, "estimates").push({ requestId: value.requestId, ms: now, kind: "change", raw: value, adjusted });
 	const check = safeCapacity(capacity, adjusted.reserveUsd, byModel);
 	const afford = capacityAffordability(check, ctx.treasury);
-	if (!afford.fits) {
-		denyProject(project, ctx, {
-			requestId: value.requestId,
-			increaseUsd,
-			by: "rule",
-			basis: adjusted.basis,
-			reason: "insufficient-capacity",
-			resetAtMs: afford.binding?.resetsAtMs ?? null,
-		});
-		return;
-	}
 	const original = num(data.originalApprovedUsd, ctx.estimateAfterUsd);
 	const cumulative = num(data.autoIncreasesUsd, 0) + increaseUsd;
-	if (cumulative <= (num(cfg?.autoChangePercent, DEFAULT_AUTO_CHANGE_PERCENT) / 100) * original && check.fits && !check.ownerLevel) {
+	if (cumulative <= (num(cfg?.autoChangePercent, DEFAULT_AUTO_CHANGE_PERCENT) / 100) * original && check.fits && afford.fits) {
 		const approvedUsd = before + increaseUsd;
 		approveProject(project, {
 			requestId: value.requestId,
@@ -339,10 +342,63 @@ function applyBlock(ctx) {
 		actions.push(actionKindMessage("budget-decision", project.sessionId, decisionData(project, value.requestId, "approved", approvedUsd, "rule", adjusted.basis, check.perWindow)));
 		return;
 	}
-	project.status = STATUS_PENDING;
-	data.pending = { requestId: value.requestId, kind: "change", increaseUsd, route: "auditor", sinceMs: now };
+
 	actions.push({ type: "audit", reasons: ["change-review"] });
-	actions.push(actionKindMessage("budget-decision", project.sessionId, decisionData(project, value.requestId, "pending-auditor", before, null, adjusted.basis, check.perWindow)));
+	if (!Array.isArray(value.progress) || value.progress.length === 0) {
+		denyProject(project, ctx, {
+			requestId: value.requestId,
+			increaseUsd,
+			by: "rule",
+			basis: adjusted.basis,
+			reason: "no-progress-evidence",
+			resetAtMs: null,
+		});
+		return;
+	}
+	// Inclusive p50 from adjust(): the spend so far plus the median of the remaining work.
+	const stageTotalUsd = adjusted.p50Usd;
+	const capUsd = original * (1 + num(cfg?.maxChangePercent, DEFAULT_MAX_CHANGE_PERCENT) / 100);
+	if (stageTotalUsd > capUsd) {
+		denyProject(project, ctx, {
+			requestId: value.requestId,
+			increaseUsd,
+			by: "rule",
+			basis: adjusted.basis,
+			reason: "cumulative-cap",
+			resetAtMs: null,
+		});
+		return;
+	}
+	const stageCheck = safeCapacity(capacity, stageTotalUsd, byModel);
+	const stageAfford = capacityAffordability(stageCheck, ctx.treasury);
+	if (!stageAfford.fits || !stageCheck.fits) {
+		denyProject(project, ctx, {
+			requestId: value.requestId,
+			increaseUsd,
+			by: "rule",
+			basis: adjusted.basis,
+			reason: "insufficient-capacity",
+			resetAtMs: stageAfford.binding?.resetsAtMs ?? null,
+		});
+		return;
+	}
+	const approvedUsd = Math.max(before, stageTotalUsd);
+	approveProject(project, {
+		requestId: value.requestId,
+		approvedUsd,
+		by: "rule",
+		basis: adjusted.basis,
+		staged: true,
+		nextCheckpoint: value.nextCheckpoint,
+		now,
+	});
+	actions.push(
+		actionKindMessage(
+			"budget-decision",
+			project.sessionId,
+			decisionData(project, value.requestId, "approved", approvedUsd, "rule", adjusted.basis, stageCheck.perWindow, { staged: true, nextCheckpoint: value.nextCheckpoint }),
+		),
+	);
 }
 
 function parseBlock(block) {
@@ -357,64 +413,6 @@ function parseBlock(block) {
 	} catch {
 		return null;
 	}
-}
-
-// Rule 5: there is no owner. An auditor support verdict approves the pending request; any other
-// assessment denies it with the auditor's reason. No capable model means a rule denial.
-function applyAuditResult(ctx) {
-	const { project, auditResult, now, capacity, byModel, actions } = ctx;
-	const data = dataOf(project);
-	const pending = data.pending;
-	if (!pending || pending.route !== "auditor" || !auditResult || typeof auditResult !== "object") return;
-	const increaseUsd = num(pending.increaseUsd, 0);
-	if (auditResult.status === "unavailable") {
-		denyProject(project, ctx, {
-			requestId: pending.requestId,
-			increaseUsd,
-			by: "rule",
-			basis: null,
-			reason: "audit-unavailable",
-			resetAtMs: null,
-		});
-		return;
-	}
-	const opinionReason = typeof auditResult.allocationOpinion?.reason === "string" ? auditResult.allocationOpinion.reason : "";
-	const support =
-		auditResult.assessment === "justified" && auditResult.allocationOpinion?.assessment === "support";
-	if (!support) {
-		denyProject(project, ctx, {
-			requestId: pending.requestId,
-			increaseUsd,
-			by: "auditor",
-			basis: opinionReason,
-			reason: null,
-			resetAtMs: null,
-		});
-		return;
-	}
-	const before = currentApprovedUsd(project, ctx.estimateAfterUsd);
-	const check = safeCapacity(capacity, before + increaseUsd, byModel);
-	const afford = capacityAffordability(check, ctx.treasury);
-	if (!afford.fits) {
-		denyProject(project, ctx, {
-			requestId: pending.requestId,
-			increaseUsd,
-			by: "rule",
-			basis: opinionReason,
-			reason: "insufficient-capacity",
-			resetAtMs: afford.binding?.resetsAtMs ?? null,
-		});
-		return;
-	}
-	const approvedUsd = before + increaseUsd;
-	approveProject(project, {
-		requestId: pending.requestId,
-		approvedUsd,
-		by: "auditor",
-		basis: opinionReason,
-		now,
-	});
-	actions.push(actionKindMessage("budget-decision", project.sessionId, decisionData(project, pending.requestId, "approved", approvedUsd, "auditor", opinionReason, check.perWindow)));
 }
 
 // Rule 7: one checkpoint per revision at the configured percent and at 100%; both crossed in one
@@ -457,9 +455,8 @@ function applyCheckpoint(ctx) {
  * @param {number|{costUsd:number, byModel?:object}} input.spend inclusive spend
  * @param {Array<{kind:string, body:string, requestId?:string}>} input.blocks new blocks routed to the project
  * @param {object|null} input.treasury treasury reading forwarded to the request message
- * @param {(reserveUsd:number, byModel:object)=>{fits:boolean, ownerLevel:boolean, perWindow:Array}} input.capacity
+ * @param {(reserveUsd:number, byModel:object)=>{fits:boolean, large:boolean, perWindow:Array}} input.capacity
  * @param {{n:number, p50:number, p80:number, p90:number, errorRatio:number|null, calibrated:boolean}} input.ref
- * @param {object|null} input.auditResult parsed audit opinion; `{status:"unavailable"}` means no capable model
  * @param {number} input.now
  * @param {object} input.cfg budget config (or the whole config)
  * @returns {{project: object, actions: Array<object>}}
@@ -472,7 +469,6 @@ export function evaluate({
 	treasury = null,
 	capacity = null,
 	ref = { n: 0, p50: null, p80: null, p90: null, errorRatio: null, calibrated: false },
-	auditResult = null,
 	now,
 	cfg = {},
 } = {}) {
@@ -521,9 +517,6 @@ export function evaluate({
 			actions,
 		});
 	}
-
-	// Rule 5.
-	applyAuditResult({ project: next, auditResult, now, capacity, byModel, actions, treasury, estimateAfterUsd });
 
 	// Rule 7.
 	applyCheckpoint({ project: next, now, cfg: budget, spentUsd, estimateAfterUsd, actions, goalActive });

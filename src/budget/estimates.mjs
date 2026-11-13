@@ -63,10 +63,28 @@ function clampRatio(value) {
 	return Math.min(RATIO_MAX, Math.max(RATIO_MIN, value));
 }
 
+// The most recent audit opinion of a project, or null while no audit has produced one.
+function lastOpinionOf(project) {
+	const audits = dataOf(project).audits;
+	if (!Array.isArray(audits)) return null;
+	for (let index = audits.length - 1; index >= 0; index -= 1) {
+		const opinion = audits[index]?.opinion;
+		if (opinion && typeof opinion === "object") return opinion;
+	}
+	return null;
+}
+
+// An audit does not approve or deny anything; it only keeps a project whose latest opinion is
+// "waste-likely" out of the calibration sample. Missing audits and other assessments stay in.
+function wasteLikely(project) {
+	return lastOpinionOf(project)?.assessment === "waste-likely";
+}
+
 // Actual USD of every closed project with actual > 0, narrowed to the requested workClass
 // only once that class alone has MIN_PROJECTS observations; cancelled projects count.
 export function referenceClass(closed = [], { workClass } = {}) {
 	const withActual = (Array.isArray(closed) ? closed : [])
+		.filter((project) => !wasteLikely(project))
 		.map((project) => ({ project, actualUsd: actualOf(project) }))
 		.filter((entry) => Number.isFinite(entry.actualUsd) && entry.actualUsd > 0);
 	const sameClass = workClass
