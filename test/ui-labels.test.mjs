@@ -32,6 +32,13 @@ test("detector severities have labels", () => {
 	for (const severity of sourceLiterals("src/detect", /severity:\s*"([a-z]+)"/g)) assert.ok(labels.SEVERITY_LABELS[severity], severity);
 });
 
+test("the budget tab has no owner route and no owner-decision finding label", () => {
+	assert.equal(Object.hasOwn(labels.FINDING_LABELS, "owner-decision"), false);
+	assert.equal(Object.hasOwn(labels, "BUDGET_ROUTE_LABELS"), false);
+	assert.deepEqual(labels.BUDGET_DENIAL_LABELS, { "insufficient-capacity": "여유 부족", "cumulative-cap": "누적 상한", "no-progress-evidence": "진척 증거 없음" });
+	assert.equal(labels.BUDGET_STAGE_LABEL, "단계 승인");
+});
+
 test("unknown labels use fallbacks without throwing", () => {
 	assert.equal(labels.findingLabel(undefined, "nope"), "? nope");
 	assert.equal(labels.findingLabel("D14", "outside-workspace"), "작업 폴더 밖 수정");

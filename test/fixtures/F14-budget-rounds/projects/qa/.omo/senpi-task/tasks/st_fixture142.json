@@ -1,0 +1,27 @@
+{
+  "task_id": "st_fixture142",
+  "status": "completed",
+  "residency_state": "resident",
+  "parent_session_id": "00000000-0000-4000-8000-000000000014",
+  "root_session_id": "00000000-0000-4000-8000-000000000014",
+  "depth": 1,
+  "execution_mode": "in-process",
+  "model": "anthropic-subscription/claude-opus-5-5",
+  "created_at": "2026-01-02T18:00:00.000Z",
+  "updated_at": "2026-01-02T18:00:00.000Z",
+  "started_at": "2026-01-02T18:00:00.000Z",
+  "terminal_at": "2026-01-02T18:20:00.000Z",
+  "name": "st_fixture142",
+  "task_summary": "Review the export acceptance suite, part 2",
+  "description": "Review the export acceptance suite, part 2",
+  "category": "unspecified-low",
+  "spawn_spec": {
+    "version": 1,
+    "cwd": "__FIXTURE__/projects/qa"
+  },
+  "host_pid": 41000,
+  "child_session_id": "00000000-0000-4000-8000-000000000142",
+  "task_seq": 1,
+  "config_generation": 0,
+  "background_mode": "background"
+}

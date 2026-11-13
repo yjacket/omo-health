@@ -145,6 +145,49 @@ export const DEFAULT_CONFIG = Object.freeze({
 	/** 0.8.0: eval-cell logs an analyst bundle may carry for the subject session: at most maxFiles, the last tailBytes each, written within windowMs. */
 	evalLogs: { maxFiles: 3, tailBytes: 4096, windowMs: H },
 	reflectionOrphans: { enabled: true, graceMs: 10 * MIN },
+	/**
+	 * Token budget governance (plan token-budget-governance, C-config). Percentages are of a subscription window.
+	 * `reservePercent` + `auditReservePercent` stay free in every window; `estimateAfterUsd` is the inclusive spend that
+	 * earns one estimate request; audit caps keep the auditor from causing the waste it audits.
+	 */
+	budget: {
+		enabled: true,
+		reservePercent: 10,
+		auditReservePercent: 2,
+		staleMs: 10 * MIN,
+		backfillDays: 8,
+		ingestBytesPerTick: 8 * 1024 * 1024,
+		retentionDays: 120,
+		estimateAfterUsd: 10,
+		checkpointPercent: 80,
+		autoApproveCyclePercent: 10,
+		autoApproveFreePercent: 25,
+		autoChangePercent: 20,
+		// A staged change may grow the original approval by at most this percent.
+		maxChangePercent: 100,
+		ownerProjectPercent: 25,
+		burstFactor: 1.25,
+		closeGraceMs: 24 * H,
+		providerAliases: ["claude-sdk-oauth=anthropic-subscription"],
+		calibration: { minIntervalPercent: 2, minIntervals: 10, minCoveragePercent: 20, maxGapMs: 2 * H, earlyDropPercent: 5 },
+		audit: {
+			enabled: true,
+			models: ["chatgpt-subscription/gpt-6-astra:high", "anthropic-subscription/claude-opus-5-5:high"],
+			perProjectDay: 2,
+			perDay: 4,
+			minGapMs: 6 * H,
+			timeoutMs: 15 * MIN,
+			roundsRecord: 3,
+			roundsAudit: 4,
+			roundsCostUsd: 10,
+			roundsHard: 6,
+			overForecastPercent: 20,
+			afterAcceptUsd: 5,
+			descendantUsd: 25,
+			descendantFraction: 0.2,
+			outlierFactor: 1.5,
+		},
+	},
 	// maxHoldMs (#55 C): however the judge answers, a relaunch loop is killed once it has been seen this long.
 	respawn: { enabled: true, windowMs: 5 * MIN, minBirths: 6, minSnapshots: 5, presenceFrac: 0.6, maxSurvivorFrac: 0.25, confirmMs: MIN, killAfterMs: 3 * MIN, maxHoldMs: 30 * MIN },
 	loops: {
@@ -231,7 +274,7 @@ export const DEFAULT_CONFIG = Object.freeze({
 const ENUMS = { mode: ["auto", "shadow"] };
 
 /** The operator switches the daemon reports as effective (heartbeat `config.effective`) and the dashboard can flip. */
-export const SWITCH_KEYS = Object.freeze(["mode", "actions.kill", "actions.detach", "actions.release", "monitorOrphans.enabled", "config.autoRevert", "align.enabled", "analyst.enabled", "goalLiveness.enabled", "footer.showAll"]);
+export const SWITCH_KEYS = Object.freeze(["mode", "actions.kill", "actions.detach", "actions.release", "monitorOrphans.enabled", "config.autoRevert", "align.enabled", "analyst.enabled", "goalLiveness.enabled", "footer.showAll", "budget.enabled", "budget.audit.enabled"]);
 
 function isPlainObject(value) {
 	return typeof value === "object" && value !== null && !Array.isArray(value);

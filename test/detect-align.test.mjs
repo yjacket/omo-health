@@ -218,7 +218,7 @@ const HOUR = 60 * MIN;
 const LONG_RUN = { enabled: true, activeMs: 6 * HOUR, rounds: 8, everyMs: 6 * HOUR };
 function longRunSetup() {
 	const s = setup();
-	s.world.config = { ...DEFAULT_CONFIG, align: { ...DEFAULT_CONFIG.align, longRun: LONG_RUN } };
+	s.world.config = { ...DEFAULT_CONFIG, align: { ...DEFAULT_CONFIG.align, longRun: LONG_RUN }, budget: { ...DEFAULT_CONFIG.budget, audit: { ...DEFAULT_CONFIG.budget.audit, enabled: false } } };
 	return s;
 }
 /** `n` steps 10 minutes apart up to `now`, each todo started, worked and finished: steady progress, no other D15 signal. */

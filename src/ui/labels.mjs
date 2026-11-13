@@ -60,6 +60,9 @@ export const FINDING_LABELS = Object.freeze({
 	"refusal-orphan": "정책 거부로 목표 멈춤",
 	"park-due": "한도 대기 재개",
 	drift: "작업 범위 점검 신호",
+	"treasury-short": "예산 부족",
+	"treasury-tight": "예산 주의",
+	"audit-opinion": "예산 감사 의견",
 });
 
 export const ACTION_LABELS = Object.freeze({
@@ -179,6 +182,36 @@ export const TASK_STATUS_LABELS = Object.freeze({ running: "실행 중", queued:
 
 /** A main session's goal status (SessionRow.goal.status, from the goal tool). */
 export const GOAL_STATUS_LABELS = Object.freeze({ active: "진행 중", complete: "완료", blocked: "막힘" });
+
+// Budget tab (src/budget/office.mjs snapshot). The page cannot import this module, so src/ui/static/app.js keeps a copy of
+// these eight maps; test/ui-budget-tab.test.mjs renders every key through app.js and fails when the copies differ.
+
+/** A subscription window's state (src/budget/treasury.mjs windowState). */
+export const BUDGET_STATE_LABELS = Object.freeze({ ok: "여유", tight: "빠듯", short: "부족", unknown: "모름" });
+
+/** A subscription account (src/budget/accounts.mjs) by product name; other accounts show their id. */
+export const BUDGET_ACCOUNT_LABELS = Object.freeze({ "anthropic-subscription/default": "Claude", "chatgpt-subscription/default": "Codex" });
+
+/** A budget project's status (src/budget/projects.mjs). */
+export const BUDGET_PROJECT_STATUS_LABELS = Object.freeze({ tracking: "추적", requested: "견적 요청", approved: "승인", pending: "결정 대기", closed: "종료" });
+
+/** A staged approval's chip (snapshot projects[].stage): the treasury approved up to the next checkpoint. */
+export const BUDGET_STAGE_LABEL = "단계 승인";
+
+/** Why a change was denied (snapshot events kind `denied`, data.reason); the treasury decides, never an audit. */
+export const BUDGET_DENIAL_LABELS = Object.freeze({ "insufficient-capacity": "여유 부족", "cumulative-cap": "누적 상한", "no-progress-evidence": "진척 증거 없음" });
+
+/** An audit opinion (src/budget/audit.mjs assessment). */
+export const AUDIT_ASSESSMENT_LABELS = Object.freeze({ justified: "타당", "waste-likely": "낭비 의심", "insufficient-evidence": "근거 부족" });
+
+/** An audit job without an opinion (src/budget/audit-job.mjs status). */
+export const AUDIT_STATUS_LABELS = Object.freeze({ running: "감사 중", done: "완료", failed: "실패", timeout: "시간 초과", unavailable: "모델 없음" });
+
+/** A crossed audit trigger (snapshot projects[].triggers kind; src/budget/metrics.mjs triggers and projects.mjs reasons). */
+export const BUDGET_TRIGGER_LABELS = Object.freeze({ rounds: "회차 반복", budget: "예산 초과", "after-accept": "충족 뒤 지출", descendants: "하위 작업 지출", "estimate-outlier": "견적 이탈", "change-review": "변경 검토" });
+
+/** Why an audit was deferred (snapshot projects[].auditDeferred reason). */
+export const BUDGET_AUDIT_DEFERRED_LABELS = Object.freeze({ "no-model": "쓸 모델 없음", "in-flight": "감사 진행 중", "project-day-cap": "프로젝트 하루 한도", "day-cap": "하루 한도", "min-gap": "간격 부족", "start-failed": "시작 실패" });
 
 const label = (table, key, fallback) => (typeof key === "string" && Object.hasOwn(table, key) ? table[key] : fallback);
 

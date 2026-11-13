@@ -1,0 +1,44 @@
+{
+  "clockStart": "2026-01-03T06:20:00.000Z",
+  "clockEnd": "2026-01-03T06:32:00.000Z",
+  "tickMs": 60000,
+  "projects": [
+    "projects/qa"
+  ],
+  "sensors": [
+    {
+      "sessionId": "00000000-0000-4000-8000-000000000014",
+      "pid": 41000,
+      "idle": false,
+      "sensorVersion": "0.3.2"
+    }
+  ],
+  "config": {
+    "budget": {
+      "enabled": true
+    }
+  },
+  "budgetAudit": {
+    "durationMs": 60000,
+    "result": {
+      "v": 1,
+      "auditId": "filled-by-the-replay",
+      "projectId": "00000000-0000-4000-8000-000000000014:goal-export-rounds",
+      "assessment": "waste-likely",
+      "confidence": 0.82,
+      "criteriaStatus": "unknown",
+      "findings": [
+        {
+          "pattern": "repeated-qa-without-acceptance-gain",
+          "evidence": "Rounds 1-12 reran the same acceptance suite without new evidence.",
+          "explanation": "Twelve synthetic flat-cost rounds bought no new acceptance evidence."
+        }
+      ],
+      "advice": "Stop rerunning the same acceptance suite; finish the remaining criterion and report once when it passes.",
+      "allocationOpinion": {
+        "assessment": "revise",
+        "reason": "The remaining work fits a smaller reservation than the rounds imply."
+      }
+    }
+  }
+}

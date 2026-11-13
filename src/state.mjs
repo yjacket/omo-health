@@ -116,6 +116,8 @@ export function buildWorld(input) {
 		workOf: input.workOf ?? (() => undefined),
 		/** 0.8.0 D23: the downtime record read at daemon start (collect/downtime.mjs) | undefined. */
 		downtime: input.downtime,
+		/** D26: the budget office snapshot of this tick (src/budget/office.mjs) | undefined (disabled, scans, replays). */
+		budget: input.budget,
 
 		/** Fresh sensor heartbeat for a session, if any. */
 		sensorFor(sessionId) {
