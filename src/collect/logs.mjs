@@ -89,6 +89,10 @@ export const KNOWN_EVENTS = {
 		"model_config_error",
 		// senpi 2026.11.6-3 (omo 5.1.65), info: which model family a weekly usage limit with no family named applies to.
 		"usage_limit_scope_probe",
+		// senpi 2026.11.10-3 (omo 5.1.70), warn: the one-time removal of fallback logs written before the shared redaction
+		// registry dropped queued lines or failed (retry-fallback/log.js createFallbackLogger, senpi#6334).
+		"queued_lines_dropped",
+		"retire_generations_failed",
 	]),
 	"config-reload.log": new Set([
 		"reload_deferred",
