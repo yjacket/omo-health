@@ -93,6 +93,10 @@ export const KNOWN_EVENTS = {
 		// registry dropped queued lines or failed (retry-fallback/log.js createFallbackLogger, senpi#6334).
 		"queued_lines_dropped",
 		"retire_generations_failed",
+		// senpi 2026.11.15 (omo 5.1.71), warn: the account list that keeps billing- or sign-in-blocked accounts from
+		// releasing a usage-limit hold could not be read, so the unfiltered usage was used (agent-session.js
+		// _usageOfSelectableAccounts, senpi#6536).
+		"usage_accounts_unread",
 	]),
 	"config-reload.log": new Set([
 		"reload_deferred",

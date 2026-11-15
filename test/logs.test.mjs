@@ -220,6 +220,7 @@ test("senpi 2026.10.x log events (omo 5.1.44-5.1.51) are known by default", () =
 		["info", "usage_limit_scope_probe"],
 		["warn", "queued_lines_dropped"],
 		["warn", "retire_generations_failed"],
+		["warn", "usage_accounts_unread"],
 	]);
 	write("config-reload.log", [
 		["warn", "registration_rejected"],
