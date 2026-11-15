@@ -23,7 +23,7 @@ const WORD_BY_KIND = {
 	"machine-commit": "메모리",
 	"tps-collapse": "느림",
 };
-const WORD_BY_DETECTOR = { D1: "멈춤", D2: "폭주", D4: "토큰", D5: "무응답", D6: "공급자", D7: "설정", D8: "작업정지", D9: "잔여", D10: "루프", D11: "리로드", D12: "자체점검", D14: "범위밖", D15: "범위", D16: "정리", D17: "재시작", D18: "호스트", D20: "한도", D25: "로그인" };
+const WORD_BY_DETECTOR = { D1: "멈춤", D2: "폭주", D4: "토큰", D5: "무응답", D6: "공급자", D7: "설정", D8: "작업정지", D9: "잔여", D10: "루프", D11: "리로드", D12: "자체점검", D14: "범위밖", D15: "범위", D16: "정리", D17: "재시작", D18: "호스트", D20: "한도", D25: "로그인", D26: "예산" };
 
 /**
  * Footer text for a status level and its top finding: the mark and one word (the sensor colors it by the status level).

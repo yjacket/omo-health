@@ -54,6 +54,8 @@ export const SWITCHES = Object.freeze([
 	flag("analyst.enabled", "멈춤 분석가", "원인을 알 수 없는 멈춤과 조용한 멈춤을 읽기 전용 분석가(omo -p)가 판정합니다. 끄면 이런 호출은 아무것도 종료되지 않습니다."),
 	flag("goalLiveness.enabled", "목표 대기 확인", "목표를 기다리는 세션의 깨움 소스가 끝났거나 오래 조용하면 그 세션을 깨웁니다. 끄면 keepalive도 백스톱을 붙잡지 않습니다."),
 	flag("footer.showAll", "하단 상태줄에 모두 표시", "끄면(기본) 서브에이전트 문제와 사람만 고칠 수 있는 문제만 표시합니다."),
+	flag("budget.enabled", "예산 관리", "구독 창의 잔여량과 목표별 예산을 추적해 대시보드와 상태에 보여 줍니다. 끄면 예산 계산과 알림이 모두 꺼집니다."),
+	flag("budget.audit.enabled", "지출 감사", "목표 지출이 기준을 넘으면 강한 모델 감사가 남은 작업의 필요성을 판단합니다. 끄면 감사를 시작하지 않습니다."),
 ].map((s) => Object.freeze(s)));
 
 const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);

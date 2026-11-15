@@ -50,7 +50,7 @@ describe("ui model", () => {
 	it("returns every section without throwing for an empty home", () => {
 		const home = makeHome();
 		const state = uiState({ paths: home.paths, env: home.env, now: NOW });
-		assert.deepEqual(Object.keys(state), ["generatedMs", "version", "sessions", "ended", "overview", "investigations", "history", "settings"]);
+		assert.deepEqual(Object.keys(state), ["generatedMs", "version", "sessions", "ended", "overview", "investigations", "history", "settings", "budget"]);
 		for (const key of ["sessions", "ended", "overview", "investigations", "history", "settings"]) assert.equal(state[key].error, undefined, key);
 		assert.equal(state.history.total, 0);
 		assert.deepEqual(state.investigations.rows, []);
@@ -240,6 +240,15 @@ describe("ui model", () => {
 			assert.deepEqual(state.ended, { error: "EACCES" });
 			assert.deepEqual(state.sessions, EMPTY_SESSIONS);
 		});
+	});
+
+	it("passes the budget office snapshot through, with denial events and no owner list", () => {
+		const home = makeHome();
+		const snap = { v: 1, updatedMs: NOW, enabled: true, treasury: { state: "ok", windows: [] }, projects: [{ id: "p", pending: null }], audits: [], events: [{ seq: 1, ms: NOW, projectId: "p", account: null, kind: "denied", data: { projectId: "p", requestId: "r", increaseUsd: 5, reason: "insufficient-capacity" } }] };
+		write(home.paths.health.budgetSnapshotFile, snap);
+		const state = uiState({ paths: home.paths, env: home.env, now: NOW });
+		assert.deepEqual(state.budget, snap);
+		assert.equal(Object.hasOwn(state.budget, "owner"), false);
 	});
 
 	it("surfaces the most recent death record in the overview", () => {

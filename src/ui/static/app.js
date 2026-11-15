@@ -19,7 +19,24 @@
 	const LEVEL_RANK = { ok: 0, info: 1, warn: 2, crit: 3 };
 	const OUTCOME_TONE = { "goal-complete": "ok", answered: "ok", crash: "crit", failed: "crit", cancelled: "warn", released: "warn", closed: "idle", unknown: "idle" };
 	const ENDED_COLUMNS = [{ label: "끝난 시각", cls: "col-time" }, { label: "세션" }, { label: "결말", cls: "col-outcome" }, { label: "이유" }, { label: "자식 · 시간 · omo", cls: "col-wide" }];
-	const TABS = ["sessions", "ended", "admin"];
+	const TABS = ["sessions", "ended", "admin", "budget"];
+	// Budget tab (src/budget/office.mjs snapshot). Copies of the eight maps in src/ui/labels.mjs, which this page cannot import;
+	// test/ui-budget-tab.test.mjs renders every key of those maps through this file and fails when the copies differ.
+	const BUDGET_STATE_LABELS = { ok: "여유", tight: "빠듯", short: "부족", unknown: "모름" };
+	const BUDGET_ACCOUNT_LABELS = { "anthropic-subscription/default": "Claude", "chatgpt-subscription/default": "Codex" };
+	const BUDGET_PROJECT_STATUS_LABELS = { tracking: "추적", requested: "견적 요청", approved: "승인", pending: "결정 대기", closed: "종료" };
+	const BUDGET_STAGE_LABEL = "단계 승인";
+	const BUDGET_DENIAL_LABELS = { "insufficient-capacity": "여유 부족", "cumulative-cap": "누적 상한", "no-progress-evidence": "진척 증거 없음" };
+	const AUDIT_ASSESSMENT_LABELS = { justified: "타당", "waste-likely": "낭비 의심", "insufficient-evidence": "근거 부족" };
+	const AUDIT_STATUS_LABELS = { running: "감사 중", done: "완료", failed: "실패", timeout: "시간 초과", unavailable: "모델 없음" };
+	const BUDGET_TRIGGER_LABELS = { rounds: "회차 반복", budget: "예산 초과", "after-accept": "충족 뒤 지출", descendants: "하위 작업 지출", "estimate-outlier": "견적 이탈", "change-review": "변경 검토" };
+	const BUDGET_AUDIT_DEFERRED_LABELS = { "no-model": "쓸 모델 없음", "in-flight": "감사 진행 중", "project-day-cap": "프로젝트 하루 한도", "day-cap": "하루 한도", "min-gap": "간격 부족", "start-failed": "시작 실패" };
+	const BUDGET_TONE = { ok: "ok", tight: "warn", short: "crit" };
+	const PROJECT_TONE = { requested: "info", approved: "ok", pending: "warn" };
+	const AUDIT_TONE = { justified: "ok", "waste-likely": "warn", "insufficient-evidence": "info", running: "info", failed: "crit", timeout: "warn", unavailable: "warn" };
+	const PROJECT_COLUMNS = [{ label: "목표" }, { label: "상태", cls: "col-chip" }, { label: "지출", num: true }, { label: "승인", num: true }, { label: "견적 p50", num: true }, { label: "결과" }];
+	const AUDIT_COLUMNS = [{ label: "시각", cls: "col-time" }, { label: "프로젝트" }, { label: "판정", cls: "col-chip" }, { label: "조언", cls: "col-advice" }, { label: "모델", cls: "col-model" }, { label: "비용", num: true }];
+	const COUPON_MAX = 20;
 
 	let token = null;
 	let timer = null;
@@ -36,6 +53,8 @@
 	// The server's clock at the last state: relative times on the board are measured from it, not from the browser.
 	let nowMs = Date.now();
 	let tab = "sessions";
+	// Budget clicks the daemon has not applied yet (it drains the command queue each tick): marked until a snapshot shows them.
+	const sentCoupons = new Map();
 
 	function append(node, children) {
 		for (const child of children.flat(Infinity)) {
@@ -96,7 +115,7 @@
 						el(
 							"tr",
 							{ class: row.class },
-							row.cells.map((cell, i) => el(i === 0 ? "th" : "td", { scope: i === 0 ? "row" : undefined, class: cellClass(head[i]) }, cell)),
+							row.cells.map((cell, i) => el(i === 0 ? "th" : "td", { scope: i === 0 ? "row" : undefined, class: cellClass(head[i]), "data-label": i === 0 ? undefined : head[i]?.label }, cell)),
 						),
 					),
 				),
@@ -213,7 +232,7 @@
 	/* ---------- tabs ---------- */
 
 	function tabFromHash() {
-		const match = /^#(sessions|ended|admin)$/.exec(location.hash);
+		const match = /^#(sessions|ended|admin|budget)$/.exec(location.hash);
 		return match ? match[1] : null;
 	}
 
@@ -730,6 +749,189 @@
 		return [header, warnings, el("div", { class: "switchlist" }, s.switches.map(switchRow)), others];
 	}
 
+	/* ---------- budget ---------- */
+
+	const named = (labels, key) => (typeof key === "string" && Object.hasOwn(labels, key) ? labels[key] : show(key));
+	const pct = (v) => (Number.isFinite(v) ? `${Math.round(v * 10) / 10}%` : "-");
+	const usd = (v) => (Number.isFinite(v) ? `$${v.toFixed(2)}` : "-");
+	const listOf = (v) => (Array.isArray(v) ? v : []);
+	const firstLine = (text) => (typeof text === "string" ? (text.split(/\r?\n/).find((line) => line.trim()) ?? "").trim() : "") || "-";
+
+	/** A short "label value" fact; the space keeps the text readable (`사용 70%`), the CSS gap draws it. */
+	const stat = (label, value, cls) => el("span", { class: cls ? `stat ${cls}` : "stat" }, el("span", { class: "stat__k", text: label }), " ", el("span", { class: "stat__v", text: value }));
+
+	/** Used % across the window: used (solid), committed (light), the reserve at the end (shaded), projected % at reset (tick). */
+	function meter(w) {
+		const clamp = (v) => (Number.isFinite(v) ? Math.min(100, Math.max(0, v)) : 0);
+		const used = clamp(w.usedPercent);
+		const committed = Math.min(clamp(w.committedPercent), 100 - used);
+		const reserve = clamp(w.reservePercent);
+		const projected = Number.isFinite(w.projectedAtResetPercent) ? clamp(w.projectedAtResetPercent) : null;
+		return svg(
+			"svg",
+			{ class: `meter meter--${BUDGET_TONE[w.state] ?? "idle"}`, viewBox: "0 0 100 8", preserveAspectRatio: "none", "aria-hidden": "true" },
+			svg("rect", { class: "meter__track", x: 0, y: 0, width: 100, height: 8 }),
+			reserve > 0 ? svg("rect", { class: "meter__reserve", x: 100 - reserve, y: 0, width: reserve, height: 8 }) : null,
+			committed > 0 ? svg("rect", { class: "meter__committed", x: used, y: 0, width: committed, height: 8 }) : null,
+			used > 0 ? svg("rect", { class: "meter__used", x: 0, y: 0, width: used, height: 8 }) : null,
+			projected === null ? null : svg("line", { class: "meter__projected", x1: projected, y1: 0, x2: projected, y2: 8 }),
+		);
+	}
+
+	function windowLabel(w) {
+		const label = show(w.label ?? w.windowId);
+		return w.scope && !label.toLowerCase().includes(String(w.scope).toLowerCase()) ? `${label} ${w.scope}` : label;
+	}
+
+	/** The account's reset coupons with -/+ (0..20); a sent count shows until a snapshot carries it. */
+	function coupons(w) {
+		const group = `coupons:${w.account}`;
+		const sent = sentCoupons.get(w.account);
+		const count = sent ?? (Number.isInteger(w.coupons) ? w.coupons : 0);
+		const step = (delta, text, name) =>
+			el(
+				"button",
+				{
+					type: "button",
+					class: "btn btn--step",
+					"aria-label": name,
+					"data-group": group,
+					"data-key": `${group}:${delta}`,
+					disabled: gone || busy.has(group) || count + delta < 0 || count + delta > COUPON_MAX,
+					onclick: () => post("/api/budget/coupons", { account: w.account, count: count + delta }, group, () => sentCoupons.set(w.account, count + delta)),
+				},
+				text,
+			);
+		return el("span", { class: "coupons" }, stat("리셋권", String(count)), el("span", { class: "stepper" }, step(-1, "−", "리셋권 빼기"), step(1, "+", "리셋권 더하기")), sent === undefined ? null : chip("반영 대기", "info"));
+	}
+
+	/** One subscription window: every IS-1 field as a short label. */
+	function windowRow(w) {
+		const stale = w.stale === true;
+		const ageMinutes = Number.isFinite(w.updatedMs) ? Math.max(0, Math.round((nowMs - w.updatedMs) / 60_000)) : null;
+		const hours = Number.isFinite(w.hoursLeft) ? Math.round(w.hoursLeft * 10) / 10 : "-";
+		return el(
+			"li",
+			{ class: stale ? "win win--stale" : "win" },
+			el(
+				"div",
+				{ class: "win__head" },
+				el("span", { class: "win__name" }, el("span", { class: "win__account", text: named(BUDGET_ACCOUNT_LABELS, w.account) }), el("span", { class: "win__window", text: windowLabel(w) })),
+				chip(named(BUDGET_STATE_LABELS, w.state), BUDGET_TONE[w.state]),
+			),
+			el("div", { class: "win__meter" }, meter(w), stat("사용", pct(w.usedPercent), "stat--used")),
+			el(
+				"div",
+				{ class: "win__stats" },
+				stat("리셋", Number.isFinite(w.resetsAtMs) ? `${when(w.resetsAtMs)} KST` : "-", "stat--wide"),
+				el("span", { class: "stat" }, el("span", { class: "stat__v", text: `${hours}시간` }), " ", el("span", { class: "stat__k", text: "남음" })),
+				stat("예상", pct(w.projectedAtResetPercent)),
+				stat("예비", pct(w.reservePercent)),
+				stat("배정", Number.isFinite(w.committedPercent) ? pct(w.committedPercent) : "미보정"),
+				stat("여유", pct(w.freePercent)),
+				stat("하루", pct(w.safeDailyPercent)),
+			),
+			el(
+				"div",
+				{ class: "win__foot" },
+				stat("갱신", ageMinutes === null ? "-" : `${ageMinutes}분 전`, stale ? "stat--stale" : null),
+				stale ? chip("오래됨", "warn") : null,
+				w.error ? chip("조회 실패", "crit") : null,
+				w.calibrated === true ? stat("보정", `${Number.isFinite(w.calibrationIntervals) ? w.calibrationIntervals : 0}건`) : el("span", { class: "stat" }, el("span", { class: "stat__k", text: "미보정" })),
+				coupons(w),
+			),
+			errorSlot(`coupons:${w.account}`),
+		);
+	}
+
+	/** Backfill progress: a neutral chip beside the treasury state while the ledger has bytes left to read. */
+	function ingestChip(ingest) {
+		if (!ingest || !Number.isFinite(ingest.totalBytes) || ingest.totalBytes <= 0) return null;
+		if (!Number.isFinite(ingest.pendingBytes) || ingest.pendingBytes <= 0) return null;
+		return chip(`수집 중 ${Math.round((100 * (ingest.totalBytes - ingest.pendingBytes)) / ingest.totalBytes)}%`);
+	}
+
+	function renderLimits(b) {
+		const windows = listOf(b?.treasury?.windows);
+		for (const [account, count] of sentCoupons) if (windows.some((w) => w.account === account && w.coupons === count)) sentCoupons.delete(account);
+		if (!windows.length) return empty("기록 없음");
+		return [
+			el("div", { class: "wrap-row" }, chip(`전체 ${named(BUDGET_STATE_LABELS, b.treasury.state)}`, BUDGET_TONE[b.treasury.state]), ingestChip(b.ingest), el("span", { class: "meta", text: `${when(b.updatedMs)} 기준` })),
+			el("ul", { class: "wins" }, windows.map(windowRow)),
+		];
+	}
+
+	/** Crossed triggers as chips (heavy warn, light neutral) and a deferred audit, each titled with its detail and KST time. */
+	function triggerSignals(p) {
+		const chips = listOf(p.triggers)
+			.filter((t) => t && typeof t === "object")
+			.map((t) => {
+				const title = [typeof t.detail === "string" && t.detail ? t.detail : null, Number.isFinite(t.firstMs) ? `${when(t.firstMs)} KST` : null].filter(Boolean).join(" · ");
+				return el("span", { class: t.heavy === true ? "chip chip--warn" : "chip", title: title || undefined, text: named(BUDGET_TRIGGER_LABELS, t.kind) });
+			});
+		const deferred = p.auditDeferred;
+		if (deferred && typeof deferred === "object") {
+			const title = Number.isFinite(deferred.ms) ? `${when(deferred.ms)} KST` : undefined;
+			chips.push(el("span", { class: "chip chip--warn", title, text: `감사 미룸: ${named(BUDGET_AUDIT_DEFERRED_LABELS, deferred.reason)}` }));
+		}
+		return chips.length ? el("div", { class: "wrap-row" }, chips) : null;
+	}
+
+	/** A staged approval's neutral chip, or why the last change was denied; the treasury decides, never an audit. */
+	function resultCell(p, denials) {
+		if (p.stage && typeof p.stage === "object") {
+			const next = typeof p.stage.nextCheckpoint === "string" && p.stage.nextCheckpoint ? p.stage.nextCheckpoint : null;
+			return el("span", { class: "chip", title: next ? `다음 점검: ${next}` : undefined, text: BUDGET_STAGE_LABEL });
+		}
+		const denial = denials.get(p.id);
+		if (!denial || typeof denial.reason !== "string" || !denial.reason) return "-";
+		return chip(named(BUDGET_DENIAL_LABELS, denial.reason), "warn");
+	}
+
+	function renderProjects(b) {
+		const projects = listOf(b?.projects);
+		const denials = new Map();
+		for (const event of listOf(b?.events)) {
+			if (event?.kind !== "denied" || typeof event.projectId !== "string" || denials.has(event.projectId)) continue;
+			denials.set(event.projectId, event.data && typeof event.data === "object" ? event.data : {});
+		}
+		if (!projects.length) return empty("기록 없음");
+		return table(
+			"table--budget table--projects",
+			PROJECT_COLUMNS,
+			projects.map((p) => ({
+				cells: [
+					el("span", { class: "proj" }, el("span", { class: "proj__objective", text: p.objective || show(p.id) }), p.sessionId ? el("span", { class: "proj__meta", text: `세션 ${String(p.sessionId).slice(0, 8)}` }) : null, triggerSignals(p)),
+					chip(named(BUDGET_PROJECT_STATUS_LABELS, p.status), PROJECT_TONE[p.status]),
+					el("span", { class: "money" }, el("span", { text: usd(p.spentUsd) }), el("span", { class: "money__split", text: `메인 ${usd(p.mainUsd)} · 서브 ${usd(p.childUsd)}` })),
+					p.approvedUsd > 0 ? usd(p.approvedUsd) : "-",
+					usd(p.estimate?.p50),
+					resultCell(p, denials),
+				],
+			})),
+		);
+	}
+
+	function renderAudits(b) {
+		const audits = listOf(b?.audits);
+		if (!audits.length) return empty("기록 없음");
+		const objectives = new Map(listOf(b.projects).map((p) => [p.id, p.objective]));
+		return table(
+			"table--budget table--audits",
+			AUDIT_COLUMNS,
+			audits.map((a) => ({
+				cells: [
+					when(a.ms),
+					el("span", { class: "audit__project", title: a.projectId ?? undefined, text: objectives.get(a.projectId) || show(a.projectId) }),
+					a.assessment ? chip(named(AUDIT_ASSESSMENT_LABELS, a.assessment), AUDIT_TONE[a.assessment]) : chip(named(AUDIT_STATUS_LABELS, a.status), AUDIT_TONE[a.status]),
+					el("span", { class: "audit__advice", text: firstLine(a.advice) }),
+					el("span", { class: "mono", title: a.model ?? undefined, text: a.model ? String(a.model).split("/").pop() : "-" }),
+					usd(a.costUsd),
+				],
+			})),
+		);
+	}
+
 	async function getJson(path) {
 		const res = await fetch(path, { headers: { "x-omo-health-token": token }, cache: "no-store" });
 		if (res.status === 401) {
@@ -872,6 +1074,9 @@
 		section("investigations", state.investigations, renderInvestigations);
 		section("history", state.history, renderHistory);
 		section("settings", state.settings, renderSettings);
+		section("budget-limits", state.budget, renderLimits);
+		section("budget-projects", state.budget, renderProjects);
+		section("budget-audits", state.budget, renderAudits);
 		for (const d of document.querySelectorAll("details[data-open]")) if (openKeys.has(d.dataset.open)) d.open = true;
 		if (focusKey) [...document.querySelectorAll("[data-key]")].find((n) => n.dataset.key === focusKey)?.focus({ preventScroll: true });
 	}
@@ -938,7 +1143,7 @@
 		}
 	}
 
-	async function post(path, body, group) {
+	async function post(path, body, group, onOk) {
 		if (gone || busy.has(group)) return;
 		errors.delete(group);
 		busy.add(group);
@@ -953,6 +1158,7 @@
 		busy.delete(group);
 		if (res.status === 401) return showTokenProblem(false);
 		if (!res.ok) errors.set(group, failureText(res.status, await res.json().catch(() => ({}))));
+		else onOk?.();
 		await refresh(false);
 	}
 
