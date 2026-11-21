@@ -52,8 +52,8 @@ const BUDGET_FILE = "analyst-budget.json";
 /** A D6 finding of these kinds means the lane itself is down: starting a job would only fail (a partial block leaves the lane up) */
 const PROVIDER_OPEN = /^(?:usage-limit-storm|outage-human|accounts-blocked)$/;
 
-/** Last JSON object with a `verdict` key in free text (omo -p prints a preamble line before the answer). */
-export function parseAnalystOutput(text) {
+/** Last top-level JSON object carrying `key` in free text (omo -p prints a preamble line before the answer). */
+export function parseAnalystOutput(text, key = "verdict") {
 	const src = String(text ?? "");
 	let found = null;
 	for (let i = src.indexOf("{"); i >= 0; i = src.indexOf("{", i + 1)) {
@@ -61,8 +61,9 @@ export function parseAnalystOutput(text) {
 		if (end < 0) continue;
 		try {
 			const value = JSON.parse(src.slice(i, end + 1));
-			if (value && typeof value === "object" && !Array.isArray(value) && "verdict" in value) {
-				found = value;
+			if (value && typeof value === "object" && !Array.isArray(value)) {
+				if (key in value) found = value;
+				// A nested object is never a separate answer.
 				i = end;
 			}
 		} catch {
@@ -185,7 +186,7 @@ export function bundleDocument(bundle) {
 /**
  * @returns {{start(finding, candidates, opts): object, poll(jobId, job): object|undefined, budget(pool?): object, health(): object, laneSessionIds(): Set<string>}}
  */
-export function createAnalyst({ config, paths, clock, runner, log, env = process.env }) {
+export function createAnalyst({ config, paths, clock, runner, log, env = process.env, readdir = fs.readdirSync, stat = fs.statSync }) {
 	const jobsDir = paths.health.analystJobsDir;
 	const settings = () => config.analyst;
 	const command = () => env.OMO_HEALTH_OMO ?? settings().command ?? "omo";
@@ -198,14 +199,33 @@ export function createAnalyst({ config, paths, clock, runner, log, env = process
 	const queue = [];
 	const startFailures = new Map();
 	const sessionIds = new Set();
-	try {
-		for (const name of fs.readdirSync(jobsDir)) {
+	const seenJobs = new Set();
+	let scannedMtime;
+	/** Add the lane session ids of job dirs not read yet; a jobsDir whose mtime did not change is not read again. */
+	function scanJobs(force = false) {
+		let mtime;
+		try {
+			mtime = stat(jobsDir).mtimeMs;
+		} catch {
+			mtime = undefined;
+		}
+		if (!force && mtime === scannedMtime) return sessionIds;
+		scannedMtime = mtime;
+		let names;
+		try {
+			names = readdir(jobsDir);
+		} catch {
+			return sessionIds;
+		}
+		for (const name of names) {
+			if (seenJobs.has(name)) continue;
+			seenJobs.add(name);
 			const id = readJsonSafe(path.join(jobsDir, name, "analyst.json"))?.sessionId;
 			if (id) sessionIds.add(id);
 		}
-	} catch {
-		// no jobs yet
+		return sessionIds;
 	}
+	scanJobs(true);
 
 	const dayKeyOf = (ms) => new Date(ms).toISOString().slice(0, 10);
 
@@ -316,8 +336,8 @@ export function createAnalyst({ config, paths, clock, runner, log, env = process
 	return {
 		budget,
 		health,
-		/** Session ids of every analyst run, for log-derived detectors to skip (todo 16 probe a). */
-		laneSessionIds: () => sessionIds,
+		/** Session ids of every analyst and audit run, for log-derived detectors to skip (todo 16 probe a). */
+		laneSessionIds: () => scanJobs(),
 		/**
 		 * Queue or start one job. Returns `{jobId, sessionId, model, provider, startedMs, pool, dayKey, fp, chargedMs, queued?}`
 		 * (the caller keeps it with the finding so a restarted daemon still polls and refunds it), or a verdict that does

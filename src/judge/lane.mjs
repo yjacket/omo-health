@@ -29,20 +29,41 @@ function loggedInProviders(authFile) {
 }
 
 /**
- * The first model of the lane whose provider is logged in, else `config.analyst.fallbackModel`.
- * An unreadable or unparsable omo.jsonc / auth.json is the same as an empty lane.
+ * The lane's models whose provider is logged in, in lane order. An unreadable or unparsable omo.jsonc / auth.json
+ * is the same as an empty lane, and a lane that does not exist has no models.
  */
-export function resolveLaneModel(paths, lane, config) {
-	const fallback = config.analyst.fallbackModel;
+export function laneModels(paths, lane) {
 	let models;
 	try {
 		models = parseJsonc(fs.readFileSync(paths.omoJsonc, "utf8"))?.["[native]"]?.categories?.[lane]?.models;
 	} catch {
-		return fallback;
+		return [];
 	}
-	if (!Array.isArray(models)) return fallback;
+	if (!Array.isArray(models)) return [];
 	const providers = loggedInProviders(paths.authFile);
-	return models.find((model) => typeof model === "string" && providers.has(providerOfModel(model))) ?? fallback;
+	return models.filter((model) => typeof model === "string" && providers.has(providerOfModel(model)));
+}
+
+/**
+ * The first model of the lane whose provider is logged in, else `config.analyst.fallbackModel`.
+ * An unreadable or unparsable omo.jsonc / auth.json is the same as an empty lane.
+ */
+export function resolveLaneModel(paths, lane, config) {
+	return laneModels(paths, lane)[0] ?? config.analyst.fallbackModel;
+}
+
+/** The model's name without its provider path and `:level` suffix: `a/b/claude-opus-5-5:max` -> `claude-opus-5-5`. */
+export function modelName(model) {
+	const text = String(model ?? "");
+	const slash = text.lastIndexOf("/");
+	const name = slash >= 0 ? text.slice(slash + 1) : text;
+	const colon = name.lastIndexOf(":");
+	return colon > 0 ? name.slice(0, colon) : name;
+}
+
+/** The model's family: its name up to the first `-`, lowercased (`claude-opus-5-5` -> `claude`). */
+export function modelFamily(model) {
+	return modelName(model).split("-")[0].toLowerCase();
 }
 
 /** Throws unless every guard flag is in `args`. The runner calls it on the final argv too. */
