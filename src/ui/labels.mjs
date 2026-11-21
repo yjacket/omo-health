@@ -55,6 +55,7 @@ export const FINDING_LABELS = Object.freeze({
 	"host-resumed": "크래시한 세션 새 탭에서 재개됨",
 	"host-resume-chooser": "재개한 세션의 목표 재개 창",
 	"host-crash-stopped": "크래시 세션 자동 재개 중단",
+	"host-restart-resume-failed": "호스트 재시작 후 세션 자동 재개 실패",
 	"stale-heartbeats": "남은 센서 하트비트 정리",
 	"park-invalid": "한도 대기 기록 오류",
 	"refusal-orphan": "정책 거부로 목표 멈춤",
