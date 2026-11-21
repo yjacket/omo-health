@@ -127,8 +127,15 @@ function countChildren(rows) {
  * @param {object[]} findings open findings of this tick
  * @param {object[]} investigations investigation records (createInvestigations().list())
  * @param {number} nowMs
+ * @param {{tokensOf?: (id: string) => ({tokens?: object, treeTokens?: number, pending?: boolean} | null | undefined)}} [options]
+ *   tokensOf is the injected token index lookup: `{tokens, treeTokens}` for an indexed session, `{pending:true}` while its
+ *   first read has not reached the end of the file, null when it is unknown. Every row carries the result.
  */
-export function buildSessionSnapshot(world, findings = [], investigations = [], nowMs = world.now) {
+export function buildSessionSnapshot(world, findings = [], investigations = [], nowMs = world.now, { tokensOf } = {}) {
+	const tokenFields = (id) => {
+		const entry = tokensOf?.(id);
+		return { tokens: entry?.tokens ?? null, treeTokens: entry?.treeTokens ?? null, tokensPending: entry?.pending === true };
+	};
 	const openInvestigations = (investigations ?? []).filter((inv) => !RESOLVED_INVESTIGATIONS.has(inv.status));
 	const healthFor = ({ sessionId, taskId }) => {
 		const own = (subject) => (taskId ? subject?.taskId === taskId || (sessionId && subject?.sessionId === sessionId) : subject?.sessionId === sessionId && !subject?.taskId);
@@ -161,6 +168,7 @@ export function buildSessionSnapshot(world, findings = [], investigations = [], 
 				startedMs: finite(task.startedAtMs ?? task.createdAtMs),
 				endedMs: finite(task.terminalAtMs),
 				health: healthFor({ sessionId: task.childSessionId, taskId: task.taskId }),
+				...tokenFields(task.childSessionId ?? task.taskId),
 				children: task.childSessionId ? childrenOf(task.childSessionId, depth + 1, next) : [],
 			}))
 			.sort((a, b) => (a.startedMs ?? 0) - (b.startedMs ?? 0));
@@ -186,6 +194,7 @@ export function buildSessionSnapshot(world, findings = [], investigations = [], 
 			todo,
 			lastInputMs: finite(toMs(hb?.lastInputAt)),
 			health: healthFor({ sessionId: session.id }),
+			...tokenFields(session.id),
 			children: childrenOf(session.id, 1, new Set()),
 		};
 		if (!groups.has(omoVersion)) groups.set(omoVersion, []);

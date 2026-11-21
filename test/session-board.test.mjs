@@ -196,6 +196,64 @@ test("detectEnded decides nothing without a previous snapshot or a fresh process
 	assert.deepEqual(detectEnded(prev, snap(NOW, []), makeWorld({ now: NOW, procsFresh: false }), NOW), []);
 });
 
+test("buildSessionSnapshot puts the injected token totals on every main and child row", () => {
+	const seen = new Map([
+		["m1", { tokens: { total: 1200, input: 900, output: 300 }, treeTokens: 20_000 }],
+		["c1", { tokens: { total: 800, input: 600, output: 200 }, treeTokens: 5000 }],
+		["c0", { tokens: { total: 40, input: 30, output: 10 }, treeTokens: null }],
+		["no-session", { tokens: { total: 7, input: 5, output: 2 }, treeTokens: null }],
+	]);
+	const asked = [];
+	const tokensOf = (id) => {
+		asked.push(id);
+		return seen.get(id);
+	};
+	const world = boardWorld({
+		tasks: [
+			taskRecord({ taskId: "t0", childSessionId: "c0", parentSessionId: "m1", name: "child zero", startedAtMs: NOW - 4500 }),
+			taskRecord({ taskId: "t1", childSessionId: "c1", parentSessionId: "m1", name: "child one", startedAtMs: NOW - 4000 }),
+			taskRecord({ taskId: "no-session", childSessionId: null, parentSessionId: "m1", name: "no session", startedAtMs: NOW - 3500 }),
+			taskRecord({ taskId: "t2", childSessionId: "c2", parentSessionId: "c1", name: "grandchild", startedAtMs: NOW - 3000 }),
+		],
+	});
+	const rows = rowsOf(buildSessionSnapshot(world, [], [], NOW, { tokensOf }));
+	const m1 = rows.get("m1");
+	assert.deepEqual(m1.tokens, { total: 1200, input: 900, output: 300 });
+	assert.equal(m1.treeTokens, 20_000);
+	assert.equal(m1.tokensPending, false);
+	const child = (taskId) => m1.children.find((c) => c.taskId === taskId);
+	assert.deepEqual(child("t1").tokens, { total: 800, input: 600, output: 200 });
+	assert.equal(child("t1").treeTokens, 5000);
+	assert.deepEqual(child("t0").tokens, { total: 40, input: 30, output: 10 });
+	assert.equal(child("t0").treeTokens, null);
+	assert.deepEqual(child("no-session").tokens, { total: 7, input: 5, output: 2 }, "a child without a session id is looked up by task id");
+	assert.equal(child("t1").children[0].tokens, null, "a child the stub does not know carries null tokens");
+	assert.ok(asked.includes("m1") && asked.includes("c1") && asked.includes("c0") && asked.includes("no-session"), "the main id, the child session id and the task id fallback are asked");
+	assert.equal(rows.get("m2").tokens, null);
+});
+
+test("buildSessionSnapshot flags a row whose first token read has not finished", () => {
+	const tokensOf = (id) => (id === "m1" ? { pending: true } : { tokens: { total: 5, input: 3, output: 2 }, treeTokens: null });
+	const m1 = rowsOf(buildSessionSnapshot(boardWorld(), [], [], NOW, { tokensOf })).get("m1");
+	assert.equal(m1.tokensPending, true);
+	assert.equal(m1.tokens, null);
+	assert.equal(m1.treeTokens, null);
+	assert.equal(m1.children[0].tokens.total, 5, "siblings of a pending row still carry their totals");
+});
+
+test("buildSessionSnapshot leaves every token field null without the tokensOf option", () => {
+	const snapshot = buildSessionSnapshot(boardWorld(), [], [], NOW);
+	const all = snapshot.groups.flatMap((g) => g.sessions);
+	const walk = (rows) => rows.flatMap((row) => [row, ...walk(row.children)]);
+	const every = walk(all);
+	assert.ok(every.length > 5);
+	for (const row of every) {
+		assert.equal(row.tokens, null);
+		assert.equal(row.treeTokens, null);
+		assert.equal(row.tokensPending, false);
+	}
+});
+
 test("buildSessionSnapshot takes the name from omo's session list when the tracker never saw the session_info entry", () => {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "board-names-"));
 	const file = path.join(dir, "2026-09-23T15-00-00-000Z_m3.jsonl");
