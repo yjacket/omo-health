@@ -38,6 +38,19 @@ test("log records become typed events and unknown events are counted", () => {
 	assert.deepEqual(logs.stats.get("session.log").unknownFirstSeenMs, { brand_new_event: Date.parse("2026-09-23T16:00:00Z") });
 });
 
+test("a host restart resume warning becomes a typed event without format drift", () => {
+	const dir = tmpDir();
+	const record = { ts: "2026-11-20T00:00:00Z", level: "warn", event: "host_restart_resume_failed", sessionId: "s1", error: "Error: resume rejected" };
+	fs.writeFileSync(path.join(dir, "session.log"), line(record));
+	const logs = new LogCollector({ logsDir: dir, full: true });
+	logs.read();
+	assert.deepEqual(logs.drain(), [{
+		src: "session.log", ms: Date.parse(record.ts), level: "warn", event: record.event,
+		sessionId: record.sessionId, type: "hostRestartResumeFailed", error: record.error,
+	}]);
+	assert.equal(logs.stats.get("session.log").unknown, 0);
+});
+
 test("extraKnown log events are not counted as unknown", () => {
 	const dir = tmpDir();
 	fs.writeFileSync(path.join(dir, "session.log"), line({ ts: "2026-09-23T16:00:00Z", level: "info", event: "new_event" }));
