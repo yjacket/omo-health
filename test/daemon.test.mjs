@@ -10,6 +10,7 @@ import { resolvePaths } from "../src/paths.mjs";
 import { queueReport } from "../src/reports/intake.mjs";
 import { RUN_KEY } from "../src/install.mjs";
 import { makeWorld, sessionState, taskRecord } from "./helpers/world.mjs";
+import { E, writeJsonl } from "./helpers/fixtures.mjs";
 import { fakeProc, guardProcessListeners } from "./helpers/fake-proc.mjs";
 
 guardProcessListeners();
@@ -396,4 +397,38 @@ test("a pinned daemon never uninstalls when its source path is missing", async (
 	});
 	assert.equal(result.reason, "idle-no-omo-hosts");
 	assert.deepEqual(removed, []);
+});
+
+test("the daemon indexes a live session's tokens into sessions/usage.json and puts them on the board", async () => {
+	const start = Date.parse("2026-09-28T12:00:00Z");
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "daemon-usage-"));
+	const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health") });
+	const file = path.join(paths.sessionsDir, "proj", "2026-09-28T12-00-00-000Z_m1.jsonl");
+	writeJsonl(file, [E.assistant({ ms: start, usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } })]);
+	let ticks = 0;
+	const clock = { now: () => start + ticks * 60_000 };
+	const reader = () =>
+		makeWorld({
+			now: clock.now(),
+			procsFresh: true,
+			sessions: [sessionState({ id: "m1", file, kind: "main", cwd: "C:\\dev\\proj", startedMs: start - 1000 })],
+			sensors: [{ sessionId: "m1", pid: 4321, ts: clock.now(), idle: true }],
+		});
+	const engine = () => ({
+		async tick() {
+			ticks++;
+			return { findings: [], world: reader() };
+		},
+		table: { all: () => [] }, close() {},
+	});
+	await runDaemon({ proc: fakeProc(), paths, config: { ...DEFAULT_CONFIG, idleExitMs: 2 * 60_000 }, clock, overrides: { procs: { kind: "fake" }, createEngine: engine, env: {} } });
+
+	const index = JSON.parse(fs.readFileSync(paths.health.usageIndexFile, "utf8"));
+	assert.equal(index.entries.m1.complete, true);
+	assert.equal(index.entries.m1.published.total, 15);
+	assert.equal(index.entries.m1.published.input, 10);
+	const board = JSON.parse(fs.readFileSync(paths.health.sessionsSnapshotFile, "utf8"));
+	const row = board.groups.flatMap((g) => g.sessions).find((session) => session.sessionId === "m1");
+	assert.equal(row.tokens.total, 15, "status/_sessions.json carries the token total");
+	assert.equal(row.tokensPending, false);
 });

@@ -32,7 +32,10 @@ import { createInvestigations } from "./investigations.mjs";
 import { pruneHome } from "./retention.mjs";
 import { backfillOnce } from "./session-backfill.mjs";
 import { buildSessionSnapshot, detectEnded } from "./session-board.mjs";
-import { appendEnded } from "./session-ledger.mjs";
+import { appendEnded, readEnded } from "./session-ledger.mjs";
+import { createSessionFileLocator } from "./collect/session-files.mjs";
+import { createUsageIndex } from "./usage-index.mjs";
+import { createUsageTracker } from "./usage-tracker.mjs";
 import { atomicWriteJson, ensureDir, readJsonSafe, statSafe } from "./util/fsx.mjs";
 import { pathKey } from "./paths.mjs";
 import { defaultRegRunner, RUN_KEY, runValueName } from "./install.mjs";
@@ -318,6 +321,10 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 	let stopping = false;
 	const ledgerCache = new Map();
 	const boardInvestigations = createInvestigations({ paths, clock });
+	// Plan todo 5: the token index and its tracker. This process is the only writer of usage.json; the
+	// tracker shares one 32 MiB budget per tick between live appends and the ended-session backlog.
+	const usageIndex = createUsageIndex({ file: paths.health.usageIndexFile, clock, log });
+	const usageTracker = createUsageTracker({ paths, index: usageIndex, locator: createSessionFileLocator({ paths, clock }), clock, log });
 	const savedBoard = readJsonSafe(paths.health.sessionsSnapshotFile);
 	let prevBoard = savedBoard?.v === 1 && clock.now() - (savedBoard.ts ?? 0) <= BOARD_RESUME_MS ? savedBoard : undefined;
 	let backfilled = false;
@@ -398,12 +405,17 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 			if (result?.world) {
 				try {
 					const boardNow = clock.now();
-					const board = buildSessionSnapshot(result.world, result.findings ?? [], boardInvestigations.list({ sinceMs: boardNow - 7 * DAY_MS }), boardNow);
+					try {
+						usageTracker.tick(result.world);
+					} catch (error) {
+						log.error("usage_tick_failed", { error: error.message, stack: String(error.stack).slice(0, 800) });
+					}
+					const board = buildSessionSnapshot(result.world, result.findings ?? [], boardInvestigations.list({ sinceMs: boardNow - 7 * DAY_MS }), boardNow, { tokensOf: usageTracker.tokensOf });
 					atomicWriteJson(paths.health.sessionsSnapshotFile, board);
 					if (result.world.procsFresh !== false) {
 						for (const record of detectEnded(prevBoard, board, result.world, boardNow)) {
 							try {
-								appendEnded(paths, record);
+								if (appendEnded(paths, record)) usageTracker.queueLedger([record]);
 							} catch (error) {
 								log.error("session_ended_write_failed", { sessionId: record.sessionId, error: error.message });
 							}
@@ -423,15 +435,31 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 				} catch (error) {
 					log.error("session_backfill_failed", { error: error.message });
 				}
+				try {
+					usageTracker.queueLedger(readEnded(paths, { sinceMs: clock.now() - 30 * DAY_MS }));
+				} catch (error) {
+					log.error("usage_queue_failed", { error: error.message });
+				}
 			}
 			if (clock.now() - lastRetentionMs >= DAY_MS) {
 				lastRetentionMs = clock.now();
 				runRetention(paths, lastRetentionMs, log);
+				try {
+					usageIndex.prune(lastRetentionMs);
+					usageTracker.queueLedger(readEnded(paths, { sinceMs: lastRetentionMs - 30 * DAY_MS }));
+				} catch (error) {
+					log.error("usage_queue_failed", { error: error.message });
+				}
 			}
 			dbMaintainer?.tick(clock.now());
 			if (clock.now() - lastStateSaveMs >= 60_000) {
 				lastStateSaveMs = clock.now();
 				saveEngineState();
+				try {
+					usageIndex.save();
+				} catch (error) {
+					log.error("usage_save_failed", { error: error.message });
+				}
 			}
 			const hosts = engine.table.all().filter(isSenpiHost).length;
 			if (hosts > 0) lastHostSeenMs = clock.now();
@@ -474,6 +502,11 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 		// during cleanup must still be logged, not crash the daemon. An injected proc (tests) must not keep them.
 		if (proc !== process) for (const [event, handler] of Object.entries(processHandlers)) proc.off(event, handler);
 		saveEngineState();
+		try {
+			usageIndex.save();
+		} catch (error) {
+			log.error("usage_save_failed", { error: error.message });
+		}
 		engine.close();
 		closeDb(db);
 		releaseLock(paths);

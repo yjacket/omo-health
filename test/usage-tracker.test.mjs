@@ -1,0 +1,294 @@
+import "./helpers/tmp-root.mjs";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { test } from "node:test";
+import { createSessionFileLocator } from "../src/collect/session-files.mjs";
+import { readUsage } from "../src/collect/usage.mjs";
+import { E, iso, tmpDir, writeJsonl } from "./helpers/fixtures.mjs";
+import { makeWorld, sessionState } from "./helpers/world.mjs";
+import { compactUsage, createUsageIndex, readUsageIndex, USAGE_TICK_BYTES } from "../src/usage-index.mjs";
+import { createUsageTracker } from "../src/usage-tracker.mjs";
+import { resolvePaths } from "../src/paths.mjs";
+
+const T0 = Date.UTC(2026, 8, 28, 12, 0, 0);
+const DAY = 86_400_000;
+
+const usage = (input, output = 0, cacheRead = 0, cacheWrite = 0, cost = 0) => ({ input, output, cacheRead, cacheWrite, cost: { total: cost } });
+
+function makeClock(start = T0) {
+	let now = start;
+	return { clock: { now: () => now }, advance: (ms) => (now += ms) };
+}
+
+function setup(prefix = "usage-tracker-", indexOptions = {}) {
+	const root = tmpDir(prefix);
+	const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health") });
+	const { clock, advance } = makeClock();
+	const events = [];
+	const log = {
+		info: (event, data) => events.push({ level: "info", event, data }),
+		error: (event, data) => events.push({ level: "error", event, data }),
+		warn: () => {},
+	};
+	const index = createUsageIndex({ file: paths.health.usageIndexFile, clock, log, ...indexOptions });
+	const locator = createSessionFileLocator({ paths, clock, rescanMs: 0 });
+	const tracker = createUsageTracker({ paths, index, locator, clock, log });
+	// Every cwd is under this test's temp root; a real project path would let a store leak between runs.
+	return { root, paths, clock, advance, events, log, index, locator, tracker, cwd: path.join(root, "proj") };
+}
+
+/** `<sessionsDir>/<slug>/<ts>_<id>.jsonl`, the shape the live collector and the locator agree on. */
+function mainFile(paths, id) {
+	return path.join(paths.sessionsDir, "proj", `2026-09-28T12-00-00-000Z_${id}.jsonl`);
+}
+
+/** `<cwd>/.omo/senpi-task/children/<taskId>/sessions/<taskId>/<ts>_<sessionId>.jsonl`. */
+function childFile(cwd, taskId, sessionId) {
+	return path.join(cwd, ".omo", "senpi-task", "children", taskId, "sessions", taskId, `2026-09-28T12-00-00-000Z_${sessionId}.jsonl`);
+}
+
+/** One JSONL record of at least `bytes` bytes, its usage in the message. */
+function bigRecord(bytes, totals) {
+	const entry = { type: "message", timestamp: iso(T0), message: { role: "assistant", provider: "p", model: "m", usage: totals, stopReason: "stop", content: "" } };
+	const base = JSON.stringify(entry).length;
+	entry.message.content = "x".repeat(Math.max(0, bytes - base));
+	return JSON.stringify(entry);
+}
+
+function writeLines(file, lines) {
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	fs.writeFileSync(file, `${lines.join("\n")}\n`);
+}
+
+const emptyWorld = (clock) => makeWorld({ now: clock.now(), sessions: [] });
+
+test("a complete live session reads only appended bytes each tick", () => {
+	const s = setup();
+	const file = mainFile(s.paths, "m1");
+	writeJsonl(file, [E.assistant({ ms: T0, usage: usage(10, 5) })]);
+	const world = () => makeWorld({ now: s.clock.now(), sessions: [sessionState({ id: "m1", file, kind: "main", cwd: s.cwd })] });
+	const first = s.tracker.tick(world());
+	assert.equal(first.bytesRead, fs.statSync(file).size, "the first tick reads the whole first record");
+	assert.equal(s.index.get("m1").complete, true);
+	assert.equal(compactUsage(s.index.get("m1")).total, 15);
+
+	const appended = `${JSON.stringify(E.assistant({ ms: T0 + 1000, usage: usage(7, 3) }))}\n`;
+	fs.appendFileSync(file, appended);
+	const second = s.tracker.tick(world());
+	assert.equal(second.bytesRead, Buffer.byteLength(appended), "the second tick reads only the appended bytes");
+	assert.equal(compactUsage(s.index.get("m1")).total, 25);
+	assert.equal(s.index.get("m1").published.total, 25);
+});
+
+test("a live child attached to another session's file gets no tokens, and its row ends missing", () => {
+	const s = setup();
+	const parent = mainFile(s.paths, "p1");
+	writeJsonl(parent, [E.assistant({ ms: T0, usage: usage(100) })]);
+	const other = childFile(s.cwd, "st_c", "other");
+	writeJsonl(other, [E.assistant({ ms: T0, usage: usage(999) })]);
+	const world = makeWorld({
+		now: s.clock.now(),
+		sessions: [
+			sessionState({ id: "p1", file: parent, kind: "main", cwd: s.cwd }),
+			// The live collector's newest-file fallback gave this child another session's file.
+			sessionState({ id: "c1", file: other, kind: "child", taskId: "st_c", parentSessionId: "p1", cwd: s.cwd }),
+		],
+	});
+	s.tracker.queueLedger([{ sessionId: "c1", kind: "child", taskId: "st_c", parentSessionId: "p1", cwd: s.cwd, endedMs: T0 }]);
+	s.tracker.tick(world);
+	assert.equal(s.index.get("c1").state, "missing", "the backlog found no exact child file");
+	assert.equal(s.index.has("other"), false, "the other session's file was never indexed");
+	assert.equal(compactUsage(s.index.get("p1")).total, 100);
+	assert.equal(s.tracker.tokensOf("p1").treeTokens, null, "the parent's tree total excludes the mismatched child");
+	assert.equal(s.tracker.tokensOf("c1"), null);
+});
+
+test("a tick never reads more than the byte budget: a 40 MiB live record waits while a backlog waits", () => {
+	const s = setup();
+	const live = mainFile(s.paths, "m1");
+	writeJsonl(live, [E.assistant({ ms: T0, usage: usage(10) })]);
+	const backlog = mainFile(s.paths, "b1");
+	writeJsonl(backlog, [E.assistant({ ms: T0, usage: usage(5) })]);
+	const world = makeWorld({ now: s.clock.now(), sessions: [sessionState({ id: "m1", file: live, kind: "main", cwd: s.cwd })] });
+	s.tracker.tick(world);
+	assert.equal(compactUsage(s.index.get("m1")).total, 10);
+
+	fs.appendFileSync(live, `${bigRecord(40 * 1024 * 1024, usage(1000))}\n`);
+	s.tracker.queueLedger([{ sessionId: "b1", kind: "main", cwd: s.cwd, endedMs: T0 }]);
+	const first = s.tracker.tick(world);
+	assert.equal(first.bytesRead, USAGE_TICK_BYTES, "the whole budget went to the live append");
+	assert.equal(s.index.get("m1").complete, true);
+	assert.equal(compactUsage(s.index.get("m1")).total, 10, "the previous total stays while the record is partial");
+	assert.equal(s.index.has("b1"), false, "the backlog got nothing this tick");
+
+	const second = s.tracker.tick(world);
+	assert.ok(second.bytesRead <= USAGE_TICK_BYTES);
+	assert.equal(compactUsage(s.index.get("m1")).total, 1010, "the full record counts once it completes");
+	assert.equal(compactUsage(s.index.get("b1")).total, 5);
+});
+
+test("a 32 MiB budget drains three 20 MiB files in two ticks and logs usage_backlog once after saving", () => {
+	const s = setup();
+	const rows = [];
+	for (let i = 1; i <= 3; i += 1) {
+		writeLines(mainFile(s.paths, `f${i}`), [bigRecord(20 * 1024 * 1024, usage(100 * i))]);
+		rows.push({ sessionId: `f${i}`, kind: "main", cwd: s.cwd, endedMs: T0 + i });
+	}
+	s.tracker.queueLedger(rows);
+	const first = s.tracker.tick(emptyWorld(s.clock));
+	assert.equal(first.bytesRead, USAGE_TICK_BYTES);
+	assert.equal(s.events.filter((e) => e.event === "usage_backlog").length, 0, "the backlog is not empty yet");
+	assert.equal(fs.existsSync(s.paths.health.usageIndexFile), false, "the index is not saved before the backlog empties");
+
+	const second = s.tracker.tick(emptyWorld(s.clock));
+	assert.ok(second.bytesRead <= USAGE_TICK_BYTES);
+	assert.deepEqual([1, 2, 3].map((i) => compactUsage(s.index.get(`f${i}`)).total), [100, 200, 300]);
+	const logged = s.events.filter((e) => e.event === "usage_backlog");
+	assert.equal(logged.length, 1, "usage_backlog is logged once");
+	assert.deepEqual(logged[0].data, { indexed: 3, missing: 0 });
+	const saved = readUsageIndex(s.paths.health.usageIndexFile);
+	assert.equal(saved.get("f3").complete, true, "the log came after the save");
+});
+
+test("a 96 MiB file shows pending for three ticks, then its full total", () => {
+	const s = setup();
+	const lines = [];
+	for (let i = 0; i < 96; i += 1) lines.push(bigRecord(1024 * 1024, usage(10)));
+	writeLines(mainFile(s.paths, "big"), lines);
+	s.tracker.queueLedger([{ sessionId: "big", kind: "main", cwd: s.cwd, endedMs: T0 }]);
+	for (let i = 0; i < 3; i += 1) {
+		const tick = s.tracker.tick(emptyWorld(s.clock));
+		assert.ok(tick.bytesRead <= USAGE_TICK_BYTES);
+		assert.equal(compactUsage(s.index.get("big")), null, `tick ${i + 1} shows no partial total`);
+		assert.deepEqual(s.tracker.tokensOf("big"), { pending: true });
+	}
+	s.tracker.tick(emptyWorld(s.clock));
+	assert.equal(compactUsage(s.index.get("big")).total, 960);
+	assert.equal(s.tracker.tokensOf("big").tokens.total, 960);
+	assert.equal(s.tracker.tokensOf("big").treeTokens, null);
+});
+
+test("a missing child is retried after a day of fake clock on the next queueLedger", () => {
+	const s = setup();
+	const row = { sessionId: "c9", kind: "child", taskId: "st_9", parentSessionId: "p9", cwd: s.cwd, endedMs: T0 };
+	s.tracker.queueLedger([row]);
+	s.tracker.tick(emptyWorld(s.clock));
+	assert.equal(s.index.get("c9").state, "missing");
+	const checked = s.index.get("c9").checkedMs;
+
+	s.tracker.queueLedger([row]);
+	assert.equal(s.tracker.tick(emptyWorld(s.clock)).bytesRead, 0, "too soon: the missing row is not retried");
+	assert.equal(s.index.get("c9").checkedMs, checked);
+
+	writeJsonl(childFile(s.cwd, "st_9", "c9"), [E.assistant({ ms: T0, usage: usage(42) })]);
+	s.advance(DAY + 1);
+	s.tracker.queueLedger([row]);
+	const tick = s.tracker.tick(emptyWorld(s.clock));
+	assert.ok(tick.bytesRead > 0);
+	assert.equal(compactUsage(s.index.get("c9")).total, 42);
+	assert.ok(s.index.get("c9").checkedMs > checked);
+});
+
+test("an ended file that grew after a complete read is requeued and its tree total follows", () => {
+	const s = setup();
+	const parent = mainFile(s.paths, "p1");
+	writeJsonl(parent, [E.assistant({ ms: T0, usage: usage(10) })]);
+	writeJsonl(childFile(s.cwd, "st_c", "c1"), [E.assistant({ ms: T0, usage: usage(5) })]);
+	const parentRow = { sessionId: "p1", kind: "main", cwd: s.cwd, endedMs: T0 + 10 };
+	const rows = [parentRow, { sessionId: "c1", kind: "child", taskId: "st_c", parentSessionId: "p1", cwd: s.cwd, endedMs: T0 + 20 }];
+	s.tracker.queueLedger(rows);
+	s.tracker.tick(emptyWorld(s.clock));
+	assert.equal(s.tracker.tokensOf("p1").treeTokens, 15);
+
+	const appended = `${JSON.stringify(E.assistant({ ms: T0 + 1000, usage: usage(7) }))}\n`;
+	fs.appendFileSync(parent, appended);
+	s.tracker.queueLedger([parentRow]);
+	const tick = s.tracker.tick(emptyWorld(s.clock));
+	assert.equal(tick.bytesRead, Buffer.byteLength(appended));
+	assert.equal(compactUsage(s.index.get("p1")).total, 17);
+	assert.equal(s.tracker.tokensOf("p1").treeTokens, 22);
+});
+
+test("a restart resumes an interrupted file from the saved offset instead of recounting it", () => {
+	const s = setup();
+	const file = mainFile(s.paths, "r1");
+	writeLines(file, [bigRecord(12 * 1024 * 1024, usage(100)), bigRecord(12 * 1024 * 1024, usage(200)), bigRecord(12 * 1024 * 1024, usage(300))]);
+	const row = { sessionId: "r1", kind: "main", cwd: s.cwd, endedMs: T0 };
+	s.tracker.queueLedger([row]);
+	s.tracker.tick(emptyWorld(s.clock));
+	assert.equal(s.index.get("r1").complete, false);
+	s.index.save();
+	const savedOffset = readUsageIndex(s.paths.health.usageIndexFile).get("r1").offset;
+	assert.ok(savedOffset > 0, "the offset of the last complete record is persisted");
+
+	const index = createUsageIndex({ file: s.paths.health.usageIndexFile, clock: s.clock, log: s.log });
+	const locator = createSessionFileLocator({ paths: s.paths, clock: s.clock, rescanMs: 0 });
+	const tracker = createUsageTracker({ paths: s.paths, index, locator, clock: s.clock, log: s.log });
+	tracker.queueLedger([row]);
+	const tick = tracker.tick(emptyWorld(s.clock));
+	assert.equal(tick.bytesRead, fs.statSync(file).size - savedOffset, "only the bytes after the persisted offset are read");
+	assert.equal(index.get("r1").complete, true);
+	assert.equal(compactUsage(index.get("r1")).total, 600);
+});
+
+test("a child of a child is located through its grandparent's cwd", () => {
+	const s = setup();
+	writeJsonl(childFile(s.cwd, "st_mid", "mid1"), [E.assistant({ ms: T0, usage: usage(3) })]);
+	writeJsonl(childFile(s.cwd, "st_deep", "deep1"), [E.assistant({ ms: T0, usage: usage(4) })]);
+	s.tracker.queueLedger([
+		{ sessionId: "mid1", kind: "child", taskId: "st_mid", parentSessionId: "root1", cwd: s.cwd, endedMs: T0 + 1 },
+		{ sessionId: "deep1", kind: "child", taskId: "st_deep", parentSessionId: "mid1", cwd: null, endedMs: T0 + 2 },
+	]);
+	s.tracker.tick(emptyWorld(s.clock));
+	assert.equal(compactUsage(s.index.get("deep1")).total, 4);
+	assert.equal(s.tracker.tokensOf("mid1").treeTokens, 7);
+});
+
+test("a read failure keeps tokensOf null with one log, and the next success restores the total", () => {
+	let failingReads = 0;
+	const s = setup("usage-tracker-busy-", {
+		read: (file, from, options) => {
+			if (failingReads > 0) {
+				failingReads -= 1;
+				const error = new Error("EBUSY: resource busy or locked, open");
+				error.code = "EBUSY";
+				throw error;
+			}
+			return readUsage(file, from, options);
+		},
+	});
+	const file = mainFile(s.paths, "m1");
+	writeJsonl(file, [E.assistant({ ms: T0, usage: usage(10, 5) })]);
+	const world = () => makeWorld({ now: s.clock.now(), sessions: [sessionState({ id: "m1", file, kind: "main", cwd: s.cwd })] });
+	s.tracker.tick(world());
+	assert.equal(s.tracker.tokensOf("m1").tokens.total, 15);
+
+	const appended = `${JSON.stringify(E.assistant({ ms: T0 + 1000, usage: usage(7, 3) }))}\n`;
+	fs.appendFileSync(file, appended);
+	failingReads = 2;
+	assert.equal(s.tracker.tick(world()).bytesRead, 0);
+	assert.equal(s.tracker.tokensOf("m1"), null, "a read failure shows no tokens (IS-12)");
+	assert.equal(s.events.filter((event) => event.event === "usage_read_failed").length, 1);
+
+	assert.equal(s.tracker.tick(world()).bytesRead, 0);
+	assert.equal(s.tracker.tokensOf("m1"), null, "the second failure still shows no tokens");
+	assert.equal(s.events.filter((event) => event.event === "usage_read_failed").length, 1, "one failure streak logs once");
+
+	assert.equal(s.tracker.tick(world()).bytesRead, Buffer.byteLength(appended));
+	assert.equal(s.tracker.tokensOf("m1").tokens.total, 25, "the next success restores the total");
+	assert.equal(s.events.filter((event) => event.event === "usage_read_failed").length, 1);
+});
+
+test("tokensOf reports treeTokens only when a descendant pushes the tree above the session's own total", () => {
+	const s = setup();
+	writeLines(mainFile(s.paths, "p2"), [JSON.stringify(E.assistant({ ms: T0, usage: usage(10) }))]);
+	writeJsonl(childFile(s.cwd, "st_x", "c2"), [E.assistant({ ms: T0, usage: usage(6) })]);
+	s.tracker.queueLedger([
+		{ sessionId: "p2", kind: "main", cwd: s.cwd, endedMs: T0 + 1 },
+		{ sessionId: "c2", kind: "child", taskId: "st_x", parentSessionId: "p2", cwd: s.cwd, endedMs: T0 + 2 },
+	]);
+	s.tracker.tick(emptyWorld(s.clock));
+	assert.deepEqual(s.tracker.tokensOf("p2"), { tokens: compactUsage(s.index.get("p2")), treeTokens: 16 });
+	assert.deepEqual(s.tracker.tokensOf("c2"), { tokens: compactUsage(s.index.get("c2")), treeTokens: null });
+});
