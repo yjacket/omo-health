@@ -1,0 +1,699 @@
+import "./helpers/tmp-root.mjs";
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { tmpDir } from "./helpers/fixtures.mjs";
+import { createRecordScanner, readUsage, usageTimeline } from "../src/collect/usage.mjs";
+
+const MiB = 1024 * 1024;
+const MIN = 60_000;
+const HOUR = 3_600_000;
+const T0 = Date.UTC(2026, 8, 28, 10, 5, 0);
+const iso = (ms) => new Date(ms).toISOString();
+
+let seq = 0;
+const nextId = () => (++seq).toString(16).padStart(8, "0");
+
+function setup(t) {
+	const dir = tmpDir("omoh-usage-");
+	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+	return {
+		dir,
+		file(name = "session.jsonl") {
+			return path.join(dir, name);
+		},
+	};
+}
+
+function use({ input = 1, output = 2, cacheRead = 3, cacheWrite = 4, cost = 0.1, totalTokens, costUnknown } = {}) {
+	const usage = { input, output, cacheRead, cacheWrite, cost: { total: cost } };
+	if (totalTokens !== undefined) usage.totalTokens = totalTokens;
+	if (costUnknown !== undefined) usage.costUnknown = costUnknown;
+	return usage;
+}
+
+const sumFour = (usage) => (usage.input ?? 0) + (usage.output ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
+
+function assistant({ ms = T0, usage, provider = "anthropic-subscription", model = "claude-opus-5-5", responseModel, stopReason = "stop", content = [], errorMessage } = {}) {
+	const message = { role: "assistant", content, provider, model };
+	if (responseModel !== undefined) message.responseModel = responseModel;
+	if (usage !== undefined) message.usage = usage;
+	message.stopReason = stopReason;
+	if (errorMessage !== undefined) message.errorMessage = errorMessage;
+	message.timestamp = ms;
+	return { type: "message", id: nextId(), timestamp: iso(ms), message };
+}
+
+function usageEntry(usage, { ms = T0, provider = "openai", model = "gpt-5" } = {}) {
+	return { type: "usage", timestamp: iso(ms), provider, model, usage };
+}
+
+function toolResult({ ms = T0, name = "bash", text = "ok", isError = false, usage } = {}) {
+	const message = { role: "toolResult", toolCallId: nextId(), toolName: name, content: [{ type: "text", text }], isError, timestamp: ms };
+	if (usage !== undefined) message.usage = usage;
+	return { type: "message", id: nextId(), timestamp: iso(ms), message };
+}
+
+function prewarm(phase, { ms = T0, provider = "anthropic-subscription", model = "claude-opus-5-5", usage } = {}) {
+	return {
+		type: "custom",
+		customType: "prompt-cache-prewarm",
+		timestamp: iso(ms),
+		data: { phase, provider, model, usage: usage ?? use({ input: 5, output: 6, cacheRead: 7, cacheWrite: 8, cost: 0.2 }) },
+	};
+}
+
+function compaction(usage, { ms = T0, provider, model } = {}) {
+	const entry = { type: "compaction", timestamp: iso(ms), usage };
+	if (provider !== undefined) entry.provider = provider;
+	if (model !== undefined) entry.model = model;
+	return entry;
+}
+
+function branchSummary(usage, ms = T0) {
+	return { type: "branch_summary", timestamp: iso(ms), usage };
+}
+
+function textRecord(text, ms = T0) {
+	return { type: "message", id: nextId(), timestamp: iso(ms), message: { role: "user", content: [{ type: "text", text }], timestamp: ms } };
+}
+
+function userImages(count, ms = T0) {
+	return {
+		type: "message",
+		id: nextId(),
+		timestamp: iso(ms),
+		message: {
+			role: "user",
+			content: Array.from({ length: count }, () => ({ type: "image", data: "AAAA" })),
+			timestamp: ms,
+		},
+	};
+}
+
+function writeRecords(file, records, { crlf = false, bom = false, trailingNewline = true } = {}) {
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	const separator = crlf ? "\r\n" : "\n";
+	let text = records.map((record) => (typeof record === "string" ? record : JSON.stringify(record))).join(separator);
+	if (trailingNewline) text += separator;
+	if (bom) text = `\uFEFF${text}`;
+	fs.writeFileSync(file, text);
+}
+
+function appendRaw(file, text) {
+	fs.appendFileSync(file, text);
+}
+
+/** Independent oracle: JSON.parse every line and apply IS-1 by hand. */
+function oracleTotals(file) {
+	const text = fs.readFileSync(file, "utf8");
+	const totals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0, costUnknown: false, turns: 0 };
+	for (const raw of text.split("\n")) {
+		const line = raw.replace(/^\uFEFF/, "").replace(/\r$/, "");
+		if (!line.trim()) continue;
+		let entry;
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		let usage;
+		if (entry.type === "message" && entry.message?.role === "assistant") usage = entry.message.usage;
+		else if (entry.type === "message" && entry.message?.role === "toolResult") usage = entry.message.usage;
+		else if (entry.type === "usage") usage = entry.usage;
+		else if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.usage) usage = entry.usage;
+		else if (entry.type === "custom" && entry.customType === "prompt-cache-prewarm" && entry.data?.phase === "warmed") {
+			const candidate = entry.data.usage;
+			const valid =
+				candidate &&
+				["input", "output", "cacheRead", "cacheWrite"].every((key) => Number.isFinite(candidate[key])) &&
+				candidate.cost &&
+				Number.isFinite(candidate.cost.total);
+			if (valid) usage = candidate;
+		}
+		if (!usage) continue;
+		for (const key of ["input", "output", "cacheRead", "cacheWrite"]) {
+			totals[key] += Number.isFinite(usage[key]) && usage[key] >= 0 ? usage[key] : 0;
+		}
+		totals.total = totals.input + totals.output + totals.cacheRead + totals.cacheWrite;
+		totals.cost += Number.isFinite(usage.cost?.total) ? usage.cost.total : 0;
+		if (usage.costUnknown === true) totals.costUnknown = true;
+		if (entry.type === "message" && entry.message?.role === "assistant") totals.turns += 1;
+	}
+	return totals;
+}
+
+const core = (usage) => ({
+	input: usage.input,
+	output: usage.output,
+	cacheRead: usage.cacheRead,
+	cacheWrite: usage.cacheWrite,
+	total: usage.total,
+	cost: usage.cost,
+	costUnknown: usage.costUnknown,
+	turns: usage.turns,
+	models: usage.models,
+	usedModels: usage.usedModels,
+	modelsIncomplete: usage.modelsIncomplete,
+});
+
+function fixedLine(target) {
+	const base = JSON.stringify(textRecord(""));
+	const count = target - base.length - 1;
+	assert.ok(count >= 0, `fixed line of ${target} bytes is too small`);
+	const line = `${JSON.stringify(textRecord("a".repeat(count)))}\n`;
+	assert.equal(Buffer.byteLength(line), target);
+	return line;
+}
+
+function scanInChunks(buffer, chunkSize) {
+	const scanner = createRecordScanner();
+	for (let index = 0; index < buffer.length; index += chunkSize) scanner.push(buffer.subarray(index, index + chunkSize));
+	const entry = scanner.finish();
+	return { entry, malformed: scanner.malformed };
+}
+
+test("counts every usage carrier the way /session does", (t) => {
+	const { file } = setup(t);
+	const a = use({ input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.1 });
+	const u = use({ input: 10, output: 20, cacheRead: 30, cacheWrite: 40, cost: 0.2 });
+	const b = use({ input: 5, output: 5, cacheRead: 5, cacheWrite: 5, cost: 0.01 });
+	const c = use({ input: 1, output: 1, cacheRead: 1, cacheWrite: 1, cost: 0.02 });
+	const p = use({ input: 2, output: 2, cacheRead: 2, cacheWrite: 2, cost: 0.03 });
+	const tr = use({ input: 3, output: 3, cacheRead: 3, cacheWrite: 3, cost: 0.04 });
+	writeRecords(file(), [
+		assistant({ usage: a }),
+		usageEntry(u, { provider: "openai", model: "gpt-5" }),
+		branchSummary(b),
+		compaction(c),
+		prewarm("warmed", { usage: p }),
+		toolResult({ usage: tr }),
+	]);
+	const got = readUsage(file()).effective;
+	assert.equal(got.input, 1 + 10 + 5 + 1 + 2 + 3);
+	assert.equal(got.output, 2 + 20 + 5 + 1 + 2 + 3);
+	assert.equal(got.cacheRead, 3 + 30 + 5 + 1 + 2 + 3);
+	assert.equal(got.cacheWrite, 4 + 40 + 5 + 1 + 2 + 3);
+	assert.equal(got.total, sumFour(a) + sumFour(u) + sumFour(b) + sumFour(c) + sumFour(p) + sumFour(tr));
+	assert.ok(Math.abs(got.cost - (0.1 + 0.2 + 0.01 + 0.02 + 0.03 + 0.04)) < 1e-9);
+	assert.equal(got.turns, 1);
+	assert.equal(got.models["anthropic-subscription/claude-opus-5-5"].tokens, sumFour(a));
+	assert.equal(got.models["openai/gpt-5"].tokens, sumFour(u));
+	assert.equal(got.models["Tools/summaries"].tokens, sumFour(b) + sumFour(c) + sumFour(p) + sumFour(tr));
+	assert.equal(got.total, oracleTotals(file()).total);
+});
+
+test("ignores a prewarm entry that is not warmed but still records its model", (t) => {
+	const { file } = setup(t);
+	writeRecords(file(), [prewarm("skipped", { provider: "xai", model: "grok-5" }), prewarm("failed", { provider: "moonshot", model: "kimi-k3" })]);
+	const got = readUsage(file()).effective;
+	assert.equal(got.total, 0);
+	assert.deepEqual(got.usedModels, { "xai/grok-5": true, "moonshot/kimi-k3": true });
+});
+
+test("counts an aborted assistant reply", (t) => {
+	const { file } = setup(t);
+	writeRecords(file(), [assistant({ usage: use({ input: 1, output: 0, cacheRead: 0, cacheWrite: 0 }), stopReason: "aborted" })]);
+	const got = readUsage(file()).effective;
+	assert.equal(got.total, 1);
+	assert.equal(got.turns, 1);
+});
+
+test("ignores totalTokens when it differs from the four counters", (t) => {
+	const { file } = setup(t);
+	writeRecords(file(), [assistant({ usage: use({ input: 1, output: 2, cacheRead: 3, cacheWrite: 4, totalTokens: 999_999 }) })]);
+	const got = readUsage(file()).effective;
+	assert.equal(got.total, 10);
+	assert.equal(got.total, oracleTotals(file()).total);
+});
+
+test("keeps costUnknown", (t) => {
+	const { file } = setup(t);
+	writeRecords(file(), [assistant({ usage: use({ input: 1, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, costUnknown: true }) })]);
+	const got = readUsage(file()).effective;
+	assert.equal(got.costUnknown, true);
+	assert.equal(got.cost, 0);
+});
+
+test("keys an assistant reply by responseModel", (t) => {
+	const { file } = setup(t);
+	writeRecords(file(), [assistant({ model: "claude-opus-5-5", responseModel: "claude-sonnet-4-5", usage: use() })]);
+	const got = readUsage(file()).effective;
+	assert.ok(got.models["anthropic-subscription/claude-sonnet-4-5"]);
+	assert.equal(got.models["anthropic-subscription/claude-opus-5-5"], undefined);
+});
+
+test("usedModels lists every processing model and flags an incomplete model list", (t) => {
+	const { file } = setup(t);
+	writeRecords(file(), [
+		assistant({ model: "claude-opus-5-5", responseModel: "claude-sonnet-4-5", usage: use() }),
+		usageEntry(use(), { provider: "openai", model: "gpt-5" }),
+		prewarm("warmed", { provider: "google", model: "gemini-3", usage: use() }),
+		prewarm("skipped", { provider: "xai", model: "grok-5" }),
+		prewarm("failed", { provider: "moonshot", model: "kimi-k3" }),
+		compaction(use()),
+	]);
+	const got = readUsage(file()).effective;
+	assert.deepEqual(got.usedModels, {
+		"anthropic-subscription/claude-opus-5-5": true,
+		"anthropic-subscription/claude-sonnet-4-5": true,
+		"openai/gpt-5": true,
+		"google/gemini-3": true,
+		"xai/grok-5": true,
+		"moonshot/kimi-k3": true,
+	});
+	assert.equal(got.modelsIncomplete, true);
+});
+
+test("an incremental append with a partial last line equals a one-shot read", (t) => {
+	const { file } = setup(t);
+	const records = [
+		assistant({ usage: use({ input: 1, output: 1, cacheRead: 1, cacheWrite: 1 }) }),
+		assistant({ usage: use({ input: 2, output: 2, cacheRead: 2, cacheWrite: 2 }) }),
+		assistant({ usage: use({ input: 3, output: 3, cacheRead: 3, cacheWrite: 3 }) }),
+	];
+	const third = `${JSON.stringify(records[2])}\n`;
+	const half = third.slice(0, Math.floor(third.length / 2));
+	fs.writeFileSync(file(), `${JSON.stringify(records[0])}\n${JSON.stringify(records[1])}\n${half}`);
+	const first = readUsage(file());
+	assert.equal(first.effective.total, 12);
+	assert.equal(first.offset, first.size - half.length);
+	appendRaw(file(), third.slice(half.length));
+	const second = readUsage(file(), first);
+	const oneshot = readUsage(file());
+	assert.equal(second.effective.total, 24);
+	assert.equal(second.done, true);
+	assert.deepEqual(core(second.effective), core(oneshot.effective));
+});
+
+test("handles CRLF line endings", (t) => {
+	const { file } = setup(t);
+	writeRecords(file(), [assistant({ usage: use({ input: 1, output: 0, cacheRead: 0, cacheWrite: 0 }) }), assistant({ usage: use({ input: 2, output: 0, cacheRead: 0, cacheWrite: 0 }) })], { crlf: true });
+	const got = readUsage(file()).effective;
+	assert.equal(got.total, 3);
+	assert.equal(got.diagnostics.badLines, 0);
+});
+
+test("handles a UTF-8 BOM at the start", (t) => {
+	const { file } = setup(t);
+	writeRecords(file(), [assistant({ usage: use({ input: 1, output: 0, cacheRead: 0, cacheWrite: 0 }) })], { bom: true });
+	const got = readUsage(file()).effective;
+	assert.equal(got.total, 1);
+	assert.equal(got.diagnostics.badLines, 0);
+});
+
+test("counts an invalid line in badLines", (t) => {
+	const { file } = setup(t);
+	fs.writeFileSync(
+		file(),
+		`${JSON.stringify(assistant({ usage: use({ input: 1, output: 0, cacheRead: 0, cacheWrite: 0 }) }))}\n{"broken":"usage"\n${JSON.stringify(assistant({ usage: use({ input: 2, output: 0, cacheRead: 0, cacheWrite: 0 }) }))}\n`,
+	);
+	const got = readUsage(file());
+	assert.equal(got.usage.diagnostics.badLines, 1);
+	assert.equal(got.effective.total, 3);
+});
+
+test("recounts after the file shrinks", (t) => {
+	const { file } = setup(t);
+	const first = assistant({ usage: use({ input: 1, output: 0, cacheRead: 0, cacheWrite: 0 }) });
+	const second = assistant({ usage: use({ input: 2, output: 0, cacheRead: 0, cacheWrite: 0 }) });
+	writeRecords(file(), [first, second]);
+	const from = readUsage(file());
+	assert.equal(from.effective.total, 3);
+	writeRecords(file(), [first]);
+	const got = readUsage(file(), from);
+	assert.equal(got.effective.total, 1);
+	assert.equal(got.effective.total, oracleTotals(file()).total);
+});
+
+test("recounts when the size is unchanged but the mtime differs", (t) => {
+	const { file } = setup(t);
+	writeRecords(file(), [assistant({ usage: use({ input: 1, output: 0, cacheRead: 0, cacheWrite: 0 }) })]);
+	const from = readUsage(file());
+	assert.equal(from.effective.total, 1);
+	writeRecords(file(), [assistant({ usage: use({ input: 2, output: 0, cacheRead: 0, cacheWrite: 0 }) })]);
+	assert.equal(fs.statSync(file()).size, from.size);
+	fs.utimesSync(file(), new Date(from.mtimeMs + 5000), new Date(from.mtimeMs + 5000));
+	const got = readUsage(file(), from);
+	assert.equal(got.effective.total, 2);
+});
+
+test("recounts when the head changes", (t) => {
+	const { file } = setup(t);
+	const a = assistant({ usage: use({ input: 1, output: 0, cacheRead: 0, cacheWrite: 0 }) });
+	const aLine = `${JSON.stringify(a)}\n`;
+	const head = aLine + fixedLine(4096 - Buffer.byteLength(aLine));
+	const tail = fixedLine(4096);
+	fs.writeFileSync(file(), head + tail);
+	const from = readUsage(file());
+	assert.equal(from.effective.total, 1);
+	const changed = assistant({ usage: use({ input: 2, output: 0, cacheRead: 0, cacheWrite: 0 }) });
+	const changedLine = `${JSON.stringify(changed)}\n`;
+	assert.equal(Buffer.byteLength(changedLine), Buffer.byteLength(aLine));
+	fs.writeFileSync(file(), changedLine + fixedLine(4096 - Buffer.byteLength(changedLine)) + tail);
+	// Keep the size and pretend the mtime did not move, so only the head hash can catch the rewrite.
+	const forged = { ...from, mtimeMs: fs.statSync(file()).mtimeMs };
+	const got = readUsage(file(), forged);
+	assert.equal(got.effective.total, 2);
+});
+
+test("recounts when a rewritten prefix is caught by the tail hash", (t) => {
+	const { file } = setup(t);
+	const a = assistant({ usage: use({ input: 1, output: 0, cacheRead: 0, cacheWrite: 0 }) });
+	const aLine = `${JSON.stringify(a)}\n`;
+	const head = aLine + fixedLine(4096 - Buffer.byteLength(aLine));
+	const middle = fixedLine(4096);
+	const z = assistant({ usage: use({ input: 2, output: 0, cacheRead: 0, cacheWrite: 0 }) });
+	const zLine = `${JSON.stringify(z)}\n`;
+	const tail = zLine + fixedLine(4096 - Buffer.byteLength(zLine));
+	fs.writeFileSync(file(), head + middle + tail);
+	const from = readUsage(file());
+	assert.equal(from.effective.total, 3);
+	// Rewrite a record inside the last 4 KiB before the consumed offset and append more.
+	const changed = assistant({ usage: use({ input: 222, output: 0, cacheRead: 0, cacheWrite: 0 }) });
+	const changedLine = `${JSON.stringify(changed)}\n`;
+	const newTail = changedLine + fixedLine(4096 - Buffer.byteLength(changedLine));
+	const appended = assistant({ usage: use({ input: 9, output: 0, cacheRead: 0, cacheWrite: 0 }) });
+	fs.writeFileSync(file(), head + middle + newTail + `${JSON.stringify(appended)}\n`);
+	const got = readUsage(file(), from);
+	assert.equal(got.effective.total, oracleTotals(file()).total);
+	assert.equal(got.effective.total, 1 + 222 + 9);
+});
+
+test("stops maxBytes at a line boundary and resumes to the one-shot total", (t) => {
+	const { file } = setup(t);
+	const lines = [
+		`${JSON.stringify(assistant({ usage: use({ input: 1, output: 0, cacheRead: 0, cacheWrite: 0 }) }))}\n`,
+		`${JSON.stringify(assistant({ usage: use({ input: 2, output: 0, cacheRead: 0, cacheWrite: 0 }) }))}\n`,
+		`${JSON.stringify(assistant({ usage: use({ input: 3, output: 0, cacheRead: 0, cacheWrite: 0 }) }))}\n`,
+	];
+	const boundary = Buffer.byteLength(lines[0] + lines[1]);
+	fs.writeFileSync(file(), lines.join(""));
+	const first = readUsage(file(), undefined, { maxBytes: boundary });
+	assert.equal(first.bytesRead, boundary);
+	assert.equal(first.effective.total, 3);
+	assert.equal(first.done, false);
+	const second = readUsage(file(), first);
+	const oneshot = readUsage(file());
+	assert.equal(second.done, true);
+	assert.equal(second.effective.total, 6);
+	assert.deepEqual(core(second.effective), core(oneshot.effective));
+});
+
+test("reads a 40 MiB record with usage at its end across a 32 MiB budget", (t) => {
+	const { file } = setup(t);
+	const record = assistant({ content: [{ type: "text", text: "a".repeat(40 * MiB) }], usage: use({ input: 1, output: 2, cacheRead: 3, cacheWrite: 4 }) });
+	fs.writeFileSync(file(), `${JSON.stringify(record)}\n`);
+	const first = readUsage(file(), undefined, { maxBytes: 32 * MiB });
+	assert.equal(first.bytesRead, 32 * MiB);
+	assert.equal(first.offset, 0);
+	assert.equal(first.effective.total, 0);
+	assert.equal(first.done, false);
+	const second = readUsage(file(), first, { maxBytes: 32 * MiB });
+	assert.equal(second.done, true);
+	assert.equal(second.effective.total, oracleTotals(file()).total);
+	assert.equal(second.effective.total, 10);
+	assert.equal(usageTimeline(file()).totals.total, 10);
+});
+
+test("sums a 70 MiB record with usage at its end or before content", (t) => {
+	const { file } = setup(t);
+	const usage = use({ input: 7, output: 8, cacheRead: 9, cacheWrite: 10 });
+	const atEnd = {
+		type: "message",
+		id: nextId(),
+		timestamp: iso(T0),
+		message: { role: "assistant", content: [{ type: "text", text: "a".repeat(70 * MiB) }], provider: "p", model: "m", usage, stopReason: "stop", timestamp: T0 },
+	};
+	fs.writeFileSync(file("end.jsonl"), `${JSON.stringify(atEnd)}\n`);
+	const gotEnd = readUsage(file("end.jsonl")).effective;
+	assert.equal(gotEnd.total, 34);
+	assert.equal(gotEnd.total, oracleTotals(file("end.jsonl")).total);
+
+	const beforeContent = {
+		type: "message",
+		id: nextId(),
+		timestamp: iso(T0),
+		message: { role: "assistant", provider: "p", model: "m", usage, content: [{ type: "text", text: "b".repeat(70 * MiB) }], stopReason: "stop", timestamp: T0 },
+	};
+	fs.writeFileSync(file("start.jsonl"), `${JSON.stringify(beforeContent)}\n`);
+	const gotStart = readUsage(file("start.jsonl")).effective;
+	assert.equal(gotStart.total, 34);
+	assert.equal(gotStart.total, oracleTotals(file("start.jsonl")).total);
+});
+
+test("ignores usage text inside a large record's content string", (t) => {
+	const { file } = setup(t);
+	const text = `${"x".repeat(17 * MiB)}"usage":{"input":999}${"y".repeat(16)}`;
+	const record = assistant({ content: [{ type: "text", text }], usage: use({ input: 1, output: 1, cacheRead: 1, cacheWrite: 1 }) });
+	fs.writeFileSync(file(), `${JSON.stringify(record)}\n`);
+	const got = readUsage(file()).effective;
+	assert.equal(got.total, 4);
+	assert.equal(got.total, oracleTotals(file()).total);
+});
+
+test("the scanner captures the same fields in every chunk size", (t) => {
+	const record = assistant({
+		model: "claude-opus-5-5",
+		responseModel: "claude-sonnet-4-5",
+		usage: use({ input: 1, output: 2, cacheRead: 3, cacheWrite: 4 }),
+		content: [{ type: "text", text: 'quote " slash \\ accent \u00e9' }],
+	});
+	const buffer = Buffer.from(JSON.stringify(record));
+	const oneByte = scanInChunks(buffer, 1);
+	const sevenBytes = scanInChunks(buffer, 7);
+	const fourMiB = scanInChunks(buffer, 4 * MiB);
+	assert.equal(oneByte.malformed, false);
+	assert.deepEqual(oneByte, sevenBytes);
+	assert.deepEqual(oneByte, fourMiB);
+	assert.equal(oneByte.entry.type, "message");
+	assert.equal(oneByte.entry.message.role, "assistant");
+	assert.equal(oneByte.entry.message.provider, "anthropic-subscription");
+	assert.equal(oneByte.entry.message.model, "claude-opus-5-5");
+	assert.equal(oneByte.entry.message.responseModel, "claude-sonnet-4-5");
+	assert.deepEqual(oneByte.entry.message.usage, use({ input: 1, output: 2, cacheRead: 3, cacheWrite: 4 }));
+
+	const usageLine = Buffer.from(JSON.stringify(usageEntry(use({ input: 5, output: 6, cacheRead: 7, cacheWrite: 8 }), { provider: "openai", model: "gpt-5" })));
+	const usageScan = scanInChunks(usageLine, 7);
+	assert.equal(usageScan.malformed, false);
+	assert.equal(usageScan.entry.type, "usage");
+	assert.equal(usageScan.entry.provider, "openai");
+	assert.equal(usageScan.entry.model, "gpt-5");
+});
+
+test("a resume from persisted fields without partial re-reads the cut record", (t) => {
+	const { file } = setup(t);
+	const record = assistant({ content: [{ type: "text", text: "a".repeat(MiB) }], usage: use({ input: 1, output: 2, cacheRead: 3, cacheWrite: 4 }) });
+	fs.writeFileSync(file(), `${JSON.stringify(record)}\n`);
+	const first = readUsage(file(), undefined, { maxBytes: 512 * 1024 });
+	assert.equal(first.effective.total, 0);
+	assert.ok(first.partial);
+	const persisted = { ...first };
+	delete persisted.partial;
+	const second = readUsage(file(), persisted);
+	assert.equal(second.done, true);
+	assert.equal(second.effective.total, oracleTotals(file()).total);
+	assert.equal(second.effective.total, 10);
+});
+
+test("a 40 MiB record appended to a complete file honours maxBytes on every call", (t) => {
+	const { file } = setup(t);
+	writeRecords(file(), [assistant({ usage: use({ input: 1, output: 0, cacheRead: 0, cacheWrite: 0 }) })]);
+	const from = readUsage(file());
+	assert.equal(from.effective.total, 1);
+	const appended = assistant({ content: [{ type: "text", text: "c".repeat(40 * MiB) }], usage: use({ input: 2, output: 0, cacheRead: 0, cacheWrite: 0 }) });
+	appendRaw(file(), `${JSON.stringify(appended)}\n`);
+	const first = readUsage(file(), from, { maxBytes: 32 * MiB });
+	assert.equal(first.bytesRead, 32 * MiB);
+	assert.equal(first.offset, from.offset);
+	assert.equal(first.effective.total, 1);
+	assert.equal(first.done, false);
+	const second = readUsage(file(), first, { maxBytes: 32 * MiB });
+	assert.ok(second.bytesRead <= 32 * MiB);
+	assert.equal(second.done, true);
+	assert.equal(second.effective.total, oracleTotals(file()).total);
+	assert.equal(second.effective.total, 3);
+});
+
+test("recounts a replaced file with a new identity from zero", (t) => {
+	const { file, dir } = setup(t);
+	const a = assistant({ usage: use({ input: 1, output: 0, cacheRead: 0, cacheWrite: 0 }) });
+	const headLine = `${JSON.stringify(a)}\n`;
+	const head = headLine + fixedLine(4096 - Buffer.byteLength(headLine));
+	const middle = fixedLine(4096);
+	const z = assistant({ usage: use({ input: 2, output: 0, cacheRead: 0, cacheWrite: 0 }) });
+	const tailLine = `${JSON.stringify(z)}\n`;
+	const tail = tailLine + fixedLine(4096 - Buffer.byteLength(tailLine));
+	fs.writeFileSync(file(), head + middle + tail);
+	const from = readUsage(file());
+	assert.equal(from.effective.total, 3);
+
+	const changed = assistant({ usage: use({ input: 111, output: 0, cacheRead: 0, cacheWrite: 0 }) });
+	const changedLine = `${JSON.stringify(changed)}\n`;
+	const newMiddle = changedLine + fixedLine(Math.max(0, 4096 - Buffer.byteLength(changedLine)));
+	const appended = assistant({ usage: use({ input: 9, output: 0, cacheRead: 0, cacheWrite: 0 }) });
+	const tmp = path.join(dir, "replacement.jsonl");
+	fs.writeFileSync(tmp, head + newMiddle + tail + `${JSON.stringify(appended)}\n`);
+	fs.rmSync(file(), { force: true });
+	fs.renameSync(tmp, file());
+
+	const got = readUsage(file(), from);
+	assert.notEqual(got.ino, from.ino);
+	assert.equal(got.effective.total, oracleTotals(file()).total);
+	assert.equal(got.effective.total, 1 + 111 + 2 + 9);
+});
+
+test("10 committed tokens plus a 7-token final record count once across restart and newline", (t) => {
+	const { file } = setup(t);
+	const ten = usageEntry(use({ input: 10, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }), { provider: "p", model: "m" });
+	const seven = assistant({ usage: use({ input: 7, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }) });
+	fs.writeFileSync(file(), `${JSON.stringify(ten)}\n${JSON.stringify(seven)}`);
+	const first = readUsage(file());
+	assert.equal(first.usage.total, 10);
+	assert.equal(first.effective.total, 17);
+	assert.equal(usageTimeline(file()).totals.total, 17);
+
+	const restarted = readUsage(file(), { ...first, partial: undefined });
+	assert.equal(restarted.effective.total, 17);
+	assert.equal(restarted.usage.total, 10);
+
+	appendRaw(file(), "\n");
+	const completed = readUsage(file(), { ...restarted, partial: undefined });
+	assert.equal(completed.effective.total, 17);
+	assert.equal(completed.usage.total, 17);
+	assert.equal(usageTimeline(file()).totals.total, 17);
+	assert.equal(completed.effective.models["anthropic-subscription/claude-opus-5-5"].tokens, 7);
+});
+
+test("counts a valid final fragment once and a torn fragment not at all", (t) => {
+	const { file } = setup(t);
+	const r1 = usageEntry(use({ input: 5, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }), { provider: "p", model: "m" });
+	const r2 = assistant({ usage: use({ input: 7, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }) });
+	fs.writeFileSync(file(), `${JSON.stringify(r1)}\n${JSON.stringify(r2)}`);
+	const first = readUsage(file());
+	assert.equal(first.effective.total, 12);
+	assert.equal(first.effective.models["anthropic-subscription/claude-opus-5-5"].tokens, 7);
+	const restarted = readUsage(file(), { ...first, partial: undefined });
+	assert.equal(restarted.effective.total, 12);
+	assert.equal(restarted.effective.models["anthropic-subscription/claude-opus-5-5"].tokens, 7);
+	appendRaw(file(), "\n");
+	const completed = readUsage(file(), { ...restarted, partial: undefined });
+	assert.equal(completed.effective.total, 12);
+	assert.equal(completed.effective.models["anthropic-subscription/claude-opus-5-5"].tokens, 7);
+
+	const torn = setup(t);
+	const tornR1 = usageEntry(use({ input: 5, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }), { provider: "p", model: "m" });
+	const tornR2 = assistant({ usage: use({ input: 7, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }) });
+	const full = JSON.stringify(tornR2);
+	fs.writeFileSync(torn.file(), `${JSON.stringify(tornR1)}\n${full.slice(0, full.length - 4)}`);
+	const tornRead = readUsage(torn.file()).effective;
+	assert.equal(tornRead.total, 5);
+	appendRaw(torn.file(), `${full.slice(full.length - 4)}\n`);
+	const repaired = readUsage(torn.file()).effective;
+	assert.equal(repaired.total, 12);
+});
+
+test("does not restart when a large record is appended to a 2 KiB file", (t) => {
+	const { file } = setup(t);
+	fs.writeFileSync(file(), fixedLine(2048));
+	const from = readUsage(file());
+	assert.equal(from.headLen, 2048);
+	assert.equal(from.effective.total, 0);
+	const marked = structuredClone(from);
+	marked.usage.input += 1;
+	marked.usage.total += 1;
+	const big = assistant({ content: [{ type: "text", text: "d".repeat(40 * MiB) }], usage: use({ input: 1, output: 1, cacheRead: 1, cacheWrite: 1 }) });
+	appendRaw(file(), `${JSON.stringify(big)}\n`);
+	const first = readUsage(file(), marked, { maxBytes: 32 * MiB });
+	assert.equal(first.bytesRead, 32 * MiB);
+	assert.equal(first.offset, from.offset);
+	assert.equal(first.effective.total, 1);
+	assert.equal(first.headLen, 4096);
+	assert.equal(first.done, false);
+	const second = readUsage(file(), first, { maxBytes: 32 * MiB });
+	assert.equal(second.headLen, 4096);
+	assert.equal(second.done, true);
+	assert.equal(second.effective.total, oracleTotals(file()).total + 1);
+});
+
+test("counts a malformed large record in badLines", (t) => {
+	const { file } = setup(t);
+	const malformed = `{"type":"message","usage":{"input":1},"x":"${"a".repeat(17 * MiB)}"`;
+	fs.writeFileSync(file(), `${malformed}\n`);
+	const got = readUsage(file());
+	assert.equal(got.usage.diagnostics.badLines, 1);
+	assert.equal(got.effective.total, 0);
+});
+
+test("returns null for a missing file", (t) => {
+	const { file } = setup(t);
+	assert.equal(readUsage(file("absent.jsonl")), null);
+	assert.equal(usageTimeline(file("absent.jsonl")), null);
+});
+
+test("ignores toolResult text that only mentions usage", (t) => {
+	const { file } = setup(t);
+	writeRecords(file(), [toolResult({ text: "usage limit reached; usage: 100" })]);
+	const got = readUsage(file());
+	assert.equal(got.effective.total, 0);
+});
+
+test("usageTimeline reports buckets, turns, cache, errors, tools and images equal to readUsage", (t) => {
+	const { file } = setup(t);
+	const a1 = assistant({
+		ms: T0,
+		usage: use({ input: 10, output: 90, cacheRead: 0, cacheWrite: 60, cost: 1 }),
+		stopReason: "toolUse",
+		content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: {} }],
+	});
+	const a2 = assistant({
+		ms: T0 + 5 * MIN,
+		usage: use({ input: 100, output: 100, cacheRead: 800, cacheWrite: 10, cost: 2 }),
+		stopReason: "error",
+		errorMessage: "usage limit reached",
+	});
+	const a3 = assistant({ ms: T0 + 2 * HOUR + 2 * MIN, usage: use({ input: 1, output: 1, cacheRead: 1, cacheWrite: 1, cost: 0 }) });
+	const a4 = assistant({ ms: T0 + 3 * HOUR, model: "claude-haiku-4", usage: undefined });
+	writeRecords(file(), [
+		a1,
+		toolResult({ ms: T0 + 1000, name: "bash", isError: true }),
+		a2,
+		userImages(2, T0 + 30 * MIN),
+		compaction(use({ input: 1, output: 1, cacheRead: 1, cacheWrite: 1, cost: 0 }), { ms: T0 + 40 * MIN }),
+		a3,
+		userImages(1, T0 + 2 * HOUR + 3 * MIN),
+		prewarm("failed", { provider: "xai", model: "grok-5" }),
+		a4,
+	]);
+	const timeline = usageTimeline(file(), { cacheStormWrite: 50, cacheStormReadFrac: 0.5 });
+	const full = readUsage(file()).effective;
+	assert.deepEqual(core(timeline.totals), core(full));
+	assert.equal(timeline.totals.total, 1178);
+	assert.equal(timeline.totals.turns, 3);
+	assert.deepEqual(timeline.hours, [
+		{ hourMs: Date.UTC(2026, 8, 28, 10), tokens: 1170, turns: 2 },
+		{ hourMs: Date.UTC(2026, 8, 28, 12), tokens: 4, turns: 1 },
+	]);
+	assert.deepEqual(
+		timeline.topTurns.map((turn) => [turn.total, turn.key, turn.stopReason]),
+		[
+			[1010, "anthropic-subscription/claude-opus-5-5", "error"],
+			[160, "anthropic-subscription/claude-opus-5-5", "toolUse"],
+			[4, "anthropic-subscription/claude-opus-5-5", "stop"],
+		],
+	);
+	assert.equal(timeline.cache.stormTurns, 1);
+	assert.ok(Math.abs(timeline.cache.hitRate - 802 / 986) < 1e-12);
+	assert.deepEqual(timeline.errors, { count: 1, byClass: { "usage-limit": 1 } });
+	assert.deepEqual(timeline.tools, [{ name: "bash", calls: 1, errors: 1 }]);
+	assert.equal(timeline.images.peakCount, 2);
+	assert.ok(Math.abs(timeline.images.peakMiB - 6 / MiB) < 1e-12);
+	assert.equal(typeof timeline.prepMs, "number");
+});
+
+test("usageTimeline returns null above maxFileBytes", (t) => {
+	const { file } = setup(t);
+	fs.writeFileSync(file(), fixedLine(2 * MiB));
+	assert.equal(usageTimeline(file(), { maxFileBytes: MiB }), null);
+});
