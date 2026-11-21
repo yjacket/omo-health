@@ -7,9 +7,11 @@ import { after, describe, it } from "node:test";
 import { SWITCH_KEYS } from "../src/config.mjs";
 import { SWITCHES } from "../src/control.mjs";
 import { resolvePaths } from "../src/paths.mjs";
+import { createFakeClock } from "../src/util/time.mjs";
+import { createUsageIndex } from "../src/usage-index.mjs";
 import { ACTION_LABELS, EXIT_REASON_LABELS, GOAL_STATUS_LABELS, INVESTIGATION_STATUS_LABELS, OUTCOME_LABELS, SESSION_STATE_LABELS, TASK_STATUS_LABELS, TERMINAL_LABELS, TRIGGER_LABELS } from "../src/ui/labels.mjs";
 import { buildHistory } from "../src/ui/history.mjs";
-import { buildOverview, buildSettings, buildUiState, loadUiInputs, uiState } from "../src/ui/model.mjs";
+import { buildOverview, buildSettings, buildUiState, daemonStatus, endedRow, loadDaemonInputs, loadUiInputs, uiState } from "../src/ui/model.mjs";
 
 const NOW = Date.parse("2026-09-29T03:00:00.000Z"); // 12:00 KST
 const DAY = 24 * 3600_000;
@@ -50,7 +52,7 @@ describe("ui model", () => {
 	it("returns every section without throwing for an empty home", () => {
 		const home = makeHome();
 		const state = uiState({ paths: home.paths, env: home.env, now: NOW });
-		assert.deepEqual(Object.keys(state), ["generatedMs", "version", "sessions", "ended", "overview", "investigations", "history", "settings"]);
+		assert.deepEqual(Object.keys(state), ["generatedMs", "version", "sessions", "ended", "overview", "investigations", "history", "settings", "prefs"]);
 		for (const key of ["sessions", "ended", "overview", "investigations", "history", "settings"]) assert.equal(state[key].error, undefined, key);
 		assert.equal(state.history.total, 0);
 		assert.deepEqual(state.investigations.rows, []);
@@ -59,6 +61,7 @@ describe("ui model", () => {
 		assert.deepEqual(state.sessions, EMPTY_SESSIONS);
 		assert.deepEqual(state.ended.rows, []);
 		assert.equal(state.ended.total, 0);
+		assert.deepEqual(state.prefs, { hideChildren: false });
 		assert.deepEqual(state.ended.counts.map((c) => [c.outcome, c.count]), Object.keys(OUTCOME_LABELS).map((outcome) => [outcome, 0]));
 	});
 
@@ -511,5 +514,174 @@ describe("ui model", () => {
 
 	it("keeps SWITCHES in SWITCH_KEYS order", () => {
 		assert.deepEqual(SWITCHES.map((s) => s.key), [...SWITCH_KEYS]);
+	});
+
+	describe("tokens and preferences from the daemon's usage index", () => {
+		const MAIN = "01a20000-0000-7000-8000-000000000001";
+		const totals = (total, extra = {}) => ({ total, input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.1, costUnknown: false, turns: 1, ...extra });
+		const entry = (id, extra = {}) => ({ id, state: "ok", complete: true, gone: false, published: totals(100), ...extra });
+		const writeUsage = (paths, entries) => write(paths.health.usageIndexFile, { v: 1, entries: Object.fromEntries(entries.map((e) => [e.id, e])) });
+		const row = (sessionId, endedMs, extra = {}) => ({ v: 1, sessionId, kind: "main", parentSessionId: null, taskId: null, title: sessionId, cwd: null, terminal: null, omoVersion: null, startedMs: endedMs - 60_000, endedMs, outcome: "closed", reason: null, childCount: 0, estimated: false, source: "live", ...extra });
+		const writeRows = (paths, rows) => write(path.join(paths.health.sessionsDir, "ended-2026-09-29.jsonl"), `${rows.map((r) => JSON.stringify(r)).join("\n")}\n`);
+		const endedRows = (home) => new Map(uiState({ paths: home.paths, env: home.env, now: NOW }).ended.rows.map((r) => [r.sessionId, r]));
+
+		it("passes board tokens, tree tokens and pending through, with a malformed number becoming null", () => {
+			const home = makeHome();
+			write(home.paths.health.sessionsSnapshotFile, {
+				v: 1,
+				ts: NOW,
+				groups: [
+					{
+						omoVersion: "5.1.19",
+						sessions: [
+							{
+								sessionId: MAIN,
+								title: "main",
+								tokens: { total: 120, input: 7, output: "NaN", cacheRead: "x", cacheWrite: 4, cost: 0.2, costUnknown: true, turns: 3 },
+								treeTokens: 400,
+								tokensPending: false,
+								children: [{ taskId: "st_1", name: "child", tokens: { total: 80, input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.1, costUnknown: false, turns: 2 }, treeTokens: 90, tokensPending: true, children: [] }],
+							},
+							{ sessionId: "01a20000-0000-7000-8000-000000000002", title: "untracked" },
+						],
+					},
+				],
+			});
+			const [main, untracked] = uiState({ paths: home.paths, env: home.env, now: NOW }).sessions.groups[0].sessions;
+			assert.deepEqual(main.tokens, { total: 120, input: 7, output: null, cacheRead: null, cacheWrite: 4, cost: 0.2, costUnknown: true, turns: 3 });
+			assert.equal(main.treeTokens, 400);
+			assert.equal(main.tokensPending, false);
+			const [child] = main.children;
+			assert.equal(child.tokens.total, 80);
+			assert.equal(child.treeTokens, 90);
+			assert.equal(child.tokensPending, true);
+			assert.equal(untracked.tokens, null);
+			assert.equal(untracked.treeTokens, null);
+			assert.equal(untracked.tokensPending, false);
+		});
+
+		it("marks an ended row ok, pending (incomplete or unindexed) or missing", () => {
+			const home = makeHome();
+			writeUsage(home.paths, [
+				entry("ok"),
+				entry("incomplete", { complete: false }),
+				{ id: "missing", state: "missing", complete: false, gone: false, published: null },
+			]);
+			writeRows(home.paths, [row("ok", NOW - 1000), row("incomplete", NOW - 2000), row("missing", NOW - 3000), row("unindexed", NOW - 4000)]);
+			const rows = endedRows(home);
+			assert.equal(rows.get("ok").tokensState, "ok");
+			assert.equal(rows.get("ok").tokens.total, 100);
+			assert.equal(rows.get("ok").tokensGone, false);
+			assert.equal(rows.get("incomplete").tokensState, "pending");
+			assert.equal(rows.get("incomplete").tokens, null);
+			assert.equal(rows.get("missing").tokensState, "missing");
+			assert.equal(rows.get("missing").tokens, null);
+			assert.equal(rows.get("unindexed").tokensState, "pending");
+		});
+
+		it("finds an entry by the taskId alias when the session id does not match", () => {
+			const home = makeHome();
+			writeUsage(home.paths, [entry("01a20000-0000-7000-8000-0000000000aa", { taskId: "st_alias" })]);
+			writeRows(home.paths, [row("01a20000-0000-7000-8000-0000000000bb", NOW - 1000, { taskId: "st_alias" })]);
+			const [r] = uiState({ paths: home.paths, env: home.env, now: NOW }).ended.rows;
+			assert.equal(r.tokensState, "ok");
+			assert.equal(r.tokens.total, 100);
+		});
+
+		it("keeps the last total of a complete entry whose file was then deleted, and marks a never-found row missing", () => {
+			const home = makeHome();
+			const file = path.join(home.paths.health.sessionsDir, "session.jsonl");
+			write(file, `${JSON.stringify({ type: "message", message: { role: "assistant", usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: { total: 0.1 } } } })}\n`);
+			const index = createUsageIndex({ file: home.paths.health.usageIndexFile, clock: createFakeClock(NOW) });
+			assert.ok(index.update("read", file, { kind: "main" }) > 0);
+			assert.equal(index.update("never", path.join(home.paths.health.sessionsDir, "absent.jsonl"), { kind: "main" }), 0);
+			fs.rmSync(file);
+			assert.equal(index.update("read", file), 0);
+			index.save();
+			writeRows(home.paths, [row("read", NOW - 1000), row("never", NOW - 2000)]);
+			const rows = endedRows(home);
+			assert.equal(rows.get("read").tokensState, "ok");
+			assert.equal(rows.get("read").tokens.total, 10);
+			assert.equal(rows.get("read").tokens.cost, 0.1);
+			assert.equal(rows.get("read").tokensGone, true);
+			assert.equal(rows.get("never").tokensState, "missing");
+			assert.equal(rows.get("never").tokens, null);
+			assert.equal(rows.get("never").tokensGone, false);
+		});
+
+		it("shows a tree total only when descendants add tokens", () => {
+			const home = makeHome();
+			writeUsage(home.paths, [
+				entry("m", { published: totals(100) }),
+				entry("c", { parentSessionId: "m", published: totals(50) }),
+				entry("g", { parentSessionId: "c", published: totals(25) }),
+			]);
+			writeRows(home.paths, [
+				row("m", NOW - 1000),
+				row("c", NOW - 2000, { kind: "child", parentSessionId: "m", taskId: "st_c" }),
+				row("g", NOW - 3000, { kind: "child", parentSessionId: "c", taskId: "st_g" }),
+			]);
+			const rows = endedRows(home);
+			assert.equal(rows.get("m").tokens.total, 100);
+			assert.equal(rows.get("m").treeTokens, 175);
+			assert.equal(rows.get("c").treeTokens, 75);
+			assert.equal(rows.get("g").tokens.total, 25);
+			assert.equal(rows.get("g").treeTokens, null);
+		});
+
+		it("caps 600 main and 600 child rows to 500 each and reports shown and totals, merged newest first", () => {
+			const home = makeHome();
+			const rows = [];
+			for (let i = 0; i < 600; i += 1) {
+				const id = String(i).padStart(3, "0");
+				rows.push(row(`m${id}`, NOW - 10_000 - i * 1000));
+				rows.push(row(`c${id}`, NOW - 10_500 - i * 1000, { kind: "child", parentSessionId: `m${id}`, taskId: `st_${i}` }));
+			}
+			writeRows(home.paths, rows);
+			const ended = uiState({ paths: home.paths, env: home.env, now: NOW }).ended;
+			assert.equal(ended.limit, 500);
+			assert.deepEqual(ended.limits, { main: 500, child: 500 });
+			assert.deepEqual(ended.shown, { main: 500, child: 500 });
+			assert.deepEqual(ended.totals, { main: 600, child: 600 });
+			assert.equal(ended.total, 1200);
+			assert.equal(ended.rows.length, 1000);
+			assert.equal(ended.rows.filter((r) => r.kind === "main").length, 500);
+			assert.equal(ended.rows.filter((r) => r.kind === "child").length, 500);
+			assert.equal(ended.rows[0].sessionId, "m000");
+			for (let i = 1; i < ended.rows.length; i += 1) assert.ok(ended.rows[i - 1].endedMs >= ended.rows[i].endedMs);
+			assert.ok(ended.rows.some((r) => r.sessionId === "m499"));
+			assert.ok(ended.rows.some((r) => r.sessionId === "c499"));
+			assert.equal(ended.rows.some((r) => r.sessionId === "m599"), false);
+			assert.equal(ended.rows.some((r) => r.sessionId === "c599"), false);
+		});
+
+		it("carries the stored preference and the empty-home default", () => {
+			const home = makeHome();
+			assert.deepEqual(uiState({ paths: home.paths, env: home.env, now: NOW }).prefs, { hideChildren: false });
+			write(home.paths.health.uiPrefsFile, { v: 1, hideChildren: true });
+			assert.deepEqual(uiState({ paths: home.paths, env: home.env, now: NOW }).prefs, { hideChildren: true });
+		});
+
+		it("loads the daemon inputs without reading decisions and reports the same status", () => {
+			const home = makeHome();
+			write(home.paths.health.daemonJson, heartbeat({ pid: process.pid }));
+			write(home.paths.health.stoppedFile, "");
+			const daemon = loadDaemonInputs({ paths: home.paths, env: home.env, now: NOW });
+			assert.deepEqual(Object.keys(daemon).sort(), ["heartbeat", "loaded", "now", "pidAlive", "stopped"]);
+			assert.equal(daemon.now, NOW);
+			assert.equal(daemon.stopped, true);
+			assert.equal(daemon.pidAlive, true);
+			assert.equal("decisions" in daemon, false);
+			const status = daemonStatus(daemon);
+			assert.equal(status.state, "stopped");
+			assert.equal(status.heartbeatAgeMs, 10_000);
+		});
+
+		it("exports the row builders for the session detail", () => {
+			const r = endedRow(row(MAIN, NOW), 0, new Map([[MAIN, entry(MAIN)]]), new Map([[MAIN, 250]]));
+			assert.equal(r.sessionId, MAIN);
+			assert.equal(r.tokens.total, 100);
+			assert.equal(r.treeTokens, 250);
+		});
 	});
 });

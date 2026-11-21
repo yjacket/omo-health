@@ -4,10 +4,12 @@ import { getPath, pauseState, SWITCHES } from "../control.mjs";
 import { readDecisions } from "../decisions.mjs";
 import { createInvestigations, RESOLVED } from "../investigations.mjs";
 import { readEnded } from "../session-ledger.mjs";
+import { compactUsage, readUsageIndex, treeTotals } from "../usage-index.mjs";
 import { listDirSafe, readJsonSafe, statSafe } from "../util/fsx.mjs";
 import { redact, truncate } from "../util/text.mjs";
 import { VERSION } from "../version.mjs";
 import { buildHistory, historyStart } from "./history.mjs";
+import { readUiPrefs } from "./prefs.mjs";
 import { actionLabel, analystVerdictLabel, causeLabel, daemonStateLabel, exitReasonLabel, findingLabel, goalStatusLabel, investigationStatusLabel, OUTCOME_LABELS, outcomeLabel, sessionStateLabel, severityLabel, taskStatusLabel, terminalLabel, triggerLabel, waitClassLabel } from "./labels.mjs";
 
 /** Read model of the local dashboard: one I/O loader, pure section builders. */
@@ -41,9 +43,19 @@ function pidAlive(pid) {
 	}
 }
 
-export function loadUiInputs({ paths, env, now = Date.now() }) {
+export function loadDaemonInputs({ paths, env, now }) {
 	const heartbeat = readJsonSafe(paths.health.daemonJson) ?? null;
-	const loaded = loadConfig({ env, paths });
+	return {
+		now,
+		stopped: Boolean(statSafe(paths.health.stoppedFile)),
+		heartbeat,
+		pidAlive: pidAlive(heartbeat?.pid),
+		loaded: loadConfig({ env, paths }),
+	};
+}
+
+export function loadUiInputs({ paths, env, now = Date.now() }) {
+	const { heartbeat, stopped, pidAlive: alive, loaded } = loadDaemonInputs({ paths, env, now });
 	let decisions;
 	let decisionsReadMs = null;
 	const started = performance.now();
@@ -59,6 +71,12 @@ export function loadUiInputs({ paths, env, now = Date.now() }) {
 	} catch (error) {
 		ended = { error: error.message };
 	}
+	let usage;
+	try {
+		usage = readUsageIndex(paths.health.usageIndexFile);
+	} catch (error) {
+		usage = { error: error.message };
+	}
 	return {
 		now,
 		version: VERSION,
@@ -67,8 +85,10 @@ export function loadUiInputs({ paths, env, now = Date.now() }) {
 		// Read-only: the daemon writes the board snapshot each tick and the ledger when a session ends.
 		sessionsSnapshot: readJsonSafe(paths.health.sessionsSnapshotFile) ?? null,
 		ended,
-		stopped: Boolean(statSafe(paths.health.stoppedFile)),
-		pidAlive: pidAlive(heartbeat?.pid),
+		usage,
+		prefs: readUiPrefs(paths),
+		stopped,
+		pidAlive: alive,
 		pause: pauseState(paths, now),
 		global: readJsonSafe(path.join(paths.health.statusDir, "_global.json")) ?? null,
 		deaths: listDeathRecords(paths.health.deathsDir),
@@ -99,6 +119,28 @@ const clean = (v, max = LINE_MAX) => {
 	return folded ? truncate(redact(folded), max) : null;
 };
 const num = (v) => (Number.isFinite(v) ? v : null);
+const TOKEN_NUM_KEYS = ["total", "input", "output", "cacheRead", "cacheWrite", "cost", "turns"];
+
+/** A compact token total as the page shows it: every numeric field through `num`, so a bad value reads null. */
+function boardTokens(tokens) {
+	if (!isRecord(tokens)) return null;
+	const out = {};
+	for (const key of TOKEN_NUM_KEYS) out[key] = num(tokens[key]);
+	out.costUnknown = tokens.costUnknown === true;
+	return out;
+}
+
+/** The index entry for a ledger row: by the id given, then by the entry's taskId alias. */
+function usageLookup(usage) {
+	if (typeof usage === "function") return usage;
+	const values = usage instanceof Map ? [...usage.values()] : [];
+	return (id) => {
+		if (typeof id !== "string" || !id) return null;
+		const direct = usage instanceof Map ? usage.get(id) : undefined;
+		if (direct) return direct;
+		return values.find((entry) => entry?.taskId === id) ?? null;
+	};
+}
 
 /** A folder as the board shows it: the whole path when short, else its last two segments after an ellipsis. */
 function shortPath(cwd) {
@@ -145,6 +187,9 @@ function childRow(c, depth = 0) {
 		startedMs: num(c.startedMs),
 		endedMs: num(c.endedMs),
 		health: healthOf(c.health),
+		tokens: boardTokens(c.tokens),
+		treeTokens: num(c.treeTokens),
+		tokensPending: c.tokensPending === true,
 		children,
 	};
 }
@@ -170,6 +215,9 @@ function sessionRow(s) {
 		todo: isRecord(s.todo) ? { open: num(s.todo.open), total: num(s.todo.total) } : null,
 		lastInputMs: num(s.lastInputMs),
 		health: healthOf(s.health),
+		tokens: boardTokens(s.tokens),
+		treeTokens: num(s.treeTokens),
+		tokensPending: s.tokensPending === true,
 		children,
 		childCount: children.length,
 	};
@@ -198,11 +246,15 @@ export function buildSessions(inputs) {
  * One EndedRecord of the ledger as the history table shows it. `childRows` is the number of ended child rows in the
  * window that name this session as parent: a session recorded before its children were visible keeps childCount 0.
  */
-function endedRow(r, childRows = 0) {
+export function endedRow(r, childRows = 0, usage = null, trees = null) {
 	const outcome = typeof r.outcome === "string" && Object.hasOwn(OUTCOME_LABELS, r.outcome) ? r.outcome : "unknown";
 	const startedMs = num(r.startedMs);
 	const endedMs = num(r.endedMs);
 	const cwd = clean(r.cwd, 300);
+	const entryOf = usageLookup(usage);
+	const entry = entryOf(text(r.sessionId, 80)) ?? entryOf(text(r.taskId, 80));
+	const tokens = compactUsage(entry);
+	const tree = entry && trees instanceof Map ? trees.get(entry.id) ?? null : null;
 	return {
 		sessionId: text(r.sessionId, 80),
 		sessionShort: short(r.sessionId),
@@ -224,6 +276,10 @@ function endedRow(r, childRows = 0) {
 		childCount: Math.max(num(r.childCount) ?? 0, childRows),
 		estimated: r.estimated === true,
 		source: r.source === "backfill" ? "backfill" : "live",
+		tokens,
+		tokensState: tokens ? "ok" : entry?.state === "missing" ? "missing" : "pending",
+		tokensGone: entry?.gone === true,
+		treeTokens: tree !== null && tree > (tokens?.total ?? 0) ? tree : null,
 	};
 }
 
@@ -238,12 +294,24 @@ export function buildEnded(inputs) {
 	}
 	const childRows = new Map();
 	for (const r of all) if (r.kind === "child" && typeof r.parentSessionId === "string") childRows.set(r.parentSessionId, (childRows.get(r.parentSessionId) ?? 0) + 1);
+	// Main and child rows are capped separately, then put back in the ledger's newest-first order.
+	const mains = all.filter((r) => r.kind !== "child");
+	const children = all.filter((r) => r.kind === "child");
+	const shownMains = mains.slice(0, ENDED_LIMIT);
+	const shownChildren = children.slice(0, ENDED_LIMIT);
+	const selected = new Set([...shownMains, ...shownChildren]);
+	const usage = inputs.usage instanceof Map ? inputs.usage : new Map();
+	const entryOf = usageLookup(usage);
+	const trees = treeTotals(usage);
 	return {
 		sinceMs: inputs.now - ENDED_WINDOW_MS,
 		limit: ENDED_LIMIT,
+		limits: { main: ENDED_LIMIT, child: ENDED_LIMIT },
 		total: all.length,
 		counts: [...tally].map(([outcome, count]) => ({ outcome, outcomeKo: outcomeLabel(outcome), count })),
-		rows: all.slice(0, ENDED_LIMIT).map((r) => endedRow(r, childRows.get(r.sessionId))),
+		shown: { main: shownMains.length, child: shownChildren.length },
+		totals: { main: mains.length, child: children.length },
+		rows: all.filter((r) => selected.has(r)).map((r) => endedRow(r, childRows.get(r.sessionId), entryOf, trees)),
 	};
 }
 
@@ -255,7 +323,7 @@ function actionDetailOf(action) {
 }
 
 /** One investigation file as a list row: the six columns, then what the expanded row shows. */
-function investigationRow(inv) {
+export function investigationRow(inv) {
 	const subject = isRecord(inv.subject) ? inv.subject : {};
 	const child = Boolean(subject.taskId || subject.parentSessionId);
 	const verdict = isRecord(inv.verdict) ? inv.verdict : null;
@@ -303,7 +371,7 @@ function daemonStateOf({ stopped, heartbeat: hb, pidAlive: alive, loaded }, ageM
 	return "crashed";
 }
 
-function daemonStatus(inputs) {
+export function daemonStatus(inputs) {
 	const hb = inputs.heartbeat;
 	const heartbeatAgeMs = Number.isFinite(hb?.ts) ? inputs.now - hb.ts : null;
 	const state = daemonStateOf(inputs, heartbeatAgeMs);
@@ -411,6 +479,7 @@ export function buildUiState(inputs) {
 		investigations: section(() => buildInvestigations(inputs)),
 		history: section(() => ({ ...buildHistory(inputs.decisions, inputs.now), readMs: inputs.decisionsReadMs })),
 		settings: section(() => buildSettings(inputs)),
+		prefs: section(() => inputs.prefs ?? { hideChildren: false }),
 	};
 }
 
