@@ -1,4 +1,4 @@
-import { childSubjectOf, subjectKey, subjectOf, taskParentResolver, worldLiveOwners } from "./session-subject.mjs";
+import { childSubjectOf, liveSessionView, subjectKey, subjectOf, taskParentResolver, uniqueMatch, worldLiveOwners } from "./session-subject.mjs";
 import path from "node:path";
 import { endedKey } from "./session-ledger.mjs";
 import { ambiguousLedgerTaskIds } from "./session-record.mjs";
@@ -188,8 +188,10 @@ export function buildSessionSnapshot(world, findings = [], investigations = [], 
 	};
 
 	const groups = new Map();
-	for (const session of world.sessions?.values?.() ?? []) {
-		if (session.kind !== "main" || !world.isSessionLive(session)) continue;
+	for (const raw of world.sessions?.values?.() ?? []) {
+		if (raw.kind !== "main" || !world.isSessionLive(raw)) continue;
+		const session = liveSessionView(raw, world);
+		const subject = subjectOf(session);
 		const hb = world.sensors?.get?.(session.id);
 		const hostPid = Number.isFinite(hb?.pid) ? hb.pid : session.hostPid;
 		const omoVersion = Number.isFinite(hostPid) ? (world.hostExits?.liveMarkers?.get?.(hostPid)?.omoVersion ?? null) : null;
@@ -207,8 +209,8 @@ export function buildSessionSnapshot(world, findings = [], investigations = [], 
 			todo,
 			lastInputMs: finite(toMs(hb?.lastInputAt)),
 			health: healthFor({ sessionId: session.id }),
-			...tokenFields(tokensOf?.(subjectOf(session), null)),
-			children: childrenOf(subjectOf(session), 1, new Set()),
+			...tokenFields(tokensOf?.(subject, null)),
+			children: childrenOf(subject, 1, new Set()),
 		};
 		if (!groups.has(omoVersion)) groups.set(omoVersion, []);
 		groups.get(omoVersion).push(row);
@@ -257,7 +259,7 @@ export function boardTaskLinks(world, nowMs = world?.now) {
 		}
 	};
 	for (const session of world?.sessions?.values?.() ?? []) {
-		if (session.kind === "main" && world.isSessionLive?.(session)) visit(subjectOf(session), 1, new Set());
+		if (session.kind === "main" && world.isSessionLive?.(session)) visit(subjectOf(liveSessionView(session, world)), 1, new Set());
 	}
 	// The board already has authoritative child session IDs, even when one equals a task ID.
 	const ambiguous = ambiguousLedgerTaskIds(rows.filter((row) => !row.sessionId), { scoped: true });
@@ -335,6 +337,15 @@ export function detectEnded(prevSnapshot, snapshot, world, nowMs = world.now) {
 		return children;
 	};
 	const curChildren = flatten(curMains, currentByTask);
+	const prevChildren = flatten(prevMains);
+	const taskParent = taskParentResolver(world, world.paths?.agentDir, [...prevChildren.values()].map(({ parentCwd }) => parentCwd));
+	const tasksByPair = new Map();
+	const pairKey = (parentId, taskId) => JSON.stringify([parentId, taskId]);
+	for (const task of world.tasks ?? []) {
+		const key = pairKey(task.parentSessionId, task.taskId);
+		if (!tasksByPair.has(key)) tasksByPair.set(key, []);
+		tasksByPair.get(key).push(task);
+	}
 	let releases;
 	const releaseOf = (...ids) => {
 		releases ??= recentReleases(world.paths);
@@ -386,17 +397,22 @@ export function detectEnded(prevSnapshot, snapshot, world, nowMs = world.now) {
 		});
 	}
 
-	for (const [key, { row, sessionId, parentSessionId, root, parentCwd, parentProjectKey }] of flatten(prevMains)) {
+	for (const [key, { row, sessionId, parentSessionId, root, parentCwd, parentProjectKey }] of prevChildren) {
 		if (TERMINAL_STATUSES.has(row.status)) continue;
 		// A running task-only child may acquire its session ID between snapshots.
 		const current = curChildren.get(key)?.row ?? (!row.sessionId ? currentByTask.get(key) : undefined);
 		if (current && !TERMINAL_STATUSES.has(current.status)) continue;
 		const taskId = row.taskId;
-		const task = (world.tasks ?? []).find((t) => t.taskId === taskId && t.parentSessionId === parentSessionId);
+		const candidates = tasksByPair.get(pairKey(parentSessionId, taskId)) ?? [];
+		const task = uniqueMatch(candidates, (candidate) => {
+			if (!candidate.storeDir) return candidates.length === 1 ? candidate : undefined;
+			return taskParent(candidate)?.projectKey === parentProjectKey ? candidate : undefined;
+		});
 		const status = task?.status ?? current?.status;
 		let outcome;
 		let reason;
-		const release = releaseOf(taskId, row.sessionId);
+		// The decision log is raw-ID keyed and cannot distinguish this pair across stores.
+		const release = candidates.length <= 1 && (!candidates.length || task) ? releaseOf(taskId, row.sessionId) : undefined;
 		if (status === "completed" && task?.hasFinalResponse !== false) {
 			outcome = "answered";
 			reason = "작업이 최종 응답과 함께 완료되었습니다.";

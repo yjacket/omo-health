@@ -45,7 +45,7 @@ export function childSubjectOf({ sessionId, task, world, parent }) {
 }
 
 /** Resolve a task's parent from its spawning store, not the child's spawn cwd. */
-export function taskParentResolver(world, agentDir = world?.paths?.agentDir) {
+export function taskParentResolver(world, agentDir = world?.paths?.agentDir, knownCwds = []) {
 	let userStores;
 	const userStoreProject = (storeDir) => {
 		if (!agentDir || path.dirname(path.dirname(storeDir)) !== path.resolve(agentDir, "projects")) return null;
@@ -53,6 +53,7 @@ export function taskParentResolver(world, agentDir = world?.paths?.agentDir) {
 			userStores = new Map();
 			// The per-user directory name is a hash. Reverse it only against known projects.
 			const cwds = new Set(world?.config?.extraProjects ?? []);
+			for (const cwd of knownCwds) if (cwd) cwds.add(cwd);
 			for (const row of world?.sessions?.values?.() ?? []) if (row.cwd) cwds.add(row.cwd);
 			for (const sensor of world?.sensors?.values?.() ?? []) if (sensor.cwd) cwds.add(sensor.cwd);
 			for (const task of world?.tasks ?? []) if (task.spawnCwd) cwds.add(task.spawnCwd);
@@ -110,8 +111,19 @@ function sortedOwners(owners) {
 	return [...owners.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([, owner]) => owner);
 }
 
+/** Project the sensor's exact live transcript without changing the raw-ID runtime registry. */
+export function liveSessionView(session, world) {
+	const heartbeat = session?.kind === "main" ? world?.sensorFor?.(session.id) : undefined;
+	if (typeof heartbeat?.sessionFile !== "string" || !heartbeat.sessionFile) return session;
+	// A heartbeat without cwd may inherit it only from the very same transcript.
+	const sameFile = heartbeat.sessionFile === session.file;
+	const cwd = heartbeat.cwd || (sameFile ? session.cwd : undefined);
+	const projectKey = projectKeyOf(heartbeat.cwd) ?? (sameFile ? subjectOf(session).projectKey : null);
+	return { ...session, file: heartbeat.sessionFile, cwd, projectKey };
+}
+
 export function worldLiveOwners(world) {
-	const rows = [...(world?.sessions?.values?.() ?? [])];
+	const rows = [...(world?.sessions?.values?.() ?? [])].map((row) => liveSessionView(row, world));
 	return rows.map(sessionSubjects(rows, world));
 }
 

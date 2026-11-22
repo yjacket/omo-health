@@ -15,7 +15,9 @@ import { boardLiveOwners, subjectOf } from "../src/session-subject.mjs";
 import { createDetailOperations } from "../src/ui/detail-worker.mjs";
 import { buildEnded, loadUiInputs } from "../src/ui/model.mjs";
 import { createSessionFileLocator } from "../src/collect/session-files.mjs";
+import { SessionRegistry } from "../src/collect/sessions.mjs";
 import { normalizeTask, projectStoreName, taskStoreDir } from "../src/collect/tasks.mjs";
+import { buildWorld } from "../src/state.mjs";
 import { createUsageIndex } from "../src/usage-index.mjs";
 import { createUsageTracker } from "../src/usage-tracker.mjs";
 import { expectedSelector } from "./helpers/ended-selector.mjs";
@@ -142,6 +144,110 @@ test("plan94 a same-named main enters history only for the project that ended", 
 	const history = buildEnded(loadUiInputs({ paths, now, env: {} }));
 	assert.deepEqual(history.rows.map(({ sessionId, cwd }) => [sessionId, cwd]), [["review.1", a]]);
 	assert.deepEqual(current.groups.flatMap(({ sessions }) => sessions.map(({ sessionId, cwd }) => [sessionId, cwd])), [["review.1", b]]);
+});
+
+test("plan99 a fresh heartbeat owns the live file despite a raw-ID registry collision", async (t) => {
+	for (const last of ["A", "B"]) await t.test(`registry enumerates ${last} last`, (t) => {
+		const { paths, a, b } = setup(t);
+		const sessionId = "review.1";
+		const transcript = (dir, cwd, total) => {
+			const file = path.join(paths.sessionsDir, dir, `2026-10-10T12-00-00-000Z_${sessionId}.jsonl`);
+			writeJsonl(file, [E.header(sessionId, cwd, now - 1000), E.assistant({
+				ms: now - 50, usage: { input: total, output: 0, cacheRead: 0, cacheWrite: 0 },
+			})]);
+			return file;
+		};
+		// Use an explicit path outside A's default project subdirectory: no locator fallback can find it.
+		const fileA = transcript("explicit-session-dir", a, 17);
+		const fileB = transcript(subjectOf({ cwd: b }).projectKey, b, 99);
+		const sensors = new Map([[sessionId, { ts: now, sessionId, cwd: a, sessionFile: fileA }]]);
+		const registry = new SessionRegistry({ paths, config: DEFAULT_CONFIG, clock });
+		registry.refresh({ sensors });
+		const order = last === "A" ? [fileB, fileA] : [fileA, fileB];
+		registry.trackers = new Map(order.map((file) => [file, registry.trackers.get(file)]));
+		const world = buildWorld({ now, paths, sensors, registry: registry.snapshot() });
+		assert.equal(world.sessions.get(sessionId).file, order.at(-1));
+		assert.ok(appendEnded(paths, main(sessionId, b), { nowMs: now }));
+
+		const index = createUsageIndex({ file: paths.health.usageIndexFile, clock });
+		const tracker = createUsageTracker({ paths, clock, index, locator: createSessionFileLocator({ paths, clock }) });
+		tracker.queueLedger(streamEnded(paths, { withLocation: true }));
+		tracker.tick(world);
+		index.save();
+		const board = buildSessionSnapshot(world, [], [], now, { tokensOf: tracker.tokensOf });
+		const live = board.groups[0].sessions[0];
+		const history = buildEnded(loadUiInputs({ paths, now, env: {} }));
+		assert.deepEqual({
+			live: [live.sessionId, live.cwd, live.tokens?.total],
+			liveOwners: board.liveOwners,
+			history: history.rows.map(({ sessionId, cwd, tokens }) => [sessionId, cwd, tokens?.total]),
+			indexedLiveFile: [...index.values()].find((entry) => entry.projectKey === subjectOf({ cwd: a }).projectKey)?.file,
+		}, {
+			live: [sessionId, a, 17],
+			liveOwners: [subjectOf({ cwd: a, sessionId })],
+			history: [[sessionId, b, 99]],
+			indexedLiveFile: fileA,
+		});
+		if (last === "B") {
+			sensors.set(sessionId, { ts: now, sessionId, cwd: a });
+			tracker.tick(world);
+			const fallback = buildSessionSnapshot(world, [], [], now, { tokensOf: tracker.tokensOf }).groups[0].sessions[0];
+			assert.deepEqual([fallback.cwd, fallback.tokens.total], [b, 99], "a heartbeat without a file preserves registry attribution");
+		}
+	});
+});
+
+test("plan99 ended child details take outcome and reason from their parent project store", async (t) => {
+	for (const first of ["A", "B"]) await t.test(`task store ${first} first`, (t) => {
+		const { paths, a, b } = setup(t);
+		const parentId = "review.1";
+		const childId = "review.child";
+		const taskId = "st_shared";
+		const parent = (cwd, children) => ({ ...main(parentId, cwd), children });
+		const child = { sessionId: childId, taskId, status: "running", name: "shared child" };
+		const snapshot = (ts, sessions) => ({ v: 1, ts, groups: [{ sessions }] });
+		const prev = snapshot(now - 1, [parent(a, [child]), parent(b, [child])]);
+		const current = snapshot(now, [parent(a, []), parent(b, [])]);
+		const task = (storeDir, status, fields) => normalizeTask({
+			task_id: taskId, parent_session_id: parentId, child_session_id: childId,
+			status, terminal_at: new Date(now).toISOString(), ...fields,
+		}, storeDir);
+		const failed = task(taskStoreDir(a), "error", { error_message: "failure from A only" });
+		const answered = task(path.join(paths.agentDir, "projects", projectStoreName(b), "senpi-task"), "completed", { final_response: "ok" });
+		const tasks = first === "A" ? [failed, answered] : [answered, failed];
+		const world = { now, paths, tasks };
+		const records = detectEnded(prev, current, world);
+		assert.equal(appendEndedBatch(paths, records, { nowMs: now }).filter(({ appended }) => appended).length, 2);
+		const history = buildEnded(loadUiInputs({ paths, now, env: {} }));
+		const facts = history.rows.map((row) => {
+			const { outcome, reason } = readDetail(paths, row).session;
+			return [row.cwd, outcome, reason];
+		}).sort(([left], [right]) => left.localeCompare(right));
+		assert.deepEqual(facts, [
+			[a, "failed", "작업이 오류로 끝났습니다: failure from A only"],
+			[b, "answered", "작업이 최종 응답과 함께 완료되었습니다."],
+		]);
+	});
+});
+
+test("plan99 an unresolved child store does not lend task or release evidence to an end", (t) => {
+	const { paths, a, b } = setup(t);
+	const cwd = path.join(path.dirname(a), "unmatched");
+	const parentId = "review.1";
+	const child = { sessionId: "review.child", taskId: "st_shared", status: "running" };
+	const snapshot = (children) => ({ v: 1, ts: now, groups: [{ sessions: [{ ...main(parentId, cwd), children }] }] });
+	const tasks = [a, b].map((project) => normalizeTask({
+		task_id: child.taskId, parent_session_id: parentId, status: "error", error_message: "foreign failure",
+	}, taskStoreDir(project)));
+	fs.mkdirSync(paths.health.decisionsDir, { recursive: true });
+	fs.writeFileSync(path.join(paths.health.decisionsDir, "2026-10-10.jsonl"), `${JSON.stringify({
+		action: { kind: "kill-pids" }, result: "execute", subject: { taskId: child.taskId, sessionId: child.sessionId },
+	})}\n`);
+	const world = { now, paths, tasks };
+	const [gone] = detectEnded(snapshot([child]), snapshot([]), world);
+	const [cancelled] = detectEnded(snapshot([child]), snapshot([{ ...child, status: "cancelled" }]), world);
+	assert.deepEqual([gone.outcome, gone.reason], ["unknown", "작업 상태가 없음이고 끝난 이유를 알려 줄 기록이 없습니다."]);
+	assert.deepEqual([cancelled.outcome, cancelled.reason], ["cancelled", "작업이 취소되었습니다."]);
 });
 
 test("plan98 recent child stays with the ended project when a live main reuses its parent ID", async (t) => {
