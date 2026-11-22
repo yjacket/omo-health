@@ -399,6 +399,25 @@ export function usageEntryFor(usage, sessionId, taskId) {
 	return match;
 }
 
+/** Snapshot the subject and descendants for one audit, not the resident scan cursors. */
+export function relatedUsageEntries(index, sessionId) {
+	const related = [];
+	for (const entry of index?.values() ?? []) {
+		let matches = entry.id === sessionId || entry.rootSessionId === sessionId;
+		let parent = entry.parentSessionId;
+		for (let depth = 0; !matches && parent && depth < TREE_DEPTH; depth += 1) {
+			matches = parent === sessionId;
+			if (!matches) parent = index.get(parent)?.parentSessionId;
+		}
+		if (matches) {
+			// A partial record may contain a large buffer or scanner functions.
+			const { partial, ...snapshot } = entry;
+			related.push(snapshot);
+		}
+	}
+	return related;
+}
+
 /**
  * `{file, clock, log, read}`: `file` is the only path ever written, and only
  * `save()` writes it. The file is loaded here, so a fresh process resumes every

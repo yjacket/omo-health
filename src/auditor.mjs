@@ -8,7 +8,7 @@ import { ANALYST_POLL_MS, parseAnalystOutput, unavailableReason } from "./judge/
 import { laneArgs } from "./judge/lane.mjs";
 import { usageEntryOf } from "./session-record.mjs";
 import { auditReasonLabel } from "./ui/labels.mjs";
-import { fresh, isSpillModelKey } from "./usage-index.mjs";
+import { fresh, isSpillModelKey, relatedUsageEntries } from "./usage-index.mjs";
 import { atomicWriteFile, atomicWriteJson, ensureDir, listDirSafe, readJsonSafe, readTextSafe, removeSafe, statSafe } from "./util/fsx.mjs";
 import { redact, truncate } from "./util/text.mjs";
 
@@ -28,6 +28,7 @@ export const REQUEST_TTL_MS = 10 * MIN;
 export const MESSAGE_SCAN_TOTAL_BYTES = 64 * 1024 * 1024;
 const DESCENDANT_SCAN_MAX = 50;
 const TIMELINE_MAX_BYTES = 256 * 1024 * 1024;
+const MAX_CHANGED_TIMELINES = 3;
 const SAFE_ID = /^[A-Za-z0-9][\w.-]{0,127}$/;
 const ACTIVE = new Set(["queued", "launching", "running"]);
 
@@ -155,15 +156,36 @@ export function auditModelFacts(entry, full) {
 	};
 }
 
-export function readAuditTimeline(file, tokens, { maxFileBytes = TIMELINE_MAX_BYTES, timeline = usageTimeline, log } = {}) {
+function auditFileVersion(file) {
 	const stat = file ? statSafe(file) : null;
-	if (!stat?.isFile() || stat.size > maxFileBytes) return null;
+	if (!stat?.isFile()) return null;
+	const { size, mtimeMs, ino, birthtimeMs } = stat;
+	return { size, mtimeMs, ino, birthtimeMs };
+}
+
+function sameAuditVersion(a, b) {
+	return b && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ino === b.ino && a.birthtimeMs === b.birthtimeMs;
+}
+
+export function readVersionedAuditTimeline(file, tokens, { maxFileBytes = TIMELINE_MAX_BYTES, timeline = usageTimeline, log } = {}) {
+	const version = auditFileVersion(file);
+	if (!version || version.size > maxFileBytes) return { full: null };
 	try {
-		return timeline(file, { ...tokens, maxFileBytes });
+		const full = timeline(file, { ...tokens, maxFileBytes });
+		if (!full) return { full };
+		// usageTimeline reads against its own fstat. Bracket that scan so a file
+		// that changed while opening or reading cannot certify model coverage.
+		const changedDuringScan = !sameAuditVersion(version, auditFileVersion(file));
+		return { full, timelineSource: { file, version, changedDuringScan } };
 	} catch (error) {
 		log?.warn?.("audit_timeline_failed", { file: path.basename(file), error: error.message });
-		return null;
+		return { full: null };
 	}
+}
+
+export function readAuditTimeline(file, tokens, options) {
+	const { full, timelineSource } = readVersionedAuditTimeline(file, tokens, options);
+	return timelineSource?.changedDuringScan ? null : full;
 }
 
 export function createAuditor({ paths, config, clock, log, runner, index, env = process.env, timelineMaxBytes = TIMELINE_MAX_BYTES, createWorker = (url, options) => new Worker(url, options), afterStart } = {}) {
@@ -272,11 +294,16 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		}
 	}
 
-	function launchPrepared(record, now, { loaded, full, warning }) {
+	function launchPrepared(record, now, { loaded, full, warning, timelineSource }, changedVersions) {
 		if (config.audit?.enabled !== true) return fail(record, "disabled", null, now);
 		if (!loaded?.found) return fail(record, "not-found", null, now);
 		if (readBudget(paths, now).count >= config.audit.perDay) return fail(record, "cap", null, now);
 		if (warning) log?.warn?.("audit_timeline_failed", warning);
+		if (timelineSource && (timelineSource.changedDuringScan ||
+			!sameAuditVersion(timelineSource.version, auditFileVersion(timelineSource.file)))) {
+			if (changedVersions + 1 >= MAX_CHANGED_TIMELINES) return fail(record, "models-unknown", null, now);
+			return startPreparation(record, now, changedVersions + 1);
+		}
 		// The resident index may have learned identities since the worker prepared the evidence.
 		const facts = auditModelFacts(index ? usageEntryOf(index, loaded.session ?? {}) : null, full);
 		// The record join already collected every analyst model for its selected fps, including decision-only fps.
@@ -334,9 +361,9 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		}
 	}
 
-	function startPreparation(record, now) {
+	function startPreparation(record, now, changedVersions = 0) {
 		if (config.audit?.enabled !== true) return fail(record, "disabled", null, now);
-		pending = { record, ...Promise.withResolvers() };
+		pending = { record, changedVersions, ...Promise.withResolvers() };
 		try {
 			if (!worker) {
 				const owner = worker = createWorker(new URL("./audit-prepare-worker.mjs", import.meta.url), {
@@ -352,7 +379,7 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 				owner.on("exit", (code) => lostWorker(owner, `preparation worker exited (${code})`));
 			}
 			worker.ref();
-			worker.postMessage({ sessionId: record.sessionId, now, bounds: {
+			worker.postMessage({ sessionId: record.sessionId, now, indexEntries: relatedUsageEntries(index, record.sessionId), indexFull: index?.full === true, bounds: {
 				messageScanMaxBytes: timelineMaxBytes, messageScanTotalBytes: MESSAGE_SCAN_TOTAL_BYTES,
 				descendantScanMax: DESCENDANT_SCAN_MAX, tokens: config.tokens,
 			} });
@@ -368,11 +395,11 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		for (const record of recovering) resolveLaunching(record);
 		if (recovering.length || slotHeld()) return;
 		if (pending) {
-			const { record, result, error } = pending;
+			const { record, result, error, changedVersions } = pending;
 			if (!result && error === undefined) return;
 			pending = undefined;
 			if (error !== undefined) return fail(record, "prepare-error", error, now);
-			return launchPrepared(record, now, result);
+			return launchPrepared(record, now, result, changedVersions);
 		}
 		const next = [...records.values()].filter((record) => record.status === "queued").sort((a, b) => a.requestedMs - b.requestedMs)[0];
 		if (next) startPreparation(next, now);

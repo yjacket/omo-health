@@ -793,10 +793,116 @@ test("(IS-1, IS-9) reviewer launch excludes an identity learned only by the resi
 		}
 
 		h.tick(auditor);
+		if (changed) {
+			await auditor.preparing();
+			auditor.tick(h.state.now);
+		}
 		assert.equal(h.record("m1").status, "running");
 		assert.equal(h.runner.starts.length, 1);
 		assert.equal(modelOf(h.runner.starts[0]), changed ? "google/gemini-3-pro" : "openai/gpt-5-5");
 	}
+});
+
+test("(IS-9) an unindexed append after preparation retries before selecting a reviewer", async (t) => {
+	const h = harness();
+	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+	const index = indexed(h, "m1");
+	const auditor = h.auditor({ index });
+	h.request("m1");
+	h.tick(auditor);
+	const first = auditor.preparing();
+	await first;
+	appendJsonl(h.files.m1, [openaiLine()]);
+	assert.equal(index.get("m1").published.usedModels["openai/gpt-5-5"], undefined);
+	h.tick(auditor);
+	assert.equal(h.runner.starts.length, 0, "the stale timeline must not launch a reviewer");
+	assert.equal(h.budget(), undefined);
+	assert.equal(h.record("m1").status, "queued");
+	const retry = auditor.preparing();
+	assert.ok(retry && retry !== first);
+	await retry;
+	h.tick(auditor);
+	assert.equal(h.record("m1").status, "running");
+	assert.equal(h.runner.starts.length, 1);
+	assert.equal(modelOf(h.runner.starts[0]), "google/gemini-3-pro");
+	assert.equal(h.budget().count, 1);
+});
+
+test("(IS-9) three consecutive timeline version changes fail models-unknown uncharged", async (t) => {
+	const h = harness();
+	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+	const auditor = h.auditor({ index: indexed(h, "m1") });
+	h.request("m1");
+	h.tick(auditor);
+	for (let i = 1; i <= 3; i++) {
+		const preparation = auditor.preparing();
+		assert.ok(preparation);
+		await preparation;
+		appendJsonl(h.files.m1, [openaiLine({ id: `a-change-${i}` })]);
+		h.tick(auditor);
+		assert.equal(h.runner.starts.length, 0, `version change ${i} must not launch`);
+		assert.equal(h.budget(), undefined);
+		assert.equal(h.record("m1").status, i < 3 ? "queued" : "failed");
+	}
+	assert.equal(h.record("m1").reason, "models-unknown");
+	assert.equal(auditor.preparing(), undefined);
+});
+
+test("(IS-1) a saturated index sends only related entries to the worker", async (t) => {
+	const h = harness();
+	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+	const index = indexed(h, "m1");
+	for (let depth = 1; depth <= 9; depth++) {
+		index.markMissing(`child-${depth}`, { parentSessionId: depth === 1 ? "m1" : `child-${depth - 1}` });
+	}
+	index.markMissing("root-only", { parentSessionId: "absent", rootSessionId: "m1" });
+	const longPath = "C:/" + ("unrelated/".repeat(800));
+	for (let i = 0; !index.full && i < 3000; i++) {
+		index.markMissing(`unrelated-${i}`, { file: longPath, parentSessionId: `unrelated-${i}` });
+	}
+	assert.equal(index.full, true);
+	assert.ok([...index.values()].length > 1000);
+	let posted;
+	const auditor = h.auditor({ index, createWorker(url, options) {
+		const worker = new Worker(url, options);
+		const post = worker.postMessage.bind(worker);
+		worker.postMessage = (job) => { posted = job; post(job); };
+		return worker;
+	} });
+	h.request("m1");
+	await h.prepare(auditor);
+	assert.equal(posted.indexFull, true);
+	assert.deepEqual(posted.indexEntries.map(({ id }) => id).sort(),
+		["m1", ...Array.from({ length: 8 }, (_, i) => `child-${i + 1}`), "root-only"].sort());
+	assert.equal(h.record("m1").status, "running");
+});
+
+test("(IS-1) worker prepares tokens, children and model facts after the index file is deleted", async (t) => {
+	const h = harness({ entries: [openaiLine()] });
+	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+	const index = indexed(h, "m1");
+	const childFile = path.join(h.root, "child.jsonl");
+	writeJsonl(childFile, [openaiLine()]);
+	index.update("c1", childFile, { parentSessionId: "m1" });
+	index.save();
+	const resident = createUsageIndex({ file: index.file, clock: h.clock, log: silent });
+	fs.unlinkSync(index.file);
+	let reply;
+	const auditor = h.auditor({ index: resident, timelineMaxBytes: 0, createWorker(url, options) {
+		const worker = new Worker(url, options);
+		worker.on("message", (result) => { reply = result; });
+		return worker;
+	} });
+	h.request("m1");
+	await h.prepare(auditor);
+	const ownTotal = resident.get("m1").published.total;
+	const childTotal = resident.get("c1").published.total;
+	assert.equal(reply.loaded.tokens?.total, ownTotal, "the worker uses the resident publication");
+	assert.equal(reply.loaded.tokens.treeTotal, ownTotal + childTotal);
+	assert.ok(reply.loaded.tokens.models.some(({ key }) => key === "openai/gpt-5-5"));
+	assert.deepEqual(reply.loaded.children.map((child) => [child.sessionId, child.tokens?.total]), [["c1", childTotal]]);
+	assert.equal(reply.full, null, "the timeline cannot supply the model facts");
+	assert.equal(modelOf(h.runner.starts[0]), "google/gemini-3-pro");
 });
 
 test("(gate 15) the auditor excludes an identity missing only from published.usedModels", async () => {
