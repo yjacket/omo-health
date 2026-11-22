@@ -279,6 +279,40 @@ test("verdict and action reasons reach the document only as recognized codes; fr
 	assert.equal(reasonCode("poll-error:damn"), "poll-error");
 });
 
+/* ---------------------------------------------------------------- coverage */
+
+test("a record whose coverage.infoFindings is true sends coverage.infoFindings true", () => {
+	const row = { sessionId: "s1", taskId: "st_s1", kind: "main", startedMs: T0, endedMs: T0 + HOUR, outcome: "answered" };
+	const decisions = [{ event: "coverage", ts: iso(T0 - 60_000), infoFindings: true }];
+	const record = buildSessionRecord({ id: "s1", row, ledger: [row], decisions, investigations: [], messages: [] });
+	assert.equal(record.coverage.infoFindings, true);
+	assert.deepEqual(auditBundle(record, null, { config: DEFAULT_CONFIG, now: T0 }).coverage, { infoFindings: true });
+});
+
+test("a session predating coverage sends coverage.infoFindings false, whether false or absent", () => {
+	const row = { sessionId: "s1", taskId: "st_s1", kind: "main", startedMs: T0, endedMs: T0 + HOUR, outcome: "answered" };
+	const record = buildSessionRecord({ id: "s1", row, ledger: [row], decisions: [], investigations: [], messages: [] });
+	assert.equal(record.coverage.infoFindings, false);
+	assert.deepEqual(auditBundle(record, null, { config: DEFAULT_CONFIG, now: T0 }).coverage, { infoFindings: false });
+	const absent = emptyRecord();
+	delete absent.coverage;
+	assert.deepEqual(auditBundle(absent, null, { config: DEFAULT_CONFIG, now: T0 }).coverage, { infoFindings: false });
+	const explicitFalse = { ...emptyRecord(), coverage: { infoFindings: false } };
+	assert.deepEqual(auditBundle(explicitFalse, null, { config: DEFAULT_CONFIG, now: T0 }).coverage, { infoFindings: false });
+});
+
+test("a record whose coverage holds extra keys or text sends only the boolean", () => {
+	const record = { ...emptyRecord(), coverage: { infoFindings: true, since: T0, note: "QA-SECRET-COVERAGE" } };
+	const bundle = auditBundle(record, null, { config: DEFAULT_CONFIG, now: T0 });
+	assert.deepEqual(bundle.coverage, { infoFindings: true });
+	assert.equal(JSON.stringify(bundle).includes("QA-SECRET-COVERAGE"), false);
+	const document = auditDocument(bundle);
+	assert.equal(document.includes("QA-SECRET-COVERAGE"), false);
+	assert.match(document, /coverage\.infoFindings/);
+	const truthyText = { ...emptyRecord(), coverage: { infoFindings: "yes" } };
+	assert.deepEqual(auditBundle(truthyText, null, { config: DEFAULT_CONFIG, now: T0 }).coverage, { infoFindings: false });
+});
+
 /* ---------------------------------------------------------------- size */
 
 test("the 100,000 cap trims hours first and leaves the rest alone when that is enough", () => {
