@@ -171,3 +171,18 @@ test("a missing config.json is not unreadable and ignores the last good copy", (
 	assert.equal(usedLastGood, false);
 	assert.equal(config.actions.kill, true);
 });
+
+test("audit defaults are frozen and lanes accepts a string array only", () => {
+	assert.deepEqual(DEFAULT_CONFIG.audit, { enabled: true, lanes: ["ultrabrain", "architect", "deep-high"], timeoutMs: 15 * 60_000, perDay: 20 });
+	const { paths } = tempPaths();
+	fs.writeFileSync(paths.health.configFile, JSON.stringify({ audit: { lanes: ["architect"], perDay: 3 } }));
+	const ok = loadConfig({ env: {}, paths });
+	assert.deepEqual(ok.config.audit.lanes, ["architect"]);
+	assert.equal(ok.config.audit.perDay, 3);
+	assert.equal(ok.config.audit.timeoutMs, 15 * 60_000);
+	assert.deepEqual(ok.warnings, []);
+	fs.writeFileSync(paths.health.configFile, JSON.stringify({ audit: { lanes: [1, "x"] } }));
+	const bad = loadConfig({ env: {}, paths });
+	assert.deepEqual(bad.config.audit.lanes, ["ultrabrain", "architect", "deep-high"]);
+	assert.equal(bad.warnings.length, 1);
+});

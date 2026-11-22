@@ -432,3 +432,35 @@ test("the daemon indexes a live session's tokens into sessions/usage.json and pu
 	assert.equal(row.tokens.total, 15, "status/_sessions.json carries the token total");
 	assert.equal(row.tokensPending, false);
 });
+
+test("the idle exit is held while the auditor is busy, and the auditor ticks on the daemon clock in every mode", async () => {
+	const f = fixture();
+	const ticked = [];
+	let factoryOptions;
+	const createAuditor = (options) => {
+		factoryOptions = options;
+		return { tick: (now) => ticked.push(now), busy: () => f.ticks < 5 };
+	};
+	const result = await runDaemon({ proc: fakeProc(), paths: f.paths, mode: "shadow", config: { ...DEFAULT_CONFIG, idleExitMs: 2 * 60_000 }, clock: f.clock, overrides: { procs: { kind: "fake" }, createEngine: f.fakeEngine, createAuditor, env: {} } });
+	assert.equal(result.reason, "idle-no-omo-hosts");
+	assert.equal(f.ticks, 5, "without the hold the daemon would leave after 3 ticks");
+	assert.equal(ticked.length, 5);
+	assert.deepEqual(ticked, ticked.toSorted((a, b) => a - b));
+	assert.equal(factoryOptions.paths, f.paths);
+	assert.equal(typeof factoryOptions.runner.poll, "function");
+});
+
+test("a throwing audit tick is logged as audit_tick_failed and the daemon keeps running", async () => {
+	const f = fixture();
+	const createAuditor = () => ({
+		tick() {
+			throw new Error("audit boom");
+		},
+		busy: () => false,
+	});
+	const result = await runDaemon({ proc: fakeProc(), paths: f.paths, config: { ...DEFAULT_CONFIG, idleExitMs: 2 * 60_000 }, clock: f.clock, overrides: { procs: { kind: "fake" }, createEngine: f.fakeEngine, createAuditor, env: {} } });
+	assert.equal(result.reason, "idle-no-omo-hosts");
+	assert.equal(f.ticks, 3);
+	const log = fs.readFileSync(path.join(f.paths.health.logsDir, "daemon.log"), "utf8");
+	assert.match(log, /audit_tick_failed/);
+});

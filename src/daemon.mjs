@@ -23,6 +23,7 @@ import { createOmoLoginSource } from "./collect/omo-login.mjs";
 import { createEngine, loadDetectors } from "./engine.mjs";
 import { createEvidence } from "./evidence.mjs";
 import { createAnalyst, parseAnalystOutput, unavailableReason } from "./judge/analyst.mjs";
+import { AUDIT_CONTRACT, createAuditor } from "./auditor.mjs";
 import { createRunner } from "./runner.mjs";
 import { countTempFiles, createBaseline } from "./baseline.mjs";
 import { closeDb, createMaintainer, openDb } from "./db/db.mjs";
@@ -333,6 +334,8 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 	// tracker shares one 32 MiB budget per tick between live appends and the ended-session backlog.
 	const usageIndex = createUsageIndex({ file: paths.health.usageIndexFile, clock, log });
 	const usageTracker = createUsageTracker({ paths, index: usageIndex, locator: createSessionFileLocator({ paths, clock }), clock, log });
+	// Plan todo 12: owner-requested audits (display-only, so they run in shadow mode too); one runs at a time.
+	const auditor = (overrides.createAuditor ?? createAuditor)({ paths, config, clock, log, env, runner: createRunner({ paths, clock, contracts: { audit: AUDIT_CONTRACT } }) });
 	const savedBoard = readJsonSafe(paths.health.sessionsSnapshotFile);
 	let prevBoard = savedBoard?.v === 1 && clock.now() - (savedBoard.ts ?? 0) <= BOARD_RESUME_MS ? savedBoard : undefined;
 	let backfilled = false;
@@ -434,6 +437,11 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 					log.error("session_board_failed", { error: error.message, stack: String(error.stack).slice(0, 800) });
 				}
 			}
+			try {
+				auditor.tick(clock.now());
+			} catch (error) {
+				log.error("audit_tick_failed", { error: error.message, stack: String(error.stack).slice(0, 800) });
+			}
 			// One-time reconstruction of the last 30 days, after the first tick so the board is up first.
 			if (!backfilled) {
 				backfilled = true;
@@ -489,7 +497,7 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 				...(reloader ? { config: reloader.state() } : {}),
 			};
 			atomicWriteJson(paths.health.daemonJson, heartbeat);
-			if (clock.now() - lastHostSeenMs > config.idleExitMs && !hasPendingParks(paths)) {
+			if (clock.now() - lastHostSeenMs > config.idleExitMs && !hasPendingParks(paths) && !auditor.busy()) {
 				exitReason = "idle-no-omo-hosts";
 				break;
 			}
