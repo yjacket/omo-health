@@ -206,44 +206,82 @@ function encodeNonFinite(key, value) {
 	return { [NUMBER_TAG]: value > 0 ? "Infinity" : "-Infinity" };
 }
 
-/** JSON.parse reviver: decode the tagged shape; ordinary strings (including legacy
- * `number:Infinity` text) are never touched. */
-function decodeNonFinite(key, value) {
-	if (!isObject(value) || Array.isArray(value)) return value;
-	const tag = value[NUMBER_TAG];
-	if (typeof tag !== "string") return value;
-	// Only the rare tagged value pays for the key-count check.
-	if (Object.keys(value).length !== 1) return value;
-	const decoded = NUMBER_TAGS.get(tag);
-	return decoded === undefined ? value : decoded;
+const INVALID_NUMBER = Symbol("invalidNumber");
+
+/** A well-formed tag is exactly `{"$n": "Infinity" | "-Infinity" | "NaN"}`. */
+function taggedNumber(value) {
+	if (!isObject(value) || Array.isArray(value)) return INVALID_NUMBER;
+	const keys = Object.keys(value);
+	if (keys.length !== 1 || keys[0] !== NUMBER_TAG) return INVALID_NUMBER;
+	return NUMBER_TAGS.get(value[NUMBER_TAG]) ?? INVALID_NUMBER;
+}
+
+/**
+ * Validate one persisted numeric slot in place. A v1 file only ever held plain
+ * numbers (an exponent that parses to -Infinity stays a number); a v2 file may
+ * also hold a well-formed tag, decoded here so the rest of the loader never sees
+ * the tagged shape. Null, strings, plain objects and malformed tags are invalid.
+ */
+function normalizeNumber(node, key, version) {
+	if (!Object.hasOwn(node, key)) return true;
+	const value = node[key];
+	if (typeof value === "number") return true;
+	if (version !== 1) {
+		const decoded = taggedNumber(value);
+		if (decoded !== INVALID_NUMBER) {
+			node[key] = decoded;
+			return true;
+		}
+	}
+	return false;
 }
 
 /**
  * A persisted counter tree may be absent as a whole (a never-read row), but every
- * numeric leaf must be a number. JSON.stringify turns Infinity/NaN into null, so a
- * null (or any other non-number) there is data loss; the row must be recounted.
+ * numeric leaf must be a number, or for v2 a well-formed tag. JSON.stringify turns
+ * Infinity/NaN into null, so a null (or any other non-number) there is data loss;
+ * the row must be recounted.
  */
-function validCounterTree(tree) {
+function validCounterTree(tree, version) {
 	if (tree === null || tree === undefined) return true;
 	if (!isObject(tree) || Array.isArray(tree)) return false;
-	for (const key of COUNTER_KEYS) if (key in tree && typeof tree[key] !== "number") return false;
+	for (const key of COUNTER_KEYS) if (!normalizeNumber(tree, key, version)) return false;
 	if ("costUnknown" in tree && typeof tree.costUnknown !== "boolean") return false;
 	if ("modelsIncomplete" in tree && typeof tree.modelsIncomplete !== "boolean") return false;
 	for (const models of [tree.models, tree.usedModels, tree.diagnostics]) {
 		if (models === null || models === undefined) continue;
 		if (!isObject(models) || Array.isArray(models)) return false;
 	}
-	for (const model of Object.values(tree.models ?? {})) {
-		if (!isObject(model) || typeof model.tokens !== "number" || typeof model.cost !== "number") return false;
+	// for-in over the 105k-model maps: Object.values would allocate an array per tree
+	// in a process the daemon caps at 96 MiB.
+	const models = tree.models;
+	if (models) {
+		for (const key in models) {
+			if (!Object.hasOwn(models, key)) continue;
+			const model = models[key];
+			if (!isObject(model) || Array.isArray(model)) return false;
+			if (!normalizeNumber(model, "tokens", version) || !normalizeNumber(model, "cost", version)) return false;
+			if (typeof model.tokens !== "number" || typeof model.cost !== "number") return false;
+		}
 	}
-	for (const flag of Object.values(tree.usedModels ?? {})) if (flag !== true) return false;
+	const usedModels = tree.usedModels;
+	if (usedModels) {
+		for (const key in usedModels) if (Object.hasOwn(usedModels, key) && usedModels[key] !== true) return false;
+	}
 	const diagnostics = tree.diagnostics;
-	if (diagnostics && (typeof diagnostics.badLines !== "number" || typeof diagnostics.skippedLines !== "number")) return false;
+	if (diagnostics) {
+		if (!normalizeNumber(diagnostics, "badLines", version) || !normalizeNumber(diagnostics, "skippedLines", version)) return false;
+		if (typeof diagnostics.badLines !== "number" || typeof diagnostics.skippedLines !== "number") return false;
+	}
 	return true;
 }
 
-function validV1Entry(entry) {
-	return USAGE_KEYS.every((key) => validCounterTree(entry[key]));
+const ENTRY_NUMBERS = [...CURSOR_NUMBERS, "checkedMs"];
+
+/** Every persisted numeric slot and counter leaf must fit the file's version. */
+function validEntry(entry, version) {
+	for (const key of ENTRY_NUMBERS) if (!normalizeNumber(entry, key, version)) return false;
+	return USAGE_KEYS.every((key) => validCounterTree(entry[key], version));
 }
 
 /** Drop a lossy cursor and publication so the tracker recounts the session file. */
@@ -416,18 +454,20 @@ export function readUsageIndex(file) {
 	let data;
 	try {
 		const body = text.replace(/^\uFEFF/, "");
-		// V8's reviver path keeps a temporary node array; a tag-free 25 MB index fits the
-		// 96 MiB cap only through the plain parser, and then there is nothing to decode.
-		data = JSON.parse(body, body.includes(`"${NUMBER_TAG}"`) ? decodeNonFinite : undefined);
+		// No reviver: V8's reviver path keeps a temporary node array for the whole
+		// document, which aborts a 105,000-model index under the daemon's 96 MiB cap.
+		// The tagged leaves are rare and decoded in place per entry below.
+		data = JSON.parse(body);
 	} catch {
 		return out;
 	}
 	if (!isObject(data) || (data.v !== 1 && data.v !== USAGE_INDEX_VERSION) || !isObject(data.entries)) return out;
+	const version = data.v;
 	for (const [id, entry] of Object.entries(data.entries)) {
 		if (!isObject(entry)) continue;
-		// The previous writer serialized an overflowed total as null. Keeping its cursor
-		// would publish a finite sum that disagrees with a one-shot read (IS-1).
-		if (data.v === 1 && !validV1Entry(entry)) invalidateCursor(entry);
+		// A version mismatch, a malformed tag, a null or a string in a numeric slot
+		// would otherwise publish a total the one-shot read disagrees with (IS-1).
+		if (!validEntry(entry, version)) invalidateCursor(entry);
 		out.set(id, entry);
 	}
 	return out;

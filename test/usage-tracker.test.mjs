@@ -367,6 +367,42 @@ test("(gate 11) a previous-writer row with a null overflowed total is recounted 
 	assert.equal(compactUsage(readUsageIndex(s.paths.health.usageIndexFile).get(id)).total, Infinity, "the repaired row reloads as Infinity");
 });
 
+test("(gate 12) malformed numeric fields keep a row pending until the tracker recounts it", (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const id = "malformed";
+	const file = mainFile(s.paths, id);
+	writeJsonl(file, [E.assistant({ ms: T0, usage: usage(42) })]);
+	s.index.update(id, file);
+	s.index.save();
+	const savedText = fs.readFileSync(s.paths.health.usageIndexFile, "utf8");
+	const cases = [
+		["v2 published.total null", (data) => { data.entries[id].published.total = null; }],
+		["v1 published.total tag", (data) => { data.v = 1; data.entries[id].published.total = { $n: "Infinity" }; }],
+		["v2 malformed tag", (data) => { data.entries[id].published.total = { $n: "Bogus" }; }],
+		["v2 string numeric field", (data) => { data.entries[id].published.input = "number:Infinity"; }],
+	];
+	const row = { sessionId: id, kind: "main", cwd: s.cwd, endedMs: T0 };
+	for (const [name, mutate] of cases) {
+		const data = JSON.parse(savedText);
+		mutate(data);
+		fs.writeFileSync(s.paths.health.usageIndexFile, JSON.stringify(data));
+		const index = createUsageIndex({ file: s.paths.health.usageIndexFile, clock: s.clock, log: s.log });
+		const loaded = index.get(id);
+		assert.equal(loaded.offset, 0, name);
+		assert.equal(loaded.complete, false, name);
+		assert.equal(compactUsage(loaded), null, name);
+		assert.equal(index.fresh(loaded), false, name);
+
+		const locator = createSessionFileLocator({ paths: s.paths, clock: s.clock, rescanMs: 0 });
+		const tracker = createUsageTracker({ paths: s.paths, index, locator, clock: s.clock, log: s.log });
+		assert.equal(tracker.queueLedger([row]), 1, `${name} needs a recount`);
+		tracker.tick(emptyWorld(s.clock));
+		assert.equal(compactUsage(index.get(id)).total, readUsage(file).effective.total, name);
+		assert.equal(compactUsage(index.get(id)).total, 42, name);
+	}
+});
+
 test("a child of a child is located through its grandparent's cwd", () => {
 	const s = setup();
 	writeJsonl(childFile(s.cwd, "st_mid", "mid1"), [E.assistant({ ms: T0, usage: usage(3) })]);

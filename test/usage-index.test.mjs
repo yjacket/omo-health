@@ -268,36 +268,135 @@ test("(gate 11) a 105,000-model entry saves and reloads under a 96 MiB heap", (t
 	const { dir } = setup(t);
 	const script = path.join(dir, "heap-save.mjs");
 	const indexUrl = new URL("../src/usage-index.mjs", import.meta.url).href;
+	// The save and the reload are separate capped processes, like the daemon's own
+	// fresh start: a same-process reload would hold two 105k-model documents at once.
 	const child = [
 		'import fs from "node:fs";',
 		`import { createUsageIndex, readUsageIndex } from ${JSON.stringify(indexUrl)};`,
 		"const dir = process.argv[2];",
 		'const session = dir + "/session.jsonl";',
 		'const indexFile = dir + "/usage.json";',
-		'const fd = fs.openSync(session, "w");',
-		"for (let i = 0; i < 105000; i += 1000) {",
-		'\tlet chunk = "";',
-		'\tfor (let j = i; j < Math.min(i + 1000, 105000); j += 1) chunk += JSON.stringify({ type: "message", message: { role: "assistant", provider: "p", model: "model-" + j, usage: { input: 1 } } }) + "\\n";',
-		"\tfs.writeSync(fd, chunk);",
+		'if (process.argv[3] === "reload") {',
+		'\tconst reloaded = readUsageIndex(indexFile).get("s1");',
+		'\tconsole.log("ok " + reloaded.published.total + " " + Object.keys(reloaded.published.models).length);',
+		"} else {",
+		'\tconst fd = fs.openSync(session, "w");',
+		"\tfor (let i = 0; i < 105000; i += 1000) {",
+		'\t\tlet chunk = "";',
+		'\t\tfor (let j = i; j < Math.min(i + 1000, 105000); j += 1) chunk += JSON.stringify({ type: "message", message: { role: "assistant", provider: "p", model: "model-" + j, usage: { input: 1 } } }) + "\\n";',
+		"\t\tfs.writeSync(fd, chunk);",
+		"\t}",
+		"\tfs.closeSync(fd);",
+		"\tconst index = createUsageIndex({ file: indexFile, clock: Date });",
+		'\tindex.update("s1", session);',
+		'\tconst total = index.get("s1").published.total;',
+		'\tif (total !== 105000) throw new Error("read total " + total);',
+		"\tindex.save();",
+		'\tconsole.log("saved " + total);',
 		"}",
-		"fs.closeSync(fd);",
-		"const index = createUsageIndex({ file: indexFile, clock: Date });",
-		'index.update("s1", session);',
-		'const total = index.get("s1").published.total;',
-		'if (total !== 105000) throw new Error("read total " + total);',
-		"index.save();",
-		'const reloaded = readUsageIndex(indexFile).get("s1");',
-		"const models = Object.keys(reloaded.published.models).length;",
-		'console.log("ok " + total + " " + models);',
 	];
 	fs.writeFileSync(script, `${child.join("\n")}\n`);
-	const result = spawnSync(process.execPath, ["--max-old-space-size=96", script, dir], { encoding: "utf8", timeout: 180_000 });
-	assert.equal(result.status, 0, `child exit ${result.status}: ${result.stderr}`);
+	const run = (mode) => spawnSync(process.execPath, ["--max-old-space-size=96", script, dir, mode], { encoding: "utf8", timeout: 180_000 });
+	const saved = run("save");
+	assert.equal(saved.status, 0, `save child exit ${saved.status}: ${saved.stderr}`);
+	assert.match(saved.stdout, /^saved 105000$/m);
+	const result = run("reload");
+	assert.equal(result.status, 0, `reload child exit ${result.status}: ${result.stderr}`);
 	assert.match(result.stdout, /^ok 105000 105000$/m);
 	const reloaded = readUsageIndex(path.join(dir, "usage.json")).get("s1");
 	assert.equal(reloaded.published.total, 105000);
 	assert.equal(reloaded.usage.total, 105000);
 	assert.equal(Object.keys(reloaded.published.models).length, 105000);
+});
+
+test("(gate 12) a 105,000-model entry with one overflow record loads and saves under a 96 MiB heap", (t) => {
+	const { dir } = setup(t);
+	const script = path.join(dir, "heap-reload.mjs");
+	const indexUrl = new URL("../src/usage-index.mjs", import.meta.url).href;
+	const child = [
+		'import fs from "node:fs";',
+		`import { createUsageIndex } from ${JSON.stringify(indexUrl)};`,
+		"const dir = process.argv[2];",
+		'const session = dir + "/session.jsonl";',
+		'const indexFile = dir + "/usage.json";',
+		"if (!fs.existsSync(indexFile)) {",
+		'\tconst fd = fs.openSync(session, "w");',
+		"\tfor (let i = 0; i < 105000; i += 1000) {",
+		'\t\tlet chunk = "";',
+		'\t\tfor (let j = i; j < Math.min(i + 1000, 105000); j += 1) chunk += JSON.stringify({ type: "message", message: { role: "assistant", provider: "p", model: "model-" + j, usage: { input: 1 } } }) + "\\n";',
+		"\t\tfs.writeSync(fd, chunk);",
+		"\t}",
+		'\tfs.writeSync(fd, JSON.stringify({ type: "message", message: { role: "assistant", provider: "p", model: "model-0", usage: { input: 1e308, output: 1e308 } } }) + "\\n");',
+		"\tfs.closeSync(fd);",
+		"}",
+		'const index = createUsageIndex({ file: indexFile, clock: Date });',
+		'index.update("s1", session);',
+		'const published = index.get("s1").published;',
+		'console.log("ok " + published.total + " " + Object.keys(published.models).length);',
+		"index.save();",
+	];
+	fs.writeFileSync(script, `${child.join("\n")}\n`);
+	const run = () => spawnSync(process.execPath, ["--max-old-space-size=96", script, dir], { encoding: "utf8", timeout: 180_000 });
+	const saved = run();
+	assert.equal(saved.status, 0, `save child exit ${saved.status}: ${saved.stderr}`);
+	assert.match(saved.stdout, /^ok Infinity 105000$/m);
+	const reloadedRun = run();
+	assert.equal(reloadedRun.status, 0, `reload child exit ${reloadedRun.status}: ${reloadedRun.stderr}`);
+	assert.match(reloadedRun.stdout, /^ok Infinity 105000$/m);
+	assert.equal(reloadedRun.stdout.split("\n")[0], saved.stdout.split("\n")[0], "the reloaded published totals equal the saved ones");
+	const reloaded = readUsageIndex(path.join(dir, "usage.json")).get("s1");
+	assert.equal(reloaded.published.total, Infinity);
+	assert.equal(reloaded.usage.total, Infinity);
+	assert.equal(Object.keys(reloaded.published.models).length, 105000);
+	assert.equal(reloaded.published.models["p/model-0"].tokens, Infinity);
+});
+
+test("(gate 12) malformed numeric fields invalidate a row at load: v2 null, v1 tag, malformed tag, string", (t) => {
+	const { dir, fileOf, indexOf } = setup(t);
+	const file = fileOf();
+	writeText(file, `${line()}\n`);
+	const index = indexOf();
+	index.update("s1", file);
+	index.save();
+	const savedFile = path.join(dir, "usage.json");
+	const template = fs.readFileSync(savedFile, "utf8");
+	const cases = [
+		["v2 published.total null", (data) => { data.entries.s1.published.total = null; }],
+		["v1 published.total tag", (data) => { data.v = 1; data.entries.s1.published.total = { $n: "Infinity" }; }],
+		["v2 malformed tag", (data) => { data.entries.s1.published.total = { $n: "Bogus" }; }],
+		["v2 string numeric field", (data) => { data.entries.s1.published.input = "number:Infinity"; }],
+	];
+	for (const [name, mutate] of cases) {
+		const data = JSON.parse(template);
+		mutate(data);
+		writeText(savedFile, JSON.stringify(data));
+		const loaded = readUsageIndex(savedFile).get("s1");
+		assert.equal(loaded.offset, 0, name);
+		assert.equal(loaded.complete, false, name);
+		assert.equal("published" in loaded, false, name);
+		assert.equal(compactUsage(loaded), null, name);
+		assert.equal(fresh(loaded), false, name);
+	}
+});
+
+test("(gate 12) valid v1 and v2 files load unchanged", (t) => {
+	const { dir, fileOf, indexOf } = setup(t);
+	const file = fileOf();
+	writeText(file, `${line()}\n`);
+	const index = indexOf();
+	index.update("s1", file);
+	index.save();
+	const savedFile = path.join(dir, "usage.json");
+	const v2 = readUsageIndex(savedFile).get("s1");
+	assert.equal(compactUsage(v2).total, 10);
+	assert.equal(fresh(v2), true);
+	const v1Data = JSON.parse(fs.readFileSync(savedFile, "utf8"));
+	v1Data.v = 1;
+	writeText(savedFile, JSON.stringify(v1Data));
+	const v1 = readUsageIndex(savedFile).get("s1");
+	assert.deepEqual(v1, v2);
+	assert.equal(compactUsage(v1).total, 10);
+	assert.equal(fresh(v1), true);
 });
 
 test("a three-call first read shows nothing until the file is read to the end", (t) => {
