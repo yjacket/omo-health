@@ -36,6 +36,7 @@ function use({ input = 1, output = 2, cacheRead = 3, cacheWrite = 4, cost = 0.1,
 }
 
 const sumFour = (usage) => (usage.input ?? 0) + (usage.output ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
+const modelBill13 = { input: 7, output: 2, cacheRead: 3, cacheWrite: 1, tokens: 13, cost: 0.125 };
 
 function assistant({ ms = T0, usage, provider = "anthropic-subscription", model = "claude-opus-5-5", responseModel, stopReason = "stop", content = [], errorMessage } = {}) {
 	const message = { role: "assistant", content, provider, model };
@@ -202,6 +203,19 @@ function senpiModelTokens(file) {
 	}
 	return Object.fromEntries([...byKey].map(([key, totals]) => [key, senpiTotal(totals)]));
 }
+
+test("(IS-1) a JSON-round-tripped cursor preserves senpi's per-key fractional sums", (t) => {
+	const { file } = setup(t);
+	const fractional = (input, output) => usageEntry(use({ input, output, cacheRead: 0, cacheWrite: 0, cost: 0 }), { provider: "p", model: "frac" });
+	writeRecords(file(), [fractional(0.1, 0.2)]);
+	const saved = JSON.parse(JSON.stringify(readUsage(file())));
+	fs.appendFileSync(file(), `${JSON.stringify(fractional(0, 0.3))}\n`);
+	const resumed = readUsage(file(), saved).effective.models;
+	const expected = senpiModelTokens(file());
+	assert.equal(expected["p/frac"], 0.6);
+	assert.equal(resumed["p/frac"].tokens, expected["p/frac"], "sum the four counters after the append");
+	assert.deepEqual(resumed, readUsage(file()).effective.models);
+});
 
 test("(IS-1) negative, mixed-sign and fractional counters match senpi's raw sums", (t) => {
 	const { file } = setup(t);
@@ -464,7 +478,7 @@ test("a >16 MiB record records the identity of every usage carrier", (t) => {
 		const got = readUsage(file(name)).effective;
 		assert.equal(got.total, 10, kind);
 		assert.deepEqual(got.usedModels, { [id]: true }, kind);
-		assert.deepEqual(got.models, { [USAGE_TOOLS_KEY]: { tokens: 10, cost: 0.1 } }, kind);
+		assert.deepEqual(got.models, { [USAGE_TOOLS_KEY]: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, tokens: 10, cost: 0.1 } }, kind);
 		assert.equal(got.modelsIncomplete, false, kind);
 	}
 });
@@ -1029,7 +1043,10 @@ test("(gate 13) small records cap composite billing and model ids at 256 charact
 	fs.writeFileSync(file(), `${records.map((entry) => JSON.stringify({ type: "usage", ...entry })).join("\n")}\n`);
 	const got = readUsage(file()).effective;
 	const atLimit = `p/${records[0].model}`;
-	assert.deepEqual(got.models, { [atLimit]: { tokens: 10, cost: 1 }, "(model id too long)": { tokens: 23, cost: 6 } });
+	assert.deepEqual(got.models, {
+		[atLimit]: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, tokens: 10, cost: 1 },
+		"(model id too long)": { input: 5, output: 4, cacheRead: 6, cacheWrite: 8, tokens: 23, cost: 6 },
+	});
 	assert.deepEqual(got.usedModels, { [atLimit]: true, "(model id too long)": true });
 	assert.equal(got.modelsIncomplete, true);
 	assert.equal(got.total, 33);
@@ -1037,7 +1054,7 @@ test("(gate 13) small records cap composite billing and model ids at 256 charact
 	const billingOnly = file("billing-only.jsonl");
 	fs.writeFileSync(billingOnly, `${JSON.stringify({ type: "usage", ...records[2] })}\n`);
 	const billed = readUsage(billingOnly).effective;
-	assert.deepEqual(billed.models, { "(model id too long)": { tokens: 12, cost: 4 } });
+	assert.deepEqual(billed.models, { "(model id too long)": { input: 3, output: 2, cacheRead: 3, cacheWrite: 4, tokens: 12, cost: 4 } });
 	assert.deepEqual(billed.usedModels, {});
 	// The provider is not a usable id, so no model identity was recorded.
 	assert.equal(billed.modelsIncomplete, true);
@@ -1051,15 +1068,15 @@ test("(gate 13) a full cursor and an EOF overlay merge without losing spill bill
 	const first = readUsage(file());
 	assert.equal(Object.keys(first.usage.models).length, 1000);
 	assert.equal(first.usage.modelsIncomplete, false);
-	assert.deepEqual(first.overlay.models, { "p/m1000": { tokens: 2, cost: 0.25 } });
+	assert.deepEqual(first.overlay.models, { "p/m1000": { input: 2, output: 0, cacheRead: 0, cacheWrite: 0, tokens: 2, cost: 0.25 } });
 	assert.equal(Object.keys(first.effective.models).length, 1000);
 	assert.equal(Object.keys(first.effective.usedModels).length, 1000);
-	assert.deepEqual(first.effective.models["(other models)"], { tokens: 4, cost: 0.5 });
+	assert.deepEqual(first.effective.models["(other models)"], { input: 4, output: 0, cacheRead: 0, cacheWrite: 0, tokens: 4, cost: 0.5 });
 	assert.equal(first.effective.modelsIncomplete, true);
 	fs.appendFileSync(file(), `\n${record(999)}\n${record(0)}\n`);
 	const resumed = readUsage(file(), first).effective;
 	assert.deepEqual(resumed, readUsage(file()).effective);
-	assert.deepEqual(resumed.models["(other models)"], { tokens: 6, cost: 0.75 });
+	assert.deepEqual(resumed.models["(other models)"], { input: 6, output: 0, cacheRead: 0, cacheWrite: 0, tokens: 6, cost: 0.75 });
 	assert.equal(resumed.total, 2006);
 	assert.equal(resumed.cost, 250.75);
 });
@@ -1186,7 +1203,7 @@ test("(gate 5) a 35 MiB reply made of 32 KiB text blocks counts like JSON.parse 
 	assert.equal(got.total, 13);
 	assert.equal(got.total, oracleTotals(file()).total);
 	assert.deepEqual(got.usedModels, { "p/alpha": true });
-	assert.deepEqual(got.models, { "p/alpha": { tokens: 13, cost: 0.125 } });
+	assert.deepEqual(got.models, { "p/alpha": modelBill13 });
 	assert.equal(got.modelsIncomplete, false);
 	assert.equal(usageTimeline(file()).totals.total, oracleTotals(file()).total);
 });
@@ -1332,7 +1349,7 @@ test("(gate 6 row 10) a compaction's long model alone adds no id and marks the m
 
 test("(gate 6) a selected array identity preserves billing coercion", (t) => {
 	const line = `{${gate6Gap}"type":"message","message":${JSON.stringify({ ...gate6Message, provider: ["p"] })}}`;
-	assert.deepEqual(assertLargeRecordParity(t, line).models, { "p/alpha": { tokens: 13, cost: 0.125 } });
+	assert.deepEqual(assertLargeRecordParity(t, line).models, { "p/alpha": modelBill13 });
 });
 
 test("(gate 6) two million ignored levels validate under a 96 MiB heap", (t) => {
@@ -1365,7 +1382,7 @@ test("(gate 6) oversized non-string identities bill as too long and mark the mod
 	const message = { ...gate6Message, provider: [gate6Long] };
 	fs.writeFileSync(file(), `{${gate6Gap}"type":"message","message":${JSON.stringify(message)}}\n`);
 	const got = readUsage(file()).effective;
-	assert.deepEqual(got.models, { "(model id too long)/alpha": { tokens: 13, cost: 0.125 } });
+	assert.deepEqual(got.models, { "(model id too long)/alpha": modelBill13 });
 	assert.deepEqual(got.usedModels, {});
 	assert.equal(got.modelsIncomplete, true);
 });
@@ -1392,7 +1409,7 @@ test("(gate 7) an oversized unused top-level usage keeps an assistant message's 
 	const line = gate7Make({ type: "message", usage: { input: gate6Long }, message: gate7Message });
 	const got = assertLargeRecordParity(t, line);
 	assert.equal(got.total, 13);
-	assert.deepEqual(got.models, { "p/alpha": { tokens: 13, cost: 0.125 } });
+	assert.deepEqual(got.models, { "p/alpha": modelBill13 });
 	assert.deepEqual(got.diagnostics, { badLines: 0, skippedLines: 0 });
 });
 
@@ -1400,7 +1417,7 @@ test("(gate 7) an oversized unused data.usage keeps a type usage entry's usage",
 	const line = gate7Make({ data: { usage: { output: gate6Long } }, provider: "p", model: "alpha", usage: gate7Usage, type: "usage" });
 	const got = assertLargeRecordParity(t, line);
 	assert.equal(got.total, 13);
-	assert.deepEqual(got.models, { "p/alpha": { tokens: 13, cost: 0.125 } });
+	assert.deepEqual(got.models, { "p/alpha": modelBill13 });
 	assert.deepEqual(got.diagnostics, { badLines: 0, skippedLines: 0 });
 });
 
@@ -1409,7 +1426,7 @@ test("(gate 7) an oversized costUnknown keeps its prefix and still bills the cou
 	const got = assertLargeRecordParity(t, line);
 	assert.equal(got.total, 13);
 	assert.equal(got.costUnknown, false);
-	assert.deepEqual(got.models, { "p/alpha": { tokens: 13, cost: 0.125 } });
+	assert.deepEqual(got.models, { "p/alpha": modelBill13 });
 	assert.deepEqual(got.diagnostics, { badLines: 0, skippedLines: 0 });
 });
 
@@ -1421,7 +1438,7 @@ test("(gate 7) a non-coercible provider bills a small record under an unreadable
 	const got = readUsage(file()).effective;
 	assert.equal(got.total, 13);
 	assert.equal(got.cost, 0.125);
-	assert.deepEqual(got.models, { "(model id unreadable)/alpha": { tokens: 13, cost: 0.125 } });
+	assert.deepEqual(got.models, { "(model id unreadable)/alpha": modelBill13 });
 	assert.deepEqual(got.diagnostics, { badLines: 0, skippedLines: 0 });
 	assert.deepEqual(usageTimeline(file()).totals, got);
 });
@@ -1434,7 +1451,7 @@ test("(gate 7) a non-coercible provider bills a >16 MiB record under an unreadab
 	const got = readUsage(file()).effective;
 	assert.equal(got.total, 13);
 	assert.equal(got.cost, 0.125);
-	assert.deepEqual(got.models, { "(model id unreadable)/alpha": { tokens: 13, cost: 0.125 } });
+	assert.deepEqual(got.models, { "(model id unreadable)/alpha": modelBill13 });
 	assert.deepEqual(got.usedModels, {});
 	assert.deepEqual(got.diagnostics, { badLines: 0, skippedLines: 0 });
 	assert.deepEqual(usageTimeline(file()).totals, got);
@@ -1477,7 +1494,7 @@ test("(gate 8) escaped usage bills the same as compact and large records", (t) =
 	const escaped = compact.replace('"usage"', '"\\u0075sage"').replace('"role":"assistant"', '"role": "assistant"');
 	for (const [line, projected] of [[compact, false], [`{${gate6Gap}${escaped.slice(1)}`, true], [escaped, false]]) {
 		const timeline = gate8Parity(file(), `${line}\n`);
-		assert.deepEqual(timeline.totals.models, { "p/(model id unreadable)": { tokens: 13, cost: 0.125 } });
+		assert.deepEqual(timeline.totals.models, { "p/(model id unreadable)": modelBill13 });
 		assert.deepEqual(timeline.totals.usedModels, { "p/alpha": true });
 		assert.deepEqual(timeline.topTurns.map((turn) => turn.key), projected ? [] : ["p/(model id unreadable)"]);
 	}

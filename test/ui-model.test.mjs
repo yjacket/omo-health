@@ -769,6 +769,22 @@ describe("ui model", () => {
 			assert.equal(endedRow(r, 0, index).tokensState, "pending");
 		});
 
+		it("(plan 34) ended task-only rows compete even when only one is indexed", () => {
+			const home = makeHome();
+			const taskId = "st_shared";
+			writeUsage(home.paths, [
+				{ id: taskId, meta: { kind: "child", taskId } },
+				{ id: "child-session", total: 75 },
+			]);
+			writeRows(home.paths, [
+				row(taskId, NOW - 1000, { kind: "child", taskId, parentSessionId: "main-a", title: "task A" }),
+				row(taskId, NOW - 2000, { kind: "child", taskId, parentSessionId: "main-b", title: "task B" }),
+				row("child-session", NOW - 3000, { kind: "child", taskId, parentSessionId: "main-c", title: "session" }),
+			]);
+			const { rows } = uiState({ paths: home.paths, env: home.env, now: NOW }).ended;
+			assert.deepEqual(rows.map((r) => [r.title, r.tokens?.total ?? null]), [["task A", null], ["task B", null], ["session", 75]]);
+		});
+
 		it("keeps the last total of a complete entry whose file was then deleted, and marks a never-found row missing", () => {
 			const home = makeHome();
 			const file = path.join(home.paths.health.sessionsDir, "session.jsonl");

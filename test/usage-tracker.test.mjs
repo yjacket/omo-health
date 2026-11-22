@@ -105,6 +105,38 @@ test("board uses a unique task-only token match but never an ambiguous or wrong-
 	assert.deepEqual(totals([first, second]), [null, null]);
 });
 
+test("(plan 34) visible task-only board rows compete even when only one is indexed", (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const taskId = "st_shared";
+	const tasks = ["a", "b"].map((id) => taskRecord({
+		taskId, uid: `store-${id}/${taskId}`, spawnCwd: path.join(s.root, `store-${id}`),
+		parentSessionId: `main-${id}`, childSessionId: null,
+	}));
+	function indexChild(i) {
+		const id = `indexed-${i}`;
+		const file = childFile(tasks[i].spawnCwd, taskId, id);
+		writeLines(file, [bigRecord(0, usage(42 + i))]);
+		s.index.update(id, file, { kind: "child", taskId });
+	}
+	function rowsFor(parents) {
+		const world = makeWorld({
+			now: T0,
+			sessions: parents.map((id) => sessionState({ id, startedMs: T0 - 5000 })),
+			tasks,
+			sensors: parents.map((sessionId, i) => ({ sessionId, pid: 100 + i, ts: T0 - 1000 })),
+			procsFresh: true,
+		});
+		const snapshot = buildSessionSnapshot(world, [], [], T0, { tokensOf: (id, task) => s.tracker.tokensOf(id, task) });
+		return snapshot.groups.flatMap((g) => g.sessions.flatMap((r) => r.children.map((c) => [c.tokens?.total ?? null, c.tokensPending])));
+	}
+	indexChild(0);
+	assert.deepEqual(rowsFor(["main-a"]), [[42, false]], "a child outside the board does not compete");
+	assert.deepEqual(rowsFor(["main-a", "main-b"]), [[null, false], [null, false]], "only one candidate is indexed");
+	indexChild(1);
+	assert.deepEqual(rowsFor(["main-a", "main-b"]), [[null, false], [null, false]], "both candidates are indexed");
+});
+
 test("(gate 16) saturation marks uncounted rows full, logs once, and prune lets the backlog count again", (t) => {
 	const s = setup("usage-full-");
 	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));

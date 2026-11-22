@@ -323,7 +323,7 @@ if (mode === "fixture") {
 	const row = index.markMissing(id(0), { file: pathOf(0), kind: "main" });
 	const fd = fs.openSync(file, "w");
 	try {
-		fs.writeSync(fd, '{"v":3}\\n');
+		fs.writeSync(fd, JSON.stringify({ v: usage.USAGE_INDEX_VERSION }) + "\\n");
 		for (let i = 0; i < N; ++i) fs.writeSync(fd, JSON.stringify({ ...row, id: id(i), file: pathOf(i), checkedMs: N - i }) + "\\n");
 	} finally { fs.closeSync(fd); }
 } else {
@@ -456,7 +456,9 @@ test("(gate 14) exact budget, spill, and a previously oversized persisted row", 
 	const index = indexOf();
 	for (let i = 0; i < 3; i++) index.update(`s${i}`, file);
 	const beforeSave = index.get("s2").published;
-	assert.deepEqual(beforeSave.models, { "(other models)": { tokens: 5120, cost: beforeSave.cost } });
+	assert.deepEqual(beforeSave.models, {
+		"(other models)": { input: 512, output: 1024, cacheRead: 1536, cacheWrite: 2048, tokens: 5120, cost: beforeSave.cost },
+	});
 	assert.equal(beforeSave.modelsIncomplete, true);
 	index.save();
 	const data = parseIndex(fs.readFileSync(saved, "utf8"));
@@ -620,6 +622,67 @@ test("an index over the same file resumes an appended entry at its saved offset"
 	const oracle = indexOf("oracle.json");
 	oracle.update("s1", file, {}, { maxBytes: USAGE_TICK_BYTES });
 	assert.equal(compactUsage(oracle.get("s1")).total, 30, "the resumed total equals a one-shot read");
+});
+
+test("(IS-1) index save, reload and append preserve fractional per-model tokens", (t) => {
+	const { fileOf, indexOf } = setup(t);
+	const file = fileOf();
+	const fractional = (input, output) => JSON.stringify(assistant({
+		usage: use({ input, output, cacheRead: 0, cacheWrite: 0, cost: 0.125 }),
+	}));
+	// Keep an EOF overlay too, so all three saved trees contain this model.
+	const first = fractional(0.1, 0.2);
+	const second = fractional(0, 0);
+	writeText(file, `${first}\n${second}`);
+	const index = indexOf();
+	index.update("s", file);
+	assert.equal(index.save(), true);
+
+	const reloaded = indexOf();
+	const key = "anthropic-subscription/claude-opus-5-5";
+	assert.equal(reloaded.get("s").offset, Buffer.byteLength(`${first}\n`));
+	const appended = `\n${fractional(0, 0.3)}\n`;
+	fs.appendFileSync(file, appended);
+	assert.equal(reloaded.update("s", file), Buffer.byteLength(second + appended));
+	const resumed = reloaded.get("s").published.models[key];
+	const once = readUsage(file).effective.models[key];
+	assert.equal(once.tokens, 0.1 + (0 + 0.2 + 0.3) + 0 + 0, "senpi sums by counter before summing the key");
+	assert.equal(resumed.tokens, once.tokens);
+	assert.deepEqual(resumed, { input: 0.1, output: 0.5, cacheRead: 0, cacheWrite: 0, tokens: 0.6, cost: 0.375 });
+
+	const saved = parseIndex(fs.readFileSync(fileOf("usage.json"), "utf8")).entries.s;
+	for (const [tree, input, output] of [["usage", 0.1, 0.2], ["overlay", 0, 0], ["published", 0.1, 0.2]]) {
+		assert.deepEqual(saved[tree].models[key], {
+			input, output, cacheRead: 0, cacheWrite: 0, tokens: input + output,
+			cost: tree === "published" ? 0.25 : 0.125,
+		}, tree);
+	}
+});
+
+test("(IS-1) a v3 row without model counters starts empty and is recounted", (t) => {
+	const { fileOf, indexOf } = setup(t);
+	const file = fileOf();
+	const savedFile = fileOf("usage.json");
+	writeText(file, `${line()}\n`);
+	const writer = indexOf();
+	writer.update("s", file);
+	assert.equal(writer.save(), true);
+	const old = parseIndex(fs.readFileSync(savedFile, "utf8"));
+	old.v = 3;
+	for (const name of ["usage", "overlay", "published"]) {
+		for (const model of Object.values(old.entries.s[name].models)) {
+			for (const field of ["input", "output", "cacheRead", "cacheWrite"]) delete model[field];
+		}
+	}
+	writeText(savedFile, indexText(old));
+	assert.equal(readUsageIndex(savedFile).has("s"), false, "the dashboard must not publish a v3 total");
+	const restarted = indexOf();
+	assert.equal(restarted.has("s"), false, "there is no trusted v3 cursor");
+	assert.equal(restarted.update("s", file), fs.statSync(file).size);
+	assert.equal(restarted.get("s").complete, true);
+	assert.deepEqual(restarted.get("s").published.models, readUsage(file).effective.models);
+	assert.equal(restarted.save(), true);
+	assert.equal(readUsageIndex(savedFile).get("s").complete, true);
 });
 
 test("a resumable append reads only the appended bytes", (t) => {
@@ -934,7 +997,10 @@ for (const treeName of ["usage", "overlay", "published"]) {
 		index.update("s", file);
 		index.save();
 		const original = fs.readFileSync(indexFile, "utf8");
-		for (const leaf of ["total", "input", "output", "cacheRead", "cacheWrite", "cost", "turns", "models.tokens", "models.cost"]) {
+		for (const leaf of [
+			"total", "input", "output", "cacheRead", "cacheWrite", "cost", "turns",
+			"models.input", "models.output", "models.cacheRead", "models.cacheWrite", "models.tokens", "models.cost",
+		]) {
 			for (const malformed of [false, true]) {
 				const data = parseIndex(original);
 				const tree = data.entries.s[treeName];
@@ -966,6 +1032,7 @@ test("(gate 12) malformed numeric fields invalidate a row at load: null, malform
 		["tag with an extra field", (data) => { data.entries.s1.published.total = { $n: "Infinity", extra: true }; }],
 		["malformed tag", (data) => { data.entries.s1.published.total = { $n: "Bogus" }; }],
 		["string numeric field", (data) => { data.entries.s1.published.input = "number:Infinity"; }],
+		["model tokens disagree with counters", (data) => { Object.values(data.entries.s1.published.models)[0].tokens += 1; }],
 	];
 	for (const [name, mutate] of cases) {
 		const data = parseIndex(template);
@@ -1242,7 +1309,7 @@ test("(IS-1) a negative total and cost save and reload through the index", (t) =
 	index.update("s1", file);
 	assert.equal(compactUsage(index.get("s1")).total, -2);
 	assert.equal(compactUsage(index.get("s1")).cost, -0.5);
-	assert.deepEqual(index.get("s1").published.models["p/m"], { tokens: -2, cost: -0.5 });
+	assert.deepEqual(index.get("s1").published.models["p/m"], { input: -5, output: 3, cacheRead: 0, cacheWrite: 0, tokens: -2, cost: -0.5 });
 	assert.equal(index.save(), true);
 	const saved = fileOf("usage.json");
 	assert.equal(compactUsage(readUsageIndex(saved).get("s1")).total, -2);

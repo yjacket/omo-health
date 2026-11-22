@@ -15,7 +15,7 @@ import { appendEnded } from "../src/session-ledger.mjs";
 import { createDetailWorker, createSessionDetail, createStartAudit } from "../src/ui/cli.mjs";
 import { daemonStatus, loadDaemonInputs, uiState } from "../src/ui/model.mjs";
 import { createUiServer } from "../src/ui/server.mjs";
-import { createUsageIndex } from "../src/usage-index.mjs";
+import { createUsageIndex, USAGE_INDEX_VERSION } from "../src/usage-index.mjs";
 import { writeTask } from "./helpers/fixtures.mjs";
 
 const TOKEN = "test-token-abc_123";
@@ -618,7 +618,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 
 			function writeIndexRow(file, row) {
 				fs.mkdirSync(path.dirname(file), { recursive: true });
-				fs.writeFileSync(file, `{"v":3}\n${JSON.stringify(row)}\n`);
+				fs.writeFileSync(file, `${JSON.stringify({ v: USAGE_INDEX_VERSION })}\n${JSON.stringify(row)}\n`);
 			}
 
 			function makeWorld({ daemon = "running", enabled = true, usedModels = { "anthropic/claude-used": true }, lanes = { ultrabrain: ["anthropic/claude-used"], architect: ["openai/gpt-review:high"] }, providers = ["anthropic", "openai"], growFile = false, budgetCount = null, entries } = {}) {
@@ -746,6 +746,42 @@ describe("ui server", { timeout: 20_000 }, () => {
 					const [status, body] = await world.startAudit(children[1].sessionId);
 					assert.deepEqual([status, body.error], [409, "models-unknown"]);
 				} finally {
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				}
+			});
+
+			it("(plan 34) task-only ledger collisions leave detail and reviewer facts unknown", async () => {
+				const world = makeWorld();
+				try {
+					const taskId = "st_shared";
+					const children = ["a", "b"].map((id, i) => ({
+						v: 1, kind: "child", sessionId: taskId, taskId, parentSessionId: `main-${id}`,
+						title: `task ${id}`, cwd: path.join(world.dir, id), outcome: "answered",
+						startedMs: world.nowMs - 2000, endedMs: world.nowMs + i, reason: "", source: "live",
+					}));
+					// The append-time ID dedupe would skip the second row. Exercise a ledger
+					// where both writer-shaped records are already present.
+					const ledger = path.join(world.paths.health.sessionsDir, "ended-2026-11-22.jsonl");
+					fs.appendFileSync(ledger, children.map((row) => `${JSON.stringify(row)}\n`).join(""));
+					const file = writeTask(children[0].cwd, { task_id: taskId, status: "completed" }, [
+						{ type: "session", id: "child-a" },
+						{ type: "message", message: { role: "assistant", provider: "anthropic", model: "claude-used", usage: { input: 42 }, stopReason: "stop" } },
+					]);
+					const index = createUsageIndex({ file: world.paths.health.usageIndexFile, clock: { now: world.now } });
+					index.update(taskId, file, { kind: "child", taskId });
+					index.save();
+
+					const detail = await world.detail(taskId);
+					const cached = await world.detail(taskId);
+					const [status, body] = await world.startAudit(taskId);
+					const facts = (r) => [r.session.title, r.tokens?.total ?? null, r.audit.blocked, r.audit.planned?.model ?? null];
+					assert.deepEqual([facts(detail), facts(cached), [status, body.error]], [
+						["task b", null, "models-unknown", null],
+						["task b", null, "models-unknown", null],
+						[409, "models-unknown"],
+					]);
+				} finally {
+					await world.detail.close();
 					fs.rmSync(world.dir, { recursive: true, force: true });
 				}
 			});

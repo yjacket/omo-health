@@ -238,8 +238,26 @@ function modelRows(published) {
 		.sort((a, b) => sortRank(b.tokens) - sortRank(a.tokens) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
 }
 
-export function usageEntryOf(usage, row) {
-	return usageEntryFor(usage, row.sessionId, row.taskId) ?? (usage.full === true ? FULL_USAGE : null);
+export function ledgerUsageSessionId({ sessionId, taskId }) {
+	// Live and backfill writers use the task ID as the ledger key if there is no child session ID.
+	return nonEmpty(sessionId) && sessionId !== taskId ? sessionId : null;
+}
+
+export function ambiguousLedgerTaskIds(rows) {
+	const seen = new Set();
+	const ambiguous = new Set();
+	for (const row of rows) {
+		if (!isRecord(row) || !nonEmpty(row.taskId) || ledgerUsageSessionId(row)) continue;
+		if (seen.has(row.taskId)) ambiguous.add(row.taskId);
+		else seen.add(row.taskId);
+	}
+	return ambiguous;
+}
+
+export function usageEntryOf(usage, row, ambiguous) {
+	const sessionId = ledgerUsageSessionId(row);
+	if (!sessionId && (row.usageTaskIdAmbiguous === true || ambiguous?.has(row.taskId))) return null;
+	return usageEntryFor(usage, sessionId, row.taskId) ?? (usage.full === true ? FULL_USAGE : null);
 }
 
 const FULL_USAGE = Object.freeze({ state: "full" });
@@ -261,6 +279,7 @@ export function buildSessionRecord(inputs = {}) {
 	const startedMs = msOf(row.startedMs);
 	const endedMs = msOf(row.endedMs);
 	const descendants = inputs.descendants ?? collectDescendants(row, ledger, usage.values());
+	const ambiguous = inputs.ambiguous ?? ambiguousLedgerTaskIds(ledger);
 	const nodes = [row, ...descendants];
 	const sessionAllowed = new Set(nodes.map((node) => node.sessionId).filter(nonEmpty));
 	const taskOnly = new Set(nodes.filter((node) => !nonEmpty(node.sessionId)).map((node) => node.taskId).filter(nonEmpty));
@@ -333,7 +352,7 @@ export function buildSessionRecord(inputs = {}) {
 		.map((message) => ({ ms: Number.isFinite(message.ms) ? message.ms : null, recipient: clean(message.recipient, 200), text: clean(typeof message.text === "string" ? message.text : "", MESSAGE_TEXT_MAX) }))
 		.sort((a, b) => (b.ms ?? 0) - (a.ms ?? 0));
 
-	const entry = usageEntryOf(usage, row);
+	const entry = usageEntryOf(usage, row, ambiguous);
 	const compact = compactUsage(entry);
 	const trees = treeTotals(usage.values());
 	const tokens = entry
@@ -349,7 +368,7 @@ export function buildSessionRecord(inputs = {}) {
 
 	const children = descendants
 		.map((node) => {
-			const childEntry = usageEntryOf(usage, node);
+			const childEntry = usageEntryOf(usage, node, ambiguous);
 			const childCompact = compactUsage(childEntry);
 			return {
 				sessionId: node.sessionId,
@@ -365,6 +384,8 @@ export function buildSessionRecord(inputs = {}) {
 		.sort((a, b) => (b.endedMs ?? 0) - (a.endedMs ?? 0));
 
 	const session = cleanValue(row);
+	// Cached previews and audit preparation re-read the index from this session alone.
+	if (!ledgerUsageSessionId(row) && ambiguous.has(row.taskId)) session.usageTaskIdAmbiguous = true;
 	session.durationMs = Number.isFinite(startedMs) && Number.isFinite(endedMs) && endedMs >= startedMs ? endedMs - startedMs : null;
 
 	return {
@@ -558,7 +579,7 @@ function recordLedger(rows, id, usage, descendantScanMax) {
 		if (!candidates.size) selected.delete(rec.sessionId);
 		if (!selected.size) break;
 	}
-	return row ? { row, descendants, ancestors, scanned } : null;
+	return row ? { row, descendants, ancestors, scanned, ambiguous: ambiguousLedgerTaskIds(links) } : null;
 }
 
 /**
@@ -571,7 +592,7 @@ export function loadSessionRecord({ paths, id, now = Date.now(), messageScanMaxB
 	const usage = index ?? readUsageIndex(paths.health.usageIndexFile);
 	const joined = recordLedger(() => streamEnded(paths, { sinceMs: now - 30 * DAY_MS }), id, usage, descendantScanMax);
 	if (!joined) return { found: false, id };
-	const { row, descendants, ancestors, scanned } = joined;
+	const { row, descendants, ancestors, scanned, ambiguous } = joined;
 	const startedMs = msOf(row.startedMs);
 	const decisions = readDecisions(paths, (Number.isFinite(startedMs) ? startedMs : now) - 30 * DAY_MS);
 	const decisionHistory = scanDecisionHistory(streamDecisions(paths), row);
@@ -602,5 +623,5 @@ export function loadSessionRecord({ paths, id, now = Date.now(), messageScanMaxB
 		for (const message of scanMessages(file) ?? []) messages.push({ ...message, recipient: sessionId });
 	}
 
-	return buildSessionRecord({ id, row, descendants, usage, decisions, decisionHistory, investigations, messages, truncated: { messagesSkipped: skipped } });
+	return buildSessionRecord({ id, row, descendants, ambiguous, usage, decisions, decisionHistory, investigations, messages, truncated: { messagesSkipped: skipped } });
 }

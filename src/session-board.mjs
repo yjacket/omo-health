@@ -130,12 +130,11 @@ function countChildren(rows) {
  * @param {{tokensOf?: (sessionId: string | null, taskId: string | null) => ({tokens?: object, treeTokens?: number | null, pending?: boolean, state?: "full"} | null | undefined)}} [options]
  *   tokensOf is the injected token index lookup: `{tokens, treeTokens}` for an indexed session, `{state:"full"}` when the
  *   index refused the session, `{pending:true}` while its first read has not reached the end of the file, null when it is
- *   unknown. Task id is a fallback only when session id is absent. Rows carry `tokensState: "full"` for refusal
+ *   unknown. Task id is a fallback only for an unambiguous visible row without a session id. Rows carry `tokensState: "full"` for refusal
  *   or `tokensState` / `treeTokensState` of `"overflow"` for a non-finite total.
  */
 export function buildSessionSnapshot(world, findings = [], investigations = [], nowMs = world.now, { tokensOf } = {}) {
-	const tokenFields = (sessionId, taskId) => {
-		const entry = tokensOf?.(sessionId, taskId);
+	const tokenFields = (entry) => {
 		const tokens = entry?.tokens ?? null;
 		const tree = entry?.treeTokens ?? null;
 		const overflow = typeof tokens?.total === "number" && !Number.isFinite(tokens.total);
@@ -154,7 +153,7 @@ export function buildSessionSnapshot(world, findings = [], investigations = [], 
 		return healthOf((findings ?? []).filter((f) => own(f.subject)), openInvestigations.filter((inv) => own(inv.subject)));
 	};
 
-	// Children by parent session id; a task seen in two stores counts once.
+	// Children by parent session id; repeated observations of the same UID count once.
 	const byParent = new Map();
 	const seen = new Set();
 	for (const task of world.tasks ?? []) {
@@ -166,23 +165,31 @@ export function buildSessionSnapshot(world, findings = [], investigations = [], 
 		if (!byParent.has(task.parentSessionId)) byParent.set(task.parentSessionId, []);
 		byParent.get(task.parentSessionId).push(task);
 	}
+	const taskOnlyRows = new Map();
 	const childrenOf = (parentId, depth, trail) => {
 		if (depth > 8 || trail.has(parentId)) return [];
 		const next = new Set(trail).add(parentId);
 		return (byParent.get(parentId) ?? [])
-			.map((task) => ({
-				taskId: task.taskId,
-				sessionId: task.childSessionId ?? null,
-				name: clean(task.name ?? task.summary ?? task.taskId),
-				category: task.category ?? null,
-				model: task.model ?? null,
-				status: task.status,
-				startedMs: finite(task.startedAtMs ?? task.createdAtMs),
-				endedMs: finite(task.terminalAtMs),
-				health: healthFor({ sessionId: task.childSessionId, taskId: task.taskId }),
-				...tokenFields(task.childSessionId ?? null, task.taskId ?? null),
-				children: task.childSessionId ? childrenOf(task.childSessionId, depth + 1, next) : [],
-			}))
+			.map((task) => {
+				const sessionId = task.childSessionId || null;
+				const taskId = task.taskId ?? null;
+				const taskOnly = !sessionId && taskId;
+				const row = {
+					taskId: task.taskId,
+					sessionId,
+					name: clean(task.name ?? task.summary ?? task.taskId),
+					category: task.category ?? null,
+					model: task.model ?? null,
+					status: task.status,
+					startedMs: finite(task.startedAtMs ?? task.createdAtMs),
+					endedMs: finite(task.terminalAtMs),
+					health: healthFor({ sessionId, taskId }),
+					...tokenFields(taskOnly ? null : tokensOf?.(sessionId, taskId)),
+					children: sessionId ? childrenOf(sessionId, depth + 1, next) : [],
+				};
+				if (tokensOf && taskOnly) taskOnlyRows.set(taskId, taskOnlyRows.has(taskId) ? null : row);
+				return row;
+			})
 			.sort((a, b) => (a.startedMs ?? 0) - (b.startedMs ?? 0));
 	};
 
@@ -206,11 +213,15 @@ export function buildSessionSnapshot(world, findings = [], investigations = [], 
 			todo,
 			lastInputMs: finite(toMs(hb?.lastInputAt)),
 			health: healthFor({ sessionId: session.id }),
-			...tokenFields(session.id, null),
+			...tokenFields(tokensOf?.(session.id, null)),
 			children: childrenOf(session.id, 1, new Set()),
 		};
 		if (!groups.has(omoVersion)) groups.set(omoVersion, []);
 		groups.get(omoVersion).push(row);
+	}
+	// Only rows reached from live main sessions compete, including across groups.
+	for (const [taskId, row] of taskOnlyRows) {
+		if (row) Object.assign(row, tokenFields(tokensOf(null, taskId)));
 	}
 	return {
 		v: 1,

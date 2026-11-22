@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import { basename } from "node:path";
-import { MODEL_KEY_LENGTH, MODEL_KEY_LIMIT, readUsage } from "./collect/usage.mjs";
+import { addModelCounters, emptyModelBilling, MODEL_KEY_LENGTH, MODEL_KEY_LIMIT, readUsage } from "./collect/usage.mjs";
 import { atomicWriteChunks, statSafe } from "./util/fsx.mjs";
 
 /**
@@ -15,12 +15,14 @@ import { atomicWriteChunks, statSafe } from "./util/fsx.mjs";
  * advances record by record, while `published` only moves when a read ends
  * `done`, so a partial append never shows an intermediate sum (IS-1, IS-3, IS-12).
  */
-export const USAGE_INDEX_VERSION = 3;
+export const USAGE_INDEX_VERSION = 4;
 const INDEX_HEADER = JSON.stringify({ v: USAGE_INDEX_VERSION });
 const FULL_HEADER = JSON.stringify({ v: USAGE_INDEX_VERSION, full: true });
 const FULL_ENTRY = Object.freeze({ state: "full" });
 /** Fixed per-row allowance for V8 objects, map entries and writer bookkeeping. */
 export const INDEX_ENTRY_OVERHEAD = 1536;
+// Allow for the four model counters separately from line weight (eight bytes per counter).
+const MODEL_COUNTER_BYTES = 4 * 8;
 // The index must fit in the delta between the 80 MiB control and the 96 MiB daemon.
 export const INDEX_BYTE_BUDGET = 16 * 1024 * 1024;
 // Separate from resident rows: only one serialized/decoded line is processed at a time.
@@ -235,9 +237,9 @@ function boundedModels(entry, remaining) {
 			if (SPILL_KEYS.has(key)) continue;
 			if (remaining > 0) remaining--;
 			else {
-				spill ??= models[OTHER_MODELS] ?? { tokens: 0, cost: 0 };
-				spill.tokens += models[key].tokens;
-				spill.cost += models[key].cost;
+				spill ??= models[OTHER_MODELS] ?? emptyModelBilling();
+				const { input, output, cacheRead, cacheWrite, cost } = models[key];
+				addModelCounters(spill, input, output, cacheRead, cacheWrite, cost);
 				delete models[key];
 			}
 		}
@@ -298,7 +300,7 @@ const nullableString = (value) => value === null || typeof value === "string";
 const hasShape = (value, fields) => record(value) && Object.keys(value).length === fields.length &&
 	fields.every((key) => Object.hasOwn(value, key));
 const DIAGNOSTICS_KEYS = ["badLines", "skippedLines"];
-const MODEL_COUNTERS = ["tokens", "cost"];
+const MODEL_COUNTERS = ["input", "output", "cacheRead", "cacheWrite", "tokens", "cost"];
 const TREE_KEYS = [...COUNTER_KEYS, "costUnknown", "modelsIncomplete", "models", "usedModels", "diagnostics"];
 
 /** Validate and decode a whole row atomically; -1 means recount, never publish. */
@@ -334,6 +336,7 @@ function validateEntry(entry, remaining) {
 					if (value !== true) return -1;
 				} else {
 					if (!hasShape(value, MODEL_COUNTERS) || !MODEL_COUNTERS.every((field) => normalizeNumber(value, field))) return -1;
+					if (!Object.is(value.tokens, value.input + value.output + value.cacheRead + value.cacheWrite)) return -1;
 				}
 			}
 		}
@@ -349,16 +352,20 @@ function stringBytes(value) {
 
 function entryBytes(entry, line) {
 	let strings = 0;
+	let modelBytes = 0;
 	for (const key of ENTRY_STRING_KEYS) strings += stringBytes(entry[key]);
 	for (const name of USAGE_KEYS) {
-		for (const key in entry[name]?.models) strings += stringBytes(key);
+		for (const key in entry[name]?.models) {
+			strings += stringBytes(key);
+			modelBytes += MODEL_COUNTER_BYTES;
+		}
 		for (const key in entry[name]?.usedModels) strings += stringBytes(key);
 	}
 	// The serialized weight also approximates variable-size non-string data (e.g. model
 	// counters). It is a floor, not a measure of the resident strings' encoding.
 	let serialized = line.length;
 	for (let i = 0; i < line.length; i++) if (line.charCodeAt(i) > 127) serialized++;
-	return INDEX_ENTRY_OVERHEAD + Math.max(strings, serialized);
+	return INDEX_ENTRY_OVERHEAD + modelBytes + Math.max(strings, serialized);
 }
 
 function fitsIndexLine(text) {
