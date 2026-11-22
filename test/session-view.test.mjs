@@ -174,4 +174,11 @@ describe("session view", () => {
 		assert.equal(view.audit.statusKo, "대기 중");
 		assert.equal(view.audit.state.reasonKo, null);
 	});
+
+	it("(coverage) labels an incomplete detector review like other audit failures", () => {
+		const state = { status: "failed", reason: "incomplete-checks", result: null };
+		const view = buildSessionView(record(), { audit: { state } });
+		assert.equal(view.audit.state.reasonKo, "감지를 모두 검토하지 않은 답을 받았습니다");
+		assert.equal(view.audit.state.result, null);
+	});
 });

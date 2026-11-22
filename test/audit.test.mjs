@@ -8,6 +8,7 @@ import { readUsage, usageTimeline } from "../src/collect/usage.mjs";
 import { DEFAULT_CONFIG } from "../src/config.mjs";
 import { loadDetectors } from "../src/engine.mjs";
 import { AUDIT_REASON_CODES, reasonCode } from "../src/audit-codes.mjs";
+import * as audit from "../src/judge/audit.mjs";
 import {
 	AUDIT_JUDGMENTS,
 	AUDIT_OVERALL,
@@ -280,6 +281,34 @@ test("verdict and action reasons reach the document only as recognized codes; fr
 });
 
 /* ---------------------------------------------------------------- coverage */
+
+test("(coverage) the prompt requires each fired detector in first appearance order", () => {
+	const record = emptyRecord({ health: {
+		findings: [
+			finding(1, 1, { detector: "D8" }),
+			finding(2, 1, { detector: "D1", scope: "machine" }),
+			finding(3, 1, { detector: "D8" }),
+			finding(4, 1, { detector: "D10" }),
+			finding(5, 1, { detector: "D6" }),
+			finding(6, 1, { detector: "not-a-detector" }),
+		],
+		investigations: [{ ...investigation(1), detector: "D2" }],
+	} });
+	const document = auditDocument(auditBundle(record, timelineShell()));
+	assert.match(document, /^Fired detectors: D8, D1, D10, D6\. Write at least one check per fired detector\. Set item to its detector ID or one of its finding refs\.$/m);
+});
+
+for (const [name, fired, findingRefs, item, evidence, covered] of [
+	["detector ID item", ["D1"], { F1: "D1" }, "D1", ["T"], true],
+	["finding ref item", ["D1"], { F1: "D1" }, "F1", ["T"], true],
+	["finding ref evidence", ["D1", "D6"], { F1: "D1", F2: "D6" }, "D1", ["검토 근거: (F2)."], true],
+	["missing detector", ["D1", "D6"], { F1: "D1", F2: "D6", F20: "D1" }, "D1", ["F20", "D6", "I2"], false],
+	["no findings", [], {}, "T", ["T"], true],
+]) {
+	test(`(coverage) check coverage: ${name}`, () => {
+		assert.equal(audit.hasDetectorCoverage([{ item, evidence }], fired, findingRefs), covered);
+	});
+}
 
 test("a record whose coverage.infoFindings is true sends coverage.infoFindings true", () => {
 	const row = { sessionId: "s1", taskId: "st_s1", kind: "main", startedMs: T0, endedMs: T0 + HOUR, outcome: "answered" };

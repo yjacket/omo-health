@@ -955,6 +955,23 @@ describe("ui server", { timeout: 20_000 }, () => {
 				});
 			}
 
+			it("(plan 25) a compaction that carries usage without a model id blocks the preview as models-unknown", async () => {
+				const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } };
+				const entry = { type: "compaction", provider: "xai", usage };
+				const world = makeWorld({ usedModels: {}, entries: [entry], providers: ["xai", "google"], lanes: { ultrabrain: ["xai/grok-5"], architect: ["google/gemini-review"] } });
+				try {
+					const detail = (await world.detail(AUDIT_ID)).audit;
+					assert.equal(detail.blocked, "models-unknown");
+					assert.equal(detail.planned, null);
+					const posted = await world.startAudit(AUDIT_ID);
+					assert.equal(posted[1].error, "models-unknown");
+					assert.equal(fs.existsSync(requestFileOf(world)), false);
+				} finally {
+					await world.detail.close();
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				}
+			});
+
 			it("(gate 15) preview and POST exclude an identity missing only from published.usedModels", async () => {
 				const world = makeWorld({
 					usedModels: { "openai/alpha-review": true },

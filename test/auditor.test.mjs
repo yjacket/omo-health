@@ -25,7 +25,7 @@ const DAY = 24 * 60 * 60_000;
 const POLL = 30_000;
 const silent = { info() {}, warn() {}, error() {} };
 const LANES = { ultrabrain: ["openai/gpt-5-5"], architect: ["google/gemini-3-pro"], "deep-high": ["xai/grok-5"] };
-const ANSWER = {
+const TOKEN_ONLY_ANSWER = {
 	overall: "sound",
 	summary: "토큰 사용과 점검이 모두 적절했습니다.",
 	tokens: { judgment: "normal", explanation: "정상 범위입니다." },
@@ -34,7 +34,7 @@ const ANSWER = {
 	confidence: 0.8,
 };
 const RUNNING = { status: "running", result: null, exitCode: null };
-const DONE = { status: "done", result: ANSWER, exitCode: 0 };
+const DONE = { status: "done", result: TOKEN_ONLY_ANSWER, exitCode: 0 };
 
 /** poll results in order; the last one repeats. */
 const queue = (...results) => (_jobId, n) => results[Math.min(n, results.length - 1)];
@@ -130,6 +130,40 @@ function crashAfterStart(h, { writeMeta = true } = {}) {
 }
 
 const modelOf = (start) => start.args[start.args.indexOf("--model") + 1];
+
+for (const complete of [true, false]) {
+	test(`(coverage) an audit ${complete ? "reviewing every fired detector finishes done" : "omitting a fired detector fails without a refund"}`, (t) => {
+		const h = harness();
+		t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+		fs.mkdirSync(h.paths.health.decisionsDir, { recursive: true });
+		appendJsonl(path.join(h.paths.health.decisionsDir, "2026-11-20.jsonl"), [
+			{ ts: new Date(BASE - 100_000).toISOString(), fp: "d8", event: "opened", detector: "D8", subject: { sessionId: "m1" } },
+			{ ts: new Date(BASE - 110_000).toISOString(), fp: "d1", event: "opened", detector: "D1" },
+		]);
+		h.request("m1");
+		h.tick(h.auditor());
+		const launched = readAuditState(h.paths, "m1");
+		assert.equal(launched.status, "running");
+		const checks = [{ item: "D8", judgment: "sound", explanation: "적절했습니다.", evidence: ["F1"] }];
+		if (complete) checks.push({ item: "머신 감지", judgment: "sound", explanation: "적절했습니다.", evidence: ["근거: F2"] });
+		h.runner.script = () => ({ ...DONE, result: { ...TOKEN_ONLY_ANSWER, checks } });
+		h.tick(h.auditor()); // Finish on a fresh auditor, using the launch-time evidence.
+
+		const state = readAuditState(h.paths, "m1");
+		assert.equal(state.status, complete ? "done" : "failed");
+		assert.deepEqual(launched.firedDetectors, ["D8", "D1"]);
+		assert.deepEqual(h.budget().jobs, [launched.jobId]);
+		assert.equal(h.budget().count, 1);
+		if (complete) {
+			assert.deepEqual(state.result.checks, checks);
+			assert.equal(state.reason, null);
+		} else {
+			assert.equal(state.reason, "incomplete-checks");
+			assert.equal(state.result, null);
+			assert.equal(state.reasonKo, "감지를 모두 검토하지 않은 답을 받았습니다");
+		}
+	});
+}
 
 test("(gate 16) audit preparation reaches reviewer launch with a resident index at 96 MiB", (t) => {
 	const h = harness({ providers: ["openai", "google"], entries: [E.assistant({ ms: BASE - 120_000, model: "gpt-5-5", provider: "openai" })] });
@@ -651,6 +685,23 @@ for (const kind of ["toolResult", "compaction"]) {
 		assert.equal(modelOf(h.runner.starts[0]), "google/gemini-3-pro");
 	});
 }
+
+test("(plan 25) a compaction carrying usage without a model fails the queued audit as models-unknown without starting the runner or charging", (t) => {
+	const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } };
+	const h = harness({
+		entries: [
+			E.assistant({ ms: BASE - 120_000, id: "a-m1", model: "claude-opus-5-5", provider: "anthropic-subscription" }),
+			{ type: "compaction", id: "cmp-1", timestamp: new Date(BASE - 60_000).toISOString(), provider: "openai", usage },
+		],
+	});
+	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+	const a = h.auditor();
+	h.request("m1");
+	h.tick(a);
+	assert.equal(h.record("m1").reason, "models-unknown");
+	assert.equal(h.runner.starts.length, 0);
+	assert.equal(h.budget(), undefined);
+});
 
 for (const incomplete of ["timeline", "index"]) {
 	test(`(gate 14) the auditor refuses when only the ${incomplete} lost model identities`, () => {

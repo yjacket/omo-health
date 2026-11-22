@@ -2,10 +2,11 @@ import crypto from "node:crypto";
 import path from "node:path";
 import { createSessionFileLocator } from "./collect/session-files.mjs";
 import { usageTimeline } from "./collect/usage.mjs";
-import { auditBundle, auditDocument, resolveAuditModel, validateAudit } from "./judge/audit.mjs";
+import { auditBundle, auditDocument, detectorFindingRefs, firedDetectors, hasDetectorCoverage, resolveAuditModel, validateAudit } from "./judge/audit.mjs";
 import { ANALYST_POLL_MS, parseAnalystOutput, unavailableReason } from "./judge/analyst.mjs";
 import { laneArgs } from "./judge/lane.mjs";
 import { loadSessionRecord } from "./session-record.mjs";
+import { auditReasonLabel } from "./ui/labels.mjs";
 import { fresh, isSpillModelKey, readUsageIndex } from "./usage-index.mjs";
 import { atomicWriteFile, atomicWriteJson, ensureDir, listDirSafe, readJsonSafe, readTextSafe, removeSafe, statSafe } from "./util/fsx.mjs";
 import { redact, truncate } from "./util/text.mjs";
@@ -60,9 +61,11 @@ export function readAuditState(paths, sessionId) {
 	if (!id) return null;
 	const record = readJsonSafe(path.join(paths.health.auditsDir, `${id}.json`));
 	const held = record?.holdUntilExit === true;
-	if (record && (ACTIVE.has(record.status) || held)) return record;
-	const request = readJsonSafe(path.join(paths.health.auditRequestsDir, `${id}.json`));
-	if (request?.v === 1 && request.sessionId === id) return { v: 1, sessionId: id, status: "requested", requestedMs: request.requestedMs };
+	if (!record || (!ACTIVE.has(record.status) && !held)) {
+		const request = readJsonSafe(path.join(paths.health.auditRequestsDir, `${id}.json`));
+		if (request?.v === 1 && request.sessionId === id) return { v: 1, sessionId: id, status: "requested", requestedMs: request.requestedMs };
+	}
+	if (record?.status === "failed" && record.reason) return { ...record, reasonKo: auditReasonLabel(record.reason) };
 	return record ?? null;
 }
 
@@ -262,10 +265,11 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		const jobDir = path.join(jobsDir, jobId);
 		ensureDir(jobDir);
 		atomicWriteFile(bundleFileOf(jobId), auditDocument(bundle));
-		atomicWriteJson(path.join(jobDir, "refs.json"), refsOf(bundle));
+		atomicWriteJson(path.join(jobDir, "refs.json"), { refs: refsOf(bundle), findingRefs: detectorFindingRefs(bundle) });
 		atomicWriteJson(path.join(jobDir, "analyst.json"), { jobId, sessionId: laneSessionId, kind: "audit", subject: { sessionId: loaded.session?.sessionId ?? record.sessionId, taskId: loaded.session?.taskId ?? null }, model: choice.model, lane: choice.lane, createdMs: now });
 
 		Object.assign(record, { status: "launching", jobId, laneSessionId, model: choice.model, lane: choice.lane, independence: choice.independence, launchMs: now, prepMs: Number.isFinite(full?.prepMs) ? Math.round(full.prepMs) : null });
+		record.firedDetectors = firedDetectors(bundle);
 		save(record);
 		charge(jobId, now);
 		try {
@@ -299,10 +303,14 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 
 	function finish(record, out, now) {
 		if (out.status === "done") {
-			let refs = readJsonSafe(path.join(jobsDir, record.jobId, "refs.json"), []);
-			if (!Array.isArray(refs)) refs = [];
-			const verdict = validateAudit(out.result ?? null, { refs });
+			const metadata = readJsonSafe(path.join(jobsDir, record.jobId, "refs.json"));
+			const refs = Array.isArray(metadata) ? metadata : metadata?.refs;
+			const verdict = validateAudit(out.result ?? null, { refs: Array.isArray(refs) ? refs : [] });
 			if (verdict.ok) {
+				// In-flight audits from before coverage tracking cannot prove complete review.
+				if (!Array.isArray(record.firedDetectors) || !hasDetectorCoverage(verdict.result.checks, record.firedDetectors, metadata?.findingRefs ?? {})) {
+					return fail(record, "incomplete-checks", null, now);
+				}
 				record.status = "done";
 				record.result = verdict.result;
 				record.reason = null;

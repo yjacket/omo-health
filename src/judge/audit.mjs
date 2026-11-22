@@ -28,6 +28,7 @@ const REF_TOKEN = /\b(?:[FAIM]\d+|T)\b/g;
 const METRIC_KEY = /^[A-Za-z][\w.-]{0,40}$/;
 const METRIC_VALUE = /^-?\d+(\.\d+)?(ms|s|m|h|%|KiB|MiB|GiB|B)?$/;
 const RULE_ID = /^R\d+[a-z]*$/;
+const DETECTOR_ID = /^D\d+$/;
 
 /** The fixed question the reviewer answers; it is the only free prose in the bundle. */
 export const AUDIT_QUESTION = "Review whether omo-health's findings, actions and token accounting for this session were right.";
@@ -414,11 +415,30 @@ export function auditBundle(record, timeline, { config, now } = {}) {
 	return bundle;
 }
 
-function firedDetectors(bundle) {
-	const ids = new Set();
-	for (const finding of bundle.omo_health_record.findings) if (finding.detector) ids.add(finding.detector);
-	for (const investigation of bundle.omo_health_record.investigations) if (investigation.detector) ids.add(investigation.detector);
-	return [...ids].sort();
+/** Session and machine findings share the bundle's ordered F refs. */
+export function detectorFindingRefs(bundle) {
+	return Object.fromEntries(bundle.omo_health_record.findings
+		.filter(({ detector }) => DETECTOR_ID.test(detector))
+		.map(({ ref, detector }) => [ref, detector]));
+}
+
+export function firedDetectors(bundle) {
+	return [...new Set(Object.values(detectorFindingRefs(bundle)))];
+}
+
+/** Check coverage on validated checks, using only surviving evidence citations. */
+export function hasDetectorCoverage(checks, fired, findingRefs) {
+	const remaining = new Set(fired);
+	for (const { item, evidence } of checks) {
+		remaining.delete(item);
+		if (Object.hasOwn(findingRefs, item)) remaining.delete(findingRefs[item]);
+		for (const line of evidence) {
+			for (const [ref] of line.matchAll(REF_TOKEN)) {
+				if (Object.hasOwn(findingRefs, ref)) remaining.delete(findingRefs[ref]);
+			}
+		}
+	}
+	return remaining.size === 0;
 }
 
 function suggestedDetectors(bundle) {
@@ -442,7 +462,8 @@ export function auditDocument(bundle) {
 		"Write your free text in Korean, for the machine owner.",
 		"Judge every record against its structured facts and the thresholds: severity, metrics, the actions taken and the analyst's verdict with its confidence. A missing finding alone is not a miss, and a high count alone is not waste; answer `unclear` when the data cannot decide.",
 		"When coverage.infoFindings is false, info findings were not being recorded before the session started, so their absence is not a miss.",
-		`Write one check for each detector that fired for the session or its descendants (${fired.length ? fired.join(", ") : "none"}), one for each detector whose conditions the aggregates suggest should have fired${suggested.length ? ` (${suggested.join(", ")})` : ""}, and one for token usage.`,
+		`Fired detectors: ${fired.length ? fired.join(", ") : "none"}. Write at least one check per fired detector. Set item to its detector ID or one of its finding refs.`,
+		`Also write one check for each detector whose conditions the aggregates suggest should have fired${suggested.length ? ` (${suggested.join(", ")})` : ""}, and one for token usage.`,
 		"Cite ref ids (F1 for findings, A1 for actions, I1 for investigations, M1 for messages, T for tokens) for every claim you can.",
 		"",
 		`Answer with ONE JSON object matching this schema:\n${JSON.stringify(AUDIT_SCHEMA)}`,

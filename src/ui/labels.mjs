@@ -195,6 +195,7 @@ export const AUDIT_REASON_LABELS = Object.freeze({
 	"models-unknown": "세션이 쓴 모델을 다 확인하지 못해 조사할 수 없습니다",
 	timeout: "제한 시간 안에 답하지 않았습니다",
 	"bad-output": "쓸 수 없는 답을 받았습니다",
+	"incomplete-checks": "감지를 모두 검토하지 않은 답을 받았습니다",
 	unavailable: "모델을 쓸 수 없습니다",
 	"spawn-error": "조사를 실행하지 못했습니다",
 	"evidence-too-large": "기록이 너무 커서 조사할 수 없습니다",
