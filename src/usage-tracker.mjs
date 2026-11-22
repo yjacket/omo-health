@@ -81,11 +81,6 @@ export function createUsageTracker({ paths, index, locator, clock, log } = {}) {
 		return locator?.mainFile?.(row.sessionId);
 	};
 
-	const isComplete = (id) => {
-		const entry = index.get(id);
-		return entry?.state === "ok" && entry.complete === true;
-	};
-
 	const counts = () => {
 		let indexed = 0;
 		let missing = 0;
@@ -114,7 +109,7 @@ export function createUsageTracker({ paths, index, locator, clock, log } = {}) {
 				if (!entry) need = true;
 				else if (entry.state === "ok" && entry.complete !== true) need = true;
 				else if (entry.gone === true) need = checkedAgo;
-				else if (entry.complete === true && !isFresh(entry)) need = true;
+				else if (entry.complete === true && (entry.readError === true || !isFresh(entry))) need = true;
 				else if (entry.state === "missing" && checkedAgo) need = true;
 				if (need) queue.set(row.sessionId, row);
 			}
@@ -132,23 +127,20 @@ export function createUsageTracker({ paths, index, locator, clock, log } = {}) {
 			let budget = USAGE_TICK_BYTES;
 			const sessions = [...(world?.sessions?.values?.() ?? [])];
 			const liveSessions = new Map(sessions.filter((session) => isNonEmptyString(session?.id)).map((session) => [session.id, session]));
-			const live = [];
+			const liveAppends = [];
+			const liveFirstReads = [];
 			for (const session of sessions) {
 				if (!isNonEmptyString(session?.id)) continue;
 				const sessionFile = verifiedFile(session, liveSessions);
 				if (!sessionFile) continue;
-				live.push({ id: session.id, file: sessionFile, meta: metaOf(session) });
+				const entry = index.get(session.id);
+				const reads = entry?.state === "ok" && entry.complete === true ? liveAppends : liveFirstReads;
+				reads.push({ id: session.id, file: sessionFile, meta: metaOf(session) });
 			}
-			// (a) bytes appended to a session already indexed
-			for (const item of live) {
+			// (a) live appends, then (b) first/incomplete live reads. A previous
+			// publication sets priority, not whether a file has unread bytes.
+			for (const item of [...liveAppends, ...liveFirstReads]) {
 				if (budget <= 0) break;
-				if (!isComplete(item.id)) continue;
-				budget = Math.max(0, budget - index.update(item.id, item.file, item.meta, { maxBytes: budget }));
-			}
-			// (b) live sessions never read, or whose first read was interrupted
-			for (const item of live) {
-				if (budget <= 0) break;
-				if (isComplete(item.id)) continue;
 				budget = Math.max(0, budget - index.update(item.id, item.file, item.meta, { maxBytes: budget }));
 			}
 			// (c) the ended-session backlog, newest first
@@ -161,7 +153,13 @@ export function createUsageTracker({ paths, index, locator, clock, log } = {}) {
 					continue;
 				}
 				budget = Math.max(0, budget - index.update(id, rowFile, metaOf(row), { maxBytes: budget }));
-				if (isComplete(id)) queue.delete(id);
+				const entry = index.get(id);
+				// Missing/gone files are retried by queueLedger, not every tick.
+				if (entry.readError === true) continue;
+				if (entry.state === "missing" || entry.gone === true ||
+					(entry.state === "ok" && entry.complete === true && entry.evaluatedTo === entry.size)) {
+					queue.delete(id);
+				}
 			}
 			trees = treeTotals(index.entries());
 			const state = counts();

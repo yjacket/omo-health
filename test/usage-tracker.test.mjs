@@ -170,6 +170,60 @@ test("a 96 MiB file shows pending for three ticks, then its full total", () => {
 	assert.equal(s.tracker.tokensOf("big").treeTokens, null);
 });
 
+test("(gate 10) a previously published ended file stays queued through three reads", (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const file = mainFile(s.paths, "ended");
+	const record = '{"type":"usage","usage":{"input":1}}';
+	const row = { sessionId: "ended", kind: "main", cwd: s.cwd, endedMs: T0 };
+	writeLines(file, [record]);
+	s.index.update(row.sessionId, file);
+	const previous = s.tracker.tokensOf(row.sessionId).tokens;
+	assert.equal(previous.total, 1);
+
+	// The gate witness uses a million records; pad them so reaching EOF takes three byte budgets.
+	const block = `${record.padEnd(74)}\n`.repeat(10_000);
+	for (let i = 0; i < 100; i += 1) fs.appendFileSync(file, block);
+	assert.equal(s.tracker.queueLedger([row]), 1);
+	const size = fs.statSync(file).size;
+	const world = emptyWorld(s.clock);
+	for (let i = 1; i <= 2; i += 1) {
+		assert.equal(s.tracker.tick(world).bytesRead, USAGE_TICK_BYTES, `tick ${i}`);
+		assert.deepEqual(s.tracker.tokensOf(row.sessionId).tokens, previous);
+		assert.equal(s.events.some(({ event }) => event === "usage_backlog"), false, `tick ${i} has not drained the queue`);
+	}
+	assert.equal(s.tracker.tick(world).bytesRead, size - Buffer.byteLength(record) - 1 - 2 * USAGE_TICK_BYTES);
+	assert.equal(s.index.fresh(s.index.get(row.sessionId)), true);
+	assert.equal(s.tracker.tokensOf(row.sessionId).tokens.total, 1_000_001);
+	assert.equal(s.tracker.tokensOf(row.sessionId).tokens.total, readUsage(file).effective.total);
+	assert.equal(s.events.filter(({ event }) => event === "usage_backlog").length, 1);
+	assert.equal(s.tracker.tick(world).bytesRead, 0, "EOF drains the queue");
+});
+
+test("(gate 10) a queued file that grows after publication drains through its new end", (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const file = mainFile(s.paths, "growing");
+	const row = { sessionId: "growing", kind: "main", cwd: s.cwd, endedMs: T0 };
+	const world = emptyWorld(s.clock);
+	writeLines(file, [bigRecord(34 * 1024 * 1024, usage(7))]);
+	assert.equal(s.tracker.queueLedger([row]), 1);
+	assert.equal(s.tracker.tick(world).bytesRead, USAGE_TICK_BYTES);
+	assert.equal(s.tracker.tokensOf(row.sessionId).pending, true);
+
+	// A live read can publish the file while its ledger row is still queued.
+	s.index.update(row.sessionId, file);
+	assert.equal(s.tracker.tokensOf(row.sessionId).tokens.total, 7);
+	const appended = `${bigRecord(34 * 1024 * 1024, usage(3))}\n`;
+	fs.appendFileSync(file, appended);
+	assert.equal(s.tracker.tick(world).bytesRead, USAGE_TICK_BYTES);
+	assert.equal(s.tracker.tokensOf(row.sessionId).tokens.total, 7);
+	assert.equal(s.tracker.tick(world).bytesRead, Buffer.byteLength(appended) - USAGE_TICK_BYTES);
+	assert.equal(s.tracker.tokensOf(row.sessionId).tokens.total, 10);
+	assert.equal(s.index.fresh(s.index.get(row.sessionId)), true);
+	assert.equal(s.tracker.tick(world).bytesRead, 0);
+});
+
 test("a completed backlog file deleted after its read keeps the published total and marks the row gone", () => {
 	const s = setup();
 	const file = mainFile(s.paths, "d1");

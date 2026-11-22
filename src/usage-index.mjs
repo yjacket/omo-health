@@ -14,7 +14,7 @@ import { atomicWriteJson, readJsonSafe, statSafe } from "./util/fsx.mjs";
  * advances record by record, while `published` only moves when a read ends
  * `done`, so a partial append never shows an intermediate sum (IS-1, IS-3, IS-12).
  */
-export const USAGE_INDEX_VERSION = 1;
+export const USAGE_INDEX_VERSION = 2;
 /** Per-tick byte budget for live appends, first reads and the backlog. */
 export const USAGE_TICK_BYTES = 32 * 1024 * 1024;
 const PRUNE_KEEP_MS = 45 * 24 * 3600_000;
@@ -24,6 +24,7 @@ const isObject = (value) => typeof value === "object" && value !== null;
 
 const META_KEYS = ["kind", "taskId", "parentSessionId", "rootSessionId"];
 const MEMORY_ONLY_KEYS = new Set(["scanOffset", "partial", "readError"]);
+const USAGE_KEYS = ["usage", "overlay", "published"];
 const CURSOR_NUMBERS = ["size", "offset", "evaluatedTo", "mtimeMs", "ino", "birthtimeMs", "headLen"];
 const PERSISTED_KEYS = [
 	"id",
@@ -189,13 +190,35 @@ function persisted(entry) {
 	for (const [key, value] of Object.entries(entry)) {
 		if (!Object.hasOwn(out, key) && !MEMORY_ONLY_KEYS.has(key) && value !== undefined) out[key] = value;
 	}
+	for (const key of USAGE_KEYS) out[key] = mapCounters(out[key], encodeCounter);
 	return out;
+}
+
+// Counter trees have numeric/boolean leaves (including model totals and diagnostics).
+// Scope the tags to these trees so arbitrary strings in metadata are never decoded.
+function mapCounters(value, mapLeaf) {
+	if (Array.isArray(value)) return value.map((item) => mapCounters(item, mapLeaf));
+	if (isObject(value)) return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, mapCounters(item, mapLeaf)]));
+	return mapLeaf(value);
+}
+
+function encodeCounter(value) {
+	return typeof value === "number" && !Number.isFinite(value) ? `number:${value}` : value;
+}
+
+function decodeCounter(value) {
+	switch (value) {
+		case "number:Infinity": return Infinity;
+		case "number:-Infinity": return -Infinity;
+		case "number:NaN": return NaN;
+		default: return value;
+	}
 }
 
 /**
  * `{file, clock, log, read}`: `file` is the only path ever written, and only
  * `save()` writes it. The file is loaded here, so a fresh process resumes every
- * persisted cursor; a different version or a corrupt file starts empty, and the
+ * persisted cursor; an unsupported version or a corrupt file starts empty, and the
  * memory-only keys are never taken from disk. `read` defaults to `readUsage` and
  * lets tests inject a read failure.
  */
@@ -343,13 +366,17 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 	};
 }
 
-/** The index as the dashboard reads it: a Map of entries, empty when absent, other version or corrupt. */
+/** The index as the dashboard reads it: a Map of entries, empty when absent, unsupported or corrupt. */
 export function readUsageIndex(file) {
 	const out = new Map();
 	const data = readJsonSafe(file);
-	if (!isObject(data) || data.v !== USAGE_INDEX_VERSION || !isObject(data.entries)) return out;
+	if (!isObject(data) || (data.v !== 1 && data.v !== USAGE_INDEX_VERSION) || !isObject(data.entries)) return out;
 	for (const [id, entry] of Object.entries(data.entries)) {
-		if (isObject(entry)) out.set(id, entry);
+		if (!isObject(entry)) continue;
+		if (data.v === USAGE_INDEX_VERSION) {
+			for (const key of USAGE_KEYS) if (Object.hasOwn(entry, key)) entry[key] = mapCounters(entry[key], decodeCounter);
+		}
+		out.set(id, entry);
 	}
 	return out;
 }

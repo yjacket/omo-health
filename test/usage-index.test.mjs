@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
 import { tmpDir } from "./helpers/fixtures.mjs";
+import { readUsage } from "../src/collect/usage.mjs";
 import { createFakeClock, iso } from "../src/util/time.mjs";
 import {
 	USAGE_INDEX_VERSION,
@@ -128,7 +129,7 @@ for (const field of ["size", "offset", "evaluatedTo", "mtimeMs", "ino", "birthti
 test("a different index version or a corrupt file reads as empty", (t) => {
 	const { dir } = setup(t);
 	const file = path.join(dir, "usage.json");
-	fs.writeFileSync(file, JSON.stringify({ v: 2, entries: { s1: { id: "s1" } } }));
+	fs.writeFileSync(file, JSON.stringify({ v: USAGE_INDEX_VERSION + 1, entries: { s1: { id: "s1" } } }));
 	assert.equal(readUsageIndex(file).size, 0);
 	fs.writeFileSync(file, "{not json");
 	assert.equal(readUsageIndex(file).size, 0);
@@ -138,7 +139,7 @@ test("a different index version or a corrupt file reads as empty", (t) => {
 test("constructing an index over a corrupt, different-version or absent file starts empty", (t) => {
 	const { dir, clock, log } = setup(t);
 	const file = path.join(dir, "usage.json");
-	for (const text of [JSON.stringify({ v: 2, entries: { s1: { id: "s1", state: "ok", complete: true } } }), "{not json", ""]) {
+	for (const text of [JSON.stringify({ v: USAGE_INDEX_VERSION + 1, entries: { s1: { id: "s1", state: "ok", complete: true } } }), "{not json", ""]) {
 		fs.writeFileSync(file, text);
 		const index = createUsageIndex({ file, clock, log });
 		assert.deepEqual(index.entries(), []);
@@ -203,6 +204,64 @@ test("a resumable append reads only the appended bytes", (t) => {
 	assert.equal(compactUsage(index.get("s1")).total, 30);
 	assert.equal(index.fresh(index.get("s1")), true);
 });
+
+test("(gate 10) finite records that overflow survive a reload and a resumable append", (t) => {
+	const { fileOf, indexOf } = setup(t);
+	const file = fileOf();
+	const overflowing = JSON.stringify(assistant({ usage: use({ input: 1e308, output: 1e308, cost: 1e308 }) }));
+	writeText(file, `${overflowing}\n${overflowing}\n${overflowing}`);
+	const index = indexOf();
+	index.update("s1", file);
+	const { usage, overlay, published } = index.get("s1");
+	assert.equal(usage.cost, Infinity);
+	assert.equal(overlay.total, Infinity, "the unterminated record has its own overflow");
+	assert.equal(published.models["anthropic-subscription/claude-opus-5-5"].tokens, Infinity);
+	const before = compactUsage(index.get("s1"));
+	assert.equal(before.total, Infinity);
+	assert.equal(index.save(), true);
+	assert.deepEqual(compactUsage(readUsageIndex(fileOf("usage.json")).get("s1")), before, "dashboard reload");
+
+	const reloaded = indexOf();
+	assert.equal(reloaded.fresh(reloaded.get("s1")), true);
+	assert.deepEqual(reloaded.get("s1").usage, usage);
+	assert.deepEqual(reloaded.get("s1").overlay, overlay);
+	assert.deepEqual(reloaded.get("s1").published, published);
+	const append = `\n${line()}\n`;
+	fs.appendFileSync(file, append);
+	assert.equal(reloaded.update("s1", file), Buffer.byteLength(overflowing + append), "re-read only the previous EOF fragment and new bytes");
+	assert.deepEqual(reloaded.get("s1").published, readUsage(file).effective);
+	assert.equal(compactUsage(reloaded.get("s1")).total, Infinity);
+});
+
+for (const [expected, appendUsage] of [[-Infinity, use()], [NaN, use({ input: 1e308, output: 1e308 })]]) {
+	test(`(gate 10) ${expected} from a legacy index survives save, reload and append`, (t) => {
+		const { fileOf, indexOf } = setup(t);
+		const file = fileOf();
+		const savedFile = fileOf("usage.json");
+		writeText(file, `${line()}\n`);
+		const index = indexOf();
+		index.update("s1", file);
+		index.save();
+		const legacy = JSON.parse(fs.readFileSync(savedFile, "utf8"));
+		legacy.v = 1;
+		// A legacy file may contain an exponent that JSON.parse converts to -Infinity.
+		writeText(savedFile, JSON.stringify(legacy).replaceAll('"total":10', '"total":-1e999'));
+		const migrated = indexOf();
+		assert.equal(migrated.get("s1").usage.total, -Infinity);
+		const appended = `${JSON.stringify(assistant({ usage: appendUsage }))}\n`;
+		fs.appendFileSync(file, appended);
+		assert.equal(migrated.update("s1", file), Buffer.byteLength(appended), "resume the v1 cursor");
+		assert.equal(compactUsage(migrated.get("s1")).total, expected);
+		assert.equal(migrated.save(), true);
+
+		const reloaded = indexOf();
+		assert.deepEqual(compactUsage(reloaded.get("s1")), compactUsage(migrated.get("s1")));
+		const last = `${line()}\n`;
+		fs.appendFileSync(file, last);
+		assert.equal(reloaded.update("s1", file), Buffer.byteLength(last));
+		assert.equal(compactUsage(reloaded.get("s1")).total, expected);
+	});
+}
 
 test("a three-call first read shows nothing until the file is read to the end", (t) => {
 	const { fileOf, indexOf } = setup(t);
