@@ -740,6 +740,9 @@ export function createRecordScanner() {
 		get malformed() {
 			return malformed;
 		},
+		get incomplete() {
+			return !malformed && state !== STATE_END;
+		},
 		get oversized() {
 			if (malformed || state !== STATE_END || !entry) return false;
 			const carrier = usageCarrier(entry);
@@ -1029,7 +1032,11 @@ export function readUsage(file, from, { maxBytes = Infinity } = {}) {
 				}
 			}
 		}
-		const evaluatedTo = pending ? offset : position;
+		// An unfinished first record is not a zero-token publication. Keep
+		// scanning it on append, just as we do for a deferred exact reread.
+		const incompleteFirstRecord = offset === 0 && acc?.kind === "scanner" &&
+			acc.len <= RECORD_PARSE_LIMIT && !acc.markerTail && acc.scanner.incomplete;
+		const evaluatedTo = pending || incompleteFirstRecord ? offset : position;
 		const effective = cloneUsage(usage);
 		mergeUsage(effective, overlay);
 		const tailLength = Math.min(offset, HEAD_LIMIT);

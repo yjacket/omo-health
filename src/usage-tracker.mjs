@@ -324,6 +324,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 		 * (`treeTokens` is non-null when at least one descendant has a counted total),
 		 * `{pending:true}` while a live header probe or first read is deferred or
 		 * an entry's first full read has not finished, and null when nothing is known.
+		 * A deferred exact reread can return both the last `tokens` and `pending:true`.
 		 * A counted descendant can supply a tree total even without an own total.
 		 */
 		tokensOf(sessionId, taskId) {
@@ -337,7 +338,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			if (!entry) return treeTokens === null ? null : tree;
 			if (entry.state === "full") return { state: "full", ...tree };
 			const tokens = compactUsage(entry);
-			if (tokens) return { tokens, treeTokens, treeTokensComplete };
+			if (tokens) return { tokens, treeTokens, treeTokensComplete, ...(entry.pending && !entry.gone ? { pending: true } : {}) };
 			if (entry.state === "ok" && entry.readError !== true) return { pending: true, ...tree };
 			return treeTokens === null ? null : tree;
 		},

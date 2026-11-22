@@ -40,7 +40,7 @@ const TREE_DEPTH = 8;
 const isObject = (value) => typeof value === "object" && value !== null;
 
 const META_KEYS = ["kind", "taskId", "parentSessionId", "rootSessionId"];
-const MEMORY_ONLY_KEYS = ["scanOffset", "partial", "readError"];
+const MEMORY_ONLY_KEYS = ["scanOffset", "partial", "readError", "pending"];
 const USAGE_KEYS = ["usage", "overlay", "published"];
 const ENTRY_STRING_KEYS = ["id", "file", ...META_KEYS, "state", "head", "tail"];
 const OTHER_MODELS = "(other models)";
@@ -296,9 +296,10 @@ function persistedMeta(entry) {
 	return meta;
 }
 
-function boundedModels(entry, remaining) {
+function boundedModels(entry, remaining, keepPublished = false) {
 	const budget = remaining;
-	for (const name of USAGE_KEYS) {
+	// A deferred reread must not spill names from an already admitted publication.
+	for (const name of keepPublished ? ["published", "usage", "overlay"] : USAGE_KEYS) {
 		const tree = entry[name];
 		if (!tree) continue;
 		const { models, usedModels } = tree;
@@ -530,6 +531,7 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 		Object.assign(entry, newEntry(entry.id), persistedMeta(entry), { checkedMs: entry.checkedMs });
 		entry.partial = undefined;
 		entry.scanOffset = undefined;
+		delete entry.pending;
 	};
 
 	return {
@@ -595,7 +597,7 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			const restart = isRestart(from, result);
 			entry.state = "ok";
 			entry.gone = false;
-			entry.complete = result.done === true || (!restart && !result.pending && entry.complete === true);
+			entry.complete = result.done === true || (!restart && entry.complete === true);
 			entry.size = result.size;
 			entry.mtimeMs = result.mtimeMs;
 			entry.offset = result.offset;
@@ -609,9 +611,10 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			entry.evaluatedTo = result.evaluatedTo;
 			entry.scanOffset = result.scanOffset;
 			entry.partial = result.partial;
+			entry.pending = result.pending === true;
 			if (result.done === true) entry.published = result.effective;
-			else if (restart || result.pending) entry.published = null;
-			const slots = boundedModels(entry, USAGE_INDEX_MODEL_BUDGET - named);
+			else if (restart) entry.published = null;
+			const slots = boundedModels(entry, USAGE_INDEX_MODEL_BUDGET - named, entry.pending && entry.published !== null);
 			admit(entry, slots);
 			return result.bytesRead;
 		},

@@ -153,6 +153,77 @@ test("(IS-2, IS-12) an over-capture identity waits until the exact reread fits",
 	assert.equal(s.tracker.tokensOf(id).tokens.total, 42);
 });
 
+test("(IS-2) a deferred exact reread keeps the last published tokens on the board and in history", (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const bytes = 2 * 1024 * 1024;
+	const id = "published";
+	const file = mainFile(s.paths, id);
+	const busy = mainFile(s.paths, "busy");
+	const world = makeWorld({
+		now: s.clock.now(),
+		sessions: [sessionState({ id: "busy", file: busy }), sessionState({ id, file })],
+		sensors: [{ sessionId: id, pid: 100, ts: T0 }],
+	});
+	const board = () => buildSessionSnapshot(world, [], [], T0, { tokensOf: s.tracker.tokensOf })
+		.groups.flatMap((group) => group.sessions).find((row) => row.sessionId === id);
+	const row = { sessionId: id, kind: "main", startedMs: T0 - 1000, endedMs: T0 };
+	writeLines(file, [bigRecord(0, usage(10))]);
+	fs.writeFileSync(busy, "");
+	s.tracker.tick(world);
+	assert.equal(s.tracker.tokensOf(id).tokens.total, 10);
+	const start = s.index.get(id).offset;
+	const before = structuredClone(s.index.get(id).published);
+
+	const identity = `{"label":"${"m".repeat(128 * 1024)}"}`;
+	const record = bigRecord(bytes + 1 - (identity.length - 3), usage(42)).replace('"m"', identity);
+	assert.equal(Buffer.byteLength(record), bytes + 1);
+	fs.appendFileSync(file, record.slice(0, -1));
+	s.tracker.tick(world);
+	assert.equal(s.index.get(id).scanOffset, start + bytes);
+
+	const busyLine = bigRecord(1023, usage(1)) + "\n";
+	const busyBytes = USAGE_TICK_BYTES - bytes / 2;
+	fs.writeFileSync(busy, busyLine.repeat(busyBytes / busyLine.length));
+	fs.appendFileSync(file, "}\n");
+	assert.equal(s.tracker.tick(world).bytesRead, busyBytes + 2, "the exact reread does not fit this tick");
+	const deferred = s.index.get(id);
+	assert.equal(deferred.offset, start, "inexact usage is not committed");
+	assert.equal(deferred.usage.total, 10);
+	assert.equal(s.index.fresh(deferred), false, "the old publication is not audit-fresh");
+
+	s.index.save();
+	const saved = readUsageIndex(s.paths.health.usageIndexFile);
+	const history = endedRow(row, 0, saved);
+	const live = board();
+	const lookup = s.tracker.tokensOf(id);
+	assert.deepEqual(
+		[lookup?.tokens?.total, lookup?.pending, live?.tokens?.total, live?.tokensPending, history.tokens?.total, history.tokensState],
+		[10, true, 10, true, 10, "ok"],
+	);
+	assert.deepEqual(structuredClone(deferred.published), before);
+	assert.deepEqual(structuredClone(saved.get(id).published), before);
+	assert.equal(s.index.fresh(saved.get(id)), false);
+
+	assert.equal(s.tracker.tick(world).bytesRead, bytes + 1);
+	const models = {};
+	let total = 0;
+	for (const line of fs.readFileSync(file, "utf8").trimEnd().split("\n")) {
+		const { message } = JSON.parse(line);
+		const { input, output, cacheRead, cacheWrite, cost } = message.usage;
+		const tokens = input + output + cacheRead + cacheWrite;
+		models[`${message.provider}/${String(message.model)}`] = { input, output, cacheRead, cacheWrite, tokens, cost: cost.total };
+		total += tokens;
+	}
+	assert.equal(total, 52);
+	assert.deepEqual(s.index.get(id).published.models, models);
+	assert.equal(s.tracker.tokensOf(id).tokens.total, total);
+	assert.equal(board().tokensPending, false);
+	assert.equal(s.index.fresh(s.index.get(id)), true);
+	s.index.save();
+	assert.equal(endedRow(row, 0, readUsageIndex(s.paths.health.usageIndexFile)).tokens.total, total);
+});
+
 test("tracker tokens resolve by session id or by a unique task id when the session id is absent", () => {
 	const s = setup();
 	const file = childFile(s.cwd, "st_x", "child-a");
