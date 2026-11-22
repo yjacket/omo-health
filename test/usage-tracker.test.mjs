@@ -290,7 +290,7 @@ for (const spent of [0, 256]) test(`(IS-1, IS-12) an in-place longer replacement
 	fs.truncateSync(file, offset);
 	fs.appendFileSync(file, replacement);
 	const stat = fs.statSync(file);
-	assert.deepEqual([stat.ino, stat.birthtimeMs], [ino, birthtimeMs]);
+	assert.deepEqual([fs.statSync(file, { bigint: true }).ino.toString(), stat.birthtimeMs], [ino, birthtimeMs]);
 
 	if (spent) {
 		assert.equal(s.tracker.tick(world, { maxBytes: spent }).bytesRead, spent);
@@ -308,6 +308,40 @@ for (const spent of [0, 256]) test(`(IS-1, IS-12) an in-place longer replacement
 	assert.equal(s.tracker.tokensOf(sub(s, id)).tokens.total, clean.total);
 	assert.deepEqual(s.index.get(key(s, id)).published, clean);
 	assert.equal(tick.bytesRead, replacement.length - spent, "the replacement is scanned once from the committed offset");
+});
+
+test("(IS-1) a same-size rewrite with a torn fragment recounts records between the fingerprints", (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const id = "same-size-middle-rewrite";
+	const file = mainFile(s.paths, id);
+	const world = makeWorld({ now: s.clock.now(), sessions: [sessionState({ id, file, cwd: s.cwd })] });
+	// Each unchanged bookend is longer than a 4 KiB fingerprint.
+	const head = bigRecord(5 * 1024, usage(5));
+	const tail = bigRecord(5 * 1024, usage(3));
+	const middle = (total, model) => bigRecord(512, usage(total)).replace('"model":"m"', `"model":"${model}"`);
+	const torn = `${bigRecord(513, usage(99)).slice(0, -1)} `;
+	writeLines(file, [head, middle(13, "old"), tail]);
+	fs.appendFileSync(file, torn);
+	s.tracker.tick(world);
+	const { offset, scanOffset, size, mtimeMs, ino, birthtimeMs, published } = s.index.get(key(s, id));
+	assert.equal(scanOffset - offset, torn.length);
+	assert.equal(published.total, 21);
+
+	fs.writeFileSync(file, `${head}\n${middle(29, "new")}\n${tail}\n${bigRecord(512, usage(31))}\n`);
+	fs.utimesSync(file, new Date(mtimeMs + 5000), new Date(mtimeMs + 5000));
+	const stat = fs.statSync(file);
+	assert.deepEqual([stat.size, fs.statSync(file, { bigint: true }).ino.toString(), stat.birthtimeMs], [size, ino, birthtimeMs]);
+	assert.ok(stat.mtimeMs > mtimeMs);
+	s.tracker.tick(world);
+
+	const clean = readUsage(file).effective;
+	const modelIds = (totals) => Object.keys(totals.models).sort();
+	assert.deepEqual([clean.total, modelIds(clean)], [68, ["p/m", "p/new"]]);
+	assert.deepEqual([
+		s.tracker.tokensOf(sub(s, id)).tokens.total,
+		modelIds(s.index.get(key(s, id)).published),
+	], [clean.total, modelIds(clean)]);
 });
 
 test("(IS-1, IS-12) a same-size fragment replacement can overlap the head fingerprint", (t) => {
@@ -332,7 +366,8 @@ test("(IS-1, IS-12) a same-size fragment replacement can overlap the head finger
 	assert.equal(s.tracker.tick(world, { maxBytes: 256 }).bytesRead, 256);
 	assert.equal(s.tracker.tokensOf(sub(s, id)).pending, true);
 	assert.equal(s.tracker.tokensOf(sub(s, id)).tokens.total, 7);
-	assert.equal(s.tracker.tick(world).bytesRead, tail.length - 256);
+	assert.equal(s.index.fresh(s.index.get(key(s, id))), false, "a pending recount is not audit-fresh");
+	assert.equal(s.tracker.tick(world).bytesRead, size - 256, "the same-size replacement is recounted from byte zero");
 	assert.deepEqual(s.index.get(key(s, id)).published, readUsage(file).effective);
 	assert.equal(s.tracker.tokensOf(sub(s, id)).tokens.total, 38);
 });

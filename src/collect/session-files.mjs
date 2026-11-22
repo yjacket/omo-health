@@ -6,6 +6,7 @@ import { packScopedText, SubjectMap, uniqueMatch } from "../session-subject.mjs"
 import { fresh, readUsageIndex, soleChildSessionFile } from "../usage-index.mjs";
 import { idFromFileName } from "./sessions.mjs";
 import { senpiTaskStoreDir } from "./tasks.mjs";
+import { readUsageFileStamp, sameFileStamp } from "./usage.mjs";
 
 const HEADER_BYTES = 64 * 1024;
 
@@ -60,8 +61,7 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 
 	const readMainFile = (subject) => {
 		const file = paths.health?.usageIndexFile;
-		const stat = file && statSafe(file);
-		const stamp = stat?.isFile() ? `${stat.ino}:${stat.birthtimeMs}:${stat.mtimeMs}:${stat.size}` : null;
+		const stamp = file ? readUsageFileStamp(file) : null;
 		let entry;
 		if (subject.projectKey == null) {
 			// Check uniqueness before filtering unusable entries; never keep the
@@ -69,7 +69,7 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 			if (stamp === null) return undefined;
 			entry = readUsageIndex(file).getForSubject(subject);
 		} else {
-			if (stamp !== usageStamp) {
+			if (stamp === null ? usageStamp !== null : !sameFileStamp(stamp, usageStamp)) {
 				usageStamp = stamp;
 				indexedMainEntries = new SubjectMap();
 				if (stamp !== null) {

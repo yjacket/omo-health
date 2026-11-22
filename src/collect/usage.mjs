@@ -883,6 +883,43 @@ function readRange(fd, position, length, onRead) {
 	return got === length ? buffer : buffer.subarray(0, got);
 }
 
+// BigInt stats preserve all inode bits, but their *timeMs fields truncate fractions.
+function milliseconds(ns) {
+	return Number(ns / 1_000_000_000n) * 1000 + Number(ns % 1_000_000_000n) / 1_000_000;
+}
+
+function usageFileStamp(stat) {
+	return {
+		size: Number(stat.size),
+		mtimeMs: milliseconds(stat.mtimeNs),
+		ino: stat.ino.toString(),
+		birthtimeMs: milliseconds(stat.birthtimeNs),
+	};
+}
+
+export function readUsageFileStamp(file) {
+	try {
+		const stat = fs.statSync(file, { bigint: true });
+		return stat.isFile() ? usageFileStamp(stat) : null;
+	} catch {
+		return null;
+	}
+}
+
+export function isExactInode(ino) {
+	// Node's BigInt stat can represent the high bit as a signed inode.
+	return typeof ino === "string" && /^(?:0|-?[1-9][0-9]*)$/.test(ino);
+}
+
+export function sameFileIdentity(a, b) {
+	return Boolean(a && b && isExactInode(a.ino) && a.ino === b.ino &&
+		Number.isFinite(a.birthtimeMs) && a.birthtimeMs === b.birthtimeMs);
+}
+
+export function sameFileStamp(a, b) {
+	return sameFileIdentity(a, b) && a.size === b.size && a.mtimeMs === b.mtimeMs;
+}
+
 /**
  * Read token usage from `file`, resuming from the persisted fields in `from`.
  * Returns null for a missing file; read errors throw. `offset` is the end of the
@@ -900,11 +937,7 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 		throw error;
 	}
 	try {
-		const stat = fs.fstatSync(fd);
-		const size = stat.size;
-		const mtimeMs = stat.mtimeMs;
-		const ino = stat.ino;
-		const birthtimeMs = stat.birthtimeMs;
+		const { size, mtimeMs, ino, birthtimeMs } = usageFileStamp(fs.fstatSync(fd, { bigint: true }));
 		const hashRange = (position, length) => sha1(readRange(fd, position, length));
 
 		let restart =
@@ -916,22 +949,21 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 			typeof from.head !== "string" ||
 			typeof from.tail !== "string";
 		// A writer can truncate a torn record in place and regrow past the old
-		// size before we see it. Only the committed prefix can be reused.
-		const rewind = !restart && (size !== from.size || mtimeMs !== from.mtimeMs) &&
+		// size before we see it. Reuse only the validated committed prefix,
+		// and only on growth; same-size rewrites and shrinks must recount.
+		const rewind = !restart && size > from.size &&
 			Number.isSafeInteger(from.scanOffset) && from.scanOffset > from.offset;
 		// If the head overlaps the discarded fragment, the tail covers the
 		// entire committed prefix instead.
 		const refreshHead = rewind && from.headLen > from.offset;
 		if (!restart) {
-			if (size < (rewind ? from.offset : from.size)) {
+			if (size < from.size || (size === from.size && from.mtimeMs !== mtimeMs)) {
 				restart = true;
-			} else if (from.ino === undefined || from.birthtimeMs === undefined || ino !== from.ino || birthtimeMs !== from.birthtimeMs) {
+			} else if (!sameFileIdentity({ ino, birthtimeMs }, from)) {
 				restart = true;
 			} else if (!refreshHead && hashRange(0, from.headLen) !== from.head) {
 				restart = true;
 			} else if (hashRange(from.offset - Math.min(from.offset, HEAD_LIMIT), Math.min(from.offset, HEAD_LIMIT)) !== from.tail) {
-				restart = true;
-			} else if (!rewind && size === from.size && from.mtimeMs !== mtimeMs) {
 				restart = true;
 			}
 		}
@@ -1067,7 +1099,6 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 		const tailLength = Math.min(offset, HEAD_LIMIT);
 		return {
 			offset,
-			rewound,
 			scanOffset: position,
 			partial: acc,
 			size,

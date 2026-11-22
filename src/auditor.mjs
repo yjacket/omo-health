@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { Worker } from "node:worker_threads";
-import { usageTimeline } from "./collect/usage.mjs";
+import { readUsageFileStamp, sameFileIdentity, sameFileStamp, usageTimeline } from "./collect/usage.mjs";
 import { createInvestigations } from "./investigations.mjs";
 import { auditBundle, auditDocument, detectorFindingRefs, firedDetectors, hasDetectorCoverage, resolveAuditModel, validateAudit } from "./judge/audit.mjs";
 import { ANALYST_POLL_MS, parseAnalystOutput, unavailableReason } from "./judge/analyst.mjs";
@@ -11,7 +11,7 @@ import { auditFileKey, boardLiveOwners, subjectKey, subjectOf } from "./session-
 import { collectAnalystDecisionModels, configDecisionFact, recoverPendingAnalystModels, usageEntryOf } from "./session-record.mjs";
 import { auditReasonLabel } from "./ui/labels.mjs";
 import { fresh, isSpillModelKey, readUsageIndex, relatedUsageEntries } from "./usage-index.mjs";
-import { atomicWriteFile, atomicWriteJson, ensureDir, listDirSafe, readJsonSafe, readTextSafe, removeSafe, statSafe } from "./util/fsx.mjs";
+import { atomicWriteFile, atomicWriteJson, ensureDir, listDirSafe, readJsonSafe, readTextSafe, removeSafe } from "./util/fsx.mjs";
 import { JsonlTail } from "./util/tail.mjs";
 import { redact, truncate } from "./util/text.mjs";
 
@@ -167,24 +167,26 @@ export function auditModelFacts(entry, full) {
 }
 
 export function auditFileVersion(file) {
-	const stat = file ? statSafe(file) : null;
-	if (!stat?.isFile()) return null;
-	const { size, mtimeMs, ino, birthtimeMs } = stat;
-	return { size, mtimeMs, ino, birthtimeMs };
+	return file ? readUsageFileStamp(file) : null;
 }
 
 export function sameAuditVersion(a, b) {
-	return a && b && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ino === b.ino && a.birthtimeMs === b.birthtimeMs;
+	return sameFileStamp(a, b);
 }
 
-const INDEX_VERSION_KEYS = ["id", "file", "size", "mtimeMs", "ino", "birthtimeMs", "head", "headLen", "tail", "offset", "evaluatedTo", "state", "complete", "gone", "readError"];
+const INDEX_VERSION_KEYS = ["id", "file", "size", "mtimeMs", "head", "headLen", "tail", "offset", "evaluatedTo", "state", "complete", "gone", "readError"];
 
 export function auditIndexVersion(entry) {
-	return entry ? Object.fromEntries(INDEX_VERSION_KEYS.map((key) => [key, entry[key]])) : null;
+	return entry ? { ...Object.fromEntries(INDEX_VERSION_KEYS.map((key) => [key, entry[key]])),
+		ino: entry.ino, birthtimeMs: entry.birthtimeMs } : null;
 }
 
 function sameAuditIndexVersion(version, entry) {
-	return version && entry ? INDEX_VERSION_KEYS.every((key) => version[key] === entry[key]) : version === entry;
+	if (!version || !entry) return version === entry;
+	// Missing/recount-marker rows have no file identity to compare.
+	const bothUnstamped = version.ino == null && entry.ino == null && version.birthtimeMs == null && entry.birthtimeMs == null;
+	return (bothUnstamped || sameFileIdentity(version, entry)) &&
+		INDEX_VERSION_KEYS.every((key) => version[key] === entry[key]);
 }
 
 function auditFileVersions(dir, suffix) {
@@ -233,7 +235,7 @@ function launchAuditFacts(paths, investigations, loaded, selectedFps, auditSubje
 		const start = analystStart.decisions.get(file);
 		if (sameAuditVersion(version, start)) continue;
 		const tail = new JsonlTail(file, { maxReadBytes: 64 * 1024 });
-		if (start && start.ino === version.ino && start.birthtimeMs === version.birthtimeMs && start.size < version.size) {
+		if (sameFileIdentity(start, version) && start.size < version.size) {
 			tail.offset = start.size;
 		}
 		let batch;

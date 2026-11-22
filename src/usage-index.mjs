@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { addModelCounters, emptyModelBilling, MODEL_KEY_LENGTH, MODEL_KEY_LIMIT, readUsage } from "./collect/usage.mjs";
+import { addModelCounters, emptyModelBilling, isExactInode, MODEL_KEY_LENGTH, MODEL_KEY_LIMIT, readUsage, readUsageFileStamp, sameFileStamp } from "./collect/usage.mjs";
 import { pathKey } from "./paths.mjs";
 import { parseSubjectKey, SubjectMap, subjectKey, subjectOf, uniqueMatch } from "./session-subject.mjs";
 import { atomicWriteChunks, statSafe } from "./util/fsx.mjs";
@@ -43,12 +43,12 @@ const isObject = (value) => typeof value === "object" && value !== null;
 const META_KEYS = ["kind", "taskId", "parentSessionId", "rootSessionId", "parentKey", "rootKey"];
 const MEMORY_ONLY_KEYS = ["scanOffset", "partial", "readError", "pending"];
 const USAGE_KEYS = ["usage", "overlay", "published"];
-const ENTRY_STRING_KEYS = ["id", "projectKey", "file", ...META_KEYS, "state", "head", "tail"];
+const ENTRY_STRING_KEYS = ["id", "projectKey", "file", ...META_KEYS, "state", "head", "tail", "ino"];
 const OTHER_MODELS = "(other models)";
 const SPILL_KEYS = new Set([OTHER_MODELS, "(model id too long)", "(model id unreadable)"]);
 export const isSpillModelKey = (key) => SPILL_KEYS.has(key);
 const COUNTER_KEYS = ["input", "output", "cacheRead", "cacheWrite", "total", "cost", "turns"];
-const CURSOR_NUMBERS = ["size", "offset", "evaluatedTo", "mtimeMs", "ino", "birthtimeMs", "headLen"];
+const CURSOR_NUMBERS = ["size", "offset", "evaluatedTo", "mtimeMs", "birthtimeMs", "headLen"];
 const PERSISTED_KEYS = [
 	"id",
 	"projectKey",
@@ -125,20 +125,8 @@ export function parentSubject(entry) {
 		{ projectKey: entry.projectKey, sessionId: entry.parentSessionId } : null);
 }
 
-function hasNumericCursor(entry) {
-	return CURSOR_NUMBERS.every((key) => Number.isFinite(entry[key]));
-}
-
-/** The identity facts `readUsage` resumes on; a change means it recounted from 0. */
-function isRestart(previous, result) {
-	if (!isObject(previous) || previous.state !== "ok" || previous.offset === undefined || previous.usage === undefined) return true;
-	if (result.rewound) return false; // The reader validated and reused the committed prefix.
-	if (result.size < previous.size) return true;
-	if (previous.ino !== undefined && (result.ino !== previous.ino || result.birthtimeMs !== previous.birthtimeMs)) return true;
-	if (previous.headLen === result.headLen && previous.head !== result.head) return true;
-	if (result.size === previous.size && previous.mtimeMs !== result.mtimeMs) return true;
-	if (previous.offset === result.offset && previous.tail !== result.tail) return true;
-	return false;
+function hasStatCursor(entry) {
+	return isExactInode(entry.ino) && CURSOR_NUMBERS.every((key) => Number.isFinite(entry[key]));
 }
 
 function ownerTotals(usage) {
@@ -209,17 +197,10 @@ export function compactUsage(entry) {
  */
 export function fresh(entry) {
 	if (!isObject(entry) || entry.state !== "ok" || entry.complete !== true || entry.gone === true) return false;
-	if (!hasNumericCursor(entry)) return false;
+	if (!hasStatCursor(entry)) return false;
 	if (entry.evaluatedTo !== entry.size) return false;
 	if (isTaskOnlyEntry(entry) && !isSoleChildSessionFile(entry.file)) return false;
-	const stat = statSafe(entry.file);
-	return Boolean(
-		stat &&
-			stat.size === entry.size &&
-			stat.mtimeMs === entry.mtimeMs &&
-			stat.ino === entry.ino &&
-			stat.birthtimeMs === entry.birthtimeMs,
-	);
+	return sameFileStamp(readUsageFileStamp(entry.file), entry);
 }
 
 /** `fresh` under the name the requeue path uses. */
@@ -390,7 +371,7 @@ function normalizeNumber(node, key) {
 }
 
 const ENTRY_NUMBERS = [...CURSOR_NUMBERS, "checkedMs"];
-const CURSOR_NULLS = [...CURSOR_NUMBERS, "head", "tail", ...USAGE_KEYS];
+const CURSOR_NULLS = [...CURSOR_NUMBERS, "ino", "head", "tail", ...USAGE_KEYS];
 const record = (value) => isObject(value) && !Array.isArray(value);
 const nullableString = (value) => value === null || typeof value === "string";
 const hasShape = (value, fields) => record(value) && Object.keys(value).length === fields.length &&
@@ -413,6 +394,7 @@ function validateEntry(entry, remaining) {
 			CURSOR_NULLS.every((key) => entry[key] === null) ? 0 : -1;
 	}
 	if (entry.state !== "ok" || typeof entry.file !== "string" || typeof entry.head !== "string" || typeof entry.tail !== "string") return -1;
+	if (!isExactInode(entry.ino)) return -1;
 	if (!ENTRY_NUMBERS.every((key) => Number.isFinite(entry[key]))) return -1;
 	if (!["size", "offset", "evaluatedTo", "headLen"].every((key) => Number.isSafeInteger(entry[key]) && entry[key] >= 0)) return -1;
 	if (entry.offset > entry.evaluatedTo || entry.evaluatedTo > entry.size || entry.headLen > Math.min(entry.size, 4096)) return -1;
@@ -651,7 +633,7 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			entry.checkedMs = clock.now();
 			// Keep any last published total for a missing file, but never resume or compare a malformed cursor.
 			const canResume = !isTaskOnlyEntry(entry) || (sameFile && !entry.gone);
-			const from = canResume && hasNumericCursor(entry) ? entry : undefined;
+			const from = canResume && hasStatCursor(entry) ? entry : undefined;
 			let result;
 			let bytesRead = 0;
 			try {
@@ -680,10 +662,10 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 				admit(entry, entry.gone ? previousSlots : 0);
 				return 0;
 			}
-			const restart = isRestart(from, result);
 			entry.state = "ok";
 			entry.gone = false;
-			entry.complete = result.done === true || (!restart && entry.complete === true);
+			// The cursor may restart without withdrawing the last publication.
+			entry.complete = result.done === true || entry.complete === true;
 			entry.size = result.size;
 			entry.mtimeMs = result.mtimeMs;
 			entry.offset = result.offset;
@@ -697,9 +679,8 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			entry.evaluatedTo = result.evaluatedTo;
 			entry.scanOffset = result.scanOffset;
 			entry.partial = result.partial;
-			entry.pending = result.pending === true;
+			entry.pending = result.pending === true || (!result.done && entry.published !== null);
 			if (result.done === true) entry.published = result.effective;
-			else if (restart) entry.published = null;
 			const slots = boundedModels(entry, USAGE_INDEX_MODEL_BUDGET - named, entry.pending && entry.published !== null);
 			admit(entry, slots);
 			return result.bytesRead;

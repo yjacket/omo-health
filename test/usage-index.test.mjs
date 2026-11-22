@@ -890,6 +890,73 @@ test("a file replaced with the same size and mtime is not fresh and is recounted
 	assert.equal(index.fresh(index.get(key("s1"))), true);
 });
 
+test("inode changes above 2^53 invalidate freshness and restart the reader", (t) => {
+	const { fileOf, indexOf } = setup(t);
+	const file = fileOf();
+	const indexFile = fileOf("usage.json");
+	const text = `${line()}\n`;
+	writeText(file, text);
+	const first = 2n ** 60n + 1n;
+	const second = first + 1n;
+	assert.equal(Number(first), Number(second), "numeric stat cannot distinguish these IDs");
+	let ino = first;
+	const { statSync, fstatSync } = fs;
+	const realIno = statSync(file, { bigint: true }).ino;
+	t.mock.method(fs, "statSync", (path, options) => {
+		const stat = statSync(path, options);
+		if (path === file) stat.ino = options?.bigint ? ino : Number(ino);
+		return stat;
+	});
+	t.mock.method(fs, "fstatSync", (fd, options) => {
+		const stat = fstatSync(fd, options);
+		if (stat.ino === (options?.bigint ? realIno : Number(realIno))) stat.ino = options?.bigint ? ino : Number(ino);
+		return stat;
+	});
+	const index = indexOf();
+	index.update(sub("s1"), file);
+	assert.equal(index.fresh(index.get(key("s1"))), true);
+	index.save();
+
+	const reopened = indexOf();
+	const entry = reopened.get(key("s1"));
+	assert.equal(reopened.fresh(entry), true, "an exact ID survives reload");
+	ino = second; // Keep size and both timestamps unchanged.
+	const wasFresh = reopened.fresh(entry);
+	const scanned = reopened.update(sub("s1"), file);
+	assert.deepEqual([wasFresh, scanned], [false, Buffer.byteLength(text)]);
+	assert.equal(parseIndex(fs.readFileSync(indexFile, "utf8")).entries.s1.ino, first.toString());
+	assert.equal(reopened.get(key("s1")).ino, second.toString());
+	assert.equal(reopened.fresh(reopened.get(key("s1"))), true);
+});
+
+test("a persisted inode must be an exact decimal string or be recounted once", (t) => {
+	const { fileOf, indexOf } = setup(t);
+	const file = fileOf();
+	const indexFile = fileOf("usage.json");
+	const text = `${line()}\n`;
+	writeText(file, text);
+	const index = indexOf();
+	index.update(sub("s1"), file);
+	index.save();
+	const original = fs.readFileSync(indexFile, "utf8");
+	const exact = fs.statSync(file, { bigint: true }).ino.toString();
+	for (const invalid of [Number(exact), `+${exact}`, `${exact}.0`]) {
+		const data = parseIndex(original);
+		data.entries.s1.ino = invalid;
+		writeText(indexFile, indexText(data));
+		const reopened = indexOf();
+		const entry = reopened.get(key("s1"));
+		assert.equal(reopened.fresh(entry), false);
+		assert.equal(compactUsage(entry), null);
+		assert.equal(reopened.update(sub("s1"), file), Buffer.byteLength(text));
+		assert.equal(reopened.save(), true);
+		const repaired = indexOf();
+		assert.equal(repaired.get(key("s1")).ino, exact);
+		assert.equal(repaired.fresh(repaired.get(key("s1"))), true);
+		assert.equal(repaired.update(sub("s1"), file), 0);
+	}
+});
+
 test("a valid final record without a newline is published and stays published through reload and its newline", (t) => {
 	const { fileOf, indexOf } = setup(t);
 	const file = fileOf();
@@ -1549,9 +1616,9 @@ test("(IS-4, IS-12) a failed usage read still spends the tick's scan budget", (t
 		descriptors.set(fd, file === files.get("broken") ? "broken" : file === files.get("next") ? "next" : undefined);
 		return fd;
 	});
-	t.mock.method(fs, "fstatSync", (fd, ...args) => {
-		const stat = fstatSync(fd, ...args);
-		return descriptors.get(fd) ? { ...stat, size: USAGE_TICK_BYTES } : stat;
+	t.mock.method(fs, "fstatSync", (fd, options) => {
+		const stat = fstatSync(fd, options);
+		return descriptors.get(fd) ? { ...stat, size: options?.bigint ? BigInt(USAGE_TICK_BYTES) : USAGE_TICK_BYTES } : stat;
 	});
 	let brokenScanReads = 0;
 	t.mock.method(fs, "readSync", (fd, buffer, offset, length, position) => {
