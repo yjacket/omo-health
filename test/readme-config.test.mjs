@@ -6,7 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { DEFAULT_CONFIG, loadConfig } from "../src/config.mjs";
 
-const SECTIONS = ["align", "monitorOrphans", "reflectionOrphans", "crashResume", "analyst", "baseline", "respawn"];
+const SECTIONS = ["align", "monitorOrphans", "reflectionOrphans", "crashResume", "analyst", "baseline", "respawn", "audit"];
 
 function sampleConfigText() {
 	const readme = fs.readFileSync(new URL("../README.md", import.meta.url), "utf8");
