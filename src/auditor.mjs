@@ -8,7 +8,7 @@ import { ANALYST_POLL_MS, parseAnalystOutput, unavailableReason } from "./judge/
 import { laneArgs } from "./judge/lane.mjs";
 import { usageEntryOf } from "./session-record.mjs";
 import { auditReasonLabel } from "./ui/labels.mjs";
-import { fresh, isSpillModelKey, relatedUsageEntries } from "./usage-index.mjs";
+import { fresh, isSpillModelKey, readUsageIndex, relatedUsageEntries } from "./usage-index.mjs";
 import { atomicWriteFile, atomicWriteJson, ensureDir, listDirSafe, readJsonSafe, readTextSafe, removeSafe, statSafe } from "./util/fsx.mjs";
 import { redact, truncate } from "./util/text.mjs";
 
@@ -366,9 +366,10 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		pending = { record, changedVersions, ...Promise.withResolvers() };
 		try {
 			if (!worker) {
-				const owner = worker = createWorker(new URL("./audit-prepare-worker.mjs", import.meta.url), {
+				worker = createWorker(new URL("./audit-prepare-worker.mjs", import.meta.url), {
 					workerData: { paths, auditPrepareWorker: true }, execArgv: [], resourceLimits: { maxOldGenerationSizeMb: 64 },
 				});
+				const owner = worker;
 				owner.on("message", (result) => {
 					if (worker !== owner || !pending) return;
 					pending.result = result;
@@ -379,7 +380,9 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 				owner.on("exit", (code) => lostWorker(owner, `preparation worker exited (${code})`));
 			}
 			worker.ref();
-			worker.postMessage({ sessionId: record.sessionId, now, indexEntries: relatedUsageEntries(index, record.sessionId), indexFull: index?.full === true, bounds: {
+			// The daemon passes its resident index; an auditor built without one reads the file here, never in the worker.
+			const source = index ?? readUsageIndex(paths.health.usageIndexFile);
+			worker.postMessage({ sessionId: record.sessionId, now, indexEntries: relatedUsageEntries(source, record.sessionId), indexFull: source?.full === true, bounds: {
 				messageScanMaxBytes: timelineMaxBytes, messageScanTotalBytes: MESSAGE_SCAN_TOTAL_BYTES,
 				descendantScanMax: DESCENDANT_SCAN_MAX, tokens: config.tokens,
 			} });
