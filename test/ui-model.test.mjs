@@ -142,6 +142,26 @@ function endedDetailFunctions(names, globals) {
 	return runInNewContext(`${functions.join("\n")}\n({ ${names.map((name) => `${name}: typeof ${name} === "function" ? ${name} : undefined`).join(", ")} })`, globals);
 }
 
+it("plan78: 81- and 300-character history IDs survive browser keys, detail URLs and audit bodies", () => {
+	const ids = ["x".repeat(80) + "A", "x".repeat(299) + "B"];
+	const posts = [];
+	const { endedItem, endedDetailUrl, startAudit } = endedDetailFunctions(
+		["endedDetailId", "endedDetailUrl", "endedItem", "startAudit"], {
+			el: (tag, attrs, ...children) => ({ tag, ...attrs, children: children.flat() }),
+			openEnded: new Set(), endedDetails: new Map(), cellClass() {},
+			ENDED_COLUMNS: Array(6).fill("column"), when() {}, endedSessionCell() {}, outcomeMark() {}, endedTokenCell() {}, show() {},
+			append: (body, children) => Object.assign(body, { children }),
+			post: (url, body) => posts.push([url, body.sessionId]),
+		},
+	);
+	const rows = ids.map((sessionId) => endedRow({ sessionId, endedMs: NOW }));
+	const rendered = rows.map(endedItem);
+	rows.forEach(startAudit);
+	assert.deepEqual(rendered.map(({ children: [row] }) => row.children[0].children[0]["data-key"]), ids.map((id) => `ended:${id}`));
+	assert.deepEqual(rows.map(endedDetailUrl), ids.map((id) => `/api/session?id=${id}`));
+	assert.deepEqual(posts, ids.map((id) => ["/api/audit", id]));
+});
+
 it("IS-10 unconfirmed: the app audit block renders the overdue status when flagged", () => {
 	const el = (tag, attrs, ...children) => ({ tag, attrs, children });
 	const { auditBlock } = endedDetailFunctions(["auditBlock", "auditProgress"], {

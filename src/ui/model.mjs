@@ -142,6 +142,7 @@ function listDeathRecords(dir) {
 
 const short = (id) => (typeof id === "string" && id ? id.slice(0, 8) : null);
 const text = (v, max = LINE_MAX) => (typeof v === "string" && v ? v.slice(0, max) : null);
+const exactId = (v) => typeof v === "string" && v ? v : null;
 const lines = (list) => (Array.isArray(list) ? list.filter((line) => typeof line === "string" && line).slice(0, MAX_LINES).map((line) => line.slice(0, LINE_MAX)) : []);
 /** Free text from the snapshot or the ledger as the page shows it: whitespace folded, credentials masked, bounded. */
 const clean = (v, max = LINE_MAX) => {
@@ -206,7 +207,7 @@ function childRow(c, depth = 0) {
 	const children = depth < CHILD_DEPTH_MAX && Array.isArray(c.children) ? c.children.filter(isRecord).map((child) => childRow(child, depth + 1)) : [];
 	return {
 		taskId: text(c.taskId, 80),
-		sessionId: text(c.sessionId, 80),
+		sessionId: exactId(c.sessionId),
 		sessionShort: short(c.sessionId),
 		name: clean(c.name, 120) ?? text(c.taskId, 80) ?? "?",
 		category: clean(c.category, 60),
@@ -228,7 +229,7 @@ function sessionRow(s) {
 	const cwd = clean(s.cwd, 300);
 	const children = (Array.isArray(s.children) ? s.children : []).filter(isRecord).map((c) => childRow(c));
 	return {
-		sessionId: text(s.sessionId, 80),
+		sessionId: exactId(s.sessionId),
 		sessionShort: short(s.sessionId),
 		title: clean(s.title, TITLE_MAX) ?? short(s.sessionId) ?? "(제목 없음)",
 		titleSource: typeof s.titleSource === "string" ? s.titleSource.slice(0, 20) : "none",
@@ -283,10 +284,10 @@ export function endedRow(r, childRows = 0, usage = null, trees = null, full = us
 	const overflow = tokens !== null && !Number.isFinite(tokens.total);
 	const treeOverflow = tree !== null && !Number.isFinite(tree);
 	return {
-		sessionId: text(r.sessionId, 80),
+		sessionId: exactId(r.sessionId),
 		sessionShort: short(r.sessionId),
 		kind: r.kind === "child" ? "child" : "main",
-		parentSessionId: text(r.parentSessionId, 80),
+		parentSessionId: exactId(r.parentSessionId),
 		parentShort: short(r.parentSessionId),
 		taskId: text(r.taskId, 80),
 		title: clean(r.title, TITLE_MAX) ?? short(r.sessionId) ?? "(제목 없음)",

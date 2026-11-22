@@ -8,7 +8,7 @@ import path from "node:path";
 import { Worker } from "node:worker_threads";
 import { afterEach, test } from "node:test";
 import { AUDIT_CONTRACT, REQUEST_TTL_MS, auditsToday, createAuditor, readAuditState, requestAudit } from "../src/auditor.mjs";
-import { safeSubjectId } from "../src/session-id.mjs";
+import { auditFileKey, safeSubjectId } from "../src/session-id.mjs";
 import { createSessionFileLocator } from "../src/collect/session-files.mjs";
 import { usageTimeline } from "../src/collect/usage.mjs";
 import { DEFAULT_CONFIG } from "../src/config.mjs";
@@ -145,7 +145,7 @@ function harness({ providers = ["anthropic-subscription", "openai", "google", "x
 		state.now += 1;
 		return claim;
 	};
-	h.record = (id) => readJsonSafe(path.join(paths.health.auditsDir, `${id}.json`));
+	h.record = (id) => readJsonSafe(path.join(paths.health.auditsDir, `${auditFileKey(id)}.json`));
 	h.budget = () => readJsonSafe(paths.health.auditBudgetFile);
 	h.jobsOf = (id) => h.runner.starts.filter((start) => start.jobId.endsWith(`-${id}`));
 	return h;
@@ -505,7 +505,7 @@ test("a request becomes queued, then running with the marker, the guard flags an
 	assert.deepEqual([marker.kind, marker.sessionId, marker.model, marker.jobId], ["audit", record.laneSessionId, record.model, record.jobId]);
 	assert.deepEqual(h.budget().jobs, [record.jobId]);
 	assert.equal(h.budget().count, 1);
-	assert.equal(fs.existsSync(path.join(h.paths.health.auditRequestsDir, "m1.json")), false, "the request is consumed");
+	assert.equal(fs.existsSync(path.join(h.paths.health.auditRequestsDir, `${auditFileKey("m1")}.json`)), false, "the request is consumed");
 
 	h.runner.script = () => DONE;
 	h.tick(a);
@@ -835,7 +835,7 @@ test("(IS-10) only a confirmed non-launch refunds, even when its poll result is 
 	assert.deepEqual(h.budget(), refundedBudget);
 
 	// Replay the running record left by a crash after the budget write but before the failure record write.
-	fs.writeFileSync(path.join(h.paths.health.auditsDir, "m2.json"), JSON.stringify(running));
+	fs.writeFileSync(path.join(h.paths.health.auditsDir, `${auditFileKey("m2")}.json`), JSON.stringify(running));
 	h.tick(h.auditor());
 	assert.deepEqual([h.record("m2").status, h.record("m2").reason], ["failed", "spawn-error"]);
 	assert.deepEqual(h.budget(), refundedBudget);
@@ -1568,7 +1568,7 @@ test("an expired request ends failed expired and starts nothing", () => {
 	assert.equal(h.record("m1").reason, "expired");
 	assert.equal(h.record("m1").status, "failed");
 	assert.equal(h.runner.starts.length, 0);
-	assert.equal(fs.existsSync(path.join(h.paths.health.auditRequestsDir, "m1.json")), false);
+	assert.equal(fs.existsSync(path.join(h.paths.health.auditRequestsDir, `${auditFileKey("m1")}.json`)), false);
 });
 
 test("an invalid request file is deleted", () => {
@@ -1577,9 +1577,9 @@ test("an invalid request file is deleted", () => {
 	fs.mkdirSync(h.paths.health.auditRequestsDir, { recursive: true });
 	const bad = [
 		["x.json", "not json"],
-		["m1.json", JSON.stringify({ v: 1, sessionId: "m2", requestedMs: BASE })],
+		[`${auditFileKey("m1")}.json`, JSON.stringify({ v: 1, sessionId: "m2", requestedMs: BASE })],
 		["..%2f.json", JSON.stringify({ v: 1, sessionId: "../x", requestedMs: BASE })],
-		["m3.json", JSON.stringify({ v: 2, sessionId: "m3", requestedMs: BASE })],
+		[`${auditFileKey("m3")}.json`, JSON.stringify({ v: 2, sessionId: "m3", requestedMs: BASE })],
 	];
 	for (const [name, text] of bad) fs.writeFileSync(path.join(h.paths.health.auditRequestsDir, name), text);
 	h.tick(a);
@@ -1595,7 +1595,7 @@ test("a duplicate request while running is deleted and keeps the original job", 
 	const jobId = h.record("m1").jobId;
 	h.request("m1");
 	h.tick(a);
-	assert.equal(fs.existsSync(path.join(h.paths.health.auditRequestsDir, "m1.json")), false);
+	assert.equal(fs.existsSync(path.join(h.paths.health.auditRequestsDir, `${auditFileKey("m1")}.json`)), false);
 	assert.equal(h.record("m1").jobId, jobId);
 	assert.equal(h.record("m1").status, "running");
 	assert.equal(h.runner.starts.length, 1);
@@ -1613,7 +1613,7 @@ test("a failed first kill is retried by the restarted daemon, and the second aud
 	h.tick(a);
 	h.tick(a);
 	assert.equal(h.runner.terminates.length, 1, "the first taskkill was sent and failed; alive stays true");
-	const recordFile = path.join(h.paths.health.auditsDir, "m1.json");
+	const recordFile = path.join(h.paths.health.auditsDir, `${auditFileKey("m1")}.json`);
 	const { terminationUnconfirmed, deadlineMs, ...record } = h.record("m1");
 	fs.writeFileSync(recordFile, JSON.stringify({ ...record, status: "failed", reason: "timeout", finishedMs: h.state.now }));
 	await a.close();
@@ -1642,7 +1642,7 @@ test("a retry request during a timeout hold is deleted across a restart, and is 
 	const jobId = h.record("m1").jobId;
 	h.request("m1");
 	h.tick(a);
-	assert.equal(fs.existsSync(path.join(h.paths.health.auditRequestsDir, "m1.json")), false);
+	assert.equal(fs.existsSync(path.join(h.paths.health.auditRequestsDir, `${auditFileKey("m1")}.json`)), false);
 	const b = h.auditor();
 	h.tick(b);
 	assert.deepEqual([h.record("m1").jobId, h.record("m1").holdUntilExit], [jobId, true]);
@@ -1667,7 +1667,7 @@ test("a duplicate request while launching with adoptJob throwing is deleted: sam
 	const jobId = h.record("m1").jobId;
 	h.request("m1");
 	h.tick(b);
-	assert.equal(fs.existsSync(path.join(h.paths.health.auditRequestsDir, "m1.json")), false);
+	assert.equal(fs.existsSync(path.join(h.paths.health.auditRequestsDir, `${auditFileKey("m1")}.json`)), false);
 	assert.equal(h.record("m1").jobId, jobId);
 	assert.equal(h.record("m1").status, "launching");
 	assert.equal(h.runner.starts.length, 1);
@@ -1820,7 +1820,8 @@ test("a duplicate audit request cannot replace the first claim", (t) => {
 	const h = harness();
 	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
 	const dir = h.paths.health.auditRequestsDir;
-	const file = path.join(dir, "m1.json");
+	const name = `${auditFileKey("m1")}.json`;
+	const file = path.join(dir, name);
 	const first = requestAudit(h.paths, "m1", BASE);
 	const before = fs.readFileSync(file);
 	const second = requestAudit(h.paths, "m1", BASE + 1);
@@ -1828,15 +1829,15 @@ test("a duplicate audit request cannot replace the first claim", (t) => {
 	assert.deepEqual(first, { created: true, request: { v: 1, sessionId: "m1", requestedMs: BASE, claimId: first.request.claimId } });
 	assert.match(first.request.claimId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 	assert.deepEqual(second, { created: false });
-	assert.deepEqual(fs.readdirSync(dir), ["m1.json"]);
+	assert.deepEqual(fs.readdirSync(dir), [name]);
 });
 
-test("plan77: direct audit requests and daemon intake reject unsafe file stems", async (t) => {
+test("plan77: direct audit requests and daemon intake reject invalid session IDs", async (t) => {
 	const h = harness({ sessions: [] });
 	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
 	const { paths } = h;
 	const directAccepted = [];
-	for (const id of [".", "..", "../x", "a/b", "a\\b", "%2e%2e", "x.", "a\0b", "a\n", "x".repeat(81), "con", "nul.txt"]) {
+	for (const id of [".", "..", "../x", "a/b", "a\\b", "%2e%2e", "x.", "a\0b", "a\n", "x".repeat(1025)]) {
 		try {
 			requestAudit(paths, id, BASE);
 			directAccepted.push(id);
@@ -1859,11 +1860,11 @@ test("plan77: direct audit requests and daemon intake reject unsafe file stems",
 test("request helpers: safeSubjectId, the atomic request file and the state a request, a running record and a finished record show", async () => {
 	const h = harness();
 	assert.equal(safeSubjectId("abc-1.2_x"), "abc-1.2_x");
-	for (const bad of ["", "../x", "a/b", "a b", "_budget", 5, null, "x".repeat(200)]) assert.equal(safeSubjectId(bad), null, String(bad));
+	for (const bad of ["", "../x", "a/b", "a b", "_budget", 5, null, "x".repeat(1025)]) assert.equal(safeSubjectId(bad), null, String(bad));
 	assert.throws(() => requestAudit(h.paths, "../x", BASE));
 	assert.equal(readAuditState(h.paths, "m1"), null);
 	const { request: { claimId } } = requestAudit(h.paths, "m1", BASE);
-	assert.deepEqual(readJsonSafe(path.join(h.paths.health.auditRequestsDir, "m1.json")), { v: 1, sessionId: "m1", requestedMs: BASE, claimId });
+	assert.deepEqual(readJsonSafe(path.join(h.paths.health.auditRequestsDir, `${auditFileKey("m1")}.json`)), { v: 1, sessionId: "m1", requestedMs: BASE, claimId });
 	assert.equal(readAuditState(h.paths, "m1").status, "requested");
 	const a = h.auditor();
 	await h.prepare(a);
@@ -1873,6 +1874,48 @@ test("request helpers: safeSubjectId, the atomic request file and the state a re
 	assert.equal(readAuditState(h.paths, "m1").status, "done");
 	requestAudit(h.paths, "m1", h.state.now);
 	assert.equal(readAuditState(h.paths, "m1").status, "requested", "a rerun request shows before the daemon takes it");
+});
+
+test("plan78: case-distinct audits keep separate verdicts across an auditor restart", async () => {
+	const ids = ["Review.1", "review.1"];
+	const h = harness({ sessions: [ids[0]] });
+	const otherDir = path.join(h.paths.sessionsDir, "other");
+	fs.mkdirSync(otherDir);
+	fs.renameSync(h.files[ids[0]], path.join(otherDir, path.basename(h.files[ids[0]])));
+	h.addSession(ids[1]);
+	const summaries = ["대문자 세션의 사용량은 적절했습니다.", "소문자 세션의 점검 결과는 정상이었습니다."];
+	const first = h.auditor();
+	for (const [i, id] of ids.entries()) {
+		assert.equal(h.request(id).created, true);
+		await h.prepare(first);
+		h.runner.script = () => ({ ...DONE, result: { ...DONE.result, summary: summaries[i] } });
+		const owner = i === 0 ? first : h.auditor();
+		if (owner !== first) await first.close();
+		h.tick(owner);
+	}
+	assert.equal(h.runner.starts.length, 2);
+	assert.deepEqual(ids.map((id) => {
+		const record = readAuditState(h.paths, id);
+		return [record?.sessionId, record?.status, record?.result?.summary];
+	}), ids.map((id, i) => [id, "done", summaries[i]]));
+});
+
+test("plan78: mismatched on-disk audit identities are ignored by readers and restart", () => {
+	const h = harness({ sessions: [] });
+	const { auditsDir, auditRequestsDir } = h.paths.health;
+	assert.equal(requestAudit(h.paths, "m1", BASE - REQUEST_TTL_MS - 1).created, true);
+	const [name] = fs.readdirSync(auditRequestsDir);
+	const first = h.auditor();
+	first.tick(BASE);
+	assert.equal(readAuditState(h.paths, "m1").reason, "expired");
+	fs.writeFileSync(path.join(auditsDir, name), JSON.stringify({
+		v: 1, sessionId: "m2", status: "launching", jobId: "wrong-audit", laneSessionId: "wrong-lane", launchMs: BASE,
+	}));
+	fs.writeFileSync(path.join(auditRequestsDir, name), JSON.stringify({ v: 1, sessionId: "m2", requestedMs: BASE }));
+	const restarted = h.auditor();
+	restarted.tick(BASE);
+	assert.deepEqual([readAuditState(h.paths, "m1"), readAuditState(h.paths, "m2"), restarted.busy(), h.runner.adopts, fs.readdirSync(auditRequestsDir)],
+		[null, null, false, [], []]);
 });
 
 test("IS-8: a config reload after audit preparation still hides current D4 thresholds", async (t) => {

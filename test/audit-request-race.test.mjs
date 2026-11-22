@@ -6,6 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import { auditFileKey } from "../src/session-id.mjs";
 
 const contender = `
 	import fs from "node:fs";
@@ -46,6 +47,7 @@ test("only one of two processes released by the same signal claims the audit", a
 	}));
 	// The baseline returns the request itself for every successful write.
 	assert.deepEqual(results.map((result) => result.created ?? Boolean(result)).sort(), [false, true]);
-	assert.deepEqual(fs.readdirSync(dir), ["same-id.json"]);
-	assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, "same-id.json"), "utf8")), results.find((result) => result.created).request);
+	const name = `${auditFileKey("same-id")}.json`;
+	assert.deepEqual(fs.readdirSync(dir), [name]);
+	assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, name), "utf8")), results.find((result) => result.created).request);
 });

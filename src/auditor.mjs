@@ -7,7 +7,7 @@ import { createInvestigations } from "./investigations.mjs";
 import { auditBundle, auditDocument, detectorFindingRefs, firedDetectors, hasDetectorCoverage, resolveAuditModel, validateAudit } from "./judge/audit.mjs";
 import { ANALYST_POLL_MS, parseAnalystOutput, unavailableReason } from "./judge/analyst.mjs";
 import { laneArgs } from "./judge/lane.mjs";
-import { safeSubjectId } from "./session-id.mjs";
+import { auditFileKey } from "./session-id.mjs";
 import { collectAnalystDecisionModels, configDecisionFact, recoverPendingAnalystModels, usageEntryOf } from "./session-record.mjs";
 import { auditReasonLabel } from "./ui/labels.mjs";
 import { fresh, isSpillModelKey, readUsageIndex, relatedUsageEntries } from "./usage-index.mjs";
@@ -54,13 +54,23 @@ function readBudget(paths, now) {
 	return { day, count: 0, jobs: [], refunded: [] };
 }
 
+function auditFileName(sessionId) {
+	const key = auditFileKey(sessionId);
+	return key === null ? null : `${key}.json`;
+}
+
+function readNamedRequest(dir, name) {
+	const request = readJsonSafe(path.join(dir, name));
+	return request?.v === 1 && auditFileName(request.sessionId) === name && Number.isFinite(request.requestedMs) ? request : null;
+}
+
 /** Publish a complete request without replacing an existing claim for the id. */
 export function requestAudit(paths, sessionId, nowMs) {
-	const id = safeSubjectId(sessionId);
-	if (!id) throw new Error("invalid session id");
-	const request = { v: 1, sessionId: id, requestedMs: nowMs, claimId: crypto.randomUUID() };
+	const name = auditFileName(sessionId);
+	if (name === null) throw new Error("invalid session id");
+	const request = { v: 1, sessionId, requestedMs: nowMs, claimId: crypto.randomUUID() };
 	const dir = ensureDir(paths.health.auditRequestsDir);
-	const file = path.join(dir, `${id}.json`);
+	const file = path.join(dir, name);
 	const temp = path.join(dir, `.${request.claimId}.tmp`);
 	try {
 		fs.writeFileSync(temp, `${JSON.stringify(request, null, 2)}\n`, { flag: "wx" });
@@ -78,24 +88,25 @@ export function requestAudit(paths, sessionId, nowMs) {
 
 /** Withdraw a claim only if the pending request still belongs to that caller. */
 export function withdrawAuditRequest(paths, sessionId, claimId) {
-	const id = safeSubjectId(sessionId);
-	if (!id || typeof claimId !== "string") return;
-	const file = path.join(paths.health.auditRequestsDir, `${id}.json`);
+	const name = auditFileName(sessionId);
+	if (name === null || typeof claimId !== "string") return;
+	const file = path.join(paths.health.auditRequestsDir, name);
 	const pending = readJsonSafe(file);
-	if (pending?.v === 1 && pending.sessionId === id && pending.claimId === claimId) removeSafe(file);
+	if (pending?.v === 1 && pending.sessionId === sessionId && pending.claimId === claimId) removeSafe(file);
 }
 
 /** The session's audit record; an active one wins, else a waiting request, else the last finished record, else null. */
 export function readAuditState(paths, sessionId) {
-	const id = safeSubjectId(sessionId);
-	if (!id) return null;
-	const record = readJsonSafe(path.join(paths.health.auditsDir, `${id}.json`));
+	const name = auditFileName(sessionId);
+	if (name === null) return null;
+	const raw = readJsonSafe(path.join(paths.health.auditsDir, name));
+	const record = raw?.sessionId === sessionId ? raw : null;
 	const held = record?.holdUntilExit === true;
 	if (!record || (!ACTIVE.has(record.status) && !held)) {
-		const request = readJsonSafe(path.join(paths.health.auditRequestsDir, `${id}.json`));
-		if (request?.v === 1 && request.sessionId === id) {
+		const request = readNamedRequest(paths.health.auditRequestsDir, name);
+		if (request?.sessionId === sessionId) {
 			const { requestedMs, claimId } = request;
-			return { v: 1, sessionId: id, status: "requested", requestedMs, ...(typeof claimId === "string" ? { claimId } : {}) };
+			return { v: 1, sessionId, status: "requested", requestedMs, ...(typeof claimId === "string" ? { claimId } : {}) };
 		}
 	}
 	if (record?.status === "failed" && record.reason) return { ...record, reasonKo: auditReasonLabel(record.reason) };
@@ -104,7 +115,8 @@ export function readAuditState(paths, sessionId) {
 
 /** Audits charged today (UTC) plus requests still waiting for the daemon. */
 export function auditsToday(paths, nowMs) {
-	const pending = listDirSafe(paths.health.auditRequestsDir).filter((name) => name.endsWith(".json")).length;
+	const dir = paths.health.auditRequestsDir;
+	const pending = listDirSafe(dir).filter((name) => name.endsWith(".json") && readNamedRequest(dir, name)).length;
 	return readBudget(paths, nowMs).count + pending;
 }
 
@@ -279,9 +291,9 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 	let lastPruneMs = clock.now();
 
 	const recordFile = (sessionId) => {
-		const id = safeSubjectId(sessionId);
-		if (id === null) throw new Error("invalid session id");
-		return path.join(auditsDir, `${id}.json`);
+		const name = auditFileName(sessionId);
+		if (name === null) throw new Error("invalid session id");
+		return path.join(auditsDir, name);
 	};
 	const save = (record) => atomicWriteJson(recordFile(record.sessionId), record);
 	const bundleFileOf = (jobId) => path.join(jobsDir, jobId, "bundle.md");
@@ -310,7 +322,7 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 	for (const name of listDirSafe(auditsDir)) {
 		if (!name.endsWith(".json") || name.startsWith("_")) continue;
 		const record = readJsonSafe(path.join(auditsDir, name));
-		if (record?.v !== 1 || !safeSubjectId(record.sessionId) || typeof record.status !== "string") continue;
+		if (record?.v !== 1 || auditFileName(record.sessionId) !== name || typeof record.status !== "string") continue;
 		if (record.status === "failed" && record.reason === "timeout" && held(record)) resumeLegacyTimeout(record);
 		records.set(record.sessionId, record);
 	}
@@ -398,12 +410,12 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		for (const name of listDirSafe(dir)) {
 			if (!name.endsWith(".json")) continue;
 			const file = path.join(dir, name);
-			const request = readJsonSafe(file);
-			const id = safeSubjectId(request?.sessionId);
-			if (request?.v !== 1 || !id || `${id}.json` !== name || !Number.isFinite(request.requestedMs)) {
+			const request = readNamedRequest(dir, name);
+			if (!request) {
 				removeSafe(file);
 				continue;
 			}
+			const id = request.sessionId;
 			const existing = records.get(id);
 			if (existing && (ACTIVE.has(existing.status) || held(existing))) {
 				removeSafe(file);

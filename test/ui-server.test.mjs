@@ -16,6 +16,7 @@ import { resolvePaths } from "../src/paths.mjs";
 import { emptyUsage } from "../src/collect/usage.mjs";
 import { appendDecision } from "../src/decisions.mjs";
 import { BACKFILL_MARKER, backfillOnce } from "../src/session-backfill.mjs";
+import { auditFileKey } from "../src/session-id.mjs";
 import { appendEnded, readEnded } from "../src/session-ledger.mjs";
 import { createDetailWorker, createSessionDetail, createStartAudit } from "../src/ui/cli.mjs";
 import { buildEnded, daemonStatus, loadDaemonInputs, uiState } from "../src/ui/model.mjs";
@@ -681,11 +682,11 @@ describe("ui server", { timeout: 20_000 }, () => {
 	});
 
 	describe("audit", () => {
-		it("rejects extra keys, a non-string id, a malformed id and a reserved device name with 422", async () => {
+		it("rejects extra keys, a non-string id, a malformed id and an over-limit id with 422", async () => {
 			assert.equal((await postJson("/api/audit", { sessionId: KNOWN_ID, extra: 1 })).status, 422);
 			assert.equal((await postJson("/api/audit", { sessionId: 12345 })).status, 422);
 			assert.equal((await postJson("/api/audit", { sessionId: "..%2Fx" })).status, 422);
-			assert.equal((await postJson("/api/audit", { sessionId: "COM1" })).status, 422);
+			assert.equal((await postJson("/api/audit", { sessionId: "x".repeat(1025) })).status, 422);
 			assert.equal((await postJson("/api/audit", {})).status, 422);
 			assert.deepEqual(auditCalls, []);
 		});
@@ -740,7 +741,8 @@ describe("ui server", { timeout: 20_000 }, () => {
 				const worldPaths = resolvePaths(env);
 				const nowMs = Date.parse("2026-11-22T00:00:00.000Z");
 				const now = () => nowMs;
-				const sessionFile = path.join(worldPaths.sessionsDir, "slug", `2026-11-22T00-00-00-000Z_${sessionId}.jsonl`);
+				// Seed the usage index with a short transcript path when the ID cannot fit in a Windows path component.
+				const sessionFile = path.join(worldPaths.sessionsDir, "slug", `2026-11-22T00-00-00-000Z_${sessionId.length > 200 ? "indexed" : sessionId}.jsonl`);
 				fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
 				const sessionLines = [{ type: "session", id: sessionId }, ...(entries ?? [])];
 				fs.writeFileSync(sessionFile, `${sessionLines.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
@@ -795,8 +797,57 @@ describe("ui server", { timeout: 20_000 }, () => {
 			}
 
 			function requestFileOf(world) {
-				return path.join(world.paths.health.auditRequestsDir, `${AUDIT_ID}.json`);
+				return path.join(world.paths.health.auditRequestsDir, `${auditFileKey(AUDIT_ID)}.json`);
 			}
+
+			for (const length of [81, 300]) {
+				it(`plan78: ${length}-character history ID opens and queues that exact session`, async (t) => {
+					const sessionId = "x".repeat(length - 1) + "Z";
+					const world = makeWorld({ sessionId });
+					const { paths, env, now } = world;
+					const ui = createUiServer({ paths, token: TOKEN, getState: () => STATE, sessionDetail: world.detail, startAudit: world.startAudit, now });
+					const auditor = createAuditor({ paths, config: loadConfig({ paths, env }).config, clock: { now }, runner: {}, env });
+					t.after(async () => {
+						await Promise.all([ui.close(), world.detail.close(), auditor.close()]);
+						fs.rmSync(world.dir, { recursive: true, force: true });
+					});
+					const { port } = await ui.listen();
+					const detail = await getAt(port, `/api/session?id=${sessionId}`);
+					const posted = await postAt(port, "/api/audit", { sessionId });
+					assert.deepEqual([detail.status, posted.status], [200, 202]);
+					assert.equal(detail.body.session.sessionId, sessionId);
+					assert.equal(posted.body.audit.sessionId, sessionId);
+					auditor.tick(now());
+					const state = readAuditState(paths, sessionId);
+					assert.deepEqual([state?.status, state?.sessionId], ["queued", sessionId]);
+					assert.deepEqual(fs.readdirSync(paths.health.auditRequestsDir), []);
+				});
+			}
+
+			it("plan78: the dashboard shows each case-distinct row its own saved verdict", async (t) => {
+				const ids = ["Review.1", "review.1"];
+				const summaries = ["Uppercase verdict", "Lowercase verdict"];
+				const world = makeWorld({ sessionId: ids[0] });
+				const { paths, now } = world;
+				appendEnded(paths, { sessionId: ids[1], kind: "main", outcome: "answered", endedMs: now() }, { nowMs: now() });
+				for (const [i, id] of ids.entries()) {
+					assert.equal(requestAudit(paths, id, now()).created, true);
+					const [name] = fs.readdirSync(paths.health.auditRequestsDir);
+					fs.unlinkSync(path.join(paths.health.auditRequestsDir, name));
+					writeJson(path.join(paths.health.auditsDir, name), {
+						v: 1, sessionId: id, status: "done", result: { overall: "sound", summary: summaries[i] },
+					});
+				}
+				const ui = createUiServer({ paths, token: TOKEN, getState: () => STATE, sessionDetail: world.detail, now });
+				t.after(async () => {
+					await Promise.all([ui.close(), world.detail.close()]);
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				});
+				const { port } = await ui.listen();
+				const replies = await Promise.all(ids.map((id) => getAt(port, `/api/session?id=${id}`)));
+				assert.deepEqual(replies.map(({ status, body }) => [status, body.session?.sessionId, body.audit?.state?.sessionId, body.audit?.state?.result?.summary]),
+					ids.map((id, i) => [200, id, id, summaries[i]]));
+			});
 
 			it("plan77: dotted history opens and queues an audit without accepting unsafe IDs", async (t) => {
 				const sessionId = "review.1";
@@ -810,7 +861,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 				});
 				const { port } = await ui.listen();
 				const invalid = { status: 422, body: { error: "invalid" } };
-				for (const id of ["..", ".", "../x", "a/b", "a\\b", "%2e%2e", "con", "cOn.txt", "x.", "review ", "review\0x", "review\n", "x".repeat(81)]) {
+				for (const id of ["..", ".", "../x", "a/b", "a\\b", "%2e%2e", "x.", "review ", "review\0x", "review\n", "x".repeat(1025)]) {
 					assert.deepEqual(await getAt(port, `/api/session?id=${encodeURIComponent(id)}`), invalid, JSON.stringify(id));
 					assert.deepEqual(await postAt(port, "/api/audit", { sessionId: id }), invalid, JSON.stringify(id));
 				}
@@ -1221,7 +1272,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 					assert.equal(stalled.stalled, true);
 
 					fs.rmSync(requestFileOf(world), { force: true });
-					writeJson(path.join(world.paths.health.auditsDir, `${AUDIT_ID}.json`), {
+					writeJson(path.join(world.paths.health.auditsDir, `${auditFileKey(AUDIT_ID)}.json`), {
 						v: 1,
 						sessionId: AUDIT_ID,
 						status: "done",
@@ -1246,7 +1297,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 				const ui = createUiServer({ paths: world.paths, token: TOKEN, getState: () => STATE, sessionDetail: world.detail, now: world.now });
 				try {
 					const deadlineMs = world.nowMs - 30_000;
-					writeJson(path.join(world.paths.health.auditsDir, `${AUDIT_ID}.json`), {
+					writeJson(path.join(world.paths.health.auditsDir, `${auditFileKey(AUDIT_ID)}.json`), {
 						v: 1, sessionId: AUDIT_ID, status: "running", startedMs: deadlineMs - 900_000,
 						terminationUnconfirmed: true, deadlineMs,
 					});
@@ -1268,7 +1319,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 				const world = makeWorld();
 				const { config } = loadConfig({ paths: world.paths, env: world.env });
 				const deadlineMs = world.nowMs - 1;
-				writeJson(path.join(world.paths.health.auditsDir, `${AUDIT_ID}.json`), {
+				writeJson(path.join(world.paths.health.auditsDir, `${auditFileKey(AUDIT_ID)}.json`), {
 					v: 1, sessionId: AUDIT_ID, status: "running", startedMs: deadlineMs - config.audit.timeoutMs,
 					jobId: "audit-lost-meta", model: "openai/gpt-review:high", laneSessionId: "audit-lane",
 				});
@@ -1302,7 +1353,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 				const world = makeWorld();
 				const { config } = loadConfig({ paths: world.paths, env: world.env });
 				const deadlineMs = world.nowMs - 1;
-				writeJson(path.join(world.paths.health.auditsDir, `${AUDIT_ID}.json`), {
+				writeJson(path.join(world.paths.health.auditsDir, `${auditFileKey(AUDIT_ID)}.json`), {
 					v: 1, sessionId: AUDIT_ID, status: "launching", launchMs: deadlineMs - config.audit.timeoutMs,
 					jobId: "audit-interrupted-launch", model: "openai/gpt-review:high", laneSessionId: "audit-lane",
 				});
@@ -1538,7 +1589,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 						assert.deepEqual([accepted.status, accepted.body.audit.sessionId], [202, world.sessionId], `${first} must be accepted as the canonical session`);
 						const refused = await postAt(auditPort, "/api/audit", { sessionId: second });
 						assert.deepEqual([refused.status, refused.body.error], [409, "running"], `${second} must find the first request`);
-						assert.deepEqual(fs.readdirSync(world.paths.health.auditRequestsDir), [`${world.sessionId}.json`]);
+						assert.deepEqual(fs.readdirSync(world.paths.health.auditRequestsDir), [`${auditFileKey(world.sessionId)}.json`]);
 					} finally {
 						await auditServer.close();
 						fs.rmSync(world.dir, { recursive: true, force: true });
@@ -1553,7 +1604,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 					path.join(world.paths.health.sessionsDir, "ended-2026-11-22.jsonl"),
 					`${JSON.stringify({ v: 1, sessionId: world.sessionId, taskId: world.taskId, kind: "child", outcome: "answered", startedMs: world.now() - 1_000, endedMs: world.now() })}\n`,
 				);
-				writeJson(path.join(world.paths.health.auditRequestsDir, `${world.sessionId}.json`), { v: 1, sessionId: world.sessionId, requestedMs: world.now() - 1_000 });
+				writeJson(path.join(world.paths.health.auditRequestsDir, `${auditFileKey(world.sessionId)}.json`), { v: 1, sessionId: world.sessionId, requestedMs: world.now() - 1_000 });
 				const auditServer = createUiServer({
 					paths: world.paths,
 					token: TOKEN,
@@ -1591,7 +1642,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 					assert.equal(typeof pending.claimId, "string");
 					const again = await postAt(auditPort, "/api/audit", { sessionId: AUDIT_ID });
 					assert.deepEqual([again.status, again.body.error], [409, "running"]);
-					assert.deepEqual(fs.readdirSync(world.paths.health.auditRequestsDir), [`${AUDIT_ID}.json`]);
+					assert.deepEqual(fs.readdirSync(world.paths.health.auditRequestsDir), [`${auditFileKey(AUDIT_ID)}.json`]);
 				} finally {
 					await auditServer.close();
 					fs.rmSync(world.dir, { recursive: true, force: true });
@@ -1742,7 +1793,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 						auditor.tick(now() + 30_000);
 						auditor.tick(now() + 60_000);
 						assert.equal(starts.length, 1);
-						assert.deepEqual(fs.readdirSync(paths.health.auditsDir).filter((name) => !name.startsWith("_") && name.endsWith(".json")), [`${AUDIT_ID}.json`]);
+						assert.deepEqual(fs.readdirSync(paths.health.auditsDir).filter((name) => !name.startsWith("_") && name.endsWith(".json")), [`${auditFileKey(AUDIT_ID)}.json`]);
 						assert.equal(readAuditState(paths, AUDIT_ID).requestedMs, now());
 						assert.equal(readAuditState(paths, AUDIT_ID).status, "failed");
 						assert.deepEqual(JSON.parse(fs.readFileSync(paths.health.auditBudgetFile, "utf8")), {
@@ -1777,7 +1828,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 				const auditServer = createUiServer({ paths: world.paths, token: TOKEN, getState: () => STATE, startAudit: world.startAudit, now: world.now });
 				const { port: auditPort } = await auditServer.listen();
 				try {
-					writeJson(path.join(world.paths.health.auditsDir, `${AUDIT_ID}.json`), { v: 1, sessionId: AUDIT_ID, status: "launching", requestedMs: world.nowMs - 1_000, jobId: "audit-1", model: "openai/gpt-review:high" });
+					writeJson(path.join(world.paths.health.auditsDir, `${auditFileKey(AUDIT_ID)}.json`), { v: 1, sessionId: AUDIT_ID, status: "launching", requestedMs: world.nowMs - 1_000, jobId: "audit-1", model: "openai/gpt-review:high" });
 					const posted = await postAt(auditPort, "/api/audit", { sessionId: AUDIT_ID });
 					assert.deepEqual([posted.status, posted.body], [409, { error: "running", reasonKo: "이미 조사 중입니다" }]);
 					assert.equal(fs.existsSync(requestFileOf(world)), false);

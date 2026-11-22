@@ -8,6 +8,7 @@ import { Worker } from "node:worker_threads";
 import { createAuditor, requestAudit } from "../src/auditor.mjs";
 import { DEFAULT_CONFIG } from "../src/config.mjs";
 import { resolvePaths } from "../src/paths.mjs";
+import { auditFileKey } from "../src/session-id.mjs";
 import { appendEnded } from "../src/session-ledger.mjs";
 import { createUsageIndex } from "../src/usage-index.mjs";
 import { E, writeJsonl } from "./helpers/fixtures.mjs";
@@ -66,7 +67,7 @@ function fixture(t, { bystanders = 0, indexed = false, bounds } = {}) {
 				auditor.tick(NOW);
 				await auditor.preparing();
 				auditor.tick(NOW);
-				return { observed, record: JSON.parse(fs.readFileSync(path.join(paths.health.auditsDir, "owner.json"), "utf8")),
+				return { observed, record: JSON.parse(fs.readFileSync(path.join(paths.health.auditsDir, `${auditFileKey("owner")}.json`), "utf8")),
 					charged: fs.existsSync(paths.health.auditBudgetFile) };
 			} finally {
 				await auditor.close();
