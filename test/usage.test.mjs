@@ -108,10 +108,10 @@ function appendRaw(file, text) {
 
 /** Independent oracle: JSON.parse every line and apply IS-1 by hand. */
 function oracleTotals(file) {
-	const text = fs.readFileSync(file, "utf8");
+	const text = fs.readFileSync(file, "utf8").replace(/^\uFEFF/, "");
 	const totals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0, costUnknown: false, turns: 0 };
 	for (const raw of text.split("\n")) {
-		const line = raw.replace(/^\uFEFF/, "").replace(/\r$/, "");
+		const line = raw.replace(/\r$/, "");
 		if (!line.trim()) continue;
 		let entry;
 		try {
@@ -1180,6 +1180,134 @@ test("(gate 7) a non-coercible provider bills a >16 MiB record under an unreadab
 	assert.deepEqual(got.usedModels, {});
 	assert.deepEqual(got.diagnostics, { badLines: 0, skippedLines: 0 });
 	assert.deepEqual(usageTimeline(file()).totals, got);
+});
+
+const gate8Message = (message = {}, entry = {}) => JSON.stringify({
+	type: "message", message: { ...gate7Message, ...message }, ...entry,
+});
+
+function gate8Parity(file, text) {
+	fs.writeFileSync(file, text);
+	const expected = emptyUsage();
+	for (const line of text.replace(/^\uFEFF/, "").split("\n")) {
+		if (!line.trim()) continue;
+		let entry;
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			expected.diagnostics.badLines += 1;
+			continue;
+		}
+		const hit = usageOfEntry(entry);
+		if (hit) addUsage(expected, hit);
+		const models = modelsOfEntry(entry);
+		expected.modelsIncomplete ||= models.incomplete;
+		for (const id of models.ids) expected.usedModels[id] = true;
+	}
+	const got = readUsage(file).effective;
+	const timeline = usageTimeline(file);
+	for (const [reader, totals] of [["readUsage", got], ["usageTimeline", timeline.totals]]) {
+		assert.deepEqual(core(totals), core(expected), reader);
+		assert.equal(totals.diagnostics.badLines, expected.diagnostics.badLines, reader);
+	}
+	return timeline;
+}
+
+test("(gate 8) escaped usage bills the same as compact and large records", (t) => {
+	const { file } = setup(t);
+	const compact = gate8Message({ responseModel: { toString: "p" } });
+	const escaped = compact.replace('"usage"', '"\\u0075sage"').replace('"role":"assistant"', '"role": "assistant"');
+	for (const [line, projected] of [[compact, false], [`{${gate6Gap}${escaped.slice(1)}`, true], [escaped, false]]) {
+		const timeline = gate8Parity(file(), `${line}\n`);
+		assert.deepEqual(timeline.totals.models, { "p/(model id unreadable)": { tokens: 13, cost: 0.125 } });
+		assert.deepEqual(timeline.totals.usedModels, { "p/alpha": true });
+		assert.deepEqual(timeline.topTurns.map((turn) => turn.key), projected ? [] : ["p/(model id unreadable)"]);
+	}
+});
+
+test("(gate 8) escaped usage at EOF is included in both readers", (t) => {
+	const { file } = setup(t);
+	const line = gate8Message({ role: "toolResult" }).replace('"usage"', '"\\u0075sage"');
+	assert.equal(gate8Parity(file(), line).totals.total, 13);
+	assert.equal(readUsage(file()).overlay.total, 13);
+});
+
+test("(gate 8) only a single BOM at byte zero can be stripped", (t) => {
+	const { file } = setup(t);
+	const line = gate8Message();
+	assert.equal(gate8Parity(file(), `\uFEFF${line}\n`).totals.total, 13);
+	assert.equal(gate8Parity(file(), `{}\n\uFEFF${line}\n`).totals.total, 0);
+	assert.equal(gate8Parity(file(), `\uFEFF\uFEFF${line}\n`).totals.total, 0);
+});
+
+test("(gate 8) a non-coercible timestamp does not abort accounting", (t) => {
+	const { file } = setup(t);
+	const line = gate8Message({}, { timestamp: { toString: "p" } });
+	const missing = gate8Parity(file(), `${line}\n`);
+	assert.equal(missing.totals.total, 13);
+	assert.deepEqual(missing.hours, []);
+	assert.ok(Number.isNaN(missing.topTurns[0].ms));
+	const fallback = gate8Parity(file(), gate8Message({ timestamp: T0 }, { timestamp: [iso(T0 + HOUR)] }));
+	assert.equal(fallback.topTurns[0].ms, T0);
+	assert.deepEqual(fallback.hours, [{ hourMs: Math.floor(T0 / HOUR) * HOUR, tokens: 13, turns: 1 }]);
+	const numeric = gate8Parity(file(), gate8Message({}, { timestamp: 0 }));
+	assert.equal(numeric.topTurns[0].ms, 0);
+});
+
+test("(gate 8) spaced assistant role still contributes a model without usage", (t) => {
+	const { file } = setup(t);
+	const line = gate8Message({ usage: undefined }).replace('"role":"assistant"', '"role"\t:\t"assistant"');
+	assert.deepEqual(gate8Parity(file(), `${line}\n`).totals.usedModels, { "p/alpha": true });
+});
+
+test("(gate 8) timeline recognizes stats-only tool errors with separator whitespace", (t) => {
+	const { file } = setup(t);
+	const line = '{"type":"message","message":{"role":"toolResult","toolName":"bash","isError" : true}}';
+	const timeline = gate8Parity(file(), `${line}\n`);
+	assert.deepEqual(timeline.tools, [{ name: "bash", calls: 0, errors: 1 }]);
+	assert.deepEqual(timeline.totals.diagnostics, readUsage(file()).effective.diagnostics);
+});
+
+test("(gate 8) timeline recognizes an escaped image type", (t) => {
+	const { file } = setup(t);
+	const image = '{"type":"message","message":{"role":"user","content":[{"type":"im\\u0061ge","bytes":1048576}]}}';
+	assert.deepEqual(gate8Parity(file(), image).images, { peakCount: 1, peakMiB: 1 });
+});
+
+test("(gate 8) an error turn with non-text error detail is classified without coercion", (t) => {
+	const { file } = setup(t);
+	const line = gate8Message({ stopReason: "error", errorMessage: { toString: "usage limit" } });
+	const timeline = gate8Parity(file(), `${line}\n`);
+	assert.equal(timeline.totals.total, 13);
+	assert.deepEqual(timeline.errors, { count: 1, byClass: { other: 1 } });
+});
+
+test("(gate 8) nonnumeric saved cursor fields trigger a recount without coercion", (t) => {
+	const { file } = setup(t);
+	const expected = gate8Parity(file(), `${gate8Message()}\n`).totals;
+	const saved = readUsage(file());
+	for (const key of ["size", "offset", "headLen"]) {
+		const from = { ...saved, [key]: JSON.parse('{"toString":null,"valueOf":null}') };
+		assert.deepEqual(readUsage(file(), from).effective, expected, key);
+	}
+});
+
+test("(gate 8) corrupt parsed usage accumulators trigger a recount", (t) => {
+	const { file } = setup(t);
+	const expected = gate8Parity(file(), `${gate8Message()}\n`).totals;
+	const saved = readUsage(file());
+	for (const invalid of ['{"total":{"toString":null}}', '{"models":{"p/alpha":{"tokens":{"toString":null}}}}', '{"usedModels":{"__proto__":true}}']) {
+		const from = { ...saved, usage: { ...saved.usage, ...JSON.parse(invalid) } };
+		assert.deepEqual(readUsage(file(), from).effective, expected, invalid);
+	}
+});
+
+test("(gate 8) only a live partial accumulator can resume mid-record", (t) => {
+	const { file } = setup(t);
+	const expected = gate8Parity(file(), `${gate8Message()}\n`).totals;
+	const saved = readUsage(file(), undefined, { maxBytes: 8 });
+	const from = { ...saved, partial: JSON.parse('{"start":0,"kind":"scanner","scanner":null}') };
+	assert.deepEqual(readUsage(file(), from).effective, expected);
 });
 
 test("returns null for a missing file", (t) => {

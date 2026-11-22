@@ -43,6 +43,7 @@ const MODEL_ID_UNREADABLE = "(model id unreadable)";
 const TRUNCATED_STRING_ID = Symbol("truncatedStringIdentity");
 const TRUNCATED_USAGE = Symbol("truncatedUsage");
 const TRUNCATED_VALUE = Object.freeze({});
+const RECORD_ACCUMULATOR = Symbol("recordAccumulator");
 
 const STATE_VALUE = 0;
 const STATE_KEY = 1;
@@ -138,10 +139,20 @@ function cloneUsage(usage) {
 			skippedLines: src.diagnostics?.skippedLines ?? 0,
 		},
 	};
-	for (const [key, value] of Object.entries(src.models ?? {})) {
-		out.models[key] = { tokens: value?.tokens ?? 0, cost: value?.cost ?? 0 };
+	for (const key of ["input", "output", "cacheRead", "cacheWrite", "total", "cost", "turns"]) {
+		if (typeof out[key] !== "number") return undefined;
 	}
-	for (const key of Object.keys(src.usedModels ?? {})) out.usedModels[key] = true;
+	if (typeof out.diagnostics.badLines !== "number" || typeof out.diagnostics.skippedLines !== "number") return undefined;
+	for (const [key, value] of Object.entries(src.models ?? {})) {
+		const tokens = value?.tokens ?? 0;
+		const cost = value?.cost ?? 0;
+		if (!key.includes("/") || typeof tokens !== "number" || typeof cost !== "number") return undefined;
+		out.models[key] = { tokens, cost };
+	}
+	for (const key of Object.keys(src.usedModels ?? {})) {
+		if (!key.includes("/")) return undefined;
+		out.usedModels[key] = true;
+	}
 	return out;
 }
 
@@ -304,10 +315,12 @@ function consumeEntry(totals, entry, skipUsage = false) {
 	if (models.incomplete) totals.modelsIncomplete = true;
 }
 
-const USAGE_MARKERS = ['"usage"', '"role":"assistant"', '"prompt-cache-prewarm"'];
-const STAT_MARKERS = ['"isError":true', '"type":"image"', '"toolCall"', '"type":"compaction"'];
+const USAGE_MARKERS = ['"usage"', '"assistant"', '"prompt-cache-prewarm"'];
+const STAT_MARKERS = ['"isError"', '"image"', '"toolCall"', '"compaction"'];
 
-const wantsUsage = (text) => USAGE_MARKERS.some((marker) => text.includes(marker));
+// A standalone JSON string token survives arbitrary separator whitespace.
+// An escape anywhere may hide a relevant key or value from either marker set.
+const wantsUsage = (text) => text.includes("\\") || USAGE_MARKERS.some((marker) => text.includes(marker));
 const wantsStats = (text) => STAT_MARKERS.some((marker) => text.includes(marker));
 
 function stripBomBuffer(buffer) {
@@ -315,10 +328,6 @@ function stripBomBuffer(buffer) {
 		return buffer.subarray(3);
 	}
 	return buffer;
-}
-
-function stripBomText(text) {
-	return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
 }
 
 function sha1(buffer) {
@@ -640,7 +649,7 @@ export function createRecordScanner() {
 }
 
 function newAccumulator(start) {
-	return { start, kind: "buffer", parts: [], len: 0 };
+	return { [RECORD_ACCUMULATOR]: true, start, kind: "buffer", parts: [], len: 0 };
 }
 
 function appendBytes(accumulator, bytes) {
@@ -661,7 +670,7 @@ function appendBytes(accumulator, bytes) {
 				skip -= consumed;
 				scanner.push(part.subarray(consumed));
 			}
-			acc = { start: acc.start, kind: "scanner", scanner };
+			acc = { [RECORD_ACCUMULATOR]: true, start: acc.start, kind: "scanner", scanner };
 		}
 	} else {
 		acc.scanner.push(bytes);
@@ -673,8 +682,7 @@ function accumulatorText(acc) {
 	let buffer = acc.parts.length ? Buffer.concat(acc.parts, acc.len) : Buffer.alloc(0);
 	if (acc.start === 0) buffer = stripBomBuffer(buffer);
 	const text = buffer.toString("utf8");
-	const end = text.endsWith("\r") ? text.length - 1 : text.length;
-	return stripBomText(text.slice(0, end));
+	return text.endsWith("\r") ? text.slice(0, -1) : text;
 }
 
 function finishRecord(totals, acc) {
@@ -757,8 +765,9 @@ export function readUsage(file, from, { maxBytes = Infinity } = {}) {
 		let restart =
 			!isObject(from) ||
 			!isObject(from.usage) ||
-			from.offset === undefined ||
-			from.headLen === undefined ||
+			!Number.isSafeInteger(from.size) || from.size < 0 ||
+			!Number.isSafeInteger(from.offset) || from.offset < 0 || from.offset > from.size ||
+			!Number.isSafeInteger(from.headLen) || from.headLen < 0 || from.headLen > Math.min(from.size, HEAD_LIMIT) ||
 			typeof from.head !== "string" ||
 			typeof from.tail !== "string";
 		if (!restart) {
@@ -781,7 +790,8 @@ export function readUsage(file, from, { maxBytes = Infinity } = {}) {
 		let partial;
 		let headLen;
 		let head;
-		if (restart) {
+		const savedUsage = restart ? undefined : cloneUsage(from.usage);
+		if (!savedUsage) {
 			usage = emptyUsage();
 			offset = 0;
 			scanOffset = 0;
@@ -789,9 +799,9 @@ export function readUsage(file, from, { maxBytes = Infinity } = {}) {
 			headLen = Math.min(size, HEAD_LIMIT);
 			head = hashRange(0, headLen);
 		} else {
-			usage = cloneUsage(from.usage);
+			usage = savedUsage;
 			offset = from.offset;
-			const resumable = isObject(from.partial) && Number.isInteger(from.scanOffset) && from.partial.start === offset;
+			const resumable = from.partial?.[RECORD_ACCUMULATOR] === true && Number.isInteger(from.scanOffset) && from.partial.start === offset;
 			scanOffset = resumable ? from.scanOffset : offset;
 			partial = resumable ? from.partial : undefined;
 			headLen = from.headLen;
@@ -880,8 +890,12 @@ function toolsEntry(stats, name) {
 }
 
 function timestampOf(entry, message) {
-	const parsed = Date.parse(entry.timestamp);
-	if (Number.isFinite(parsed)) return parsed;
+	const timestamp = entry.timestamp;
+	if (Number.isFinite(timestamp)) return timestamp;
+	if (typeof timestamp === "string") {
+		const parsed = Date.parse(timestamp);
+		if (Number.isFinite(parsed)) return parsed;
+	}
 	return Number.isFinite(message.timestamp) ? message.timestamp : NaN;
 }
 
@@ -905,6 +919,7 @@ function countImages(stats, content) {
 }
 
 function consumeTimelineStats(stats, entry, options) {
+	if (!isObject(entry)) return;
 	if (entry.type === "compaction") {
 		stats.peakCount = Math.max(stats.peakCount, stats.segmentCount);
 		stats.peakBytes = Math.max(stats.peakBytes, stats.segmentBytes);
@@ -947,7 +962,7 @@ function consumeTimelineStats(stats, entry, options) {
 		}
 		if (message.stopReason === "error") {
 			stats.errors.count += 1;
-			const cls = classifyProviderError(message.errorMessage);
+			const cls = classifyProviderError(typeof message.errorMessage === "string" ? message.errorMessage : "");
 			stats.errors.byClass[cls] = (stats.errors.byClass[cls] ?? 0) + 1;
 		}
 		if (Array.isArray(message.content)) {
@@ -993,6 +1008,7 @@ function consumeTimelineRecord(totals, stats, acc, options) {
 		return;
 	}
 	if (usageWanted) consumeEntry(totals, entry);
+	else totals.diagnostics.skippedLines += 1;
 	consumeTimelineStats(stats, entry, options);
 }
 
