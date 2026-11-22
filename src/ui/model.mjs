@@ -4,7 +4,7 @@ import { getPath, pauseState, SWITCHES } from "../control.mjs";
 import { readDecisions } from "../decisions.mjs";
 import { createInvestigations, RESOLVED } from "../investigations.mjs";
 import { endedSelector, readEnded } from "../session-ledger.mjs";
-import { ambiguousLedgerTaskIds, retainedTreeRows, usageEntryOf, usageTreeLink } from "../session-record.mjs";
+import { ambiguousLedgerTaskIds, displayLedgerId, retainedTreeRows, usageEntryOf, usageTreeLink } from "../session-record.mjs";
 import { compactUsage, publishedUsageView, readUsageIndex, treeTotals } from "../usage-index.mjs";
 import { listDirSafe, readJsonSafe, statSafe } from "../util/fsx.mjs";
 import { redact, truncate } from "../util/text.mjs";
@@ -145,6 +145,10 @@ function listDeathRecords(dir) {
 }
 
 const short = (id) => (typeof id === "string" && id ? id.slice(0, 8) : null);
+const shortLedgerId = (id) => {
+	const display = displayLedgerId(id);
+	return display === id ? short(id) : display;
+};
 const text = (v, max = LINE_MAX) => (typeof v === "string" && v ? v.slice(0, max) : null);
 const exactId = (v) => typeof v === "string" && v ? v : null;
 const lines = (list) => (Array.isArray(list) ? list.filter((line) => typeof line === "string" && line).slice(0, MAX_LINES).map((line) => line.slice(0, LINE_MAX)) : []);
@@ -287,14 +291,15 @@ export function endedRow(r, childRows = 0, usage = null, trees = null, full = us
 	const tree = trees?.get(treeId) ?? null;
 	const overflow = tokens !== null && !Number.isFinite(tokens.total);
 	const treeOverflow = tree !== null && !Number.isFinite(tree);
+	const sessionShort = shortLedgerId(r.sessionId);
 	return {
 		sessionId: exactId(r.sessionId),
-		sessionShort: short(r.sessionId),
+		sessionShort,
 		kind: r.kind === "child" ? "child" : "main",
 		parentSessionId: exactId(r.parentSessionId),
-		parentShort: short(r.parentSessionId),
-		taskId: text(r.taskId, 80),
-		title: clean(r.title, TITLE_MAX) ?? short(r.sessionId) ?? "(제목 없음)",
+		parentShort: shortLedgerId(r.parentSessionId),
+		taskId: text(displayLedgerId(r.taskId), 80),
+		title: clean(displayLedgerId(r.title), TITLE_MAX) ?? sessionShort ?? "(제목 없음)",
 		cwd,
 		cwdShort: shortPath(cwd),
 		terminal: terminalOf(r.terminal),

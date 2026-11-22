@@ -5,6 +5,7 @@ import { senpiTaskStoreDir } from "./collect/tasks.mjs";
 import { DEFAULT_CONFIG } from "./config.mjs";
 import { streamDecisions } from "./decisions.mjs";
 import { streamInvestigations } from "./investigations.mjs";
+import { safeSubjectId } from "./session-id.mjs";
 import { ENDED_LOCATION, endedKey, endedSelector, streamEnded } from "./session-ledger.mjs";
 import { compactUsage, fresh, readUsageIndex, usageEntryFor } from "./usage-index.mjs";
 import { reasonCode } from "./audit-codes.mjs";
@@ -57,6 +58,7 @@ const nonEmpty = (v) => typeof v === "string" && v.length > 0;
 /** `redact` plus the GitHub token shape it does not mask yet. */
 const scrub = (value) => redact(String(value ?? "")).replace(/ghp_[A-Za-z0-9]{8,}/g, "ghp_[REDACTED]");
 const clean = (value, max = LINE_MAX) => (typeof value === "string" && value ? truncate(scrub(value), max) : null);
+export const displayLedgerId = (id) => typeof id === "string" ? truncate(scrub(id), TEXT_MAX) : id;
 const msOf = (value) => (typeof value === "number" && Number.isFinite(value) ? value : typeof value === "string" ? Date.parse(value) : Number.NaN);
 const timeOf = (entry) => msOf(entry?.ts);
 
@@ -531,8 +533,8 @@ export function ledgerUsageSessionId({ sessionId, taskId }) {
 	return nonEmpty(sessionId) && sessionId !== taskId ? sessionId : null;
 }
 
-const ambiguousUsageFallback = (row, ambiguous) =>
-	!ledgerUsageSessionId(row) && (row.usageTaskIdAmbiguous === true || ambiguous?.has(row.taskId));
+const ambiguousUsageFallback = (row, ambiguous, ids = row) =>
+	!ledgerUsageSessionId(ids) && (row.usageTaskIdAmbiguous === true || ambiguous?.has(ids.taskId));
 
 export function ambiguousLedgerTaskIds(rows) {
 	const seen = new Set();
@@ -546,8 +548,9 @@ export function ambiguousLedgerTaskIds(rows) {
 }
 
 export function usageEntryOf(usage, row, ambiguous) {
-	if (ambiguousUsageFallback(row, ambiguous)) return null;
-	return usageEntryFor(usage, ledgerUsageSessionId(row), row.taskId) ?? (usage.full === true ? FULL_USAGE : null);
+	const ids = row.ledgerIds ?? row;
+	if (ambiguousUsageFallback(row, ambiguous, ids)) return null;
+	return usageEntryFor(usage, ledgerUsageSessionId(ids), ids.taskId) ?? (usage.full === true ? FULL_USAGE : null);
 }
 
 export function usageTreeLink(usage, row, ambiguous) {
@@ -829,6 +832,12 @@ export function buildSessionRecord(inputs = {}) {
 		: null;
 
 	const session = cleanValue(row);
+	// Keep exact join keys off the display fields that also feed the reviewer bundle.
+	session.ledgerIds = {
+		sessionId: safeSubjectId(row.sessionId),
+		taskId: safeSubjectId(row.taskId),
+		parentSessionId: safeSubjectId(row.parentSessionId),
+	};
 	// Cached previews and audit preparation re-read the index from this session alone.
 	if (!ledgerUsageSessionId(row) && ambiguous.has(row.taskId)) session.usageTaskIdAmbiguous = true;
 	// Cached previews only receive session metadata and the model list.

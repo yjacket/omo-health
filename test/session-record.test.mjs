@@ -1025,6 +1025,31 @@ test("a ghp_ token in stored text is redacted", () => {
 	assert.ok(text.includes("ghp_[REDACTED]"));
 });
 
+test("plan86: record identity is separate from redacted ledger display IDs", () => {
+	const sessionId = "ghp_review1234";
+	const taskId = "ghp_workitem1234";
+	const parentSessionId = "ghp_upstream1234";
+	const childId = "ghp_descendant1234";
+	const childTaskId = "ghp_childtask1234";
+	const row = { sessionId, taskId, parentSessionId, kind: "child", startedMs: T0, endedMs: T0 + HOUR };
+	const child = { sessionId: childId, taskId: childTaskId, parentSessionId: sessionId, kind: "child", startedMs: T0 + MIN, endedMs: T0 + HOUR };
+	const entry = { id: sessionId, taskId };
+	const index = new Map([[sessionId, entry]]);
+	const record = buildSessionRecord({ row, ledger: [row, child], usage: index });
+	assert.equal(sessionRecord.usageEntryOf(index, record.session), entry);
+	assert.deepEqual(record.session.ledgerIds, { sessionId, taskId, parentSessionId });
+	assert.deepEqual([record.children[0].sessionId, record.children[0].taskId, record.children[0].parentSessionId], [childId, childTaskId, sessionId]);
+
+	const view = buildSessionView(record);
+	assert.equal(view.session.ledgerIds, undefined);
+	for (const item of [view.session, view.children[0]]) {
+		assert.deepEqual([item.sessionId, item.taskId, item.parentSessionId], Array(3).fill("ghp_[REDACTED]"));
+	}
+	const bundle = auditBundle(record, null, { config: DEFAULT_CONFIG, now: row.endedMs });
+	assert.deepEqual([bundle.session.sessionId, bundle.session.taskId, bundle.session.parentSessionId], [null, null, null]);
+	assert.deepEqual([bundle.children[0].sessionId, bundle.children[0].taskId], [childId, childTaskId], "reviewer bundle retains its own child ID policy");
+});
+
 test("an unknown id returns {found:false}", () => {
 	const { paths } = setup();
 	writeLedger(paths, baseRows());

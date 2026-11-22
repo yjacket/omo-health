@@ -12,7 +12,7 @@ import { sessionRecordPage } from "./session-view.mjs";
 const SESSION_CACHE_MAX = 20;
 const ACTIVE_AUDIT_STATUSES = new Set(["requested", "queued", "launching", "running"]);
 const isAuditActive = (state) => Boolean(state && (ACTIVE_AUDIT_STATUSES.has(state.status) || state.holdUntilExit === true));
-const canonicalIdOf = (session, id) => typeof session?.sessionId === "string" && session.sessionId ? session.sessionId : id;
+const canonicalIdOf = (session, id) => (session?.ledgerIds ?? session)?.sessionId || id;
 
 function detailSignature(paths, files) {
 	return JSON.stringify([files.map(auditFileVersion), recordsStamp(paths)]);
@@ -114,10 +114,11 @@ export function createDetailOperations({
 		// Keep dependency paths out of the record sent through the client view.
 		const { transcriptFiles, ...record } = loaded;
 		const session = record.session;
+		const { taskId, sessionId } = session?.ledgerIds ?? session ?? {};
 		// Injected loaders may not report dependencies; retain the selected-file lookup for them.
-		const file = transcriptFiles === undefined && (session?.taskId
-			? locator.childFile({ taskId: session.taskId, sessionId: session.sessionId, cwds: session.cwd ? [session.cwd] : [] })
-			: locator.mainFile(session?.sessionId));
+		const file = transcriptFiles === undefined && (taskId
+			? locator.childFile({ taskId, sessionId, cwds: session.cwd ? [session.cwd] : [] })
+			: locator.mainFile(sessionId));
 		const files = transcriptFiles ?? (file ? [file] : []);
 		return { record, files, signature: detailSignature(paths, files) };
 	}

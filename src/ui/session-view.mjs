@@ -1,3 +1,4 @@
+import { displayLedgerId } from "../session-record.mjs";
 import { actionLabel, analystVerdictLabel, auditJudgmentLabel, auditOverallLabel, auditReasonLabel, auditStatusLabel, auditTokenLabel, causeLabel, findingLabel, outcomeLabel, resultLabel, severityLabel, terminalLabel } from "./labels.mjs";
 import { investigationRow } from "./model.mjs";
 
@@ -27,7 +28,7 @@ export function sessionRecordPage(record, name, offset) {
 	// Internal history (e.g. selected finding IDs and analyst model provenance)
 	// stays in the worker, not in the dashboard's first page.
 	const { found, id, session, tokens, coverage, health } = record;
-	const { pendingAnalystJobs, ...sessionFields } = isRecord(session) ? session : {};
+	const { pendingAnalystJobs, ledgerIds, ...sessionFields } = isRecord(session) ? session : {};
 	const pages = Object.fromEntries(SESSION_LISTS.map((key) => [key, sessionRecordPage(record, key, 0)]));
 	return {
 		found, id, session: session ? sessionFields : session, tokens, coverage,
@@ -40,8 +41,9 @@ export function sessionRecordPage(record, name, offset) {
 function labelledSession(session) {
 	if (!isRecord(session)) return null;
 	const terminal = isRecord(session.terminal) ? session.terminal : null;
+	const { ledgerIds, ...display } = session;
 	return {
-		...session,
+		...display,
 		outcomeKo: outcomeLabel(session.outcome),
 		terminalLabel: terminal ? terminalLabel(terminal.kind) : null,
 	};
@@ -92,6 +94,9 @@ function labelledChild(child) {
 	const overflow = overflows(child.tokens?.total);
 	return {
 		...child,
+		sessionId: displayLedgerId(child.sessionId),
+		taskId: displayLedgerId(child.taskId),
+		parentSessionId: displayLedgerId(child.parentSessionId),
 		...(overflow ? { tokens: { ...child.tokens, total: null }, tokensState: "overflow" } : {}),
 		outcomeKo: outcomeLabel(child.outcome),
 	};

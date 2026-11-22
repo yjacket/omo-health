@@ -1,5 +1,6 @@
 import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import { syncBuiltinESMExports } from "node:module";
@@ -738,7 +739,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 				fs.writeFileSync(file, `${JSON.stringify({ v: USAGE_INDEX_VERSION })}\n${JSON.stringify(row)}\n`);
 			}
 
-			function makeWorld({ sessionId = AUDIT_ID, daemon = "running", enabled = true, usedModels = { "anthropic/claude-used": true }, lanes = { ultrabrain: ["anthropic/claude-used"], architect: ["openai/gpt-review:high"] }, providers = ["anthropic", "openai"], growFile = false, budgetCount = null, entries } = {}) {
+			function makeWorld({ sessionId = AUDIT_ID, total = 0, daemon = "running", enabled = true, usedModels = { "anthropic/claude-used": true }, lanes = { ultrabrain: ["anthropic/claude-used"], architect: ["openai/gpt-review:high"] }, providers = ["anthropic", "openai"], growFile = false, budgetCount = null, entries } = {}) {
 				const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omoh-audit-ui-"));
 				const env = { USERPROFILE: dir, OMO_HEALTH_HOME: path.join(dir, "health") };
 				const worldPaths = resolvePaths(env);
@@ -777,7 +778,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 							checkedMs: nowMs,
 							usage: emptyUsage(),
 							overlay: emptyUsage(),
-							published: { ...emptyUsage(), usedModels },
+							published: { ...emptyUsage(), total, usedModels },
 				});
 				writeJson(worldPaths.omoJsonc, { "[native]": { categories: Object.fromEntries(Object.entries(lanes).map(([lane, models]) => [lane, { models }])) } });
 				writeJson(worldPaths.authFile, Object.fromEntries(providers.map((provider) => [provider, {}])));
@@ -802,6 +803,36 @@ describe("ui server", { timeout: 20_000 }, () => {
 			function requestFileOf(world) {
 				return path.join(world.paths.health.auditRequestsDir, `${auditFileKey(AUDIT_ID)}.json`);
 			}
+
+			it("plan86: a redacted display ID still opens and queues an audit for the exact ledger ID", async (t) => {
+				const sessionId = "ghp_review1234";
+				const world = makeWorld({ sessionId, total: 37 });
+				const { paths, env, now } = world;
+				const ui = createUiServer({ paths, token: TOKEN, getState: () => uiState({ paths, env, now: now() }), sessionDetail: world.detail, startAudit: world.startAudit, now });
+				t.after(async () => {
+					await Promise.all([ui.close(), world.detail.close()]);
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				});
+				const { port } = await ui.listen();
+				const state = await getAt(port, "/api/state");
+				const row = state.body.ended.rows.find((entry) => entry.sessionId === sessionId);
+				const detailUrl = `/api/session?id=${encodeURIComponent(row.sessionId)}`;
+				const detail = await getAt(port, detailUrl);
+				const posted = await postAt(port, "/api/audit", { sessionId: row.sessionId });
+				assert.deepEqual(
+					[detail.status, detail.body.id, detail.body.tokens?.total, detail.body.audit?.blocked, posted.status],
+					[200, sessionId, 37, null, 202],
+				);
+				assert.equal(row.sessionShort, "ghp_[REDACTED]");
+				assert.equal(row.title, "ghp_[REDACTED]");
+				assert.equal(detail.body.session.sessionId, "ghp_[REDACTED]");
+				assert.equal(posted.body.audit.sessionId, sessionId);
+				const name = `${createHash("sha256").update(sessionId).digest("hex").slice(0, 32)}.json`;
+				assert.deepEqual(fs.readdirSync(paths.health.auditRequestsDir), [name]);
+				assert.equal(JSON.parse(fs.readFileSync(path.join(paths.health.auditRequestsDir, name), "utf8")).sessionId, sessionId);
+				const queued = await getAt(port, detailUrl);
+				assert.deepEqual([queued.body.audit.state.sessionId, queued.body.audit.state.status], [sessionId, "queued"]);
+			});
 
 			for (const length of [81, 300]) {
 				it(`${length === 300 ? "plan79" : "plan78"}: ${length}-character history ID opens and ${length === 300 ? "completes an audit for" : "queues"} that exact session`, async (t) => {
