@@ -499,7 +499,7 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 				fail(record, "bad-output", truncate(redact(readTextSafe(path.join(jobsDir, record.jobId, "out.txt"), "")), 300), now);
 			}
 		} else if (out.status === "timeout") {
-			record.holdUntilExit = true;
+			if (!out.exitConfirmed) record.holdUntilExit = true;
 			fail(record, "timeout", null, now);
 		} else if (out.status === "unavailable") {
 			fail(record, `unavailable:${out.reason}`, out.detail ? truncate(redact(String(out.detail)), 300) : null, now);
@@ -519,7 +519,7 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		}
 	}
 
-	/** Only a negative liveness check releases the slot; terminate may return "gone" while a model child survives. */
+	/** A termination request is not proof of exit; only a negative liveness check releases a legacy hold. */
 	function releaseHold(record) {
 		try {
 			if (runner.alive(record.jobId)) {

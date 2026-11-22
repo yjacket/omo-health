@@ -3,6 +3,10 @@ import fs from "node:fs";
 import { performance } from "node:perf_hooks";
 import { StringDecoder } from "node:string_decoder";
 import { classifyProviderError } from "../detect/provider.mjs";
+import { cacheStorm } from "../detect/tokens.mjs";
+
+// Match SessionTracker's retained assistant usage turns, without loading the transcript.
+const STORM_HISTORY = 200;
 
 /**
  * Token usage read from a senpi session JSONL file the way omo's own `/session`
@@ -800,7 +804,7 @@ function consumeScannerRecord(totals, scanner, fragment = false) {
 	if (fragment) {
 		const entry = scanner.preview();
 		if (entry) consumeEntry(totals, entry, scanner.oversized);
-		return;
+		return entry;
 	}
 	const entry = scanner.finish();
 	if (scanner.malformed) {
@@ -808,6 +812,7 @@ function consumeScannerRecord(totals, scanner, fragment = false) {
 		return;
 	}
 	consumeEntry(totals, entry, scanner.oversized);
+	return entry;
 }
 
 function readRange(fd, position, length) {
@@ -1015,8 +1020,29 @@ function countImages(stats, content) {
 	if (bytes > stats.segmentBytes) stats.segmentBytes = bytes;
 }
 
-function consumeTimelineStats(stats, entry, options) {
+function stormCounter(value) {
+	try {
+		return Number(value ?? 0);
+	} catch {
+		return NaN;
+	}
+}
+
+function consumeStormTurn(stats, entry) {
+	if (entry?.type !== "message" || entry.message?.role !== "assistant") return;
+	const { usage } = entry.message;
+	if (!isObject(usage)) return;
+	stats.stormHistory[stats.stormNext] = {
+		input: stormCounter(usage.input),
+		cacheRead: stormCounter(usage.cacheRead),
+		cacheWrite: stormCounter(usage.cacheWrite),
+	};
+	stats.stormNext = (stats.stormNext + 1) % STORM_HISTORY;
+}
+
+function consumeTimelineStats(stats, entry) {
 	if (!isObject(entry)) return;
+	consumeStormTurn(stats, entry);
 	if (entry.type === "compaction") {
 		stats.peakCount = Math.max(stats.peakCount, stats.segmentCount);
 		stats.peakBytes = Math.max(stats.peakBytes, stats.segmentBytes);
@@ -1059,10 +1085,6 @@ function consumeTimelineStats(stats, entry, options) {
 				});
 				if (top.length > 10) top.pop();
 			}
-			const denominator = input + cacheRead + cacheWrite;
-			if (cacheWrite >= options.cacheStormWrite && cacheRead < options.cacheStormReadFrac * denominator) {
-				stats.stormTurns += 1;
-			}
 		}
 		if (message.stopReason === "error") {
 			stats.errors.count += 1;
@@ -1088,10 +1110,10 @@ function consumeTimelineStats(stats, entry, options) {
 	if (message.role === "user") countImages(stats, message.content);
 }
 
-function consumeTimelineRecord(totals, stats, acc, options) {
+function consumeTimelineRecord(totals, stats, acc) {
 	if (acc.kind === "scanner") {
 		stats.largeRecords += 1;
-		consumeScannerRecord(totals, acc.scanner);
+		consumeStormTurn(stats, consumeScannerRecord(totals, acc.scanner));
 		return;
 	}
 	const text = accumulatorText(acc);
@@ -1115,13 +1137,13 @@ function consumeTimelineRecord(totals, stats, acc, options) {
 	}
 	if (usageWanted) consumeEntry(totals, entry);
 	else totals.diagnostics.skippedLines += 1;
-	consumeTimelineStats(stats, entry, options);
+	consumeTimelineStats(stats, entry);
 }
 
-function consumeTimelineFragment(totals, stats, acc, options) {
+function consumeTimelineFragment(totals, stats, acc) {
 	if (acc.kind === "scanner") {
 		stats.largeRecords += 1;
-		consumeScannerRecord(totals, acc.scanner, true);
+		consumeStormTurn(stats, consumeScannerRecord(totals, acc.scanner, true));
 		return;
 	}
 	const text = accumulatorText(acc);
@@ -1136,7 +1158,7 @@ function consumeTimelineFragment(totals, stats, acc, options) {
 		return;
 	}
 	if (usageWanted) consumeEntry(totals, entry);
-	consumeTimelineStats(stats, entry, options);
+	consumeTimelineStats(stats, entry);
 }
 
 /**
@@ -1165,13 +1187,13 @@ export function usageTimeline(file, { cacheStormWrite = Infinity, cacheStormRead
 			topTurns: [],
 			errors: { count: 0, byClass: {} },
 			tools: new Map(),
-			stormTurns: 0,
+			stormHistory: [],
+			stormNext: 0,
 			peakCount: 0,
 			peakBytes: 0,
 			segmentCount: 0,
 			segmentBytes: 0,
 		};
-		const options = { cacheStormWrite, cacheStormReadFrac };
 		let position = 0;
 		let acc;
 		while (position < size) {
@@ -1189,16 +1211,21 @@ export function usageTimeline(file, { cacheStormWrite = Infinity, cacheStormRead
 					break;
 				}
 				acc = appendBytes(acc, chunk.subarray(index, newline));
-				consumeTimelineRecord(totals, stats, acc, options);
+				consumeTimelineRecord(totals, stats, acc);
 				acc = newline + 1 >= chunk.length ? undefined : newAccumulator(chunkStart + newline + 1);
 				index = newline + 1;
 				if (index >= chunk.length) break;
 			}
 		}
-		if (acc) consumeTimelineFragment(totals, stats, acc, options);
+		if (acc) consumeTimelineFragment(totals, stats, acc);
 		stats.peakCount = Math.max(stats.peakCount, stats.segmentCount);
 		stats.peakBytes = Math.max(stats.peakBytes, stats.segmentBytes);
 		const denominator = totals.input + totals.cacheRead + totals.cacheWrite;
+		const { stormHistory, stormNext } = stats;
+		const turns = stormHistory.length === STORM_HISTORY
+			? [...stormHistory.slice(stormNext), ...stormHistory.slice(0, stormNext)]
+			: stormHistory;
+		const [storm] = cacheStorm({ turns }, { cacheStormWrite, cacheStormReadFrac });
 		// The scanner preserves accounting but does not parse the full record for statistics.
 		const incomplete = stats.largeRecords > 0;
 		return {
@@ -1208,7 +1235,7 @@ export function usageTimeline(file, { cacheStormWrite = Infinity, cacheStormRead
 			topTurns: stats.topTurns,
 			cache: {
 				hitRate: denominator > 0 ? totals.cacheRead / denominator : null,
-				stormTurns: stats.stormTurns,
+				stormTurns: storm?.data.turns ?? 0,
 			},
 			errors: { ...stats.errors, incomplete },
 			tools: {

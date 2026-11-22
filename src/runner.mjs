@@ -107,8 +107,9 @@ function sessionIdOf(args) {
  * full argv are the job's. A `.cmd` shim's `cmd.exe` and its `node` child both match, so a parent-child chain is one
  * job tree and its root is returned. Two independent roots are `ambiguous` (throws with `code:"ambiguous"`); a
  * process that merely mentions the bundle path (an editor) does not match; a failed query throws.
+ * `requireSingle` also rejects a matching chain, for takeover after a recorded launcher exits.
  */
-export function findJobProcess({ jobsDir, jobId, args, exec = execFileSync }) {
+export function findJobProcess({ jobsDir, jobId, args, requireSingle = false, exec = execFileSync }) {
 	const bundleFile = path.join(jobsDir, jobId, "bundle.md");
 	const laneSessionId = sessionIdOf(args);
 	if (!laneSessionId) return null;
@@ -141,6 +142,11 @@ export function findJobProcess({ jobsDir, jobId, args, exec = execFileSync }) {
 		matches.push({ pid, parentPid: Number.isSafeInteger(parentPid) ? parentPid : null, ctimeMs, cmdSha1: sha1(commandLine) });
 	}
 	if (!matches.length) return null;
+	if (requireSingle && matches.length !== 1) {
+		const error = new Error(`job process lookup for ${jobId} is ambiguous: ${matches.length} matches`);
+		error.code = "ambiguous";
+		throw error;
+	}
 	const pids = new Set(matches.map((match) => match.pid));
 	const roots = matches.filter((match) => match.parentPid === null || !pids.has(match.parentPid));
 	if (roots.length !== 1) {
@@ -162,7 +168,7 @@ function spawnError(error, pid) {
 /**
  * @returns {{start(opts): object, poll(jobId): object, jobDir(jobId): string, adoptJob(jobId, opts): string, alive(jobId): boolean, terminate(jobId): string}}
  */
-export function createRunner({ paths, spawnImpl = spawn, clock, env = process.env, isAlive = defaultIsAlive, identify = processIdentity, contracts = {}, writeJson = atomicWriteJson, findJobProcess: findProcess = (jobId, args) => findJobProcess({ jobsDir: paths.health.jobsDir, jobId, args }) }) {
+export function createRunner({ paths, spawnImpl = spawn, clock, env = process.env, isAlive = defaultIsAlive, identify = processIdentity, contracts = {}, writeJson = atomicWriteJson, findJobProcess: findProcess = (jobId, args, options) => findJobProcess({ jobsDir: paths.health.jobsDir, jobId, args, ...options }) }) {
 	const jobsDir = paths.health.jobsDir;
 	const jobDir = (jobId) => path.join(jobsDir, jobId);
 	const handlers = new Map();
@@ -202,7 +208,8 @@ export function createRunner({ paths, spawnImpl = spawn, clock, env = process.en
 		// A child error alone is not proof: Node can also emit it after assigning a pid.
 		const errored = Boolean(exit?.error) && exitCode === null;
 		const notSpawned = errored && (meta.pid === undefined || meta.pid === null);
-		if (!notSpawned && auditProcessRemains(jobId, meta)) return running();
+		const surviving = !notSpawned && pollAuditSurvivor(f, meta);
+		if (surviving) return surviving;
 		const handler = handlers.get(jobId) ?? contracts[meta.kind] ?? {};
 		const stdout = readTextSafe(f.out, "");
 		const fallback = fallbackFailure(f, meta, exitCode);
@@ -217,24 +224,67 @@ export function createRunner({ paths, spawnImpl = spawn, clock, env = process.en
 		return finish(f, meta, { status: "failed", reason: exit ? `exit-${exitCode}` : "no-result", detail, result: null, exitCode }, stderr);
 	}
 
-	/** The verified timeout path: kill the job's own tree (the one documented /T exception) and end as timeout. */
-	function timeoutKill(f, meta) {
+	/** Kill the verified job's own tree (the one documented /T exception). */
+	function killOwnTree(f, meta) {
 		spawnImpl("taskkill", ["/F", "/T", "/PID", String(meta.pid)], { windowsHide: true, stdio: "ignore" }).on?.("error", (error) => {
 			// A tree that could not be killed outlives its job: leave the reason beside the job's stderr.
 			fs.appendFile(f.err, `\ntaskkill /T failed: ${error.message}\n`, () => {});
 		});
+	}
+
+	function timeoutKill(f, meta) {
+		killOwnTree(f, meta);
 		return fallbackFailure(f, meta, null, true) ?? finish(f, meta, { status: "timeout", result: null, exitCode: null });
 	}
 
 	/**
 	 * Can this job's verified pid still be trusted? Throws when the lookup fails (not knowing is never "gone").
-	 * `meta.final` is not consulted: a timed-out job is finalized the moment taskkill is sent, so its process may still
-	 * live after the record says `timeout`; only a fresh pid+creation time+command hash can say it is gone.
+	 * `meta.final` is not consulted: the original launcher timeout path may finalize while the process still lives.
 	 */
 	function stillOurs(meta) {
 		if (!meta || !meta.pid || !Number.isFinite(meta.ctimeMs)) return false;
 		const seen = identify(meta.pid);
 		return Boolean(seen && seen.ctimeMs === meta.ctimeMs && seen.cmdSha1 === meta.cmdSha1);
+	}
+
+	/** The launcher is gone: locate a single survivor, not just the root of a matching chain. */
+	function trackAuditSurvivor(f, meta) {
+		const found = findProcess(path.basename(f.dir), meta.args ?? [], { requireSingle: true });
+		if (!found) {
+			if (meta.adopted && stillOurs(meta)) throw new Error("audit survivor missing from job process lookup");
+			return null;
+		}
+		if (!Number.isSafeInteger(found.pid) || found.pid <= 0 || !Number.isFinite(found.ctimeMs) ||
+			found.ctimeMs < meta.startedMs - ADOPT_SKEW_MS || !found.cmdSha1) throw new Error("invalid audit survivor identity");
+		if (meta.adopted && found.pid === meta.pid && found.ctimeMs === meta.ctimeMs && found.cmdSha1 === meta.cmdSha1) return meta;
+		if ((meta.adopted && stillOurs(meta)) || !stillOurs(found)) throw new Error("audit survivor identity changed during lookup");
+		const adopted = { ...meta, pid: found.pid, ctimeMs: found.ctimeMs, cmdSha1: found.cmdSha1, adopted: true, adoptedTerminationSent: false };
+		writeJson(f.meta, adopted);
+		return adopted;
+	}
+
+	function terminateAuditSurvivor(f, meta) {
+		if (!meta.adoptedTerminationSent) {
+			if (!stillOurs(meta)) throw new Error("audit survivor identity changed before termination");
+			killOwnTree(f, meta);
+			writeJson(f.meta, { ...meta, adoptedTerminationSent: true });
+		}
+		return "sent";
+	}
+
+	function pollAuditSurvivor(f, meta) {
+		if (meta.kind !== "audit") return null;
+		try {
+			const tracked = trackAuditSurvivor(f, meta);
+			if (tracked) {
+				if (clock.now() - tracked.startedMs > tracked.timeoutMs) terminateAuditSurvivor(f, tracked);
+				return running();
+			}
+			if (meta.adoptedTerminationSent) return finish(f, meta, { status: "timeout", result: null, exitCode: null, exitConfirmed: true });
+			return null;
+		} catch (error) {
+			return { ...running(), detail: truncate(error.message, 300) };
+		}
 	}
 
 	return {
@@ -313,13 +363,16 @@ export function createRunner({ paths, spawnImpl = spawn, clock, env = process.en
 			if (meta.final) {
 				if (meta.kind === "analyst" && meta.final.reason !== "unverified" && !("fallbackTargets" in meta.final)) return finish(f, meta, meta.final);
 				// A pre-fix final outcome may only reflect launcher exit. Timeout holds are checked by the auditor.
-				if (meta.final.status !== "timeout" && !meta.final.holdUntilExit && meta.final.spawned !== false && auditProcessRemains(jobId, meta)) return running();
+				if (meta.final.status !== "timeout" && !meta.final.holdUntilExit && meta.final.spawned !== false) {
+					const surviving = pollAuditSurvivor(f, meta);
+					if (surviving) return surviving;
+				}
 				// A runner from before the fallback guard may have finalized before the auditor saved the outcome.
-				return meta.final.reason === "model-fallback" ? meta.final :
+				return meta.final.exitConfirmed || meta.final.reason === "model-fallback" ? meta.final :
 					fallbackFailure(f, meta, meta.final.exitCode, meta.final.status === "timeout") ?? meta.final;
 			}
 			const exit = readJsonSafe(f.exit);
-			if (exit) return ended(f, meta, exit);
+			if (exit || meta.adopted) return ended(f, meta, exit);
 			// After a reboot or a long gap the pid can name any process: only the one started for this job is killed
 			// (src/act/kill.mjs re-verifies the same way). A process gone meanwhile is ended below.
 			if (!meta.pid || !isAlive(meta.pid)) return ended(f, meta, exit);
@@ -363,7 +416,8 @@ export function createRunner({ paths, spawnImpl = spawn, clock, env = process.en
 			}
 			if (seen) {
 				if (seen.ctimeMs !== meta.ctimeMs || seen.cmdSha1 !== meta.cmdSha1) {
-					if (auditProcessRemains(jobId, meta)) return running();
+					const surviving = pollAuditSurvivor(f, meta);
+					if (surviving) return surviving;
 					return fallbackFailure(f, meta, null) ?? finish(f, meta, { status: "failed", reason: "pid-reused", result: null, exitCode: null });
 				}
 				if (!timedOut) return running();
@@ -400,11 +454,13 @@ export function createRunner({ paths, spawnImpl = spawn, clock, env = process.en
 
 		/** Re-verify and send `taskkill /F /T` to the job's own tree: `sent`, `gone`, or a lookup error. */
 		terminate(jobId) {
-			const meta = readJsonSafe(files(jobId).meta);
-			if (!stillOurs(meta)) return "gone";
-			spawnImpl("taskkill", ["/F", "/T", "/PID", String(meta.pid)], { windowsHide: true, stdio: "ignore" }).on?.("error", (error) => {
-				fs.appendFile(files(jobId).err, `\ntaskkill /T failed: ${error.message}\n`, () => {});
-			});
+			const f = files(jobId);
+			const meta = readJsonSafe(f.meta);
+			if (meta?.adopted || !stillOurs(meta)) {
+				const tracked = meta?.kind === "audit" && trackAuditSurvivor(f, meta);
+				return tracked ? terminateAuditSurvivor(f, tracked) : "gone";
+			}
+			killOwnTree(f, meta);
 			return "sent";
 		},
 	};

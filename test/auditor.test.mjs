@@ -566,6 +566,53 @@ test("a timeout holds the slot while alive is true, retries terminate on every p
 	assert.equal(h.runner.starts.length, 2);
 });
 
+test("IS-10 deadline: the second audit starts and charges once only after the timed-out model child is gone", async () => {
+	const h = harness({ sessions: ["m1", "m2"] });
+	h.config.audit.timeoutMs = POLL;
+	const recording = createRecordingSpawn();
+	const identity = { ctimeMs: BASE, cmdSha1: "launcher" };
+	const child = { pid: 71000, ctimeMs: BASE + POLL + 2, cmdSha1: "model-child" };
+	let launcherAlive = true;
+	let childAlive = true;
+	const runner = createRunner({
+		paths: h.paths, clock: h.clock, env: {}, spawnImpl: recording.spawnImpl,
+		isAlive: (pid) => pid === 70000 ? launcherAlive : childAlive,
+		identify: (pid) => pid === child.pid ? (childAlive ? child : null) : (pid !== 70000 || launcherAlive ? identity : null),
+		findJobProcess: (jobId) => jobId.endsWith("-m1") && childAlive ? child : null,
+	});
+	const a = h.auditor({ runner });
+	h.request("m1");
+	h.request("m2");
+	await h.prepare(a);
+	const firstJob = h.record("m1").jobId;
+	launcherAlive = false;
+	fs.writeFileSync(path.join(runner.jobDir(firstJob), "exit.json"), JSON.stringify({ code: 0 }));
+	const kills = () => recording.calls.filter(({ command }) => command === "taskkill").map(({ args }) => args);
+	h.tick(a, POLL);
+	assert.equal(h.record("m1").status, "running");
+	assert.equal(h.record("m2").status, "queued");
+	assert.deepEqual(kills(), []);
+	h.tick(a);
+	assert.deepEqual(kills(), [["/F", "/T", "/PID", "71000"]]);
+	h.tick(a);
+	assert.equal(h.record("m1").status, "running");
+	assert.equal(h.record("m2").status, "queued");
+	assert.equal(recording.calls.length, 2);
+	assert.equal(h.budget().count, 1);
+	childAlive = false;
+	h.tick(a);
+	assert.deepEqual([h.record("m1").status, h.record("m1").reason], ["failed", "timeout"]);
+	assert.equal(h.record("m2").status, "queued");
+	await h.prepare(a);
+	const second = h.record("m2");
+	assert.equal(second.status, "running");
+	h.tick(a);
+	assert.equal(recording.calls.filter(({ command }) => command !== "taskkill").length, 2);
+	assert.deepEqual(kills(), [["/F", "/T", "/PID", "71000"]]);
+	assert.equal(h.budget().count, 2);
+	assert.deepEqual(h.budget().jobs, [firstJob, second.jobId]);
+});
+
 test("a launching record whose meta.json has ctimeMs null is polled through the runner, and a second audit waits for its end", async () => {
 	const h = harness({ sessions: ["m1", "m2"] });
 	h.request("m1");

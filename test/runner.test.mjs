@@ -692,6 +692,75 @@ test("IS-10: only audit liveness looks for a surviving model child after launche
 	assert.equal(runner.alive("j1"), false, "neither a different bundle nor a different lane holds the slot");
 });
 
+test("IS-10 deadline: a verified surviving audit child is killed once and times out only after disappearance", () => {
+	const child = { pid: 71000, ctimeMs: T + 1, cmdSha1: "model-child" };
+	let launcherAlive = true;
+	let childAlive = true;
+	let childLookups = 0;
+	const { runner, calls, clock } = setup({
+		isAlive: (pid) => pid === child.pid ? childAlive : launcherAlive,
+		identify(pid) {
+			if (pid !== child.pid) return launcherAlive ? SAME_PROCESS() : null;
+			childLookups++;
+			return childAlive ? child : null;
+		},
+		findProcess: () => childAlive ? child : null,
+	});
+	runner.start({ ...baseJob, kind: "audit", args: laneArgsFor("j1", "lane-1") });
+	launcherAlive = false;
+	writeExit(runner, { code: 0 });
+	const kills = () => calls.filter(({ command }) => command === "taskkill").map(({ args }) => args);
+	assert.equal(runner.poll("j1").status, "running");
+	assert.deepEqual(kills(), []);
+	const beforeDeadline = childLookups;
+
+	clock.advance(baseJob.timeoutMs + 1);
+	assert.equal(runner.poll("j1").status, "running", "a termination request is not proof of exit");
+	assert.deepEqual(kills(), [["/F", "/T", "/PID", "71000"]]);
+	assert.ok(childLookups > beforeDeadline, "the kill uses a fresh identity lookup");
+	const { pid, ctimeMs, cmdSha1, adopted, startedMs, timeoutMs, final } = readMeta(runner);
+	assert.deepEqual({ pid, ctimeMs, cmdSha1, adopted, startedMs, timeoutMs, final },
+		{ ...child, adopted: true, startedMs: T, timeoutMs: baseJob.timeoutMs, final: undefined });
+	assert.equal(runner.poll("j1").status, "running");
+	childAlive = false;
+	assert.equal(runner.poll("j1").status, "timeout");
+	assert.deepEqual(kills(), [["/F", "/T", "/PID", "71000"]]);
+});
+
+test("IS-10 deadline: multiple matches or failed verification hold the audit without killing", () => {
+	let rows = [];
+	let failQuery = false;
+	let identity;
+	const { runner, paths, calls, clock } = setup({
+		isAlive: DEAD_PID,
+		identify: (pid) => pid === 70000 ? SAME_PROCESS() : identity,
+		findProcess: (jobId, args, options) => findJobProcess({ jobsDir: paths.health.jobsDir, jobId, args, ...options, exec: () => {
+			if (failQuery) throw new Error("CIM unavailable");
+			return rows.join("\n");
+		} }),
+	});
+	const args = laneArgs({ model: "p/reviewer", bundleFile: path.join(runner.jobDir("j1"), "bundle.md"), sessionId: "lane-j1" });
+	runner.start({ ...baseJob, kind: "audit", args });
+	const argv = `omo.exe ${args.join(" ")}`;
+	const child = cimLine(71000, 70000, T + 1, argv);
+	clock.advance(baseJob.timeoutMs + 1);
+	identity = { ctimeMs: T + 1, cmdSha1: sha1(argv) };
+	for (const parentPid of [71000, 70000]) {
+		rows = [child, cimLine(71001, parentPid, T + 2, argv)];
+		assert.equal(runner.poll("j1").status, "running");
+		assert.equal(readMeta(runner).pid, 70000);
+		assert.equal(calls.length, 1);
+	}
+	rows = [child];
+	failQuery = true;
+	assert.equal(runner.poll("j1").status, "running");
+	failQuery = false;
+	identity.cmdSha1 = "reused-command";
+	assert.equal(runner.poll("j1").status, "running");
+	assert.equal(readMeta(runner).pid, 70000);
+	assert.equal(calls.length, 1);
+});
+
 test("a process that only mentions the bundle path is not adopted and nothing is killed", () => {
 	let box;
 	const finder = (jobId, args) => findJobProcess({ jobsDir: box.paths.health.jobsDir, jobId, args, exec: () => cimLine(9, 1, T, "notepad.exe " + path.join(box.paths.health.jobsDir, jobId, "bundle.md")) });

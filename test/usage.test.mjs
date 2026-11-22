@@ -5,8 +5,11 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { tmpDir } from "./helpers/fixtures.mjs";
+import { makeWorld } from "./helpers/world.mjs";
+import { SessionTracker } from "../src/collect/sessions.mjs";
 import { addUsage, createRecordScanner, emptyUsage, modelsOfEntry, readUsage, usageOfEntry, usageTimeline, USAGE_TOOLS_KEY } from "../src/collect/usage.mjs";
 import { classifyProviderError } from "../src/detect/provider.mjs";
+import { detect as detectTokens } from "../src/detect/tokens.mjs";
 
 const MiB = 1024 * 1024;
 const MIN = 60_000;
@@ -1702,7 +1705,7 @@ test("usageTimeline reports buckets, turns, cache, errors, tools and images equa
 			[4, "anthropic-subscription/claude-opus-5-5", "stop"],
 		],
 	);
-	assert.equal(timeline.cache.stormTurns, 1);
+	assert.equal(timeline.cache.stormTurns, 0, "the first turn has no preceding context and cannot start a storm");
 	assert.ok(Math.abs(timeline.cache.hitRate - 802 / 986) < 1e-12);
 	assert.deepEqual(timeline.errors, { count: 1, byClass: { "usage-limit": 1 }, incomplete: false });
 	assert.deepEqual(timeline.tools, { rows: [{ name: "bash", calls: 1, errors: 1 }], incomplete: false });
@@ -1710,6 +1713,34 @@ test("usageTimeline reports buckets, turns, cache, errors, tools and images equa
 	assert.ok(Math.abs(timeline.images.peakMiB - 6 / MiB) < 1e-12);
 	assert.equal(typeof timeline.prepMs, "number");
 });
+
+const stormRewrite = { input: 0, cacheRead: 0, cacheWrite: 60 };
+const stormBreak = { input: 100, cacheRead: 0, cacheWrite: 0 };
+for (const [label, usages, expected] of [
+	["latest consecutive run", [stormBreak, stormRewrite, stormRewrite, stormRewrite, stormBreak, stormRewrite, stormRewrite, stormBreak, stormRewrite], 2],
+	["single qualifying turn", [stormBreak, stormRewrite], 0],
+	["qualifies only against current context", [
+		{ input: 10, cacheRead: 0, cacheWrite: 0 },
+		{ input: 0, cacheRead: 30, cacheWrite: 60 },
+		{ input: 0, cacheRead: 60, cacheWrite: 100 },
+	], 0],
+]) {
+	test(`(IS-8) timeline storm evidence agrees with D4: ${label}`, (t) => {
+		const { file } = setup(t);
+		const transcript = file();
+		const tokens = { cacheStormWrite: 50, cacheStormReadFrac: 0.5 };
+		writeRecords(transcript, usages.map((usage, i) => assistant({ ms: T0 + i * MIN, usage: use(usage) })));
+		const now = T0 + usages.length * MIN;
+		const session = new SessionTracker({ file: transcript });
+		session.read();
+		session.advance(now);
+		assert.equal(session.state.turns.length, usages.length);
+		const world = makeWorld({ now, config: { tokens }, sessions: [session.state] });
+		const storms = detectTokens(world).filter(({ kind }) => kind === "cache-storm");
+		assert.deepEqual(storms.map(({ data }) => data.turns), expected ? [expected] : []);
+		assert.equal(usageTimeline(transcript, tokens).cache.stormTurns, storms[0]?.data.turns ?? 0);
+	});
+}
 
 test("(IS-8) an oversized tool-result image marks statistics incomplete without changing usage", (t) => {
 	const { file } = setup(t);

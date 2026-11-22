@@ -70,7 +70,7 @@ function sessionSubject(session, key) {
 }
 
 /** 4a: the latest run of >= 2 consecutive storm turns. */
-function cacheStorm(session, cfg) {
+export function cacheStorm(session, cfg) {
 	const turns = session.turns ?? [];
 	let run = [];
 	let best;
