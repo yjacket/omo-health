@@ -215,6 +215,19 @@ test("live end detection keeps shared task IDs isolated by parent", () => {
 	assert.deepEqual(facts(stillRunning), [ended[0]]);
 });
 
+test("live end detection passes the nearest known project cwd to the ledger", () => {
+	const parent = childRow("parent-task", { sessionId: "review.1", cwd: "C:/child-project", children: [
+		childRow("check-task", { sessionId: "check.1" }),
+	] });
+	const prev = snap(NOW - 1, [mainRow("root", { cwd: "C:/root-project", children: [parent] })]);
+	const liveParent = sessionState({ id: "review.1", cwd: "C:/live-project" });
+	const world = makeWorld({ now: NOW, sessions: [liveParent], procsFresh: true });
+	const childCwd = (snapshot) => detectEnded(snapshot, snap(NOW, []), world, NOW)
+		.find(({ sessionId }) => sessionId === "check.1").cwd;
+	assert.equal(childCwd(prev), "C:/child-project");
+	assert.equal(childCwd(snap(NOW - 1, [mainRow("root", { cwd: null, children: [{ ...parent, cwd: null }] })])), "C:/live-project");
+});
+
 test("buildSessionSnapshot puts the injected token totals on every main and child row", () => {
 	const seen = new Map([
 		["m1", { tokens: { total: 1200, input: 900, output: 300 }, treeTokens: 20_000 }],

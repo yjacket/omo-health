@@ -5,7 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { resolvePaths } from "../src/paths.mjs";
-import { appendEnded, appendEndedBatch, appendEndedLocated, ENDED_LOCATION, hasEnded, readEnded, readEndedCwd } from "../src/session-ledger.mjs";
+import { appendEnded, appendEndedBatch, appendEndedLocated, endedKey, endedSelector, ENDED_LOCATION, hasEnded, readEnded, readEndedCwd } from "../src/session-ledger.mjs";
+import { projectKeyOf, subjectOf } from "../src/session-subject.mjs";
 
 function setup() {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "ledger-"));
@@ -107,6 +108,42 @@ test("ended append dedupe scopes shared task IDs by parent or parentless cwd", (
 	const d = child(null, "project-b");
 	compareAppends(t, {}, [a, b, c, d, a, b, c, d], batchNow,
 		[true, true, true, true, false, false, false, false]);
+});
+
+test("batch persists a cwd-less child's project from batch, live, or retained parents", (t) => {
+	const paths = setup();
+	t.after(() => fs.rmSync(paths.health.sessionsDir, { recursive: true, force: true }));
+	const parent = (id, cwd, endedMs = batchNow) => rec(id, endedMs, { cwd });
+	const child = (parentSessionId, extra) => rec("check.1", batchNow, { parentSessionId, kind: "child", ...extra });
+	const append = (rows, options) => appendEndedBatch(paths, rows, { nowMs: batchNow, ...options }).map(({ appended }) => appended);
+	const a = "C:/project-a";
+	const b = "C:/project-b";
+	const c = "C:/project-c";
+	assert.deepEqual(append([child("review.1"), parent("review.1", a)]), [true, true], "a later batch row supplies the parent");
+	assert.deepEqual(append([child("review.1")], { liveRows: [{ id: "review.1", cwd: b }] }), [true], "a live parent takes precedence over retained rows");
+	assert.deepEqual(append([child("review.1", { cwd: "C:\\project-a\\." })]), [false], "own cwd deduplicates against inherited project");
+	assert.deepEqual(append([parent("older", c, batchNow - 31 * batchDay)]), [true]);
+	assert.deepEqual(append([child("older")]), [true], "the retained parent may be outside the dedupe window");
+	assert.deepEqual(append([child("older")]), [false], "the inherited repeat is skipped");
+	assert.equal(hasEnded(paths, child("older"), { nowMs: batchNow }), true);
+	const shared = readEnded(paths).filter((row) => row.parentSessionId === "review.1");
+	assert.deepEqual(shared.map((row) => subjectOf(row).projectKey), [projectKeyOf(a), projectKeyOf(b)]);
+	assert.notEqual(endedSelector(shared[0]), endedSelector(shared[1]), "same-tick rows have distinct selectors");
+	const older = readEnded(paths).find((row) => row.parentSessionId === "older");
+	assert.equal(older.cwd, null, "do not write an ancestor's cwd as the child's own cwd");
+	assert.equal(subjectOf(older).projectKey, projectKeyOf(c));
+});
+
+test("batch leaves an ambiguous parent project on the legacy unresolved key", (t) => {
+	const paths = setup();
+	t.after(() => fs.rmSync(paths.health.sessionsDir, { recursive: true, force: true }));
+	const child = rec("check.1", batchNow, { parentSessionId: "review.1", kind: "child" });
+	const rows = ["C:/a", "C:/b"].map((cwd) => rec("review.1", batchNow, { cwd }));
+	const appended = appendEndedBatch(paths, [...rows, child, child], { nowMs: batchNow });
+	assert.deepEqual(appended.map((result) => result.appended), [true, true, true, false]);
+	const stored = readEnded(paths).find((row) => row.sessionId === child.sessionId);
+	assert.equal(subjectOf(stored).projectKey, null);
+	assert.equal(endedKey(stored), JSON.stringify(["check.1", "review.1", null]));
 });
 
 test("corrupt line is skipped and hasEnded works", () => {

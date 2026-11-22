@@ -23,6 +23,10 @@ export function projectKeyOf(cwd) {
 }
 
 export function subjectOf(row, parent) {
+	// The ledger records this only when it resolved a project without an own cwd.
+	if (row?.endedProjectKey && row.projectKey == null) {
+		return { projectKey: projectKeyOf(row.cwd) ?? row.endedProjectKey, sessionId: row.sessionId ?? row.id ?? null };
+	}
 	return {
 		projectKey: row?.projectKey ?? projectKeyOf(row?.cwd) ?? parent?.projectKey ?? null,
 		sessionId: row?.sessionId ?? row?.id ?? null,

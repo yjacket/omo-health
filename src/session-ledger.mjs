@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { projectKeyOf, sessionSubjects, subjectOf } from "./session-subject.mjs";
 import { ensureDir, listDirSafe } from "./util/fsx.mjs";
 import { redact, sha1, truncate } from "./util/text.mjs";
 
@@ -141,21 +142,66 @@ export function locateEndedRows(paths, rows, { fs: fsImpl = fs } = {}) {
 	}
 }
 
-/** Ended identity: a parent scopes the ID; without one, the recorded cwd scopes it. */
+/** Use recorded project identity, not a project inferred later for display or usage. */
 export function endedKey(row) {
 	if (typeof row?.sessionId !== "string") return undefined;
 	const parent = row.parentSessionId || null;
-	return JSON.stringify([row.sessionId, parent, parent ? null : row.cwd || null]);
+	return JSON.stringify([row.sessionId, parent, projectKeyOf(row.cwd) ?? row.endedProjectKey ?? (parent ? null : row.cwd || null)]);
 }
 
 export function endedSelector(row) {
 	return sha1(JSON.stringify([endedKey(row), row.endedMs])).slice(0, 16);
 }
 
+/** Freeze inherited identity for append, selector lookup and tracker reads. */
+function scopeEndedRow(row, projectKey) {
+	return projectKey && !projectKeyOf(row.cwd) && !row.endedProjectKey
+		? { ...row, endedProjectKey: projectKey }
+		: row;
+}
+
+function scopeEndedRecords(paths, records, liveRows) {
+	if (!records.some((row) => row?.parentSessionId && !subjectOf(row).projectKey)) {
+		return records.map((row) => scopeEndedRow(row, subjectOf(row).projectKey));
+	}
+	liveRows = [...(liveRows ?? [])];
+	const batch = sessionSubjects(records);
+	const current = liveRows.length ? sessionSubjects([...records, ...liveRows]) : batch;
+	const scoped = records.map((row) => scopeEndedRow(row, batch(row).projectKey ?? current(row).projectKey));
+	let parents = new Set(scoped.filter((row) => row?.parentSessionId && !subjectOf(row).projectKey).map((row) => row.parentSessionId));
+	if (!parents.size) return scoped;
+
+	// Parents may predate the dedupe window. Retain only their identity and
+	// follow unresolved ancestor links, never holding the full ledger in memory.
+	const family = [];
+	const visited = new Set();
+	for (let depth = 0; depth < 8 && parents.size; depth++) {
+		const next = new Set();
+		for (const id of parents) visited.add(id);
+		const add = (row) => {
+			const sessionId = row?.sessionId ?? row?.id;
+			if (!parents.has(sessionId)) return;
+			const { projectKey } = subjectOf(row);
+			const parentSessionId = projectKey ? null : row.parentSessionId;
+			family.push({ sessionId, projectKey, parentSessionId });
+			if (parentSessionId && !visited.has(parentSessionId)) next.add(parentSessionId);
+		};
+		for (const row of scoped) add(row);
+		for (const row of liveRows) add(row);
+		for (const row of streamEnded(paths)) add(row);
+		parents = next;
+	}
+	const resolve = sessionSubjects(family);
+	return scoped.map((row) => scopeEndedRow(row, resolve(row).projectKey));
+}
+
 /** Look up a record's identity, or any occurrence of a bare session ID, in the last 30 days. */
-export function hasEnded(paths, record, { nowMs = Date.now() } = {}) {
-	const byId = typeof record === "string";
-	const key = byId ? record : endedKey(record);
+export function hasEnded(paths, record, { nowMs = Date.now(), liveRows } = {}) {
+	return typeof record === "string" ? hasEndedKey(paths, record, nowMs, true)
+		: hasEndedKey(paths, endedKey(scopeEndedRecords(paths, [record], liveRows)[0]), nowMs);
+}
+
+function hasEndedKey(paths, key, nowMs, byId = false) {
 	if (key === undefined) return false;
 	// The cutoff selects files, not rows: the entire cutoff day's file
 	// participates in duplicate detection.
@@ -177,8 +223,9 @@ export function appendEnded(paths, record, options = {}) {
  * queue can read that line back without scanning the day. `appended` mirrors
  * `appendEnded`; `location` is null when nothing was written.
  */
-export function appendEndedLocated(paths, record, { nowMs = Date.now() } = {}) {
-	if (hasEnded(paths, record, { nowMs: Math.max(nowMs, Number(record.endedMs) || 0) })) return { appended: false, location: null };
+export function appendEndedLocated(paths, record, { nowMs = Date.now(), liveRows } = {}) {
+	record = scopeEndedRecords(paths, [record], liveRows)[0];
+	if (hasEndedKey(paths, endedKey(record), Math.max(nowMs, Number(record.endedMs) || 0))) return { appended: false, location: null };
 	return writeEnded(paths, record);
 }
 
@@ -186,11 +233,11 @@ export function appendEndedLocated(paths, record, { nowMs = Date.now() } = {}) {
  * Append ends in input order with a shared disk scan. Backfill can also supply
  * its own window's recorded keys; successful writes are added to that set.
  */
-export function appendEndedBatch(paths, records, { nowMs = Date.now(), recorded } = {}) {
+export function appendEndedBatch(paths, records, { nowMs = Date.now(), recorded, liveRows } = {}) {
 	const skipped = { appended: false, location: null };
 	const candidates = new Set();
 	let earliest;
-	const pending = records.map((record) => {
+	const pending = scopeEndedRecords(paths, records, liveRows).map((record) => {
 		let id;
 		try {
 			id = endedKey(record);
