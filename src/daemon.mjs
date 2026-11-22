@@ -37,7 +37,7 @@ import { buildSessionSnapshot, detectEnded } from "./session-board.mjs";
 import { appendEndedBatch, ENDED_LOCATION, streamEnded } from "./session-ledger.mjs";
 import { subjectKey, worldLiveOwners } from "./session-subject.mjs";
 import { createSessionFileLocator } from "./collect/session-files.mjs";
-import { createUsageIndex } from "./usage-index.mjs";
+import { createUsageIndex, USAGE_TICK_BYTES } from "./usage-index.mjs";
 import { createUsageTracker } from "./usage-tracker.mjs";
 import { atomicWriteJson, ensureDir, readJsonSafe, statSafe } from "./util/fsx.mjs";
 import { pathKey } from "./paths.mjs";
@@ -332,7 +332,7 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 	const ledgerCache = new Map();
 	const boardInvestigations = createInvestigations({ paths, clock });
 	// Plan todo 5: the token index and its tracker. This process is the only writer of usage.json; the
-	// tracker shares one 32 MiB budget per tick between live appends and the ended-session backlog.
+	// daemon shares one 32 MiB transcript budget per tick between usage tracking and reconciliation.
 	const usageIndex = createUsageIndex({ file: paths.health.usageIndexFile, clock, log });
 	const usageTracker = createUsageTracker({ paths, index: usageIndex, locator: createSessionFileLocator({ paths, clock, indexedFile: (subject) => usageIndex.get(subjectKey(subject))?.file }), clock, log });
 	// Plan todo 12: owner-requested audits (display-only, so they run in shadow mode too); one runs at a time.
@@ -340,6 +340,7 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 	const savedBoard = readJsonSafe(paths.health.sessionsSnapshotFile);
 	let prevBoard = savedBoard?.v === 1 && clock.now() - (savedBoard.ts ?? 0) <= BOARD_RESUME_MS ? savedBoard : undefined;
 	let backfilled = false;
+	const backfillProgress = {};
 	const daemonStartedMs = clock.now();
 	let lastHostSeenMs = clock.now();
 	const lastElevate = readJsonSafe(elevateFile)?.atMs;
@@ -422,13 +423,17 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 				log.error("evidence_failed", { error: error.message, stack: String(error.stack).slice(0, 800) });
 			}
 			// The session board: the live snapshot, and the sessions that ended since the last one.
+			// Reserve enough for at least one backfill head/tail even when usage has a full tick of work.
+			const usageAllowance = USAGE_TICK_BYTES - (backfilled ? 0 : 1024 * 1024);
+			let usageBytes = 0;
 			const liveOwners = result?.world ? worldLiveOwners(result.world) : undefined;
 			if (result?.world) {
 				try {
 					const boardNow = clock.now();
 					try {
-						usageTracker.tick(result.world);
+						usageBytes = usageTracker.tick(result.world, { maxBytes: usageAllowance }).bytesRead;
 					} catch (error) {
+						usageBytes = usageAllowance;
 						log.error("usage_tick_failed", { error: error.message, stack: String(error.stack).slice(0, 800) });
 					}
 					const board = buildSessionSnapshot(result.world, result.findings ?? [], boardInvestigations.list({ sinceMs: boardNow - 7 * DAY_MS }), boardNow, {
@@ -456,19 +461,21 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 			} catch (error) {
 				log.error("audit_tick_failed", { error: error.message, stack: String(error.stack).slice(0, 800) });
 			}
-			// One-time reconstruction of the last 30 days, after the first tick so the board is up first.
+			// Reconcile after the board, using the reserved share plus any unused usage allowance.
 			if (!backfilled) {
-				backfilled = true;
 				try {
-					const summary = backfillOnce(paths, clock.now());
-					if (!summary.skipped) log.info("session_backfill", { counts: summary.counts, errors: summary.errors.length, firstError: summary.errors[0] });
+					const summary = backfillOnce(paths, clock.now(), { maxBytes: USAGE_TICK_BYTES - usageBytes, progress: backfillProgress });
+					backfilled = !summary.pending;
+					if (summary.counts) log.info("session_backfill", { counts: summary.counts, errors: summary.errors.length, firstError: summary.errors[0] });
 				} catch (error) {
 					log.error("session_backfill_failed", { error: error.message });
 				}
-				try {
-					usageTracker.queueLedger(streamEnded(paths, { sinceMs: clock.now() - 30 * DAY_MS, withLocation: true }));
-				} catch (error) {
-					log.error("usage_queue_failed", { error: error.message });
+				if (backfilled) {
+					try {
+						usageTracker.queueLedger(streamEnded(paths, { sinceMs: clock.now() - 30 * DAY_MS, withLocation: true }));
+					} catch (error) {
+						log.error("usage_queue_failed", { error: error.message });
+					}
 				}
 			}
 			if (clock.now() - lastRetentionMs >= DAY_MS) {

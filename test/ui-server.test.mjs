@@ -346,19 +346,30 @@ describe("ui server", { timeout: 20_000 }, () => {
 		const now = () => nowMs;
 		const day = 86_400_000;
 		const endedMs = nowMs - 29 * day;
-		appendEnded(paths, { sessionId: "visible", kind: "main", cwd: dir, startedMs: endedMs - 1_000, endedMs, outcome: "answered" }, { nowMs });
+		const projectA = path.join(dir, "a");
+		const projectB = path.join(dir, "b");
+		const visible = { sessionId: "visible", kind: "main", cwd: projectA, startedMs: endedMs - 1_000, endedMs, outcome: "answered" };
+		const right = { ...visible, sessionId: "right", endedMs: endedMs - 1 };
+		const ambiguousChild = { ...visible, sessionId: "ambiguous-child", kind: "child", cwd: projectB, parentSessionId: visible.sessionId, endedMs: endedMs - 2 };
+		const resolvedChild = { ...ambiguousChild, sessionId: "resolved-child", parentSessionId: right.sessionId, endedMs: endedMs - 3 };
+		const visibleFile = path.join(paths.health.sessionsDir, `ended-${new Date(endedMs).toISOString().slice(0, 10)}.jsonl`);
+		writeJsonl(visibleFile, [visible, right, ambiguousChild, resolvedChild].map((row) => ({ ...row, v: 1 })));
 
 		const retained = new Set();
 		for (const age of [31, 32, 33]) {
 			const olderMs = nowMs - age * day;
 			const file = path.join(paths.health.sessionsDir, `ended-${new Date(olderMs).toISOString().slice(0, 10)}.jsonl`);
 			retained.add(file);
-			let rows = "";
-			for (let i = 0; i < 2_000; i++) {
-				rows += JSON.stringify({ sessionId: `old-${age}-${i}`, parentSessionId: `unrelated-${i}`, endedMs: olderMs }) + "\n";
-			}
-			fs.writeFileSync(file, rows);
+			writeJsonl(file, [{ ...visible, v: 1, sessionId: age === 31 ? visible.sessionId : `old-${age}`, cwd: projectB, endedMs: olderMs }]);
 		}
+
+		const index = createUsageIndex({ file: paths.health.usageIndexFile, clock: { now } });
+		for (const [row, input] of [[visible, 10], [right, 20], [ambiguousChild, 30], [resolvedChild, 40]]) {
+			const transcript = path.join(dir, `${row.sessionId}.jsonl`);
+			writeJsonl(transcript, [{ type: "usage", provider: "p", model: "m", usage: { input } }]);
+			index.update(subjectOf(row), transcript, { parentSessionId: row.parentSessionId ?? null, parentKey: row.parentSessionId ? "" : null });
+		}
+		index.save();
 
 		const ui = createUiServer({ paths, token: TOKEN, getState: () => uiState({ paths, env, now: now() }), now });
 		try {
@@ -376,10 +387,20 @@ describe("ui server", { timeout: 20_000 }, () => {
 				});
 			}
 			syncBuiltinESMExports();
-			const { status, body } = await getAt(port, "/api/state");
-			assert.equal(status, 200);
-			assert.deepEqual(body.ended.rows.map((row) => row.sessionId), ["visible"]);
-			assert.deepEqual([...opened], [], "/api/state opened retained ledger files");
+			const checkState = async (rightTree, rightChildren) => {
+				const { status, body } = await getAt(port, "/api/state");
+				assert.equal(status, 200);
+				assert.deepEqual(body.ended.rows.map((row) => row.sessionId), ["visible", "right", "ambiguous-child", "resolved-child"]);
+				assert.deepEqual([...opened], [], "/api/state opened retained ledger files");
+				assert.deepEqual(body.ended.rows.map((row) => [row.tokens?.total, row.treeTokens, row.childCount]), [
+					[10, null, 0], [20, rightTree, rightChildren], [30, null, 0], [40, null, 0],
+				]);
+			};
+			await checkState(null, 0);
+			// Publish the resolved link and leave the ambiguous one explicitly unlinked.
+			assert.equal(index.recordParentLink(subjectOf(resolvedChild), subjectKey(subjectOf(right))), true);
+			index.save();
+			await checkState(60, 1);
 		} finally {
 			t.mock.reset();
 			syncBuiltinESMExports();

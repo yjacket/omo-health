@@ -4,9 +4,9 @@ import { DEFAULT_CONFIG, loadConfig, SWITCH_KEYS } from "../config.mjs";
 import { getPath, pauseState, SWITCHES } from "../control.mjs";
 import { readDecisions } from "../decisions.mjs";
 import { createInvestigations, RESOLVED } from "../investigations.mjs";
-import { endedSelector, readEnded, streamEnded } from "../session-ledger.mjs";
-import { ambiguousLedgerTaskIds, displayLedgerId, legacyParentOwners, usageEntryOf, usageTreeLink } from "../session-record.mjs";
-import { compactUsage, publishedUsageView, readUsageIndex, treeTotals } from "../usage-index.mjs";
+import { endedSelector, readEnded } from "../session-ledger.mjs";
+import { ambiguousLedgerTaskIds, displayLedgerId, usageEntryOf, usageTreeLink } from "../session-record.mjs";
+import { compactUsage, parentSubject, publishedUsageView, readUsageIndex, treeTotals } from "../usage-index.mjs";
 import { listDirSafe, readJsonSafe, statSafe } from "../util/fsx.mjs";
 import { redact, truncate } from "../util/text.mjs";
 import { VERSION } from "../version.mjs";
@@ -326,19 +326,12 @@ export function buildEnded(inputs) {
 	const rows = (Array.isArray(inputs.ended) ? inputs.ended : []).filter((r) => isRecord(r) && Number.isFinite(r.endedMs));
 	const resolve = sessionSubjects(rows);
 	const all = rows.map((row) => ({ ...row, ...resolve(row) }));
-	const parentOwners = legacyParentOwners(all, () => inputs.paths ? streamEnded(inputs.paths) : all);
 	const tally = new Map(Object.keys(OUTCOME_LABELS).map((outcome) => [outcome, 0]));
 	const idCounts = new Map();
 	for (const r of all) {
 		const outcome = typeof r.outcome === "string" && tally.has(r.outcome) ? r.outcome : "unknown";
 		tally.set(outcome, tally.get(outcome) + 1);
 		idCounts.set(r.sessionId, (idCounts.get(r.sessionId) ?? 0) + 1);
-	}
-	const childRows = new Map();
-	for (const r of all) if (r.kind === "child" && typeof r.parentSessionId === "string") {
-		const parentKey = subjectKey(ledgerParentSubject(r, parentOwners));
-		if (!parentKey) continue;
-		childRows.set(parentKey, (childRows.get(parentKey) ?? 0) + 1);
 	}
 	// Main and child rows are capped separately, then put back in the ledger's newest-first order.
 	const mains = all.filter((r) => r.kind !== "child");
@@ -349,9 +342,20 @@ export function buildEnded(inputs) {
 	const usage = typeof inputs.usage?.get === "function" && typeof inputs.usage?.values === "function" ? inputs.usage : new Map();
 	const ambiguous = ambiguousLedgerTaskIds(all, { scoped: true });
 	const published = publishedUsageView(usage);
-	// Retained descendants join through published index parent links. Only
-	// visible ledger rows supplement those links (e.g. for pending children).
-	const trees = treeTotals(usage, all.map((row) => usageTreeLink(published, row, ambiguous, parentOwners)));
+	const childRows = new Map();
+	// The daemon resolves bare parent IDs against the retained ledger. History
+	// only trusts a published link or the visible row's explicit parent scope.
+	const links = all.map((row) => {
+		let parent = ledgerParentSubject(row);
+		if (!parent && row.parentSessionId) {
+			const entry = usageEntryOf(published, row, ambiguous);
+			if (entry?.parentSessionId === row.parentSessionId) parent = parentSubject(entry);
+		}
+		const parentKey = subjectKey(parent);
+		if (row.kind === "child" && parentKey) childRows.set(parentKey, (childRows.get(parentKey) ?? 0) + 1);
+		return { ...usageTreeLink(published, row, ambiguous), parentKey };
+	});
+	const trees = treeTotals(usage, links);
 	return {
 		sinceMs: inputs.now - ENDED_WINDOW_MS,
 		limit: ENDED_LIMIT,

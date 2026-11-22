@@ -660,10 +660,11 @@ it("(IS-3) deleted task-only usage keeps its history label but blocks audit like
 
 it("history marks a partial tree with the required text and title", () => {
 	const { paths, env } = makeHome();
-	const row = { kind: "main", startedMs: NOW - HOUR, endedMs: NOW, outcome: "completed" };
+	const cwd = paths.healthHome;
+	const row = { kind: "main", cwd, startedMs: NOW - HOUR, endedMs: NOW, outcome: "completed" };
 	for (const id of ["partial", "complete"]) appendEnded(paths, { ...row, sessionId: id }, { nowMs: NOW });
-	appendEnded(paths, { ...row, kind: "child", sessionId: "pending", taskId: "st_pending", parentSessionId: "partial" }, { nowMs: NOW });
-	overflowIndex(paths, [["partial", "100"], ["counted-p", "20", "partial"], ["complete", "100"], ["counted-c", "20", "complete"]]);
+	appendEnded(paths, { ...row, kind: "child", sessionId: "pending", taskId: "st_pending", parentSessionId: "partial", parentProjectKey: sub("partial", cwd).projectKey }, { nowMs: NOW });
+	overflowIndex(paths, [["partial", "100"], ["counted-p", "20", "partial"], ["complete", "100"], ["counted-c", "20", "complete"]], cwd);
 	const history = new Map(JSON.parse(JSON.stringify(uiState({ paths, env, now: NOW }))).ended.rows.map((row) => [row.sessionId, row]));
 	const { endedTokenCell } = tokenFormatters("endedTokenCell");
 	const actual = ["partial", "complete"].map((id) => {
@@ -887,9 +888,10 @@ describe("ui model", () => {
 		const writeLedger = (paths, day, records) => write(path.join(paths.health.sessionsDir, `ended-${day}.jsonl`), `${records.map((r) => (typeof r === "string" ? r : JSON.stringify(r))).join("\n")}\n`);
 		const endedOf = (home) => uiState({ paths: home.paths, env: home.env, now: NOW }).ended;
 
-		it("a session recorded with childCount 0 shows the ended child rows that name it as parent; a larger recorded count stays", () => {
+		it("a session recorded with childCount 0 shows its explicitly linked ended children; a larger recorded count stays", () => {
 			const home = makeHome();
-			const child = (n, parent) => record(`c${n}`, "answered", NOW - 2 * HOUR - n * 60_000, { kind: "child", parentSessionId: parent, taskId: `st_${n}` });
+			const parentProjectKey = subjectOf(record("desk", "closed", NOW)).projectKey;
+			const child = (n, parent) => record(`c${n}`, "answered", NOW - 2 * HOUR - n * 60_000, { kind: "child", parentSessionId: parent, parentProjectKey, taskId: `st_${n}` });
 			writeLedger(home.paths, "2026-09-29", [record("desk", "closed", NOW - HOUR), record("big", "closed", NOW - HOUR, { childCount: 17 }), child(1, "desk"), child(2, "desk"), child(3, "big")]);
 			const rows = Object.fromEntries(endedOf(home).rows.map((r) => [r.sessionId, r.childCount]));
 			assert.equal(rows.desk, 2);
@@ -1260,7 +1262,7 @@ describe("ui model", () => {
 				}
 				const file = path.join(dir, `${spec.id}.jsonl`);
 				write(file, usageLine(spec.total ?? 100));
-				index.update(sub(spec.id), file, spec.meta ?? {}, spec.maxBytes ? { maxBytes: spec.maxBytes } : {});
+				index.update(sub(spec.id, spec.cwd), file, spec.meta ?? {}, spec.maxBytes ? { maxBytes: spec.maxBytes } : {});
 			}
 			index.save();
 		};
@@ -1343,6 +1345,8 @@ describe("ui model", () => {
 		it("(plan 34) ended task-only rows compete even when only one is indexed", () => {
 			const home = makeHome();
 			const taskId = "st_shared";
+			const cwd = home.paths.healthHome;
+			const parentProjectKey = sub("main-a", cwd).projectKey;
 			writeUsage(home.paths, [
 				{ id: taskId, meta: { kind: "child", taskId } },
 				{ id: "child-session", total: 75 },
@@ -1350,14 +1354,14 @@ describe("ui model", () => {
 				{ id: "main-b", total: 100 },
 				{ id: "counted-a", total: 20, meta: { parentSessionId: "main-a" } },
 				{ id: "counted-b", total: 20, meta: { parentSessionId: "main-b" } },
-			]);
+			].map((spec) => ({ ...spec, cwd })));
 			writeRows(home.paths, [
-				row(taskId, NOW - 1000, { kind: "child", taskId, parentSessionId: "main-a", title: "task A" }),
-				row(taskId, NOW - 2000, { kind: "child", taskId, parentSessionId: "main-b", title: "task B" }),
+				row(taskId, NOW - 1000, { kind: "child", taskId, parentSessionId: "main-a", parentProjectKey, title: "task A" }),
+				row(taskId, NOW - 2000, { kind: "child", taskId, parentSessionId: "main-b", parentProjectKey, title: "task B" }),
 				row("child-session", NOW - 3000, { kind: "child", taskId, parentSessionId: "main-c", title: "session" }),
 				row("main-a", NOW - 4000),
 				row("main-b", NOW - 5000),
-			]);
+			].map((entry) => ({ ...entry, cwd })));
 			const { rows } = uiState({ paths: home.paths, env: home.env, now: NOW }).ended;
 			assert.deepEqual(rows.filter((r) => r.kind === "child").map((r) => [r.title, r.tokens?.total ?? null]), [["task A", null], ["task B", null], ["session", 75]]);
 			assert.deepEqual(rows.filter((r) => r.kind === "main").map((r) => [r.sessionId, r.treeTokens, r.treeTokensComplete]),

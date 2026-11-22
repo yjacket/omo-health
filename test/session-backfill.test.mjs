@@ -112,6 +112,118 @@ function processBackfilledRows(paths, now) {
 	return tracker;
 }
 
+test("a v2 upgrade respects the transcript byte allowance each tick and resumes after restart", (t) => {
+	const a = fs.mkdtempSync(path.join(os.tmpdir(), "backfill-resume-"));
+	t.after(() => fs.rmSync(a, { recursive: true, force: true }));
+	const paths = resolvePaths({ USERPROFILE: a, OMO_HEALTH_HOME: path.join(a, "health"), OMO_HEALTH_OMO_HOME: path.join(a, ".omo") });
+	const now = Date.now();
+	const endedMs = now - HOUR;
+	const startedMs = endedMs - HOUR;
+	const marker = path.join(paths.health.sessionsDir, BACKFILL_MARKER);
+	const ledger = path.join(paths.health.sessionsDir, `ended-${iso(endedMs).slice(0, 10)}.jsonl`);
+	const seed = { sessionId: "seed", kind: "main", cwd: a, endedMs };
+	assert.ok(appendEnded(paths, seed, { nowMs: now }));
+	fs.writeFileSync(marker, JSON.stringify({ v: 2 }));
+	const files = new Set();
+	const ids = Array.from({ length: 6 }, (_, i) => `old-${i}`);
+	const headTailBytes = 320 * 1024;
+	for (const [i, id] of ids.entries()) {
+		const file = writeSession(paths, projectKeyOf(a), id, a, startedMs, endedMs,
+			[" ".repeat(i === ids.length - 1 ? headTailBytes : 2800)]);
+		fs.utimesSync(file, now / 1000, (now - (i + 1) * 1000) / 1000);
+		files.add(file);
+	}
+	const { openSync, readSync, closeSync, appendFileSync } = fs;
+	const fds = new Set();
+	let bytes = 0;
+	let reads = new Map();
+	t.mock.method(fs, "openSync", (file, flags, ...args) => {
+		const fd = openSync(file, flags, ...args);
+		if (flags === "r" && files.has(file)) {
+			fds.add(fd);
+			reads.set(file, (reads.get(file) ?? 0) + 1);
+		}
+		return fd;
+	});
+	t.mock.method(fs, "readSync", (fd, ...args) => {
+		const n = readSync(fd, ...args);
+		if (fds.has(fd)) bytes += n;
+		return n;
+	});
+	t.mock.method(fs, "closeSync", (fd) => {
+		fds.delete(fd);
+		return closeSync(fd);
+	});
+	// Small real files exercise the same daemonic allowance without writing tens of MiB.
+	const tick = (progress, at = now, maxBytes = 4096) => {
+		bytes = 0;
+		const summary = backfillOnce(paths, at, { maxBytes, progress });
+		assert.ok(bytes <= maxBytes, `tick read ${bytes} transcript bytes with a ${maxBytes}-byte allowance`);
+		return JSON.parse(fs.readFileSync(marker, "utf8")).v;
+	};
+	assert.equal(tick({}), 2, "no v3 marker before the first restart");
+	assert.deepEqual(readEnded(paths).map((r) => r.sessionId), ["seed"], "a partial scan leaves the ledger unchanged");
+
+	// Model an interruption during the append batch: only its first append reaches disk.
+	let partialWrites = 0;
+	const interrupted = t.mock.method(fs, "appendFileSync", (file, ...args) => {
+		if (file === ledger && partialWrites++ > 0) throw new Error("interrupted append batch");
+		return appendFileSync(file, ...args);
+	});
+	let progress = {};
+	for (let i = 0; i < ids.length - 1; i++) assert.equal(tick(progress, now + (i + 1) * MIN), 2);
+	assert.equal(tick(progress, now + ids.length * MIN, headTailBytes), 2, "a failed append leaves the v2 marker");
+	interrupted.mock.restore();
+	const prefix = readEnded(paths);
+	assert.equal(prefix.length, 2, "one backfill row was durable before the restart");
+	const prefixBytes = fs.readFileSync(ledger);
+
+	progress = {};
+	reads = new Map();
+	for (let i = 0; i < ids.length - 1; i++) assert.equal(tick(progress, now + (i + 1) * MIN), 2, `marker after tick ${i + 1}`);
+	assert.equal(tick(progress, now + ids.length * MIN, headTailBytes), 3, "marker after the final tick");
+	assert.equal(bytes, headTailBytes, "the large transcript spends its allowance on both the head and tail");
+	assert.deepEqual([...reads.values()], ids.map(() => 1), "the in-memory cursor visits each transcript only once per run");
+	assert.deepEqual(fs.readFileSync(ledger).subarray(0, prefixBytes.length), prefixBytes);
+	assert.deepEqual(readEnded(paths).map((r) => [r.sessionId, r.cwd]).sort(),
+		[["seed", a], ...ids.map((id) => [id, a])].sort());
+});
+
+test("a v2 upgrade leaves the unique cwd-less child untouched without suppressing conflicting projects", (t) => {
+	const { paths, now, startedMs, endedMs, sessionId, a, b } = setupProjectPair(t);
+	const original = { kind: "main", sessionId, cwd: a, endedMs };
+	assert.ok(appendEnded(paths, original, { nowMs: now }));
+	const marker = path.join(paths.health.sessionsDir, BACKFILL_MARKER);
+	fs.writeFileSync(marker, JSON.stringify({ v: 2 }));
+	const ledger = path.join(paths.health.sessionsDir, `ended-${iso(endedMs).slice(0, 10)}.jsonl`);
+	const child = (id, fields = {}) => ({
+		v: 1, kind: "child", sessionId: id, parentSessionId: sessionId, taskId: `st_${id}`, cwd: null, endedMs, ...fields,
+	});
+	const legacy = child("legacy");
+	const otherProject = child("other-project", { parentProjectKey: projectKeyOf(b) });
+	const otherChildCwd = child("other-child-cwd", { cwd: b });
+	const ambiguous = child("ambiguous");
+	const originalChildren = [legacy, otherProject, otherChildCwd, ambiguous, { ...ambiguous, cwd: b }];
+	fs.appendFileSync(ledger, originalChildren.map((row) => `${JSON.stringify(row)}\n`).join(""));
+	const originalBytes = fs.readFileSync(ledger);
+	for (const row of [legacy, otherProject, otherChildCwd, ambiguous]) {
+		writeTask(a, {
+			task_id: row.taskId, parent_session_id: row.parentSessionId, child_session_id: row.sessionId,
+			status: "completed", final_response: "done", created_at: iso(startedMs), terminal_at: iso(endedMs),
+		});
+	}
+
+	backfillOnce(paths, now);
+	const children = readEnded(paths).filter((row) => row.kind === "child");
+	assert.deepEqual(children.filter((row) => row.sessionId === "legacy"), [legacy]);
+	assert.deepEqual(children.filter((row) => row.sessionId === "other-project").map((row) => [row.cwd, row.parentProjectKey]),
+		[[null, projectKeyOf(b)], [a, projectKeyOf(a)]]);
+	assert.deepEqual(children.filter((row) => row.sessionId === "other-child-cwd").map((row) => row.cwd), [b, a]);
+	assert.deepEqual(children.filter((row) => row.sessionId === "ambiguous").map((row) => row.cwd), [null, b, a]);
+	assert.deepEqual(fs.readFileSync(ledger).subarray(0, originalBytes.length), originalBytes);
+	assert.equal(JSON.parse(fs.readFileSync(marker, "utf8")).v, 3);
+});
+
 test("a v2 upgrade restores the missing project for an ended ID and never rewrites the original", (t) => {
 	const { paths, now, startedMs, endedMs, sessionId, a, b } = setupProjectPair(t);
 	const original = { sessionId, kind: "main", cwd: a, startedMs, endedMs, outcome: "closed", reason: "original row" };

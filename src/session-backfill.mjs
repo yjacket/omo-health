@@ -1,9 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
-import { entryMs, idFromFileName, readSessionHeader } from "./collect/sessions.mjs";
+import { entryMs, idFromFileName } from "./collect/sessions.mjs";
 import { normalizeTask, senpiTaskStoreDir, taskStoreDir } from "./collect/tasks.mjs";
 import { appendEndedBatch, endedKey, streamEnded } from "./session-ledger.mjs";
-import { projectKeyOf, subjectKey } from "./session-subject.mjs";
+import { projectKeyOf, subjectKey, subjectOf } from "./session-subject.mjs";
 import { atomicWriteJson, ensureDir, listDirSafe, readJsonSafe, readTextSafe, statSafe } from "./util/fsx.mjs";
 import { redact, truncate } from "./util/text.mjs";
 import { kst, toMs } from "./util/time.mjs";
@@ -35,20 +35,23 @@ function parseLine(line) {
 }
 
 /** Head and tail of a session file without loading a huge file: last entry time and last session name. */
-function scanSessionFile(file, size) {
+function scanSessionFile(file, size, budget) {
 	const fd = fs.openSync(file, "r");
 	try {
 		const read = (offset, length) => {
 			const buf = Buffer.alloc(length);
 			const n = fs.readSync(fd, buf, 0, length, offset);
-			return buf.subarray(0, n).toString("utf8");
+			budget.remaining -= n;
+			return buf.subarray(0, n);
 		};
-		const chunks = [];
-		if (size <= HEAD_BYTES + TAIL_BYTES) chunks.push({ text: read(0, size), partialStart: false });
-		else {
-			chunks.push({ text: read(0, HEAD_BYTES), partialStart: false });
-			chunks.push({ text: read(size - TAIL_BYTES, TAIL_BYTES), partialStart: true });
-		}
+		const whole = size <= HEAD_BYTES + TAIL_BYTES;
+		const head = read(0, whole ? size : HEAD_BYTES);
+		const headerBytes = head.subarray(0, HEAD_BYTES);
+		const newline = headerBytes.indexOf(10);
+		const header = parseLine(headerBytes.subarray(0, newline === -1 ? headerBytes.length : newline).toString("utf8"));
+		if (header?.type !== "session" || typeof header.id !== "string") return {};
+		const chunks = [{ text: head.toString("utf8"), partialStart: false }];
+		if (!whole) chunks.push({ text: read(size - TAIL_BYTES, TAIL_BYTES).toString("utf8"), partialStart: true });
 		let lastMs;
 		let name;
 		for (const { text, partialStart } of chunks) {
@@ -63,7 +66,7 @@ function scanSessionFile(file, size) {
 				if (entry.type === "session_info" && typeof entry.name === "string" && entry.name.trim()) name = entry.name;
 			}
 		}
-		return { lastMs, name };
+		return { header, lastMs, name };
 	} finally {
 		fs.closeSync(fd);
 	}
@@ -167,21 +170,9 @@ function childOutcome(task, releases) {
 	return { outcome: "unknown", reason: `작업 상태가 ${clean(task.status ?? "없음", 30)}이고 끝난 이유를 알려 줄 기록이 없습니다.` };
 }
 
-/**
- * One-time reconstruction of the last `days` of ended sessions into the ended-session ledger (estimated:true,
- * source:"backfill"). A `.backfilled` marker with v >= BACKFILL_VERSION makes every later call a no-op; a missing,
- * unreadable or older marker runs the same scan. V3 reconciles sessions omitted by raw-ID deduplication by
- * appending only missing project-scoped keys, leaving existing entries untouched.
- * Never throws on a bad source file: problems are collected into the returned summary.
- */
-export function backfillOnce(paths, nowMs, { days = 30 } = {}) {
-	const markerFile = path.join(paths.health.sessionsDir, BACKFILL_MARKER);
-	const marker = readJsonSafe(markerFile);
-	if (Number(marker?.v) >= BACKFILL_VERSION) return { skipped: true };
+function startScan(paths, nowMs, days) {
 	const sinceMs = nowMs - days * DAY_MS;
-	const liveCutMs = nowMs - LIVE_MS;
 	const errors = [];
-	const counts = { main: 0, child: 0, written: 0, duplicate: 0, live: 0, outcomes: {} };
 
 	// Main session files, newest first, bounded.
 	const files = [];
@@ -198,17 +189,34 @@ export function backfillOnce(paths, nowMs, { days = 30 } = {}) {
 	}
 	files.sort((a, b) => b.mtimeMs - a.mtimeMs);
 	if (files.length > MAX_SESSION_FILES) errors.push(`session files capped at ${MAX_SESSION_FILES} of ${files.length}`);
+	return {
+		sinceMs, liveCutMs: nowMs - LIVE_MS, days, errors,
+		sessionFiles: files.length, sessionDirs: slugDirs.length,
+		files: files.slice(0, MAX_SESSION_FILES), cursor: 0, indexes: new Map(), mains: [],
+	};
+}
 
-	const indexes = new Map();
-	const mains = [];
-	for (const item of files.slice(0, MAX_SESSION_FILES)) {
+/**
+ * Reconcile only missing project-scoped rows. Pass the same `progress` object
+ * across ticks, with a fresh `maxBytes` transcript allowance each time. The
+ * scan is only in memory; an interrupted append is retried against the ledger.
+ */
+export function backfillOnce(paths, nowMs, { days = 30, maxBytes = Infinity, progress = {} } = {}) {
+	const markerFile = path.join(paths.health.sessionsDir, BACKFILL_MARKER);
+	if (!progress.scan && Number(readJsonSafe(markerFile)?.v) >= BACKFILL_VERSION) return { skipped: true };
+	const scan = progress.scan ??= startScan(paths, nowMs, days);
+	const { files, indexes, mains, errors } = scan;
+	const budget = { remaining: maxBytes };
+	while (scan.cursor < files.length) {
+		const item = files[scan.cursor];
+		if (Math.min(item.size, HEAD_BYTES + TAIL_BYTES) > budget.remaining) return { pending: true };
+		scan.cursor++;
 		try {
-			const header = readSessionHeader(item.file);
-			if (!header || typeof header.id !== "string") {
+			const { header, lastMs: scannedMs, name } = scanSessionFile(item.file, item.size, budget);
+			if (!header) {
 				errors.push(`bad session header: ${item.file}`);
 				continue;
 			}
-			const { lastMs: scannedMs, name } = scanSessionFile(item.file, item.size);
 			if (!indexes.has(item.dir)) indexes.set(item.dir, readSummaryIndex(item.dir, errors));
 			const summary = indexes.get(item.dir).get(header.id);
 			const lastMs = scannedMs ?? summary?.lastActivityTime ?? toMs(header.timestamp) ?? item.mtimeMs;
@@ -217,7 +225,14 @@ export function backfillOnce(paths, nowMs, { days = 30 } = {}) {
 			errors.push(`session ${item.file}: ${error.message}`);
 		}
 	}
+	const summary = finishScan(paths, nowMs, markerFile, scan);
+	if (!summary.pending) delete progress.scan;
+	return summary;
+}
 
+function finishScan(paths, nowMs, markerFile, { sinceMs, liveCutMs, days, errors: scanErrors, sessionFiles, sessionDirs, mains }) {
+	const errors = [...scanErrors];
+	const counts = { main: 0, child: 0, written: 0, duplicate: 0, live: 0, outcomes: {} };
 	// Child tasks from every project a session ran in.
 	const cwds = new Map();
 	for (const m of mains) if (typeof m.header.cwd === "string" && m.header.cwd) cwds.set(m.header.cwd.toLowerCase(), m.header.cwd);
@@ -236,10 +251,6 @@ export function backfillOnce(paths, nowMs, { days = 30 } = {}) {
 
 	const crashes = readCrashes(paths, sinceMs, errors);
 	const releases = readReleases(paths, sinceMs, errors);
-	// Keep only keys from the retained window, not ledger rows.
-	const recorded = new Set();
-	for (const row of streamEnded(paths, { sinceMs })) recorded.add(endedKey(row));
-
 	const pending = [];
 	const write = (record) => {
 		counts[record.kind] += 1;
@@ -321,17 +332,55 @@ export function backfillOnce(paths, nowMs, { days = 30 } = {}) {
 		});
 	}
 
-	for (const [i, { appended, error }] of appendEndedBatch(paths, pending, { nowMs, recorded }).entries()) {
-		if (error) errors.push(`append ${pending[i].sessionId}: ${error.message}`);
-		else if (appended) counts.written += 1;
+	const childPair = (row) => JSON.stringify([row.sessionId, row.parentSessionId ?? null]);
+	const childCandidates = new Map();
+	for (const row of pending) {
+		if (row.kind !== "child") continue;
+		const key = childPair(row);
+		const candidates = childCandidates.get(key) ?? [];
+		candidates.push(row);
+		childCandidates.set(key, candidates);
+	}
+	// Stream the retained window once, retaining only keys and identity evidence for candidate children.
+	const recorded = new Set();
+	const existingChildren = new Map();
+	for (const row of streamEnded(paths, { sinceMs })) {
+		recorded.add(endedKey(row));
+		if (row.kind !== "child") continue;
+		const key = childPair(row);
+		if (!childCandidates.has(key)) continue;
+		existingChildren.set(key, existingChildren.has(key) ? null : {
+			projectKey: subjectOf(row).projectKey, parentProjectKey: row.parentProjectKey, taskId: row.taskId,
+		});
+	}
+	const matches = (existing, candidate) =>
+		(!existing.projectKey || existing.projectKey === projectKeyOf(candidate.cwd)) &&
+		(!existing.parentProjectKey || existing.parentProjectKey === candidate.parentProjectKey) &&
+		(!existing.taskId || existing.taskId === candidate.taskId);
+	const matchedChildren = new Set();
+	for (const [key, existing] of existingChildren) {
+		if (!existing) continue;
+		const matchesForPair = childCandidates.get(key).filter((row) => matches(existing, row));
+		if (matchesForPair.length === 1) matchedChildren.add(matchesForPair[0]);
+	}
+	counts.duplicate += matchedChildren.size;
+	const missing = pending.filter((row) => !matchedChildren.has(row));
+	let appendFailed = false;
+	for (const [i, { appended, error }] of appendEndedBatch(paths, missing, { nowMs, recorded }).entries()) {
+		if (error) {
+			appendFailed = true;
+			errors.push(`append ${missing[i].sessionId}: ${error.message}`);
+		} else if (appended) counts.written += 1;
 		else counts.duplicate += 1;
 	}
-	const summary = { skipped: false, sinceMs, sessionFiles: files.length, sessionDirs: slugDirs.length, counts, errors: errors.map((e) => clean(e, 300)) };
+	const summary = { skipped: false, sinceMs, sessionFiles, sessionDirs, counts, errors: errors.map((e) => clean(e, 300)) };
+	if (appendFailed) return { ...summary, pending: true };
 	try {
 		ensureDir(paths.health.sessionsDir);
 		atomicWriteJson(markerFile, { v: BACKFILL_VERSION, ts: nowMs, days, counts, errorCount: errors.length });
 	} catch (error) {
 		summary.errors.push(clean(`marker: ${error.message}`, 300));
+		summary.pending = true;
 	}
 	return summary;
 }

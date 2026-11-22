@@ -305,12 +305,12 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 		},
 
 		/**
-		 * Spend this tick's `USAGE_TICK_BYTES`: live appends of indexed sessions
+		 * Spend this tick's transcript allowance: live appends of indexed sessions
 		 * first, then their first/incomplete reads, then the backlog newest first.
 		 * A record longer than the remaining budget is resumed on a later tick.
 		 */
-		tick(world) {
-			let budget = USAGE_TICK_BYTES;
+		tick(world, { maxBytes = USAGE_TICK_BYTES } = {}) {
+			let budget = maxBytes;
 			let ownershipChanged = false;
 			const sessions = [...(world?.sessions?.values?.() ?? [])];
 			const resolve = sessionSubjects([...sessions, ...ledgerRows.values()]);
@@ -505,7 +505,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 				log?.info?.("usage_backlog", state);
 				backlogLogged = true;
 			}
-			return { bytesRead: USAGE_TICK_BYTES - budget, ...state };
+			return { bytesRead: maxBytes - budget, ...state };
 		},
 
 		/**
