@@ -164,6 +164,37 @@ async function crashAfterStart(h, { writeMeta = true } = {}) {
 
 const modelOf = (start) => start.args[start.args.indexOf("--model") + 1];
 
+test("IS-8: one ordinary cold turn does not require a D4 check", async (t) => {
+	const h = harness({ entries: [E.assistant({
+		ms: BASE - 120_000,
+		usage: { input: 100, output: 10, cacheRead: 0, cacheWrite: 0 },
+	})] });
+	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+	appendDecision(h.paths, { ts: new Date(BASE - 3_600_000).toISOString(), event: "config", result: "startup", thresholdsHash: detectorThresholdsHash(h.config) });
+	const auditor = h.auditor();
+	h.request("m1");
+	await h.prepare(auditor);
+	const launched = h.record("m1");
+	assert.equal(launched.status, "running");
+	const document = fs.readFileSync(path.join(h.paths.health.jobsDir, launched.jobId, "bundle.md"), "utf8");
+	const bundle = JSON.parse(document.split("\n").find((line) => line.startsWith('{"session":')));
+	const suggestion = document.split("\n").find((line) => line.startsWith("Also write one check"));
+	assert.equal(bundle.inferenceThresholdsKnown.D4, true);
+	assert.equal(bundle.tokens.turns, 1);
+	assert.equal(bundle.tokens.cacheRead, 0);
+	assert.deepEqual(bundle.tokens.cache, { hitRate: 0, stormTurns: 0 });
+	assert.equal(bundle.tokens.errors.count, 0);
+	assert.deepEqual(launched.firedDetectors, []);
+
+	h.runner.script = queue(DONE);
+	h.tick(auditor);
+	const { status, reason } = readAuditState(h.paths, "m1");
+	assert.deepEqual(
+		{ suggestedD4: /\bD4\b/.test(suggestion), required: launched.requiredDetectors, status, reason },
+		{ suggestedD4: false, required: [], status: "done", reason: null },
+	);
+});
+
 test("IS-7 indexed transcript: audit includes the message ref for a child located through a live parent", async () => {
 	const h = harness({ sessions: [] });
 	const { index, child } = indexLiveParentTranscript(h.paths, h.root, BASE);

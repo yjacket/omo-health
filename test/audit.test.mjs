@@ -601,12 +601,48 @@ test("plan64: fast turns with a cache storm suggest D4, not D5", () => {
 		config: DEFAULT_CONFIG, now: T0 + HOUR, configDecisions: [defaultConfigDecision],
 	});
 	assert.equal(bundle.tokens.cache.stormTurns, 2);
-	assert.ok(bundle.tokens.cache.hitRate >= 0.25, "low hit rate must not independently suggest D4");
+	assert.ok(bundle.tokens.cache.hitRate >= 0.25, "the storm occurs even with a high session-wide hit rate");
 	assert.equal(bundle.tokens.errors.count, 0);
 	const suggestion = auditDocument(bundle).split("\n").find((line) => line.startsWith("Also write one check"));
 	assert.match(suggestion, /\(D4(?:,|\))/);
 	assert.doesNotMatch(suggestion, /\bD5\b/);
 	assert.deepEqual(bundle.requiredDetectors, ["D4"]);
+});
+
+test("IS-8: sustained low hit rate without a cache storm is context only", () => {
+	const file = path.join(tmpDir("omoh-audit-low-hit-rate-"), "session.jsonl");
+	const count = 32;
+	writeJsonl(file, Array.from({ length: count }, (_, i) => {
+		const ms = T0 + i * 1000;
+		return {
+			type: "message",
+			timestamp: iso(ms),
+			message: {
+				role: "assistant", provider: "fake", model: "fast-model", stopReason: "stop", timestamp: ms,
+				usage: { input: 800, output: 10, cacheRead: 100, cacheWrite: 100 },
+			},
+		};
+	}));
+	const bundle = auditBundle(emptyRecord(), usageTimeline(file, DEFAULT_CONFIG.tokens), {
+		config: DEFAULT_CONFIG, now: T0 + HOUR, configDecisions: [defaultConfigDecision],
+	});
+	assert.equal(bundle.inferenceThresholdsKnown.D4, true);
+	assert.equal(bundle.tokens.turns, count);
+	assert.deepEqual(bundle.tokens.cache, { hitRate: 0.1, stormTurns: 0 });
+	assert.equal(bundle.tokens.errors.count, 0);
+	assert.deepEqual(bundle.requiredDetectors, []);
+	assert.doesNotMatch(auditDocument(bundle), /^Also write one check.*\bD4\b/m);
+});
+
+test("IS-8: provider errors without a cache storm do not suggest D4", () => {
+	const timeline = timelineShell({ errors: { count: 1, byClass: {} } });
+	const bundle = auditBundle(emptyRecord(), timeline, {
+		config: DEFAULT_CONFIG, now: T0 + HOUR, configDecisions: [defaultConfigDecision],
+	});
+	assert.equal(bundle.inferenceThresholdsKnown.D4, true);
+	assert.equal(bundle.tokens.errors.count, 1);
+	assert.deepEqual(bundle.requiredDetectors, []);
+	assert.doesNotMatch(auditDocument(bundle), /^Also write one check.*\bD4\b/m);
 });
 
 test("IS-8: lowering the cache-storm cutoff after a session does not imply a miss", () => {

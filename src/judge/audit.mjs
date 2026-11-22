@@ -633,7 +633,8 @@ function suggestedDetectors(bundle) {
 	const tokens = bundle.tokens ?? {};
 	const known = bundle.inferenceThresholdsKnown;
 	const out = [];
-	if (known?.D4 === true && ((tokens.cache?.stormTurns ?? 0) > 0 || (tokens.cache?.hitRate !== null && tokens.cache?.hitRate < 0.25) || (tokens.errors?.count ?? 0) > 0)) out.push("D4");
+	// usageTimeline computes stormTurns with D4's cacheStorm rule.
+	if (known?.D4 === true && (tokens.cache?.stormTurns ?? 0) > 0) out.push("D4");
 	if (known?.D10 === true && (tokens.tools?.rows ?? []).some((tool) => (tool.errors ?? 0) > 0)) out.push("D10");
 	return out;
 }
