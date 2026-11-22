@@ -209,6 +209,7 @@ export const AUDIT_REASON_LABELS = Object.freeze({
 	"not-found": "세션 기록을 찾지 못했습니다",
 	"no-model": "세션과 분석가 모델과 다른 상위 모델이 없습니다",
 	"models-unknown": "세션이 쓴 모델을 다 확인하지 못해 조사할 수 없습니다",
+	"model-fallback": "선택한 검토 모델이 다른 모델로 전환되어 답을 사용하지 않았습니다",
 	timeout: "제한 시간 안에 답하지 않았습니다",
 	"bad-output": "쓸 수 없는 답을 받았습니다",
 	"incomplete-checks": "감지를 모두 검토하지 않은 답을 받았습니다",

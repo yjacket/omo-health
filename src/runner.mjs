@@ -22,6 +22,8 @@ const IDENTITY_FAILURE_LIMIT = 5;
 const ADOPT_SKEW_MS = 5_000;
 /** Job kinds whose argv must pass the analyst guard flags (no session file, no extensions/skills/context, no tools). */
 const GUARDED_KINDS = new Set(["analyst", "audit"]);
+// Print mode writes this prefix only for an applied switch, not exhaustion or reversion.
+const APPLIED_FALLBACK = /^Model fallback:/m;
 
 const STRIP_ENV = /^(CLAUDE_CODE_|ANTHROPIC_|PI_|SENPI_|OMO_)/;
 const STRIP_EXACT = new Set(["GITHUB_TOKEN", "GH_TOKEN"]);
@@ -151,12 +153,22 @@ export function createRunner({ paths, spawnImpl = spawn, clock, env = process.en
 		return outcome;
 	}
 
+	function fallbackFailure(f, meta, exitCode, holdUntilExit = false, stderr) {
+		if (meta.kind !== "audit" || !APPLIED_FALLBACK.test(stderr ?? readTextSafe(f.err, ""))) return null;
+		return finish(f, meta, {
+			status: "failed", reason: "model-fallback", result: null, exitCode,
+			...(holdUntilExit ? { holdUntilExit: true } : {}),
+		});
+	}
+
 	/** The outcome of a job whose process ended: its answer, an unavailable provider, or a failure. */
 	function ended(f, meta, exit) {
 		const handler = handlers.get(path.basename(f.dir)) ?? contracts[meta.kind] ?? {};
 		const stdout = readTextSafe(f.out, "");
 		const stderr = readTextSafe(f.err, "");
 		const exitCode = exit?.code ?? null;
+		const fallback = fallbackFailure(f, meta, exitCode, false, stderr);
+		if (fallback) return fallback;
 		const text = `${stderr}\n${stdout}`;
 		if (exitCode === 0 || (!exit && handler.parse?.(stdout) != null)) return finish(f, meta, { status: "done", result: handler.parse ? handler.parse(stdout) : stdout, exitCode });
 		const detail = truncate(redact(text.trim()), 300);
@@ -175,7 +187,7 @@ export function createRunner({ paths, spawnImpl = spawn, clock, env = process.en
 			// A tree that could not be killed outlives its job: leave the reason beside the job's stderr.
 			fs.appendFile(f.err, `\ntaskkill /T failed: ${error.message}\n`, () => {});
 		});
-		return finish(f, meta, { status: "timeout", result: null, exitCode: null });
+		return fallbackFailure(f, meta, null, true) ?? finish(f, meta, { status: "timeout", result: null, exitCode: null });
 	}
 
 	/**
@@ -217,7 +229,9 @@ export function createRunner({ paths, spawnImpl = spawn, clock, env = process.en
 				} catch (error) {
 					throw spawnError(error, undefined);
 				}
-				const options = { cwd: cwd ?? f.dir, env: childEnv(env), windowsHide: true, stdio: ["ignore", ...fds] };
+				const jobEnv = childEnv(env);
+				if (kind === "audit") jobEnv.SENPI_NO_FALLBACK = "1";
+				const options = { cwd: cwd ?? f.dir, env: jobEnv, windowsHide: true, stdio: ["ignore", ...fds] };
 				try {
 					// A shell job stays attached: DETACHED_PROCESS makes cmd.exe lose its redirected stdout and stderr. An attached child is in
 					// libuv's kill-on-close job object, so a .cmd job ends with the daemon (seen in QA, 2026-11-22); only an .exe command such as
@@ -260,7 +274,11 @@ export function createRunner({ paths, spawnImpl = spawn, clock, env = process.en
 			const f = files(jobId);
 			let meta = readJsonSafe(f.meta);
 			if (!meta) return { status: "failed", reason: "no-job", result: null, exitCode: null };
-			if (meta.final) return meta.final;
+			if (meta.final) {
+				// A runner from before the fallback guard may have finalized before the auditor saved the outcome.
+				return meta.final.reason === "model-fallback" ? meta.final :
+					fallbackFailure(f, meta, meta.final.exitCode, meta.final.status === "timeout") ?? meta.final;
+			}
 			const exit = readJsonSafe(f.exit);
 			if (exit) return ended(f, meta, exit);
 			// After a reboot or a long gap the pid can name any process: only the one started for this job is killed
@@ -305,7 +323,7 @@ export function createRunner({ paths, spawnImpl = spawn, clock, env = process.en
 				return { status: "running", result: null, exitCode: null, detail: truncate(error.message, 300) };
 			}
 			if (seen) {
-				if (seen.ctimeMs !== meta.ctimeMs || seen.cmdSha1 !== meta.cmdSha1) return finish(f, meta, { status: "failed", reason: "pid-reused", result: null, exitCode: null });
+				if (seen.ctimeMs !== meta.ctimeMs || seen.cmdSha1 !== meta.cmdSha1) return fallbackFailure(f, meta, null) ?? finish(f, meta, { status: "failed", reason: "pid-reused", result: null, exitCode: null });
 				if (!timedOut) return { status: "running", result: null, exitCode: null };
 				// The one documented exception to the no-/T rule (AGENTS.md): the verified job's OWN tree (omo.exe ->
 				// omo.exe -p -> git.exe) would be orphaned by a single-PID kill.

@@ -6,6 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
 import { childEnv, createRunner, findJobProcess, processIdentity } from "../src/runner.mjs";
+import { laneArgs } from "../src/judge/lane.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 import { sha1 } from "../src/util/text.mjs";
 import { createFakeClock } from "../src/util/time.mjs";
@@ -105,6 +106,28 @@ test("the child env drops agent, provider and GitHub credentials", () => {
 	const expected = { PATH: "C:/bin", APPDATA: "C:/Users/x/AppData/Roaming", CLAUDE_CONFIG_DIR: "C:/cfg" };
 	assert.deepEqual(calls[0].options.env, expected);
 	assert.deepEqual(childEnv(env), expected);
+});
+
+test("IS-9: only audit child processes disable senpi model fallback", () => {
+	const { runner, calls } = setup({ env: { PATH: "C:/bin", SENPI_NO_FALLBACK: "0", OMO_NO_FALLBACK: "0", PI_NO_FALLBACK: "0" } });
+	const args = laneArgs({ model: "p/reviewer", bundleFile: "C:/work/bundle.md" });
+	runner.start({ ...baseJob, kind: "analyst", args });
+	runner.start({ ...baseJob, kind: "audit", jobId: "j2", args });
+	assert.deepEqual(calls.map((call) => call.args), [args, args]);
+	assert.deepEqual(calls.map((call) => call.options.env), [
+		{ PATH: "C:/bin" },
+		{ PATH: "C:/bin", SENPI_NO_FALLBACK: "1" },
+	]);
+});
+
+test("IS-9: a restarted runner rejects a fallback verdict already finalized by an older runner", () => {
+	const { runner } = setup({ isAlive: DEAD_PID });
+	runner.start({ ...baseJob, kind: "audit", args: laneArgs({ model: "p/reviewer", bundleFile: "C:/work/bundle.md" }) });
+	writeJob(runner, "err.log", "Model fallback: p/reviewer -> p/audited (provider refused)\n");
+	writeJob(runner, "meta.json", JSON.stringify({ ...readMeta(runner), final: { status: "done", result: { overall: "sound" }, exitCode: 0 } }));
+	const rejected = { status: "failed", reason: "model-fallback", result: null, exitCode: 0 };
+	assert.deepEqual(runner.poll("j1"), rejected);
+	assert.deepEqual(readMeta(runner).final, rejected);
 });
 
 test("a finished process's stdout and stderr land in out.txt and err.log and poll parses the stdout", { timeout: 15_000 }, async () => {

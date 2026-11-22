@@ -9,6 +9,7 @@ import { DEFAULT_CONFIG } from "../src/config.mjs";
 import { appendDecision } from "../src/decisions.mjs";
 import { loadDetectors } from "../src/engine.mjs";
 import { AUDIT_REASON_CODES, reasonCode } from "../src/audit-codes.mjs";
+import { AUDIT_REASON_LABELS } from "../src/ui/labels.mjs";
 import * as audit from "../src/judge/audit.mjs";
 import {
 	AUDIT_JUDGMENTS,
@@ -786,16 +787,19 @@ test("every reason literal and template prefix in analyst, engine and runner is 
 	const codes = new Set(AUDIT_REASON_CODES);
 	const missing = [];
 	for (const relative of ["src/judge/analyst.mjs", "src/engine.mjs", "src/runner.mjs"]) {
+		// The runner also serves owner-requested session audits, whose reasons have a separate vocabulary.
+		const recognized = (prefix) => codes.has(prefix) ||
+			(relative === "src/runner.mjs" && prefix === "model-fallback" && Object.hasOwn(AUDIT_REASON_LABELS, prefix));
 		const source = fs.readFileSync(fileURLToPath(new URL(`../${relative}`, import.meta.url)), "utf8");
 		for (const match of source.matchAll(/(?:reason|skipped)\(\s*(?:"([^"]*)"|`([^`]*)`)/g)) {
 			const literal = match[1] ?? match[2] ?? "";
 			const prefix = literal.split("${")[0].replace(/[:-]$/, "");
-			if (prefix && !codes.has(prefix)) missing.push(`${relative}: ${prefix}`);
+			if (prefix && !recognized(prefix)) missing.push(`${relative}: ${prefix}`);
 		}
 		for (const match of source.matchAll(/reason:\s*(?:"([^"]*)"|`([^`]*)`)/g)) {
 			const literal = match[1] ?? match[2] ?? "";
 			const prefix = literal.split("${")[0].replace(/[:-]$/, "");
-			if (prefix && !codes.has(prefix)) missing.push(`${relative}: ${prefix}`);
+			if (prefix && !recognized(prefix)) missing.push(`${relative}: ${prefix}`);
 		}
 	}
 	assert.deepEqual(missing, []);

@@ -1556,6 +1556,40 @@ test("a decision-only fp's analyzing model is excluded from the daemon's model c
 	assert.notEqual(modelOf(h.runner.starts[0]), "openai/gpt-5-5");
 });
 
+test("IS-9: audit fallback stderr rejects a valid verdict without refunding the job", async (t) => {
+	const h = harness({ sessions: ["direct", "fallback"] });
+	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+	const recording = createRecordingSpawn();
+	const runner = createRunner({ paths: h.paths, spawnImpl: recording.spawnImpl, clock: h.clock, env: {}, isAlive: () => true, identify: () => null });
+	const auditor = h.auditor({ runner });
+	const jobs = [];
+	for (const id of ["direct", "fallback"]) {
+		h.request(id);
+		await h.prepare(auditor);
+		const { jobId, status } = h.record(id);
+		assert.equal(status, "running");
+		jobs.push(jobId);
+		const dir = runner.jobDir(jobId);
+		fs.writeFileSync(path.join(dir, "out.txt"), JSON.stringify(TOKEN_ONLY_ANSWER));
+		fs.writeFileSync(path.join(dir, "err.log"), id === "fallback"
+			? "diagnostic\r\nModel fallback: p/reviewer -> p/audited (provider refused)\r\n"
+			: "Model fallback exhausted: p/reviewer (no candidates)\nModel fallback reverted: p/other -> p/reviewer\n");
+		fs.writeFileSync(path.join(dir, "exit.json"), '{"code":0}');
+		h.tick(auditor);
+	}
+	const direct = h.record("direct");
+	assert.equal(direct.status, "done");
+	assert.deepEqual(direct.result, TOKEN_ONLY_ANSWER);
+	const rejected = readAuditState(h.paths, "fallback");
+	assert.deepEqual([rejected.status, rejected.reason, rejected.result], ["failed", "model-fallback", null]);
+	assert.equal(rejected.reasonKo, "선택한 검토 모델이 다른 모델로 전환되어 답을 사용하지 않았습니다");
+	assert.deepEqual(readJsonSafe(path.join(runner.jobDir(jobs[1]), "meta.json")).final,
+		{ status: "failed", reason: "model-fallback", result: null, exitCode: 0 });
+	assert.equal(h.budget().count, 2);
+	assert.deepEqual(h.budget().jobs, jobs);
+	assert.equal(h.budget().refunded, undefined);
+});
+
 test("a failed first kill is retried by the real runner and the one-per-PC slot stays held until the verified pid is gone", async () => {
 	const h = harness();
 	h.config.audit.timeoutMs = 60_000;

@@ -506,6 +506,7 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 				log?.warn?.("audit_adopt_pending", { sessionId: record.sessionId, jobId: record.jobId, error: error.message });
 			}
 		} else if (out.status === "failed") {
+			if (out.holdUntilExit) record.holdUntilExit = true;
 			fail(record, String(out.reason ?? "failed"), out.detail ? truncate(redact(String(out.detail)), 300) : null, now);
 		}
 	}
