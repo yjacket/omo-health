@@ -29,6 +29,10 @@ const METRIC_KEY = /^[A-Za-z][\w.-]{0,40}$/;
 const METRIC_VALUE = /^-?\d+(\.\d+)?(ms|s|m|h|%|KiB|MiB|GiB|B)?$/;
 const RULE_ID = /^R\d+[a-z]*$/;
 const DETECTOR_ID = /^D\d+$/;
+/** The answer's check limit and the most fired detectors one answer can require. */
+const AUDIT_CHECK_MAX = 40;
+/** The bundle's finding slots before truncation. */
+const FINDING_SLOTS = 50;
 
 /** The fixed question the reviewer answers; it is the only free prose in the bundle. */
 export const AUDIT_QUESTION = "Review whether omo-health's findings, actions and token accounting for this session were right.";
@@ -51,7 +55,7 @@ export const AUDIT_SCHEMA = Object.freeze({
 		checks: {
 			type: "array",
 			minItems: 1,
-			maxItems: 40,
+			maxItems: AUDIT_CHECK_MAX,
 			items: {
 				type: "object",
 				properties: {
@@ -181,6 +185,41 @@ function findingsOf(list) {
 			droppedEvidence,
 		};
 	});
+}
+
+/** Fired detector ids from the full finding list, in first-appearance order. */
+function firedDetectorIds(findings) {
+	const ids = [];
+	const seen = new Set();
+	for (const { detector } of findings) {
+		if (!DETECTOR_ID.test(detector) || seen.has(detector)) continue;
+		seen.add(detector);
+		ids.push(detector);
+	}
+	return ids;
+}
+
+/**
+ * Cut findings to `slots` while keeping the first finding of every fired
+ * detector: representatives first, then the remaining rows in their original
+ * order. Throws when the representatives alone do not fit.
+ */
+function selectFindings(findings, fired, slots) {
+	if (findings.length <= slots) return findings;
+	const firedSet = new Set(fired);
+	const chosen = new Set();
+	const represented = new Set();
+	for (let i = 0; i < findings.length && chosen.size < slots; i += 1) {
+		const { detector } = findings[i];
+		if (!firedSet.has(detector) || represented.has(detector)) continue;
+		represented.add(detector);
+		chosen.add(i);
+	}
+	if (represented.size < firedSet.size) throw new Error("evidence-too-large");
+	for (let i = 0; i < findings.length && chosen.size < slots; i += 1) {
+		if (!chosen.has(i)) chosen.add(i);
+	}
+	return [...chosen].sort((a, b) => a - b).map((index) => findings[index]);
 }
 
 function actionsOf(list) {
@@ -342,6 +381,11 @@ export function auditBundle(record, timeline, { config, now } = {}) {
 		messages: false,
 		investigations: false,
 	};
+	const allFindings = findingsOf(health.findings);
+	// Coverage is judged on every finding, before any cut: an answer cannot be
+	// required to cover more detectors than it has checks.
+	const fired = firedDetectorIds(allFindings);
+	if (fired.length > AUDIT_CHECK_MAX) throw new Error("evidence-too-large");
 	const bundle = {
 		session: {
 			sessionId: textOf(session.sessionId),
@@ -369,7 +413,7 @@ export function auditBundle(record, timeline, { config, now } = {}) {
 			tokensState: textOf(child?.tokensState),
 		})),
 		omo_health_record: {
-			findings: findingsOf(health.findings),
+			findings: allFindings,
 			actions: actionsOf(health.actions),
 			investigations: investigationsOf(health.investigations),
 			messages: messagesOf(health.messages),
@@ -390,8 +434,8 @@ export function auditBundle(record, timeline, { config, now } = {}) {
 			truncated.topTurns = true;
 		}
 		if (sizeOf(bundle) > BUNDLE_MAX_CHARS) {
-			if (bundle.omo_health_record.findings.length > 50) {
-				bundle.omo_health_record.findings = bundle.omo_health_record.findings.slice(0, 50);
+			if (bundle.omo_health_record.findings.length > FINDING_SLOTS) {
+				bundle.omo_health_record.findings = selectFindings(allFindings, fired, FINDING_SLOTS);
 				truncated.findings = true;
 			}
 			if (bundle.omo_health_record.actions.length > 50) {
@@ -500,7 +544,7 @@ export function validateAudit(raw, { refs = [] } = {}) {
 	if (!isObject(answer.tokens)) return badOutput("tokens is missing");
 	if (!AUDIT_TOKEN_JUDGMENTS.includes(answer.tokens.judgment)) return badOutput("tokens.judgment is not normal, high, wasteful or unclear");
 	if (typeof answer.tokens.explanation !== "string") return badOutput("tokens.explanation is not a string");
-	if (!Array.isArray(answer.checks) || answer.checks.length < 1 || answer.checks.length > 40) return badOutput("checks must be 1 to 40 items");
+	if (!Array.isArray(answer.checks) || answer.checks.length < 1 || answer.checks.length > AUDIT_CHECK_MAX) return badOutput("checks must be 1 to 40 items");
 	const allowed = new Set(refs);
 	const checks = [];
 	let droppedEvidence = 0;

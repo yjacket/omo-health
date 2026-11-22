@@ -390,6 +390,32 @@ test("the cap trims investigations last", () => {
 	assert.equal(bundle.truncated.investigations, true);
 });
 
+test("a fired detector whose only finding is the 60th keeps a representative row, stays in the prompt and leaves an answer that ignores it uncovered", () => {
+	const findings = Array.from({ length: 59 }, (_, i) => finding(i, 1, { detector: "D1" }));
+	findings.push(finding(59, 1, { detector: "D8" }));
+	const record = emptyRecord({ health: { findings, investigations: Array.from({ length: 150 }, (_, i) => investigation(i)) } });
+	const bundle = auditBundle(record, timelineShell(), { config: DEFAULT_CONFIG, now: T0 });
+	assert.ok(JSON.stringify(bundle).length <= 100_000);
+	assert.equal(bundle.truncated.findings, true);
+	const kept = bundle.omo_health_record.findings;
+	assert.equal(kept.length, 50);
+	// Representatives first, then the earlier rows in the existing order: F1..F49 plus the D8 row F60.
+	assert.deepEqual(kept.map((row) => row.ref), [...Array.from({ length: 49 }, (_, i) => `F${i + 1}`), "F60"]);
+	assert.equal(kept.at(-1).detector, "D8");
+	assert.deepEqual(audit.firedDetectors(bundle), ["D1", "D8"]);
+	assert.deepEqual(audit.detectorFindingRefs(bundle), { ...Object.fromEntries(Array.from({ length: 49 }, (_, i) => [`F${i + 1}`, "D1"])), F60: "D8" });
+	assert.match(auditDocument(bundle), /^Fired detectors: D1, D8\. Write at least one check per fired detector\./m);
+	const ignoring = [{ item: "D1", judgment: "sound", explanation: "맞습니다", evidence: ["F1"] }];
+	assert.equal(audit.hasDetectorCoverage(ignoring, audit.firedDetectors(bundle), audit.detectorFindingRefs(bundle)), false);
+	const covering = [{ item: "D1", judgment: "sound", explanation: "맞습니다", evidence: ["F1"] }, { item: "D8", judgment: "sound", explanation: "맞습니다", evidence: ["F60"] }];
+	assert.equal(audit.hasDetectorCoverage(covering, audit.firedDetectors(bundle), audit.detectorFindingRefs(bundle)), true);
+});
+
+test("more than 40 fired detectors throw evidence-too-large even when the bundle fits", () => {
+	const findings = Array.from({ length: 41 }, (_, i) => finding(i, 1, { detector: `D${i + 1}` }));
+	assert.throws(() => auditBundle(emptyRecord({ health: { findings } }), timelineShell(), { config: DEFAULT_CONFIG, now: T0 }), /evidence-too-large/);
+});
+
 test("a bundle still over 100,000 after every trim throws evidence-too-large", () => {
 	const record = emptyRecord({ health: { findings: Array.from({ length: 50 }, (_, i) => finding(i, 2000)) } });
 	assert.throws(() => auditBundle(record, timelineShell(), { config: DEFAULT_CONFIG, now: T0 }), /evidence-too-large/);
