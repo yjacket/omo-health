@@ -1237,6 +1237,26 @@ test("deleting a complete file marks it gone and keeps its total", (t) => {
 	assert.equal(index.fresh(entry), false);
 });
 
+test("(IS-3) deleted task-only usage survives zero candidates, not a competing file", (t) => {
+	const { dir, fileOf, indexOf } = setup(t);
+	const file = fileOf();
+	const id = "st_deleted";
+	const index = indexOf();
+	writeText(file, `${line()}\n`);
+	index.update(id, file, { kind: "child", taskId: id });
+	assert.equal(compactUsage(index.get(id))?.total, 10);
+
+	fs.rmSync(file);
+	assert.equal(compactUsage(index.get(id))?.total, 10, "unlink alone must not blank the verified total");
+	index.markMissing(id);
+	index.save();
+	const saved = readUsageIndex(path.join(dir, "usage.json")).get(id);
+	assert.deepEqual([saved.state, saved.complete, saved.gone, compactUsage(saved)?.total, fresh(saved)], ["ok", true, true, 10, false]);
+
+	writeText(fileOf("replacement.jsonl"), `${line()}\n`);
+	assert.equal(compactUsage(saved), null, "a different candidate cannot inherit the deleted file's total");
+});
+
 test("markMissing keeps a complete entry's published total and marks it gone, while a never-found row stays missing", (t) => {
 	const { dir, fileOf, indexOf } = setup(t);
 	const index = indexOf();

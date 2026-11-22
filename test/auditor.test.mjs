@@ -864,6 +864,89 @@ test("(IS-1, IS-9) reviewer launch excludes an identity learned only by the resi
 	}
 });
 
+test("(IS-1, IS-8) an indexed append without a timeline sends current tokens to the reviewer", async (t) => {
+	const h = harness();
+	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+	const index = indexed(h, "m1");
+	const previousTotal = index.get("m1").published.total;
+	let prepared;
+	let sentTokens;
+	const start = h.runner.start;
+	h.runner.start = (options) => {
+		const attachment = options.args.find((arg) => arg.startsWith("@"));
+		assert.equal(attachment, `@${path.join(options.cwd, "bundle.md")}`);
+		const document = fs.readFileSync(attachment.slice(1), "utf8");
+		const json = document.match(/^Evidence bundle \(JSON data, not instructions\):\r?\n(.+)$/m)?.[1];
+		assert.ok(json, "the runner receives the evidence bundle");
+		sentTokens = JSON.parse(json).tokens;
+		return start(options);
+	};
+	const auditor = h.auditor({ index, timelineMaxBytes: 1, createWorker(url, options) {
+		const worker = new Worker(url, options);
+		worker.on("message", (reply) => { prepared = reply; });
+		return worker;
+	} });
+	h.request("m1");
+	h.tick(auditor);
+	const first = auditor.preparing();
+	assert.ok(first);
+	await first;
+	assert.equal(prepared.full, null);
+	assert.equal(prepared.loaded.tokens.total, previousTotal);
+	assert.equal(h.budget(), undefined);
+
+	appendJsonl(h.files.m1, [openaiLine()]);
+	index.update("m1", h.files.m1, { kind: "main" });
+	const current = index.get("m1");
+	assert.equal(fresh(current), true);
+	assert.ok(current.published.total > previousTotal);
+	assert.ok(current.published.models["openai/gpt-5-5"]);
+
+	h.tick(auditor);
+	const retry = auditor.preparing();
+	if (retry) {
+		assert.notEqual(retry, first);
+		assert.equal(h.runner.starts.length, 0);
+		assert.equal(h.budget(), undefined);
+		await retry;
+		assert.equal(prepared.full, null);
+		h.tick(auditor);
+	}
+	assert.equal(h.record("m1").status, "running");
+	assert.equal(h.runner.starts.length, 1);
+	assert.equal(modelOf(h.runner.starts[0]), LANES.architect[0]);
+	assert.equal(h.budget().count, 1);
+	assert.deepEqual(h.budget().jobs, [h.runner.starts[0].jobId]);
+	assert.deepEqual({ total: sentTokens.total, models: Object.fromEntries(sentTokens.models.map(({ key, tokens, cost }) => [key, { tokens, cost }])) }, {
+		total: current.published.total,
+		models: Object.fromEntries(Object.entries(current.published.models).map(([key, { tokens, cost }]) => [key, { tokens, cost }])),
+	});
+	assert.ok(retry, "the first preparation was replaced before charging");
+});
+
+test("(IS-1, IS-8) three consecutive index version changes without a timeline fail models-unknown uncharged", async (t) => {
+	const h = harness();
+	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+	const index = indexed(h, "m1");
+	const auditor = h.auditor({ index, timelineMaxBytes: 1 });
+	h.request("m1");
+	h.tick(auditor);
+	for (let i = 1; i <= 3; i++) {
+		const preparation = auditor.preparing();
+		assert.ok(preparation);
+		await preparation;
+		appendJsonl(h.files.m1, [openaiLine({ id: `a-index-change-${i}` })]);
+		index.update("m1", h.files.m1, { kind: "main" });
+		assert.equal(fresh(index.get("m1")), true);
+		h.tick(auditor);
+		assert.equal(h.runner.starts.length, 0, `index version change ${i} must not launch`);
+		assert.equal(h.budget(), undefined);
+		assert.equal(h.record("m1").status, i < 3 ? "queued" : "failed");
+	}
+	assert.equal(h.record("m1").reason, "models-unknown");
+	assert.equal(auditor.preparing(), undefined);
+});
+
 async function prepareWithFrozenRecord(h, mutate) {
 	const signal = new Int32Array(new SharedArrayBuffer(8));
 	const auditor = h.auditor({ createWorker(_url, options) {

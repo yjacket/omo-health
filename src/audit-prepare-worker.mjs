@@ -1,5 +1,5 @@
 import { parentPort, workerData } from "node:worker_threads";
-import { auditFileVersion, readVersionedAuditTimeline, sameAuditVersion } from "./auditor.mjs";
+import { auditFileVersion, auditIndexVersion, readVersionedAuditTimeline, sameAuditVersion } from "./auditor.mjs";
 import { createSessionFileLocator } from "./collect/session-files.mjs";
 import { loadSessionRecord, usageEntryOf } from "./session-record.mjs";
 
@@ -31,11 +31,13 @@ export function prepareAudit({ sessionId, now, bounds, indexEntries, indexFull }
 		// Launch-only join keys travel separately from the record used to build the reviewer's bundle.
 		const { selectedFps, auditSubjectIds, ...loaded } = record;
 		const session = loaded.session ?? {};
-		const file = session.taskId ? usageEntryOf(index, session)?.file : mainFile(session.sessionId);
+		const entry = usageEntryOf(index, session);
+		const indexVersion = auditIndexVersion(entry);
+		const file = session.taskId ? entry?.file : mainFile(session.sessionId);
 		let warning;
 		const maxFileBytes = Math.min(scanBounds.messageScanMaxBytes, remaining);
 		const report = readVersionedAuditTimeline(file, tokens, { maxFileBytes, timeline, log: { warn: (_event, detail) => { warning = detail; } } });
-		return { loaded, selectedFps, auditSubjectIds, ...report, warning };
+		return { loaded, selectedFps, auditSubjectIds, indexVersion, ...report, warning };
 	} catch (error) {
 		if (error !== DISCOVERY_TOO_LARGE) throw error;
 		return { discoveryTooLarge: true };

@@ -513,6 +513,47 @@ it("(plan 61) history and audit preview reject a task-only file that stops being
 	assert.deepEqual(status(), [42, null, "upper"]);
 });
 
+it("(IS-3) deleted task-only usage keeps its history label but blocks audit like a session-ID child", () => {
+	const { env, paths } = makeHome();
+	const clock = createFakeClock(NOW);
+	const index = createUsageIndex({ file: paths.health.usageIndexFile, clock });
+	const locator = createSessionFileLocator({ paths, clock });
+	const tracker = createUsageTracker({ paths, index, locator, clock });
+	const cwd = path.join(env.USERPROFILE, "proj");
+	const prepare = createDetailOperations({
+		paths, env, today: () => 0,
+		daemonInputs: () => ({ now: NOW, heartbeat: heartbeat(), pidAlive: true, loaded: { config: { mode: "auto", daemonStaleMs: 45_000 } } }),
+		resolveModel: () => ({ model: "upper" }),
+	});
+	const world = makeWorld({ now: NOW, sessions: [] });
+	const subjects = [["st_deleted", "st_deleted"], ["st_exact", "child-exact"]].map(([taskId, sessionId]) => {
+		const row = { sessionId, taskId, kind: "child", cwd, startedMs: NOW - HOUR, endedMs: NOW, outcome: "completed" };
+		const file = path.join(cwd, ".omo", "senpi-task", "children", taskId, "sessions", taskId, `first_${sessionId}.jsonl`);
+		write(file, '{"type":"usage","provider":"p","model":"m","usage":{"input":42}}\n');
+		appendEnded(paths, row, { nowMs: NOW });
+		return { row, file };
+	});
+	const { endedTokenCell } = tokenFormatters("endedTokenCell");
+	const status = () => {
+		const history = new Map(uiState({ paths, env, now: NOW }).ended.rows.map((row) => [row.sessionId, row]));
+		return subjects.map(({ row }) => {
+			const entry = history.get(row.sessionId);
+			const mark = endedTokenCell(entry).children[0];
+			const preview = prepare({ kind: "preview", id: row.sessionId, now: NOW, record: { session: row, analystModels: [] } });
+			return [entry.tokens?.total ?? null, mark.text, mark.title, preview.blocked];
+		});
+	};
+	tracker.queueLedger(subjects.map(({ row }) => row));
+	tracker.tick(world);
+	assert.deepEqual(status(), [[42, "42", "42", null], [42, "42", "42", null]]);
+
+	for (const { file } of subjects) fs.rmSync(file);
+	tracker.queueLedger(subjects.map(({ row }) => row));
+	tracker.tick(world);
+	index.save();
+	assert.deepEqual(status(), [[42, "42", "42 (파일 삭제됨)", "models-unknown"], [42, "42", "42 (파일 삭제됨)", "models-unknown"]]);
+});
+
 it("history marks a partial tree with the required text and title", () => {
 	const { paths, env } = makeHome();
 	const row = { kind: "main", startedMs: NOW - HOUR, endedMs: NOW, outcome: "completed" };

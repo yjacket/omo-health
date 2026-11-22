@@ -212,6 +212,37 @@ describe("session view", () => {
 		assert.deepEqual(totals(), [[120, false, null], [120, false, null]]);
 	});
 
+	it("(IS-3) deleted task-only usage keeps its total and the existing detail label", (t) => {
+		const root = tmpDir("session-view-deleted-task-");
+		t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+		const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health") });
+		const taskId = "st_deleted";
+		const row = { sessionId: taskId, taskId, kind: "child", startedMs: T0 - 1000, endedMs: T0, outcome: "completed" };
+		appendEnded(paths, row, { nowMs: T0 });
+		const index = createUsageIndex({ file: paths.health.usageIndexFile, clock: { now: () => T0 } });
+		const file = path.join(root, "task.jsonl");
+		fs.writeFileSync(file, '{"type":"usage","provider":"p","model":"m","usage":{"input":42}}\n');
+		index.update(taskId, file, row);
+		const app = fs.readFileSync(new URL("../src/ui/static/app.js", import.meta.url), "utf8");
+		const endedTokenFacts = runInNewContext(
+			["tokenReading", "endedTokenFacts"].map((name) => app.match(new RegExp(`function ${name}\\([^]*?\\n\\t\\}`))[0]).join("\n") + "\nendedTokenFacts",
+			{
+				el: (tag, attrs) => ({ tag, ...attrs }), facts: (rows) => rows, fullCount: String,
+				empty: () => null, note: () => null, plain: (text) => text, costText: () => "-",
+			},
+		);
+		const status = () => {
+			index.save();
+			const { tokens } = JSON.parse(JSON.stringify(buildSessionView(loadSessionRecord({ paths, id: taskId, now: T0 }))));
+			const total = endedTokenFacts(tokens).find((entry) => entry?.[0] === "합계");
+			return [tokens?.total, tokens?.gone, total?.[1]?.text, total?.[2]?.text ?? null];
+		};
+		assert.deepEqual(status(), [42, false, "42", null]);
+		fs.rmSync(file);
+		index.markMissing(taskId);
+		assert.deepEqual(status(), [42, true, "42", "파일 삭제됨"]);
+	});
+
 	it("detail overflow survives index reload and JSON, and renders on the token block and child row", () => {
 		const root = tmpDir("session-view-overflow-");
 		const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health") });

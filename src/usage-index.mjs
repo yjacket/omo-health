@@ -162,6 +162,13 @@ const isSoleChildSessionFile = (file) => {
 	return Boolean(sole && pathKey(sole) === pathKey(file));
 };
 
+function canShowTaskOnlyUsage(entry) {
+	if (!entry.file) return false;
+	const sole = soleChildSessionFile(dirname(entry.file));
+	// Zero candidates does not contradict the last verified ownership.
+	return sole === undefined || Boolean(sole && !entry.gone && pathKey(sole) === pathKey(entry.file));
+}
+
 /**
  * The totals the board and history show, or null: only an `ok` entry whose first
  * full read finished has one, and a read failure keeps it null (IS-12).
@@ -169,7 +176,7 @@ const isSoleChildSessionFile = (file) => {
 export function compactUsage(entry) {
 	if (!isObject(entry) || entry.state !== "ok" || entry.complete !== true || entry.readError === true) return null;
 	if (!isObject(entry.published)) return null;
-	if (isTaskOnlyEntry(entry) && !isSoleChildSessionFile(entry.file)) return null;
+	if (isTaskOnlyEntry(entry) && !canShowTaskOnlyUsage(entry)) return null;
 	return ownerTotals(entry.published);
 }
 
@@ -180,7 +187,7 @@ export function compactUsage(entry) {
  * ino or birthtimeMs, the identity `readUsage` checks) is never fresh.
  */
 export function fresh(entry) {
-	if (!isObject(entry) || entry.state !== "ok" || entry.complete !== true) return false;
+	if (!isObject(entry) || entry.state !== "ok" || entry.complete !== true || entry.gone === true) return false;
 	if (!hasNumericCursor(entry)) return false;
 	if (entry.evaluatedTo !== entry.size) return false;
 	if (isTaskOnlyEntry(entry) && !isSoleChildSessionFile(entry.file)) return false;
@@ -456,7 +463,10 @@ export function usageEntryFor(usage, sessionId, taskId) {
 		match = entry;
 	}
 	// An exact ID can still identify its file where a task-only alias cannot.
-	if (match?.kind === "child" && match.state === "ok" && match.file && !isSoleChildSessionFile(match.file)) return undefined;
+	if (match?.kind === "child" && match.state === "ok" && match.file) {
+		const owned = isTaskOnlyEntry(match) ? canShowTaskOnlyUsage(match) : isSoleChildSessionFile(match.file);
+		if (!owned) return undefined;
+	}
 	return match;
 }
 
@@ -548,11 +558,13 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			}
 			const previousSlots = weights.get(id)?.slots ?? null;
 			unweigh(id);
+			const sameFile = entry.file && pathKey(entry.file) === pathKey(path);
 			entry.file = path;
 			applyMeta(entry, meta);
 			entry.checkedMs = clock.now();
 			// Keep any last published total for a missing file, but never resume or compare a malformed cursor.
-			const from = hasNumericCursor(entry) ? entry : undefined;
+			const canResume = !isTaskOnlyEntry(entry) || (sameFile && !entry.gone);
+			const from = canResume && hasNumericCursor(entry) ? entry : undefined;
 			let result;
 			try {
 				// Windows reports a directory as a zero-byte stream, so readUsage would succeed on one; a session file is never a directory.
@@ -606,20 +618,22 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 		/**
 		 * No session file was located for `id`. A never-found row becomes `missing`;
 		 * a row whose complete read already published a total keeps that total and
-		 * turns `gone` (IS-3), unless its claim to the file depended on being
-		 * the sole candidate. A lost claim clears the cursor and publication.
+		 * turns `gone` (IS-3). For a task-only row this requires zero candidates;
+		 * a conflicting lookup (including one in another store) clears the claim.
 		 */
-		markMissing(id, meta = {}) {
+		markMissing(id, meta = {}, { withdraw = false } = {}) {
 			const entry = entries.get(id) ?? newEntry(id);
 			const previousSlots = weights.get(id)?.slots ?? null;
 			unweigh(id);
 			applyMeta(entry, meta);
 			if (meta?.file) entry.file = meta.file;
-			if (entry.state === "ok" && entry.complete === true && !isTaskOnlyEntry(entry)) {
+			const taskOnly = isTaskOnlyEntry(entry);
+			const deleted = !taskOnly || (!withdraw && entry.file && soleChildSessionFile(dirname(entry.file)) === undefined);
+			if (entry.state === "ok" && entry.complete === true && deleted) {
 				entry.gone = true;
 			} else {
 				dropCursor(entry);
-				if (isTaskOnlyEntry(entry)) {
+				if (taskOnly) {
 					entry.file = null;
 					entry.readError = false;
 				}

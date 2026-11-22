@@ -170,6 +170,16 @@ export function sameAuditVersion(a, b) {
 	return a && b && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ino === b.ino && a.birthtimeMs === b.birthtimeMs;
 }
 
+const INDEX_VERSION_KEYS = ["id", "file", "size", "mtimeMs", "ino", "birthtimeMs", "head", "headLen", "tail", "offset", "evaluatedTo", "state", "complete", "gone", "readError"];
+
+export function auditIndexVersion(entry) {
+	return entry ? Object.fromEntries(INDEX_VERSION_KEYS.map((key) => [key, entry[key]])) : null;
+}
+
+function sameAuditIndexVersion(version, entry) {
+	return version && entry ? INDEX_VERSION_KEYS.every((key) => version[key] === entry[key]) : version === entry;
+}
+
 function auditFileVersions(dir, suffix) {
 	const files = new Map();
 	for (const name of listDirSafe(dir)) {
@@ -390,19 +400,22 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		}
 	}
 
-	function launchPrepared(record, now, { loaded, selectedFps, auditSubjectIds, full, warning, timelineSource, discoveryTooLarge }, changedVersions, analystStart) {
+	function launchPrepared(record, now, { loaded, selectedFps, auditSubjectIds, full, warning, timelineSource, indexVersion, discoveryTooLarge }, changedVersions, analystStart) {
 		if (config.audit?.enabled !== true) return fail(record, "disabled", null, now);
 		if (discoveryTooLarge) return fail(record, "evidence-too-large", null, now);
 		if (!loaded?.found) return fail(record, "not-found", null, now);
 		if (readBudget(paths, now).count >= config.audit.perDay) return fail(record, "cap", null, now);
 		if (warning) log?.warn?.("audit_timeline_failed", warning);
-		if (timelineSource && (timelineSource.changedDuringScan ||
-			!sameAuditVersion(timelineSource.version, auditFileVersion(timelineSource.file)))) {
+		const entry = index ? usageEntryOf(index, loaded.session ?? {}) : null;
+		const timelineChanged = timelineSource && (timelineSource.changedDuringScan ||
+			!sameAuditVersion(timelineSource.version, auditFileVersion(timelineSource.file)));
+		// Without a full timeline the bundle uses the worker's token rows. Do not
+		// select a reviewer against a different publication than the one it used.
+		if (timelineChanged || (index && !sameAuditIndexVersion(indexVersion, entry))) {
 			if (changedVersions + 1 >= MAX_CHANGED_TIMELINES) return fail(record, "models-unknown", null, now);
 			return startPreparation(record, now, changedVersions + 1);
 		}
-		// The resident index may have learned identities since the worker prepared the evidence.
-		const facts = auditModelFacts(index ? usageEntryOf(index, loaded.session ?? {}) : null, full);
+		const facts = auditModelFacts(entry, full);
 		if (!facts.sessionModelsKnown) return fail(record, "models-unknown", null, now);
 		const launchFacts = launchAuditFacts(paths, investigations, loaded, selectedFps, auditSubjectIds, analystStart);
 		if (!launchFacts) return fail(record, "analyst-models-unknown", null, now);

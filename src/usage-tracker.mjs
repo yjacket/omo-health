@@ -85,6 +85,8 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 		rootSessionId: source?.rootSessionId ?? null,
 	});
 
+	const childCandidate = (query) => (locator?.childCandidate ?? locator?.childFile)?.(query);
+
 	/** Verify that the live collector's file belongs to this session before billing it. */
 	const verify = (session, liveSessions, cwdOf, maxBytes) => {
 		const file = session?.file;
@@ -108,13 +110,15 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			return { matches, pending: probe.pending, bytesRead: probe.bytesRead };
 		}
 		if (session.kind !== "child" || !isNonEmptyString(session.taskId)) return result(false);
-		const found = locator?.childFile?.({ taskId: session.taskId, sessionId: session.id, cwds: cwdCandidates(session, liveSessions, cwdOf) });
-		return result(found && pathKey(found) === pathKey(file));
+		const query = { taskId: session.taskId, sessionId: session.id, cwds: cwdCandidates(session, liveSessions, cwdOf) };
+		const candidate = session.id === session.taskId ? childCandidate(query) : locator?.childFile?.(query);
+		return { ...result(candidate && pathKey(candidate) === pathKey(file)), candidate };
 	};
 
 	const locate = (row, liveSessions, cwdOf, maxBytes) => {
 		if (row.kind === "child") {
-			const file = locator?.childFile?.({ taskId: row.taskId ?? row.sessionId, sessionId: row.sessionId, cwds: cwdCandidates(row, liveSessions, cwdOf) });
+			const query = { taskId: row.taskId ?? row.sessionId, sessionId: row.sessionId, cwds: cwdCandidates(row, liveSessions, cwdOf) };
+			const file = ledgerUsageSessionId(row) ? locator?.childFile?.(query) : childCandidate(query);
 			return { file, bytesRead: 0 };
 		}
 		return locator?.findMainFile?.(row.sessionId, index.get(row.sessionId)?.file ?? null, { maxBytes }) ?? { bytesRead: 0 };
@@ -197,7 +201,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 		 */
 		tick(world) {
 			let budget = USAGE_TICK_BYTES;
-			let withdrew = false;
+			let ownershipChanged = false;
 			const sessions = [...(world?.sessions?.values?.() ?? [])];
 			const liveSessions = new Map(sessions.filter((session) => isNonEmptyString(session?.id)).map((session) => [session.id, session]));
 			const ledgerOptions = ledgerFs ? { fs: ledgerFs } : undefined;
@@ -238,25 +242,28 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			// (a) live appends, then (b) first/incomplete live reads. A previous
 			// publication sets priority, not whether a file has unread bytes.
 			for (const { session, entry } of [...liveAppends, ...liveFirstReads]) {
-				const { matches, pending, bytesRead } = verify(session, liveSessions, cwdOf, budget);
+				const { matches, pending, bytesRead, candidate } = verify(session, liveSessions, cwdOf, budget);
 				budget -= bytesRead;
 				if (pending || (matches && budget === 0 && !entry)) pendingLive.add(session.id);
 				if (isTaskOnlyEntry(entry) && entry.state === "ok" && (!matches || pathKey(session.file) !== pathKey(entry.file))) {
-					index.markMissing(session.id, metaOf(session));
-					withdrew = true;
+					if (!entry.gone || candidate !== undefined) {
+						index.markMissing(session.id, metaOf(session), { withdraw: candidate !== undefined });
+						ownershipChanged = true;
+					}
 				}
 				if (!matches || budget <= 0) continue;
 				budget = Math.max(0, budget - index.update(session.id, session.file, metaOf(session), { maxBytes: budget }));
 			}
 			// Ownership checks cost no transcript bytes and must run even when live
-			// reads exhaust the budget. A restored path starts with a cleared cursor.
+			// reads exhaust the budget. A different path or a veto invalidates the old claim.
 			const checkedFiles = new Map();
 			for (const [id, row] of taskOnlyChecks) {
 				const { file } = locate(row, liveSessions, cwdOf, 0);
 				const entry = index.get(id);
-				if (entry?.state === "ok" && (!file || pathKey(file) !== pathKey(entry.file))) {
-					index.markMissing(id, metaOf(row));
-					withdrew = true;
+				const withdraw = file === null || (file !== undefined && pathKey(file) !== pathKey(entry?.file));
+				if (entry?.state === "ok" && (withdraw || (file === undefined && !entry.gone))) {
+					index.markMissing(id, metaOf(row), { withdraw });
+					ownershipChanged = true;
 				}
 				if (file) {
 					checkedFiles.set(id, file);
@@ -274,7 +281,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 				budget -= bytesRead;
 				if (pending) break;
 				if (!rowFile) {
-					index.markMissing(id, metaOf(row));
+					index.markMissing(id, metaOf(row), { withdraw: rowFile === null });
 					queue.delete(id);
 					continue;
 				}
@@ -297,9 +304,9 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			];
 			trees = totals();
 			const state = counts();
-			// History reads the saved index. Persist revocation now so that removing
-			// the competing file cannot revive the old on-disk cursor before a recount.
-			if (withdrew) index.save();
+			// Persist deletions for history and revocations so removing a competing
+			// file cannot revive the old on-disk cursor before a recount.
+			if (ownershipChanged) index.save();
 			if (index.full && !fullLogged) {
 				fullLogged = true;
 				log?.warn?.("usage_index_full");

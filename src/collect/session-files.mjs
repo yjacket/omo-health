@@ -142,6 +142,7 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 	const childKey = (taskId, sessionId, cwds) => JSON.stringify([taskId, sessionId ?? null, cwds ?? []]);
 
 	const locateChild = ({ taskId, sessionId, cwds }) => {
+		if (!taskId) return undefined;
 		const stores = [];
 		const seen = new Set();
 		for (const cwd of cwds ?? []) {
@@ -187,5 +188,6 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 		return undefined;
 	};
 
-	return { mainFile, findMainFile, childFile };
+	// Ownership checks need an uncached answer: undefined is absence, null is a veto.
+	return { mainFile, findMainFile, childFile, childCandidate: locateChild };
 }

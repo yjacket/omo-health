@@ -118,6 +118,34 @@ test("(plan 61) the next tick withdraws a task-only publication and recounts whe
 	assert.deepEqual([s.tracker.tokensOf(null, taskId)?.tokens?.total, s.tracker.tokensOf("parent")?.treeTokens], [42, 52]);
 });
 
+test("(IS-3) deleted task-only usage stays published until a new sole candidate is counted from scratch", (t) => {
+	const reads = [];
+	const s = setup(undefined, { read(file, from, options) {
+		reads.push({ file, resumed: from !== undefined });
+		return readUsage(file, from, options);
+	} });
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const taskId = "st_deleted";
+	const row = { sessionId: taskId, taskId, kind: "child", cwd: s.cwd, endedMs: T0 };
+	const first = childFile(s.cwd, taskId, "child-first");
+	const next = childFile(s.cwd, taskId, "child-next");
+	const world = emptyWorld(s.clock);
+	writeLines(first, [bigRecord(0, usage(42))]);
+	s.tracker.queueLedger([row]);
+	s.tracker.tick(world);
+	assert.equal(s.tracker.tokensOf(null, taskId)?.tokens?.total, 42);
+
+	fs.rmSync(first);
+	assert.equal(s.tracker.tick(world).bytesRead, 0);
+	const saved = readUsageIndex(s.paths.health.usageIndexFile).get(taskId);
+	assert.deepEqual([s.tracker.tokensOf(null, taskId)?.tokens?.total, saved.gone, compactUsage(saved)?.total], [42, true, 42]);
+
+	writeLines(next, [bigRecord(0, usage(99))]);
+	assert.ok(s.tracker.tick(world).bytesRead > 0);
+	assert.deepEqual(reads, [{ file: first, resumed: false }, { file: next, resumed: false }]);
+	assert.deepEqual([s.index.get(taskId).gone, s.tracker.tokensOf(null, taskId)?.tokens?.total], [false, 99]);
+});
+
 test("board uses a unique task-only token match but never an ambiguous or wrong-session match", () => {
 	const s = setup();
 	const task = { taskId: "st_shared", parentSessionId: "main" };
