@@ -576,13 +576,21 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 		file,
 		get full() { return full; },
 		getExact(key) { return entries.get(key) ?? (full && key ? FULL_ENTRY : undefined); },
-		getForSubject: (subject) => entries.getForSubject(subject),
+		getForSubject(subject) {
+			const entry = entries.getForSubject(subject);
+			// Saturated: an absent row may have been skipped at capacity; an ambiguous one (null) stays unresolved.
+			return entry === undefined && full ? FULL_ENTRY : entry;
+		},
 		get(key, taskId) {
-			if (typeof key === "object" && key !== null) return usageEntryFor(entries, key, taskId) ?? (full && taskId ? FULL_ENTRY : undefined);
+			if (typeof key === "object" && key !== null) {
+				const entry = usageEntryFor(entries, key, taskId);
+				return entry === undefined && full && taskId ? FULL_ENTRY : entry ?? undefined;
+			}
 			// No rejected path or id is retained. While saturated, an absent row
 			// cannot be distinguished from one skipped at the capacity boundary.
 			const subject = parseSubjectKey(key);
-			return (subject ? entries.getForSubject(subject) : undefined) ?? (full && key ? FULL_ENTRY : undefined);
+			const entry = subject ? entries.getForSubject(subject) : undefined;
+			return entry === undefined && full && key ? FULL_ENTRY : entry ?? undefined;
 		},
 		has(key, taskId) {
 			if (typeof key === "object" && key !== null) return usageEntryFor(entries, key, taskId) != null;

@@ -103,6 +103,28 @@ test("cwd-less queue lookup finds a unique indexed child and rejects a cross-pro
 	assert.equal(s.tracker.tokensOf(other)?.tokens?.total, 7);
 });
 
+test("a saturated index reports absent sessions as full but leaves cross-project collisions unresolved", (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const file = s.paths.health.usageIndexFile;
+	writeLines(file, [JSON.stringify({ v: usageIndex.USAGE_INDEX_VERSION, full: true })]);
+	const index = createUsageIndex({ file, clock: s.clock });
+	const tracker = createUsageTracker({ paths: s.paths, index, locator: s.locator, clock: s.clock });
+	const query = { sessionId: "collision", projectKey: null };
+	assert.deepEqual(tracker.tokensOf(query), { state: "full" });
+	for (const [cwd, total] of [[s.cwd, 42], [path.join(s.root, "other"), 7]]) {
+		const subject = sub(s, query.sessionId, cwd);
+		const transcript = path.join(cwd, "collision.jsonl");
+		writeJsonl(transcript, [E.assistant({ ms: T0, usage: usage(total) })]);
+		index.update(subject, transcript, { kind: "main" });
+		assert.equal(tracker.tokensOf(subject)?.tokens?.total, total);
+		if (total === 42) assert.equal(tracker.tokensOf(query)?.tokens?.total, total);
+	}
+	assert.equal(index.get(subjectKey(query)), undefined);
+	assert.equal(index.get(query, "st_collision"), undefined);
+	assert.equal(tracker.tokensOf(query, "st_collision"), null);
+});
+
 test("cwd-less queue lookup recovers the scoped child cursor from a stripped ledger stream", (t) => {
 	const s = setup();
 	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));

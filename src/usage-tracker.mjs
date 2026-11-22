@@ -400,7 +400,11 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 				budget -= bytesRead;
 				if (pending) break;
 				if (!rowFile) {
-					index.markMissing(subjectOf(row), metaOf(row), { withdraw: rowFile === null });
+					// Don't turn an uncounted row into a negative-cache hit at capacity.
+					// Existing rows still need missing/gone and ownership updates.
+					if (!index.full || exactEntry(id)?.state !== "full") {
+						index.markMissing(subjectOf(row), metaOf(row), { withdraw: rowFile === null });
+					}
 					queue.delete(queuedKey);
 					continue;
 				}
@@ -474,7 +478,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			const treeTokensComplete = !pendingLive.has(id) && trees.complete.get(treeId) === true;
 			const tree = treeTokens === null ? {} : { treeTokens, treeTokensComplete };
 			if (pendingLive.has(key)) return { pending: true, ...tree };
-			if (!entry) return index.full && taskId ? { state: "full", ...tree } : treeTokens === null ? null : tree;
+			if (!entry) return entry === undefined && index.full && taskId ? { state: "full", ...tree } : treeTokens === null ? null : tree;
 			if (entry.state === "full") return { state: "full", ...tree };
 			const tokens = compactUsage(entry);
 			if (tokens) return { tokens, treeTokens, treeTokensComplete, ...(entry.pending && !entry.gone ? { pending: true } : {}) };
