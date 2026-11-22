@@ -1,12 +1,14 @@
-import { mainSessionFileMatches } from "./collect/session-files.mjs";
+import { probeSessionHeader } from "./collect/session-files.mjs";
+import { idFromFileName } from "./collect/sessions.mjs";
 import { pathKey } from "./paths.mjs";
 import { ENDED_LOCATION, locateEndedRows, readEndedCwd } from "./session-ledger.mjs";
 import { USAGE_TICK_BYTES, compactUsage, fresh as isFresh, treeTotals } from "./usage-index.mjs";
+import { statSafe } from "./util/fsx.mjs";
 
 /**
  * The daemon's token tracker (plan todo 5): one per-tick byte budget shared by
  * live appends, first reads of live sessions and the ended-session backlog,
- * including discovery of the backlog's main-session files.
+ * including live verification and discovery of the backlog's main-session files.
  *
  * Live sessions are indexed only from their own file: a main file name or
  * session header must carry its session id, and a child file must be the one
@@ -35,8 +37,9 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 	const ledgerRows = new Map();
 	/** Rows waiting for bytes: id -> ledger row, newest first. */
 	let queue = new Map();
-	/** Verified live session ids not yet handed to the index. Rebuilt each tick. */
+	/** Live session ids waiting for a header probe or to enter the index. Rebuilt each tick. */
 	const pendingLive = new Set();
+	const liveHeaders = new Map();
 	let searched = new WeakSet();
 	let trees;
 	let backlogLogged = false;
@@ -76,13 +79,30 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 	});
 
 	/** Verify that the live collector's file belongs to this session before billing it. */
-	const verifiedFile = (session, liveSessions, cwdOf) => {
+	const verify = (session, liveSessions, cwdOf, maxBytes) => {
 		const file = session?.file;
-		if (!isNonEmptyString(file)) return undefined;
-		if (session.kind === "main") return mainSessionFileMatches(file, session.id) ? file : undefined;
-		if (session.kind !== "child" || !isNonEmptyString(session.taskId)) return undefined;
+		const result = (matches) => ({ matches, bytesRead: 0 });
+		if (!isNonEmptyString(file)) return result(false);
+		if (session.kind === "main") {
+			if (idFromFileName(file) === session.id) return result(true);
+			const stat = statSafe(file);
+			const cached = liveHeaders.get(session.id);
+			if (!stat?.isFile()) {
+				liveHeaders.delete(session.id);
+				return result(false);
+			}
+			const { size, mtimeMs, ino } = stat;
+			if (cached?.file === file && cached.size === size && cached.mtimeMs === mtimeMs && cached.ino === ino) return result(cached.matches);
+			liveHeaders.delete(session.id);
+			const probe = probeSessionHeader(file, size, maxBytes);
+			const matches = probe.id === session.id;
+			// Don't cache an I/O failure on a nonempty file; retry it next tick.
+			if (!probe.pending && (probe.bytesRead > 0 || size === 0)) liveHeaders.set(session.id, { file, size, mtimeMs, ino, matches });
+			return { matches, pending: probe.pending, bytesRead: probe.bytesRead };
+		}
+		if (session.kind !== "child" || !isNonEmptyString(session.taskId)) return result(false);
 		const found = locator?.childFile?.({ taskId: session.taskId, sessionId: session.id, cwds: cwdCandidates(session, liveSessions, cwdOf) });
-		return found && pathKey(found) === pathKey(file) ? file : undefined;
+		return result(found && pathKey(found) === pathKey(file));
 	};
 
 	const locate = (row, liveSessions, cwdOf, maxBytes) => {
@@ -181,21 +201,23 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			const liveAppends = [];
 			const liveFirstReads = [];
 			pendingLive.clear();
-			for (const session of sessions) {
-				if (!isNonEmptyString(session?.id)) continue;
-				const sessionFile = verifiedFile(session, liveSessions, cwdOf);
-				if (!sessionFile) continue;
+			for (const [id, { file }] of liveHeaders) {
+				const session = liveSessions.get(id);
+				if (session?.kind !== "main" || session.file !== file) liveHeaders.delete(id);
+			}
+			for (const session of liveSessions.values()) {
 				const entry = index.get(session.id);
-				if (!entry) pendingLive.add(session.id);
 				const reads = entry?.state === "ok" && entry.complete === true ? liveAppends : liveFirstReads;
-				reads.push({ id: session.id, file: sessionFile, meta: metaOf(session) });
+				reads.push({ session, entry });
 			}
 			// (a) live appends, then (b) first/incomplete live reads. A previous
 			// publication sets priority, not whether a file has unread bytes.
-			for (const item of [...liveAppends, ...liveFirstReads]) {
-				if (budget <= 0) break;
-				budget = Math.max(0, budget - index.update(item.id, item.file, item.meta, { maxBytes: budget }));
-				pendingLive.delete(item.id);
+			for (const { session, entry } of [...liveAppends, ...liveFirstReads]) {
+				const { matches, pending, bytesRead } = verify(session, liveSessions, cwdOf, budget);
+				budget -= bytesRead;
+				if (pending || (matches && budget === 0 && !entry)) pendingLive.add(session.id);
+				if (!matches || budget <= 0) continue;
+				budget = Math.max(0, budget - index.update(session.id, session.file, metaOf(session), { maxBytes: budget }));
 			}
 			// (c) the ended-session backlog, newest first
 			for (const [id, row] of queue) {
@@ -235,13 +257,14 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 		/**
 		 * The board's lookup: `{tokens, treeTokens}` for a complete entry
 		 * (`treeTokens` is non-null when at least one descendant has a counted total),
-		 * `{pending:true}` while a verified first read has not begun or an entry's
-		 * first full read has not finished, and null when nothing is known.
+		 * `{pending:true}` while a live header probe or first read is deferred or
+		 * an entry's first full read has not finished, and null when nothing is known.
 		 * A counted descendant can supply a tree total even without an own total.
 		 */
 		tokensOf(sessionId, taskId) {
+			if (pendingLive.has(sessionId)) return { pending: true };
 			const entry = index.get(sessionId, taskId);
-			if (!entry) return pendingLive.has(sessionId) ? { pending: true } : null;
+			if (!entry) return null;
 			const treeTokens = (trees ?? treeTotals(index.entries())).get(entry.id) ?? null;
 			const tree = treeTokens === null ? {} : { treeTokens };
 			if (entry.state === "full") return { state: "full", ...tree };

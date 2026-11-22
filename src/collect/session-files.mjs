@@ -2,13 +2,31 @@ import fs from "node:fs";
 import path from "node:path";
 import { listDirSafe, statSafe } from "../util/fsx.mjs";
 import { readUsageIndex } from "../usage-index.mjs";
-import { idFromFileName, readSessionHeader } from "./sessions.mjs";
+import { idFromFileName } from "./sessions.mjs";
 import { senpiTaskStoreDir } from "./tasks.mjs";
 
 const HEADER_BYTES = 64 * 1024;
 
-export function mainSessionFileMatches(file, sessionId) {
-	return idFromFileName(file) === sessionId || readSessionHeader(file)?.id === sessionId;
+/** A header probe is atomic; callers defer the candidate if its prefix won't fit. */
+export function probeSessionHeader(file, size, maxBytes) {
+	const length = Math.min(size, HEADER_BYTES);
+	if (length > maxBytes) return { pending: true, bytesRead: 0 };
+	if (length === 0) return { bytesRead: 0 };
+	let fd;
+	let bytesRead = 0;
+	try {
+		fd = fs.openSync(file, "r");
+		const buf = Buffer.alloc(length);
+		bytesRead = fs.readSync(fd, buf, 0, length, 0);
+		const text = buf.toString("utf8", 0, bytesRead);
+		const end = text.indexOf("\n");
+		const entry = JSON.parse(end >= 0 ? text.slice(0, end) : text);
+		return { id: entry?.type === "session" ? entry.id : undefined, bytesRead };
+	} catch {
+		return { bytesRead };
+	} finally {
+		if (fd !== undefined) fs.closeSync(fd);
+	}
 }
 
 /**
@@ -71,24 +89,9 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 		let bytesRead = 0;
 		const result = (file, pending = false) => ({ file, pending, bytesRead });
 		const header = (file, size) => {
-			const length = Math.min(size, HEADER_BYTES);
-			if (length > maxBytes - bytesRead) return { pending: true };
-			if (length === 0) return {};
-			let fd;
-			try {
-				fd = fs.openSync(file, "r");
-				const buf = Buffer.alloc(length);
-				const n = fs.readSync(fd, buf, 0, length, 0);
-				bytesRead += n;
-				const text = buf.toString("utf8", 0, n);
-				const end = text.indexOf("\n");
-				const entry = JSON.parse(end >= 0 ? text.slice(0, end) : text);
-				return { id: entry?.type === "session" ? entry.id : undefined };
-			} catch {
-				return {};
-			} finally {
-				if (fd !== undefined) fs.closeSync(fd);
-			}
+			const probe = probeSessionHeader(file, size, maxBytes - bytesRead);
+			bytesRead += probe.bytesRead;
+			return probe;
 		};
 		if (!sessionId) return result();
 		if (indexedFile && idFromFileName(indexedFile) !== sessionId) {

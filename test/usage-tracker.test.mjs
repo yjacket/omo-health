@@ -9,6 +9,7 @@ import { readUsage } from "../src/collect/usage.mjs";
 import { E, iso, tmpDir, writeJsonl } from "./helpers/fixtures.mjs";
 import { makeWorld, sessionState, taskRecord } from "./helpers/world.mjs";
 import { compactUsage, createUsageIndex, readUsageIndex, USAGE_TICK_BYTES } from "../src/usage-index.mjs";
+import * as usageIndex from "../src/usage-index.mjs";
 import { endedRow } from "../src/ui/model.mjs";
 import { createUsageTracker } from "../src/usage-tracker.mjs";
 import { backfillOnce } from "../src/session-backfill.mjs";
@@ -330,6 +331,99 @@ test("(IS-4, IS-12) cold discovery shares the tick budget and keeps history pend
 	assert.equal(s.index.get(sessionId).file, file);
 	assert.equal(history().tokensState, "ok");
 	assert.equal(history().tokens.total, 42);
+});
+
+test("(IS-4, IS-12) live header probes share the tick budget and deferred sessions stay pending", (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const custom = Array.from({ length: 600 }, (_, i) => {
+		const id = `live-${i}`;
+		const file = path.join(s.cwd, `custom-${i}.jsonl`);
+		writeLines(file, [JSON.stringify({ type: "session", id }).padEnd(HEADER_BYTES - 1), bigRecord(0, usage(i + 1))]);
+		return { id, file, total: i + 1 };
+	});
+	const named = { id: "named", file: mainFile(s.paths, "named"), total: 42 };
+	writeLines(named.file, [bigRecord(0, usage(named.total))]);
+	const namedBytes = fs.statSync(named.file).size;
+	const cases = [named, ...custom];
+	const world = makeWorld({
+		now: s.clock.now(),
+		sessions: cases.map(({ id, file }) => sessionState({ id, file, cwd: s.cwd, startedMs: T0 - 1000 })),
+		sensors: cases.map(({ id: sessionId, file: sessionFile }, i) => ({ sessionId, sessionFile, pid: 100 + i, ts: T0 })),
+		procsFresh: true,
+	});
+
+	const filesByFd = new Map();
+	const bytesByFile = new Map();
+	const probesByFile = new Map();
+	let actual = 0;
+	let filesCounted = 0;
+	let fingerprints = 0;
+	let counting = false;
+	const { openSync, readSync } = fs;
+	const { update } = s.index;
+	t.mock.method(s.index, "update", (...args) => {
+		counting = true;
+		filesCounted += 1;
+		const before = actual;
+		try {
+			const scanned = update(...args);
+			fingerprints += actual - before - scanned;
+			return scanned;
+		} finally {
+			counting = false;
+		}
+	});
+	t.mock.method(fs, "openSync", (file, ...args) => {
+		const fd = openSync(file, ...args);
+		filesByFd.set(fd, file);
+		return fd;
+	});
+	t.mock.method(fs, "readSync", (fd, ...args) => {
+		const n = readSync(fd, ...args);
+		const file = filesByFd.get(fd);
+		actual += n;
+		bytesByFile.set(file, (bytesByFile.get(file) ?? 0) + n);
+		if (!counting) probesByFile.set(file, (probesByFile.get(file) ?? 0) + n);
+		return n;
+	});
+	// The archive used for red proof lacks this export; use the same allowance there.
+	const fingerprintMax = usageIndex.USAGE_FINGERPRINT_BYTES_MAX ?? 16_384;
+	const tick = (i) => {
+		actual = 0;
+		filesCounted = 0;
+		fingerprints = 0;
+		bytesByFile.clear();
+		probesByFile.clear();
+		const state = s.tracker.tick(world);
+		const ceiling = USAGE_TICK_BYTES + filesCounted * fingerprintMax;
+		assert.ok(actual <= ceiling, `tick ${i} read ${actual} actual bytes (ceiling ${ceiling}, counting ${filesCounted} files)`);
+		assert.ok(state.bytesRead <= USAGE_TICK_BYTES, `tick ${i} charged ${state.bytesRead} against ${USAGE_TICK_BYTES}`);
+		assert.equal(state.bytesRead, actual - fingerprints, `tick ${i} charged scans and probes, excluding fingerprints`);
+		t.diagnostic(`tick ${i}: ${actual} actual, ${state.bytesRead} charged, ${filesCounted} counted`);
+		return state;
+	};
+
+	tick(1);
+	assert.equal(bytesByFile.get(named.file), 3 * namedBytes, "matching filename needs only the scan and two short fingerprints");
+	assert.equal(probesByFile.has(named.file), false);
+	const waiting = custom.filter(({ file }) => !bytesByFile.has(file));
+	assert.ok(waiting.length > 0, "some live header probes did not fit");
+	const board = buildSessionSnapshot(world, [], [], world.now, { tokensOf: s.tracker.tokensOf });
+	const rows = new Map(board.groups.flatMap((g) => g.sessions.map((row) => [row.sessionId, row])));
+	for (const { id } of waiting) {
+		assert.equal(s.index.has(id), false, id);
+		assert.deepEqual(s.tracker.tokensOf(id), { pending: true }, id);
+		assert.equal(rows.get(id)?.tokensPending, true, id);
+		assert.equal(rows.get(id)?.tokens, null, id);
+	}
+	for (let i = 2; i <= 4 && cases.some(({ id }) => !s.tracker.tokensOf(id)?.tokens); i += 1) tick(i);
+	const totals = () => cases.map(({ id }) => s.tracker.tokensOf(id)?.tokens?.total);
+	const expected = cases.map(({ total }) => total);
+	assert.deepEqual(totals(), expected);
+	assert.equal(tick("unchanged").bytesRead, 0, "an unchanged world has no scan or probe bytes");
+	assert.equal(probesByFile.size, 0, "unchanged custom-named files are not re-probed");
+	assert.deepEqual(totals(), expected);
 });
 
 test("a tick never reads more than the byte budget: a 40 MiB live record waits while a backlog waits", () => {
