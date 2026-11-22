@@ -24,6 +24,7 @@ const isObject = (value) => typeof value === "object" && value !== null;
 
 const META_KEYS = ["kind", "taskId", "parentSessionId", "rootSessionId"];
 const MEMORY_ONLY_KEYS = new Set(["scanOffset", "partial", "readError"]);
+const CURSOR_NUMBERS = ["size", "offset", "evaluatedTo", "mtimeMs", "ino", "birthtimeMs", "headLen"];
 const PERSISTED_KEYS = [
 	"id",
 	"file",
@@ -81,6 +82,10 @@ function applyMeta(entry, meta) {
 	for (const key of META_KEYS) if (key in meta) entry[key] = meta[key];
 }
 
+function hasNumericCursor(entry) {
+	return CURSOR_NUMBERS.every((key) => Number.isFinite(entry[key]));
+}
+
 /** The identity facts `readUsage` resumes on; a change means it recounted from 0. */
 function isRestart(previous, result) {
 	if (!isObject(previous) || previous.state !== "ok" || previous.offset === undefined || previous.usage === undefined) return true;
@@ -123,6 +128,7 @@ export function compactUsage(entry) {
  */
 export function fresh(entry) {
 	if (!isObject(entry) || entry.state !== "ok" || entry.complete !== true) return false;
+	if (!hasNumericCursor(entry)) return false;
 	if (entry.evaluatedTo !== entry.size) return false;
 	const stat = statSafe(entry.file);
 	return Boolean(stat && stat.size === entry.size && stat.mtimeMs === entry.mtimeMs);
@@ -237,6 +243,8 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			entry.file = path;
 			applyMeta(entry, meta);
 			entry.checkedMs = clock.now();
+			// Keep any last published total for a missing file, but never resume or compare a malformed cursor.
+			const from = hasNumericCursor(entry) ? entry : undefined;
 			let result;
 			try {
 				// Windows reports a directory as a zero-byte stream, so readUsage would succeed on one; a session file is never a directory.
@@ -245,7 +253,7 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 					error.code = "EISDIR";
 					throw error;
 				}
-				result = read(path, entry, { maxBytes });
+				result = read(path, from, { maxBytes });
 			} catch (error) {
 				if (entry.readError !== true) {
 					log?.error?.("usage_read_failed", { file: basename(String(path)), error: String(error?.message ?? error) });
@@ -266,7 +274,7 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 				dirty = true;
 				return 0;
 			}
-			const restart = isRestart(entry, result);
+			const restart = isRestart(from, result);
 			entry.state = "ok";
 			entry.gone = false;
 			entry.complete = restart ? result.done === true : entry.complete === true || result.done === true;

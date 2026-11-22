@@ -892,11 +892,21 @@ function toolsEntry(stats, name) {
 function timestampOf(entry, message) {
 	const timestamp = entry.timestamp;
 	if (Number.isFinite(timestamp)) return timestamp;
-	if (typeof timestamp === "string") {
+	try {
 		const parsed = Date.parse(timestamp);
 		if (Number.isFinite(parsed)) return parsed;
+	} catch {
+		// JSON objects can shadow the methods Date.parse uses for coercion.
 	}
 	return Number.isFinite(message.timestamp) ? message.timestamp : NaN;
+}
+
+function timelineErrorClass(text) {
+	try {
+		return classifyProviderError(text);
+	} catch {
+		return classifyProviderError("");
+	}
 }
 
 function imageBytes(item) {
@@ -945,16 +955,23 @@ function consumeTimelineStats(stats, entry, options) {
 			stats.hours.set(hourMs, hour);
 		}
 		if (usage) {
-			stats.turns.push({
-				ms,
-				key: billingKey(message.provider, message.responseModel ?? message.model),
-				input,
-				output,
-				cacheRead,
-				cacheWrite,
-				total,
-				stopReason: message.stopReason,
-			});
+			const top = stats.topTurns;
+			// Insert after equal totals, just as the stable sort did (also for Infinity).
+			if (top.length < 10 || total > top[9].total) {
+				let index = top.length;
+				while (index > 0 && total > top[index - 1].total) index -= 1;
+				top.splice(index, 0, {
+					ms,
+					key: billingKey(message.provider, message.responseModel ?? message.model),
+					input,
+					output,
+					cacheRead,
+					cacheWrite,
+					total,
+					stopReason: message.stopReason,
+				});
+				if (top.length > 10) top.pop();
+			}
 			const denominator = input + cacheRead + cacheWrite;
 			if (cacheWrite >= options.cacheStormWrite && cacheRead < options.cacheStormReadFrac * denominator) {
 				stats.stormTurns += 1;
@@ -962,7 +979,7 @@ function consumeTimelineStats(stats, entry, options) {
 		}
 		if (message.stopReason === "error") {
 			stats.errors.count += 1;
-			const cls = classifyProviderError(typeof message.errorMessage === "string" ? message.errorMessage : "");
+			const cls = timelineErrorClass(message.errorMessage);
 			stats.errors.byClass[cls] = (stats.errors.byClass[cls] ?? 0) + 1;
 		}
 		if (Array.isArray(message.content)) {
@@ -1004,7 +1021,8 @@ function consumeTimelineRecord(totals, stats, acc, options) {
 	try {
 		entry = JSON.parse(text);
 	} catch {
-		totals.diagnostics.badLines += 1;
+		if (usageWanted) totals.diagnostics.badLines += 1;
+		else totals.diagnostics.skippedLines += 1;
 		return;
 	}
 	if (usageWanted) consumeEntry(totals, entry);
@@ -1054,7 +1072,7 @@ export function usageTimeline(file, { cacheStormWrite = Infinity, cacheStormRead
 		const totals = emptyUsage();
 		const stats = {
 			hours: new Map(),
-			turns: [],
+			topTurns: [],
 			errors: { count: 0, byClass: {} },
 			tools: new Map(),
 			stormTurns: 0,
@@ -1094,7 +1112,7 @@ export function usageTimeline(file, { cacheStormWrite = Infinity, cacheStormRead
 		return {
 			totals,
 			hours: [...stats.hours.values()].sort((a, b) => a.hourMs - b.hourMs).slice(-240),
-			topTurns: stats.turns.slice().sort((a, b) => b.total - a.total).slice(0, 10),
+			topTurns: stats.topTurns,
 			cache: {
 				hitRate: denominator > 0 ? totals.cacheRead / denominator : null,
 				stormTurns: stats.stormTurns,

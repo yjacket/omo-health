@@ -6,6 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { tmpDir } from "./helpers/fixtures.mjs";
 import { addUsage, createRecordScanner, emptyUsage, modelsOfEntry, readUsage, usageOfEntry, usageTimeline } from "../src/collect/usage.mjs";
+import { classifyProviderError } from "../src/detect/provider.mjs";
 
 const MiB = 1024 * 1024;
 const MIN = 60_000;
@@ -1247,7 +1248,7 @@ test("(gate 8) a non-coercible timestamp does not abort accounting", (t) => {
 	assert.equal(missing.totals.total, 13);
 	assert.deepEqual(missing.hours, []);
 	assert.ok(Number.isNaN(missing.topTurns[0].ms));
-	const fallback = gate8Parity(file(), gate8Message({ timestamp: T0 }, { timestamp: [iso(T0 + HOUR)] }));
+	const fallback = gate8Parity(file(), gate8Message({ timestamp: T0 }, { timestamp: { toString: "p" } }));
 	assert.equal(fallback.topTurns[0].ms, T0);
 	assert.deepEqual(fallback.hours, [{ hourMs: Math.floor(T0 / HOUR) * HOUR, tokens: 13, turns: 1 }]);
 	const numeric = gate8Parity(file(), gate8Message({}, { timestamp: 0 }));
@@ -1280,6 +1281,66 @@ test("(gate 8) an error turn with non-text error detail is classified without co
 	const timeline = gate8Parity(file(), `${line}\n`);
 	assert.equal(timeline.totals.total, 13);
 	assert.deepEqual(timeline.errors, { count: 1, byClass: { other: 1 } });
+});
+
+test("(gate 9) timeline classifies coercible JSON error detail like the provider detector", (t) => {
+	const { file } = setup(t);
+	const line = gate8Message({ stopReason: "error", errorMessage: ["usage limit"] });
+	const cls = classifyProviderError(JSON.parse(line).message.errorMessage);
+	assert.equal(cls, "usage-limit");
+	assert.deepEqual(gate8Parity(file(), `${line}\n`).errors, { count: 1, byClass: { [cls]: 1 } });
+});
+
+test("(gate 9) timeline preserves a parseable JSON timestamp ahead of the message fallback", (t) => {
+	const { file } = setup(t);
+	const line = gate8Message({ timestamp: T0 }, { timestamp: [iso(T0 + HOUR)] });
+	const ms = Date.parse(JSON.parse(line).timestamp);
+	const timeline = gate8Parity(file(), line);
+	assert.equal(timeline.topTurns[0].ms, ms);
+	assert.deepEqual(timeline.hours, [{ hourMs: Math.floor(ms / HOUR) * HOUR, tokens: 13, turns: 1 }]);
+});
+
+test("(gate 9) malformed stats-only lines do not alter usage diagnostics", (t) => {
+	const { file } = setup(t);
+	fs.writeFileSync(file(), '{"type":"image",}\n');
+	assert.deepEqual(usageTimeline(file()).totals, readUsage(file()).effective);
+});
+
+test("(gate 9) timeline completes under a 96 MiB heap with 1.2 million small turns", (t) => {
+	const { dir, file } = setup(t);
+	const row = (ms, input = 12) => `${JSON.stringify({
+		type: "message",
+		timestamp: ms,
+		message: { role: "assistant", provider: "p", model: "m", stopReason: "stop", usage: { input, cost: { total: 0 } } },
+	})}\n`;
+	const batch = row(T0).repeat(10_000);
+	fs.writeFileSync(file(), Array.from({ length: 11 }, (_, i) => row(T0 + i)).join(""));
+	for (let i = 0; i < 119; i += 1) fs.appendFileSync(file(), batch);
+	fs.appendFileSync(file(), row(T0).repeat(9988) + row(T0 + 11, 13));
+
+	const script = `
+		const { usageTimeline } = await import(process.argv[1]);
+		const { prepMs, ...report } = usageTimeline(process.argv[2]);
+		console.log(JSON.stringify(report));
+	`;
+	const source = new URL("../src/collect/usage.mjs", import.meta.url).href;
+	const run = (...flags) => {
+		const child = spawnSync(process.execPath, [...flags, "--input-type=module", "-e", script, source, file()], {
+			cwd: dir,
+			encoding: "utf8",
+		});
+		assert.ifError(child.error);
+		assert.equal(child.status, 0, child.stderr || `signal: ${child.signal}`);
+		return JSON.parse(child.stdout);
+	};
+	const capped = run("--max-old-space-size=96");
+	assert.deepEqual(capped, run());
+	assert.equal(capped.totals.total, 14_400_001);
+	assert.equal(capped.totals.turns, 1_200_000);
+	assert.deepEqual(
+		capped.topTurns.map(({ ms, total }) => [ms, total]),
+		[[T0 + 11, 13], ...Array.from({ length: 9 }, (_, i) => [T0 + i, 12])],
+	);
 });
 
 test("(gate 8) nonnumeric saved cursor fields trigger a recount without coercion", (t) => {

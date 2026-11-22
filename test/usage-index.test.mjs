@@ -95,6 +95,36 @@ test("save and load round-trip the entries without the in-memory fields", (t) =>
 	assert.equal(index.prune(T0), 0);
 });
 
+for (const field of ["size", "offset", "evaluatedTo", "mtimeMs", "ino", "birthtimeMs", "headLen"]) {
+	test(`(gate 9) reloaded index recounts and publishes with malformed ${field}`, (t) => {
+		const { fileOf, indexOf, logged } = setup(t);
+		const file = fileOf();
+		const original = `${line()}\n`;
+		const second = `${line()}\n`;
+		for (const [name, value] of [["object", '{"toString":null,"valueOf":null}'], ["overflow", "1e999"]]) {
+			const indexName = `${name}.json`;
+			const savedFile = fileOf(indexName);
+			writeText(file, original);
+			const index = indexOf(indexName);
+			index.update("s", file);
+			index.save();
+			const saved = fs.readFileSync(savedFile, "utf8");
+			const corrupt = saved.replace(new RegExp(`("${field}"\\s*:\\s*)[^,\\s}]+`), (_, key) => key + value);
+			assert.notEqual(corrupt, saved);
+			writeText(savedFile, corrupt);
+			const reloaded = indexOf(indexName);
+			const wasFresh = fresh(reloaded.get("s"));
+			fs.appendFileSync(file, second);
+			assert.equal(reloaded.update("s", file), Buffer.byteLength(original + second), value);
+			assert.equal(compactUsage(reloaded.get("s")).total, 20);
+			assert.equal(reloaded.save(), true);
+			assert.equal(compactUsage(indexOf(indexName).get("s")).total, 20);
+			assert.equal(wasFresh, false, value);
+		}
+		assert.deepEqual(logged, []);
+	});
+}
+
 test("a different index version or a corrupt file reads as empty", (t) => {
 	const { dir } = setup(t);
 	const file = path.join(dir, "usage.json");
