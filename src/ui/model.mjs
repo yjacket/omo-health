@@ -190,6 +190,7 @@ function childRow(c, depth = 0) {
 		tokens: boardTokens(c.tokens),
 		treeTokens: num(c.treeTokens),
 		tokensPending: c.tokensPending === true,
+		...(c.tokensState === "full" ? { tokensState: "full" } : {}),
 		children,
 	};
 }
@@ -218,6 +219,7 @@ function sessionRow(s) {
 		tokens: boardTokens(s.tokens),
 		treeTokens: num(s.treeTokens),
 		tokensPending: s.tokensPending === true,
+		...(s.tokensState === "full" ? { tokensState: "full" } : {}),
 		children,
 		childCount: children.length,
 	};
@@ -246,7 +248,7 @@ export function buildSessions(inputs) {
  * One EndedRecord of the ledger as the history table shows it. `childRows` is the number of ended child rows in the
  * window that name this session as parent: a session recorded before its children were visible keeps childCount 0.
  */
-export function endedRow(r, childRows = 0, usage = null, trees = null) {
+export function endedRow(r, childRows = 0, usage = null, trees = null, full = usage?.full === true) {
 	const outcome = typeof r.outcome === "string" && Object.hasOwn(OUTCOME_LABELS, r.outcome) ? r.outcome : "unknown";
 	const startedMs = num(r.startedMs);
 	const endedMs = num(r.endedMs);
@@ -277,7 +279,7 @@ export function endedRow(r, childRows = 0, usage = null, trees = null) {
 		estimated: r.estimated === true,
 		source: r.source === "backfill" ? "backfill" : "live",
 		tokens,
-		tokensState: tokens ? "ok" : entry?.state === "missing" ? "missing" : "pending",
+		tokensState: tokens ? "ok" : entry?.state === "missing" ? "missing" : entry?.state === "full" || (!entry && full) ? "full" : "pending",
 		tokensGone: entry?.gone === true,
 		treeTokens: tree !== null && tree > (tokens?.total ?? 0) ? tree : null,
 	};
@@ -311,7 +313,7 @@ export function buildEnded(inputs) {
 		counts: [...tally].map(([outcome, count]) => ({ outcome, outcomeKo: outcomeLabel(outcome), count })),
 		shown: { main: shownMains.length, child: shownChildren.length },
 		totals: { main: mains.length, child: children.length },
-		rows: all.filter((r) => selected.has(r)).map((r) => endedRow(r, childRows.get(r.sessionId), entryOf, trees)),
+		rows: all.filter((r) => selected.has(r)).map((r) => endedRow(r, childRows.get(r.sessionId), entryOf, trees, usage.full === true)),
 	};
 }
 

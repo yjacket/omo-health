@@ -34,6 +34,7 @@ export function createUsageTracker({ paths, index, locator, clock, log } = {}) {
 	let queue = new Map();
 	let trees;
 	let backlogLogged = false;
+	let fullLogged = false;
 	let sawBacklog = false;
 
 	const cwdCandidates = (row, liveSessions) => {
@@ -106,7 +107,7 @@ export function createUsageTracker({ paths, index, locator, clock, log } = {}) {
 				const entry = index.get(row.sessionId);
 				const checkedAgo = nowMs() - (Number.isFinite(entry?.checkedMs) ? entry.checkedMs : 0) > DAY_MS;
 				let need = false;
-				if (!entry) need = true;
+				if (!entry || entry.state === "full") need = true;
 				else if (entry.state === "ok" && entry.complete !== true) need = true;
 				else if (entry.gone === true) need = checkedAgo;
 				else if (entry.complete === true && (entry.readError === true || !isFresh(entry))) need = true;
@@ -156,13 +157,17 @@ export function createUsageTracker({ paths, index, locator, clock, log } = {}) {
 				const entry = index.get(id);
 				// Missing/gone files are retried by queueLedger, not every tick.
 				if (entry.readError === true) continue;
-				if (entry.state === "missing" || entry.gone === true ||
+				if (entry.state === "missing" || entry.state === "full" || entry.gone === true ||
 					(entry.state === "ok" && entry.complete === true && entry.evaluatedTo === entry.size)) {
 					queue.delete(id);
 				}
 			}
 			trees = treeTotals(index.entries());
 			const state = counts();
+			if (index.full && !fullLogged) {
+				fullLogged = true;
+				log?.warn?.("usage_index_full");
+			}
 			if (sawBacklog && !backlogLogged && queue.size === 0) {
 				index.save();
 				log?.info?.("usage_backlog", state);
@@ -180,6 +185,7 @@ export function createUsageTracker({ paths, index, locator, clock, log } = {}) {
 		tokensOf(id) {
 			const entry = index.get(id);
 			if (!entry) return null;
+			if (entry.state === "full") return { state: "full" };
 			if (entry.readError === true) return null;
 			const tokens = compactUsage(entry);
 			if (!tokens) return entry.state === "ok" ? { pending: true } : null;

@@ -132,7 +132,7 @@ export function readAuditTimeline(file, tokens, { maxFileBytes = TIMELINE_MAX_BY
 /**
  * @returns {{tick(now: number): void, busy(): boolean}}
  */
-export function createAuditor({ paths, config, clock, log, runner, env = process.env, timelineMaxBytes = TIMELINE_MAX_BYTES, loadRecord = loadSessionRecord, timeline = usageTimeline, afterStart } = {}) {
+export function createAuditor({ paths, config, clock, log, runner, index, env = process.env, timelineMaxBytes = TIMELINE_MAX_BYTES, loadRecord = loadSessionRecord, timeline = usageTimeline, afterStart } = {}) {
 	const auditsDir = paths.health.auditsDir;
 	const jobsDir = paths.health.jobsDir;
 	const locator = createSessionFileLocator({ paths, clock });
@@ -226,21 +226,22 @@ export function createAuditor({ paths, config, clock, log, runner, env = process
 	}
 
 	/** The session's own usage entry, its file, and the models the audited session used. */
-	function usageFacts(record) {
-		const usage = readUsageIndex(paths.health.usageIndexFile);
+	function usageFacts(record, usage) {
 		const session = record.session ?? {};
-		const entry = usage.get(session.sessionId) ?? (session.taskId ? usage.get(session.taskId) : undefined) ?? null;
+		const own = usage.get(session.sessionId);
+		const entry = own && own.state !== "full" ? own : (session.taskId ? usage.get(session.taskId) : null) ?? own ?? null;
 		const file = entry?.file ?? (session.taskId ? null : locator.mainFile(session.sessionId)) ?? null;
 		return { entry, file };
 	}
 
 	function prepare(record, now) {
 		if (config.audit?.enabled !== true) return fail(record, "disabled", null, now);
-		const loaded = loadRecord({ paths, id: record.sessionId, now, messageScanMaxBytes: timelineMaxBytes, descendantScanMax: DESCENDANT_SCAN_MAX, locator });
+		const usage = index ?? readUsageIndex(paths.health.usageIndexFile);
+		const loaded = loadRecord({ paths, id: record.sessionId, now, messageScanMaxBytes: timelineMaxBytes, descendantScanMax: DESCENDANT_SCAN_MAX, locator, index: usage });
 		if (!loaded?.found) return fail(record, "not-found", null, now);
 		if (readBudget(paths, now).count >= config.audit.perDay) return fail(record, "cap", null, now);
 
-		const { entry, file } = usageFacts(loaded);
+		const { entry, file } = usageFacts(loaded, usage);
 		const full = readAuditTimeline(file, config.tokens, { maxFileBytes: timelineMaxBytes, timeline, log });
 		// The record join already collected every analyst model for its selected fps, including decision-only fps.
 		const analystModels = loaded.analystModels ?? [];

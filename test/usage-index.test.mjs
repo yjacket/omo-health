@@ -80,6 +80,68 @@ function indexText({ v, entries }) {
 	return [JSON.stringify({ v }), ...Object.values(entries).map((entry) => JSON.stringify(entry))].join("\n") + "\n";
 }
 
+const longPathProgram = `
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import * as usage from ${JSON.stringify(new URL("../src/usage-index.mjs", import.meta.url).href)};
+const [mode, file] = process.argv.slice(1);
+const N = 16000;
+const id = (i) => "01aaa000-0000-7000-8000-" + String(i).padStart(12, "0");
+const prefix = "C:/" + ("작".repeat(195) + "/").repeat(18);
+const pathOf = (i) => prefix + "업".repeat(7) + id(i);
+assert.equal(pathOf(0).length, 3574);
+let now = N;
+const open = () => mode === "dashboard" ? usage.readUsageIndex(file) : usage.createUsageIndex({ file, clock: { now: () => now } });
+if (mode === "fixture") {
+	const index = open();
+	const row = index.markMissing(id(0), { file: pathOf(0), kind: "main" });
+	const fd = fs.openSync(file, "w");
+	try {
+		fs.writeSync(fd, '{"v":3}\\n');
+		for (let i = 0; i < N; ++i) fs.writeSync(fd, JSON.stringify({ ...row, id: id(i), file: pathOf(i), checkedMs: N - i }) + "\\n");
+	} finally { fs.closeSync(fd); }
+} else {
+	const index = open();
+	if (mode === "write") {
+		for (let n = 0; n < N; ++n) {
+			const i = n < 2 ? 1 - n : n; // The first two are deliberately out of checked-time order.
+			now = N - i;
+			index.markMissing(id(i), { file: pathOf(i), kind: "main" });
+		}
+		assert.equal(index.save(), true);
+	} else {
+		const rows = [...index.values()];
+		const bytes = (row) => JSON.stringify(row).length + 18 * 195 + 7 + usage.INDEX_ENTRY_OVERHEAD;
+		assert.ok(rows.length > 0 && rows.length < N);
+		const total = rows.reduce((sum, row) => sum + bytes(row), 0);
+		assert.ok(total <= usage.INDEX_BYTE_BUDGET && total + bytes(rows.at(-1)) - 1 > usage.INDEX_BYTE_BUDGET);
+		assert.deepEqual(rows.map((row) => row.id), Array.from({ length: rows.length }, (_, i) => id(i)));
+		assert.equal(index.full, true);
+		if (mode === "read") assert.equal(index.get(id(N - 1))?.state, "full");
+	}
+}
+`;
+
+function runLongPath(mode, file) {
+	const result = spawnSync(process.execPath, ["--max-old-space-size=96", "--input-type=module", "--eval", longPathProgram, mode, file], { encoding: "utf8" });
+	assert.equal(result.status, 0, `${mode}:\n${result.stderr}\n${result.error ?? ""}`);
+}
+
+test("(gate 16) 16000 long Korean paths save within 96 MiB, preserving the newest rows in order", (t) => {
+	const { fileOf } = setup(t);
+	const file = fileOf("usage.json");
+	runLongPath("write", file);
+	runLongPath("read", file);
+});
+
+test("(gate 16) fresh 96 MiB reader stops at the byte budget in an oversized valid file", (t) => {
+	const { fileOf } = setup(t);
+	const file = fileOf("usage.json");
+	runLongPath("fixture", file);
+	runLongPath("read", file);
+	runLongPath("dashboard", file);
+});
+
 test("(gate 15) 12000 one-model sessions under a Korean project save and resave at 96 MiB", (t) => {
 	const { dir, fileOf } = setup(t);
 	const file = fileOf("usage.json");

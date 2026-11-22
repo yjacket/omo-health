@@ -335,7 +335,7 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 	const usageIndex = createUsageIndex({ file: paths.health.usageIndexFile, clock, log });
 	const usageTracker = createUsageTracker({ paths, index: usageIndex, locator: createSessionFileLocator({ paths, clock }), clock, log });
 	// Plan todo 12: owner-requested audits (display-only, so they run in shadow mode too); one runs at a time.
-	const auditor = (overrides.createAuditor ?? createAuditor)({ paths, config, clock, log, env, runner: createRunner({ paths, clock, contracts: { audit: AUDIT_CONTRACT } }) });
+	const auditor = (overrides.createAuditor ?? createAuditor)({ paths, config, clock, log, env, index: usageIndex, runner: createRunner({ paths, clock, contracts: { audit: AUDIT_CONTRACT } }) });
 	const savedBoard = readJsonSafe(paths.health.sessionsSnapshotFile);
 	let prevBoard = savedBoard?.v === 1 && clock.now() - (savedBoard.ts ?? 0) <= BOARD_RESUME_MS ? savedBoard : undefined;
 	let backfilled = false;
@@ -421,7 +421,21 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 					} catch (error) {
 						log.error("usage_tick_failed", { error: error.message, stack: String(error.stack).slice(0, 800) });
 					}
-					const board = buildSessionSnapshot(result.world, result.findings ?? [], boardInvestigations.list({ sinceMs: boardNow - 7 * DAY_MS }), boardNow, { tokensOf: usageTracker.tokensOf });
+					const fullRows = new Set();
+					const board = buildSessionSnapshot(result.world, result.findings ?? [], boardInvestigations.list({ sinceMs: boardNow - 7 * DAY_MS }), boardNow, {
+						tokensOf(id) {
+							const tokens = usageTracker.tokensOf(id);
+							if (tokens?.state === "full") fullRows.add(id);
+							return tokens;
+						},
+					});
+					if (fullRows.size) {
+						const markFull = (row) => {
+							if (fullRows.has(row.sessionId ?? row.taskId)) row.tokensState = "full";
+							row.children.forEach(markFull);
+						};
+						for (const group of board.groups) group.sessions.forEach(markFull);
+					}
 					atomicWriteJson(paths.health.sessionsSnapshotFile, board);
 					if (result.world.procsFresh !== false) {
 						for (const record of detectEnded(prevBoard, board, result.world, boardNow)) {

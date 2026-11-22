@@ -72,7 +72,7 @@ function collectDescendants(row, ledger, usageEntries) {
 	const discovered = new Set([row.sessionId, row.taskId].filter(nonEmpty));
 	const all = [];
 	for (const r of ledger) if (isRecord(r)) all.push({ sessionId: r.sessionId ?? null, taskId: r.taskId ?? null, parentSessionId: r.parentSessionId ?? null, title: r.title ?? null, outcome: r.outcome ?? null, endedMs: msOf(r.endedMs), cwd: r.cwd ?? null });
-	for (const e of usageEntries) if (isRecord(e)) all.push({ sessionId: e.id ?? null, taskId: e.taskId ?? null, parentSessionId: e.parentSessionId ?? null, title: null, outcome: null, endedMs: msOf(e.checkedMs), cwd: null });
+	for (const e of usageEntries) if (nonEmpty(e?.parentSessionId)) all.push({ sessionId: e.id ?? null, taskId: e.taskId ?? null, parentSessionId: e.parentSessionId, title: null, outcome: null, endedMs: msOf(e.checkedMs), cwd: null });
 	let frontier = new Set(discovered);
 	for (let depth = 1; depth <= DEPTH_MAX && frontier.size; depth += 1) {
 		const next = new Set();
@@ -231,12 +231,11 @@ function modelRows(published) {
 }
 
 function usageEntryOf(usage, row) {
-	if (!(usage instanceof Map)) return null;
 	const bySession = nonEmpty(row.sessionId) ? usage.get(row.sessionId) : undefined;
-	if (bySession) return bySession;
+	if (bySession && bySession.state !== "full") return bySession;
 	// A task id is an alias only when it is a non-empty string: two main rows both carry null and must not match.
-	if (!nonEmpty(row.taskId)) return null;
-	return usage.get(row.taskId) ?? [...usage.values()].find((entry) => entry?.taskId === row.taskId) ?? null;
+	if (!nonEmpty(row.taskId)) return bySession ?? null;
+	return usage.get(row.taskId) ?? (usage instanceof Map ? [...usage.values()].find((entry) => entry?.taskId === row.taskId) : null) ?? bySession ?? null;
 }
 
 /**
@@ -246,7 +245,7 @@ function usageEntryOf(usage, row) {
 export function buildSessionRecord(inputs = {}) {
 	const { id, row } = inputs;
 	const ledger = Array.isArray(inputs.ledger) ? inputs.ledger : [];
-	const usage = inputs.usage instanceof Map ? inputs.usage : new Map();
+	const usage = typeof inputs.usage?.get === "function" && typeof inputs.usage?.values === "function" ? inputs.usage : new Map();
 	const decisions = Array.isArray(inputs.decisions) ? inputs.decisions : [];
 	const investigations = Array.isArray(inputs.investigations) ? inputs.investigations : [];
 	const messagesIn = Array.isArray(inputs.messages) ? inputs.messages : [];
@@ -255,7 +254,7 @@ export function buildSessionRecord(inputs = {}) {
 
 	const startedMs = msOf(row.startedMs);
 	const endedMs = msOf(row.endedMs);
-	const descendants = collectDescendants(row, ledger, [...usage.values()]);
+	const descendants = collectDescendants(row, ledger, usage.values());
 	const descSessionIds = new Set(descendants.map((node) => node.sessionId).filter(nonEmpty));
 	const descTaskIds = new Set(descendants.map((node) => node.taskId).filter(nonEmpty));
 	const sessionAllowed = new Set([row.sessionId, ...descSessionIds].filter(nonEmpty));
@@ -325,7 +324,7 @@ export function buildSessionRecord(inputs = {}) {
 
 	const entry = usageEntryOf(usage, row);
 	const compact = compactUsage(entry);
-	const trees = treeTotals(usage);
+	const trees = treeTotals(usage.values());
 	const tokens = entry
 		? {
 				...(compact ?? { total: null, input: null, output: null, cacheRead: null, cacheWrite: null, cost: null, costUnknown: false, turns: null }),
@@ -339,7 +338,7 @@ export function buildSessionRecord(inputs = {}) {
 
 	const children = descendants
 		.map((node) => {
-			const childEntry = usage.get(node.sessionId) ?? (node.taskId ? usage.get(node.taskId) : undefined) ?? null;
+			const childEntry = usageEntryOf(usage, node);
 			const childCompact = compactUsage(childEntry);
 			return {
 				sessionId: node.sessionId,
@@ -349,7 +348,7 @@ export function buildSessionRecord(inputs = {}) {
 				endedMs: node.endedMs,
 				depth: node.depth,
 				tokens: childCompact,
-				tokensState: childCompact ? "ok" : childEntry?.state === "missing" ? "missing" : "pending",
+				tokensState: childCompact ? "ok" : ["missing", "full"].includes(childEntry?.state) ? childEntry.state : "pending",
 			};
 		})
 		.sort((a, b) => (b.endedMs ?? 0) - (a.endedMs ?? 0));
@@ -487,16 +486,16 @@ function cwdsOf(node, ledger) {
  * messages and is listed in `truncated.messagesSkipped`; the dashboard default
  * is Infinity, only the daemon's audit preparation passes a limit.
  */
-export function loadSessionRecord({ paths, id, now = Date.now(), messageScanMaxBytes = Infinity, descendantScanMax = Infinity, scanMessages = scanOmoHealthMessages, locator } = {}) {
+export function loadSessionRecord({ paths, id, now = Date.now(), messageScanMaxBytes = Infinity, descendantScanMax = Infinity, scanMessages = scanOmoHealthMessages, locator, index } = {}) {
 	if (!nonEmpty(id)) return { found: false, id };
 	const ledger = readEnded(paths, { sinceMs: now - 30 * DAY_MS });
 	const row = ledger.find((r) => r.sessionId === id || r.taskId === id);
 	if (!row) return { found: false, id };
-	const usage = readUsageIndex(paths.health.usageIndexFile);
+	const usage = index ?? readUsageIndex(paths.health.usageIndexFile);
 	const startedMs = msOf(row.startedMs);
 	const decisions = readDecisions(paths, (Number.isFinite(startedMs) ? startedMs : now) - 30 * DAY_MS);
 	const investigations = readAllInvestigations(paths);
-	const descendants = collectDescendants(row, ledger, [...usage.values()]).sort((a, b) => (b.endedMs ?? 0) - (a.endedMs ?? 0));
+	const descendants = collectDescendants(row, ledger, usage.values()).sort((a, b) => (b.endedMs ?? 0) - (a.endedMs ?? 0));
 	const loc = locator ?? createSessionFileLocator({ paths, clock: { now: () => now } });
 
 	const files = [];

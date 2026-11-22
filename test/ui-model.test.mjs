@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { after, describe, it } from "node:test";
+import { runInNewContext } from "node:vm";
 import { SWITCH_KEYS } from "../src/config.mjs";
 import { SWITCHES } from "../src/control.mjs";
 import { resolvePaths } from "../src/paths.mjs";
@@ -11,7 +12,7 @@ import { createFakeClock } from "../src/util/time.mjs";
 import { createUsageIndex } from "../src/usage-index.mjs";
 import { ACTION_LABELS, EXIT_REASON_LABELS, GOAL_STATUS_LABELS, INVESTIGATION_STATUS_LABELS, OUTCOME_LABELS, SESSION_STATE_LABELS, TASK_STATUS_LABELS, TERMINAL_LABELS, TRIGGER_LABELS } from "../src/ui/labels.mjs";
 import { buildHistory } from "../src/ui/history.mjs";
-import { buildOverview, buildSettings, buildUiState, daemonStatus, endedRow, loadDaemonInputs, loadUiInputs, uiState } from "../src/ui/model.mjs";
+import { buildOverview, buildSessions, buildSettings, buildUiState, daemonStatus, endedRow, loadDaemonInputs, loadUiInputs, uiState } from "../src/ui/model.mjs";
 
 const NOW = Date.parse("2026-09-29T03:00:00.000Z"); // 12:00 KST
 const DAY = 24 * 3600_000;
@@ -47,6 +48,21 @@ function writeDecisions(paths, lines, rawFile = "2026-09-28.jsonl") {
 const heartbeat = (extra = {}) => ({ pid: 424242, ts: NOW - 10_000, startedMs: NOW - DAY, version: "0.3.0", mode: "auto", ...extra });
 const inputsOf = (home, overrides = {}) => ({ ...loadUiInputs({ paths: home.paths, env: home.env, now: NOW }), ...overrides });
 const running = (home, hbExtra, overrides = {}) => inputsOf(home, { heartbeat: heartbeat(hbExtra), pidAlive: true, ...overrides });
+
+it("(gate 16) history and board show a dash with the full-index tooltip", () => {
+	const id = "full-session";
+	const history = endedRow({ sessionId: id }, 0, new Map([[id, { id, state: "full" }]]));
+	const board = buildSessions({ now: NOW, sessionsSnapshot: { groups: [{ sessions: [{ sessionId: id, tokensState: "full" }] }] } }).groups[0].sessions[0];
+	const app = fs.readFileSync(new URL("../src/ui/static/app.js", import.meta.url), "utf8");
+	const readToken = runInNewContext(`(${app.match(/function tokenReading\([^]*?\n\t\}/)[0]})`, { lastState: {} });
+	for (const row of [history, board]) {
+		assert.equal(row.tokens, null);
+		assert.equal(row.tokensState, "full");
+		const reading = readToken(row.tokensState);
+		assert.equal(reading.text, "-");
+		assert.equal(reading.title, "토큰 색인이 가득 차 세지 않았습니다");
+	}
+});
 
 describe("ui model", () => {
 	it("returns every section without throwing for an empty home", () => {

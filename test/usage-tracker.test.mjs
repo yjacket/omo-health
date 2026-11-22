@@ -32,7 +32,7 @@ function setup(prefix = "usage-tracker-", indexOptions = {}) {
 	const log = {
 		info: (event, data) => events.push({ level: "info", event, data }),
 		error: (event, data) => events.push({ level: "error", event, data }),
-		warn: () => {},
+		warn: (event, data) => events.push({ level: "warn", event, data }),
 	};
 	const index = createUsageIndex({ file: paths.health.usageIndexFile, clock, log, ...indexOptions });
 	const locator = createSessionFileLocator({ paths, clock, rescanMs: 0 });
@@ -65,6 +65,28 @@ function writeLines(file, lines) {
 }
 
 const emptyWorld = (clock) => makeWorld({ now: clock.now(), sessions: [] });
+
+test("(gate 16) saturation marks uncounted rows full, logs once, and prune lets the backlog count again", (t) => {
+	const s = setup("usage-full-");
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const longPath = "C:/" + "작".repeat(3571);
+	for (let i = 0; i < 16000; i++) s.index.markMissing(`old${i}`, { file: longPath });
+	s.locator.mainFile = () => longPath + "/next.jsonl";
+	const rows = ["next", "later"].map((sessionId) => ({ sessionId, kind: "main", endedMs: T0 }));
+	s.tracker.queueLedger(rows);
+	s.tracker.tick(emptyWorld(s.clock));
+	assert.deepEqual(s.tracker.tokensOf("next"), { state: "full" });
+	s.tracker.queueLedger(rows);
+	s.tracker.tick(emptyWorld(s.clock));
+	assert.deepEqual(s.tracker.tokensOf("later"), { state: "full" });
+	assert.equal(s.events.filter(({ event }) => event === "usage_index_full").length, 1);
+	s.advance(46 * DAY);
+	assert.ok(s.index.prune(s.clock.now()) > 0);
+	s.tracker.queueLedger(rows);
+	s.tracker.tick(emptyWorld(s.clock));
+	assert.equal(s.index.get("next")?.state, "missing");
+	assert.equal(s.tracker.tokensOf("next"), null);
+});
 
 test("a complete live session reads only appended bytes each tick", () => {
 	const s = setup();

@@ -1,5 +1,6 @@
 import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -129,6 +130,58 @@ function crashAfterStart(h, { writeMeta = true } = {}) {
 }
 
 const modelOf = (start) => start.args[start.args.indexOf("--model") + 1];
+
+test("(gate 16) audit preparation reaches reviewer launch with a resident index at 96 MiB", (t) => {
+	const h = harness({ providers: ["openai", "google"], entries: [E.assistant({ ms: BASE - 120_000, model: "gpt-5-5", provider: "openai" })] });
+	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+	const source = (name) => JSON.stringify(new URL(`../src/${name}.mjs`, import.meta.url).href);
+	const program = `
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import { createUsageIndex } from ${source("usage-index")};
+import { createAuditor, requestAudit, readAuditState } from ${source("auditor")};
+import { DEFAULT_CONFIG } from ${source("config")};
+const [mode, pathsJSON, transcript] = process.argv.slice(1);
+const paths = JSON.parse(pathsJSON);
+const now = ${BASE};
+const clock = { now: () => now };
+const file = paths.health.usageIndexFile;
+const index = createUsageIndex({ file, clock });
+if (mode === "fixture") {
+	index.update("m1", transcript, { kind: "main" });
+	const seed = index.get("m1");
+	index.save();
+	const fd = fs.openSync(file, "a");
+	try {
+		const prefix = "C:/" + ("작".repeat(192) + "/").repeat(6);
+		for (let i = 0; i < 12000; i++) fs.writeSync(fd, JSON.stringify({ ...seed, id: "s" + i, file: prefix + i }) + "\\n");
+	} finally { fs.closeSync(fd); }
+} else {
+	assert.ok(index.get("m1").published.total > 0);
+	const open = fs.openSync;
+	let indexOpens = 0;
+	fs.openSync = (name, ...args) => {
+		if (name === file) ++indexOpens;
+		return open(name, ...args);
+	};
+	let launches = 0;
+	requestAudit(paths, "m1", now);
+	const auditor = createAuditor({ paths, index, clock, config: DEFAULT_CONFIG, env: {}, timelineMaxBytes: 0, runner: {
+		start() { launches++; return { pid: 5001 }; },
+	} });
+	auditor.tick(now + 1);
+	assert.equal(launches, 1);
+	const record = readAuditState(paths, "m1");
+	assert.deepEqual([record.status, record.model], ["running", "google/gemini-3-pro"]);
+	assert.ok(fs.readFileSync(paths.health.jobsDir + "/" + record.jobId + "/bundle.md", "utf8").includes('"total":' + index.get("m1").published.total));
+	assert.equal(indexOpens, 0);
+}
+`;
+	for (const mode of ["fixture", "audit"]) {
+		const result = spawnSync(process.execPath, ["--max-old-space-size=96", "--input-type=module", "--eval", program, mode, JSON.stringify(h.paths), h.files.m1], { encoding: "utf8" });
+		assert.equal(result.status, 0, `${mode}:\n${result.stderr}\n${result.error ?? ""}`);
+	}
+});
 
 test("a request becomes queued, then running with the marker, the guard flags and one charge, then done", () => {
 	const h = harness();

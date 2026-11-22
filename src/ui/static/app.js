@@ -205,6 +205,7 @@
 	function tokenReading(stateKey, total) {
 		if (stateKey === "ok") return { text: compactCount(total), title: fullCount(total) };
 		if (stateKey === "missing") return { text: "-", title: "세션 기록 파일을 찾지 못했습니다" };
+		if (stateKey === "full") return { text: "-", title: "토큰 색인이 가득 차 세지 않았습니다" };
 		return { text: "계산 중", title: lastState.overview?.daemon?.state === "running" ? "감시기가 세션 파일을 읽는 중입니다." : "감시기가 꺼져 있어 아직 계산하지 못했습니다." };
 	}
 
@@ -332,7 +333,7 @@
 	function childMeta(c) {
 		const elapsed = Number.isFinite(c.startedMs) ? elapsedText((Number.isFinite(c.endedMs) ? c.endedMs : nowMs) - c.startedMs) : null;
 		const inv = c.health.investigations[0];
-		return [c.category, c.statusKo, elapsed, c.health.open[0]?.titleKo, inv ? `조사 ${inv.statusKo}` : null, c.tokens ? `토큰 ${compactCount(c.tokens.total)}` : c.tokensPending ? "토큰 계산 중" : null].filter(Boolean).join(" · ");
+		return [c.category, c.statusKo, elapsed, c.health.open[0]?.titleKo, inv ? `조사 ${inv.statusKo}` : null, c.tokens ? `토큰 ${compactCount(c.tokens.total)}` : c.tokensState === "full" ? `토큰 ${tokenReading("full").text}` : c.tokensPending ? "토큰 계산 중" : null].filter(Boolean).join(" · ");
 	}
 
 	function tree(children, depth = 0) {
@@ -349,7 +350,7 @@
 						el("span", { class: `dot dot--${childTone(c)}`, "aria-hidden": "true" }),
 						depth ? el("span", { class: "tree__branch", "aria-hidden": "true", text: "└" }) : null,
 						el("span", { class: "tree__name", text: c.name }),
-						el("span", { class: "tree__meta", title: c.tokens ? `토큰 ${fullCount(c.tokens.total)}` : undefined, text: childMeta(c) }),
+						el("span", { class: "tree__meta", title: c.tokens ? `토큰 ${fullCount(c.tokens.total)}` : c.tokensState === "full" ? tokenReading("full").title : undefined, text: childMeta(c) }),
 					),
 					c.children.length ? tree(c.children, depth + 1) : null,
 				),
@@ -372,8 +373,8 @@
 
 	/** A live session's token marks: its own total (계산 중 until its file is read to the end), then the tree total when its children add to it. */
 	function boardTokenMarks(s) {
-		if (!s.tokens && !s.tokensPending) return null;
-		const own = tokenReading(s.tokens ? "ok" : "pending", s.tokens?.total);
+		if (!s.tokens && !s.tokensPending && s.tokensState !== "full") return null;
+		const own = tokenReading(s.tokens ? "ok" : s.tokensState ?? "pending", s.tokens?.total);
 		return [el("span", { title: own.title, text: `토큰 ${own.text}` }), Number.isFinite(s.treeTokens) ? el("span", { title: fullCount(s.treeTokens), text: `자식 포함 ${compactCount(s.treeTokens)}` }) : null];
 	}
 
@@ -501,6 +502,10 @@
 	/** The session's tokens, split the way omo's own /session splits them: input is the whole prompt, and the cache served part of it. */
 	function endedTokenFacts(t) {
 		if (!Number.isFinite(t?.total)) {
+			if (t?.state === "full") {
+				const reading = tokenReading("full");
+				return el("span", { title: reading.title, text: reading.text });
+			}
 			const missing = t?.state === "missing";
 			const reading = tokenReading(missing ? "missing" : "pending");
 			return missing ? empty(reading.title) : [empty(reading.text), note(reading.title)];

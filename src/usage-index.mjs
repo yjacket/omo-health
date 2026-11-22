@@ -17,6 +17,11 @@ import { atomicWriteChunks, statSafe } from "./util/fsx.mjs";
  */
 export const USAGE_INDEX_VERSION = 3;
 const INDEX_HEADER = JSON.stringify({ v: USAGE_INDEX_VERSION });
+const FULL_HEADER = JSON.stringify({ v: USAGE_INDEX_VERSION, full: true });
+const FULL_ENTRY = Object.freeze({ state: "full" });
+/** Serialized row bytes plus the measured cost of the row and its bookkeeping. */
+export const INDEX_ENTRY_OVERHEAD = 1280;
+export const INDEX_BYTE_BUDGET = 55 * 1024 * 1024;
 /** Per-tick byte budget for live appends, first reads and the backlog. */
 export const USAGE_TICK_BYTES = 32 * 1024 * 1024;
 /** Total named model slots, including repeats between rows or counter maps. */
@@ -168,8 +173,12 @@ export function treeTotals(entries) {
 	const totals = new Map();
 	for (const id of byId.keys()) {
 		const own = compactUsage(byId.get(id));
-		const seen = new Set([id]);
 		let total = own ? own.total : 0;
+		if (!childrenByParent.has(id)) {
+			totals.set(id, total);
+			continue;
+		}
+		const seen = new Set([id]);
 		let frontier = [id];
 		for (let depth = 0; depth < TREE_DEPTH && frontier.length; depth += 1) {
 			const next = [];
@@ -332,11 +341,19 @@ function invalidated(id, row) {
 	return entry;
 }
 
-function* indexChunks(entries, weights) {
-	yield `${INDEX_HEADER}\n`;
-	for (const [id, entry] of entries) {
-		if (entry.state === "ok" && !weights.has(id)) continue; // Recount still pending.
-		yield `${JSON.stringify(persisted(entry), encodeNonFinite)}\n`;
+const serializeEntry = (entry) => JSON.stringify(persisted(entry), encodeNonFinite);
+
+function entryBytes(line) {
+	let bytes = line.length + INDEX_ENTRY_OVERHEAD;
+	for (let i = 0; i < line.length; i++) if (line.charCodeAt(i) > 127) bytes++;
+	return bytes;
+}
+
+function* indexChunks(entries, weights, full) {
+	yield `${full ? FULL_HEADER : INDEX_HEADER}\n`;
+	for (const entry of [...entries.values()].sort((a, b) => b.checkedMs - a.checkedMs)) {
+		if (entry.state === "ok" && weights.get(entry.id).slots === null) continue; // Recount still pending.
+		yield `${serializeEntry(entry)}\n`;
 	}
 }
 
@@ -348,18 +365,10 @@ function* indexChunks(entries, weights) {
  * lets tests inject a read failure.
  */
 export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
-	const { entries, weights, count } = loadUsageIndex(file);
-	let named = count;
-	let dirty = false;
-
-	const ensure = (id) => {
-		let entry = entries.get(id);
-		if (!entry) {
-			entry = newEntry(id);
-			entries.set(id, entry);
-		}
-		return entry;
-	};
+	const loaded = loadUsageIndex(file);
+	const { entries, weights } = loaded;
+	let { named, bytes, full } = loaded;
+	let dirty = loaded.truncated;
 
 	const alias = (id) => {
 		const direct = entries.get(id);
@@ -368,9 +377,30 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 		return undefined;
 	};
 
+	const unweigh = (id) => {
+		const weight = weights.get(id);
+		if (!weight) return;
+		named -= weight.slots ?? 0;
+		bytes -= weight.bytes;
+		weights.delete(id);
+	};
+
+	const admit = (entry, slots) => {
+		const size = entryBytes(serializeEntry(entry));
+		if (bytes + size > INDEX_BYTE_BUDGET) {
+			if (entries.delete(entry.id) || !full) dirty = true;
+			full = true;
+			return FULL_ENTRY;
+		}
+		dirty = true;
+		entries.set(entry.id, entry);
+		weights.set(entry.id, { slots, bytes: size });
+		bytes += size;
+		named += slots ?? 0;
+		return entry;
+	};
+
 	const dropCursor = (entry) => {
-		named -= weights.get(entry.id) ?? 0;
-		weights.delete(entry.id);
 		Object.assign(entry, newEntry(entry.id), persistedMeta(entry), { checkedMs: entry.checkedMs });
 		entry.partial = undefined;
 		entry.scanOffset = undefined;
@@ -378,17 +408,25 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 
 	return {
 		file,
-		get: alias,
+		get full() { return full; },
+		get(id) {
+			// No rejected path or id is retained. While saturated, an absent row
+			// cannot be distinguished from one skipped at the capacity boundary.
+			return alias(id) ?? (full && typeof id === "string" && id ? FULL_ENTRY : undefined);
+		},
 		has(id) {
 			return alias(id) !== undefined;
 		},
+		values: () => entries.values(),
 		/**
 		 * Read up to `maxBytes` more bytes of `file`. Returns bytesRead; a missing
 		 * file marks the entry missing (or, after a complete read, gone) and a read
 		 * error keeps the saved totals while `readError` hides them from the board.
 		 */
 		update(id, path, meta = {}, { maxBytes = Infinity } = {}) {
-			const entry = ensure(id);
+			const entry = entries.get(id) ?? newEntry(id);
+			const previousSlots = weights.get(id)?.slots ?? null;
+			unweigh(id);
 			entry.file = path;
 			applyMeta(entry, meta);
 			entry.checkedMs = clock.now();
@@ -408,7 +446,7 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 					log?.error?.("usage_read_failed", { file: basename(String(path)), error: String(error?.message ?? error) });
 				}
 				entry.readError = true;
-				dirty = true;
+				admit(entry, previousSlots);
 				return 0;
 			}
 			entry.readError = false;
@@ -418,7 +456,7 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 				} else {
 					dropCursor(entry);
 				}
-				dirty = true;
+				admit(entry, entry.gone ? previousSlots : 0);
 				return 0;
 			}
 			const restart = isRestart(from, result);
@@ -440,11 +478,8 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			entry.partial = result.partial;
 			if (result.done === true) entry.published = result.effective;
 			else if (restart) entry.published = null;
-			named -= weights.get(id) ?? 0;
 			const slots = boundedModels(entry, USAGE_INDEX_MODEL_BUDGET - named);
-			weights.set(id, slots);
-			named += slots;
-			dirty = true;
+			admit(entry, slots);
 			return result.bytesRead;
 		},
 		/**
@@ -453,7 +488,9 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 		 * turns `gone`, exactly like the read-null path above (IS-3).
 		 */
 		markMissing(id, meta = {}) {
-			const entry = ensure(id);
+			const entry = entries.get(id) ?? newEntry(id);
+			const previousSlots = weights.get(id)?.slots ?? null;
+			unweigh(id);
 			applyMeta(entry, meta);
 			if (meta?.file) entry.file = meta.file;
 			if (entry.state === "ok" && entry.complete === true) {
@@ -462,8 +499,7 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 				dropCursor(entry);
 			}
 			entry.checkedMs = clock.now();
-			dirty = true;
-			return entry;
+			return admit(entry, entry.gone ? previousSlots : 0);
 		},
 		fresh,
 		atEnd,
@@ -473,7 +509,7 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 		/** Write the index when anything changed; returns whether it wrote. */
 		save() {
 			if (!dirty) return false;
-			atomicWriteChunks(file, indexChunks(entries, weights));
+			atomicWriteChunks(file, indexChunks(entries, weights, full));
 			dirty = false;
 			return true;
 		},
@@ -484,12 +520,14 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			for (const [id, entry] of entries) {
 				const checked = Number.isFinite(entry.checkedMs) ? entry.checkedMs : 0;
 				if (checked < cutoff && entries.delete(id)) {
-					named -= weights.get(id) ?? 0;
-					weights.delete(id);
+					unweigh(id);
 					removed += 1;
 				}
 			}
-			if (removed) dirty = true;
+			if (removed) {
+				full = false;
+				dirty = true;
+			}
 			return removed;
 		},
 	};
@@ -500,6 +538,7 @@ function* indexLines(file) {
 	try {
 		const buffer = Buffer.allocUnsafe(64 * 1024);
 		let parts = [];
+		let carried = 0;
 		let header = true;
 		let size;
 		while ((size = fs.readSync(fd, buffer, 0, buffer.length, null)) > 0) {
@@ -509,10 +548,16 @@ function* indexLines(file) {
 				const tail = chunk.subarray(start, end);
 				yield parts.length ? Buffer.concat([...parts, tail]) : tail;
 				parts = [];
+				carried = 0;
 				header = false;
 			}
 			if (start < size) {
-				if (header && start === 0 && size > INDEX_HEADER.length + 1) return;
+				if (header && start === 0 && size > FULL_HEADER.length + 1) return;
+				carried += size - start;
+				if (carried > INDEX_BYTE_BUDGET * 1.5) {
+					yield null; // Too large even at the largest UTF-8 to estimated-byte ratio.
+					return;
+				}
 				parts.push(Buffer.from(chunk.subarray(start)));
 			}
 		}
@@ -525,36 +570,57 @@ function* indexLines(file) {
 function loadUsageIndex(file, trackWeights = true) {
 	const entries = new Map();
 	const weights = new Map();
-	let count = 0;
+	let named = 0;
+	let bytes = 0;
+	let full = false;
+	let truncated = false;
 	try {
 		const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 		let header = true;
 		for (const line of indexLines(file)) {
 			if (header) {
-				if (line.toString("utf8").replace(/\r$/, "") !== INDEX_HEADER) break;
+				const signature = line.toString("utf8").replace(/\r$/, "");
+				if (signature !== INDEX_HEADER && signature !== FULL_HEADER) break;
+				full = signature === FULL_HEADER;
 				header = false;
 				continue;
 			}
+			if (line === null || bytes + line.length * (2 / 3) + INDEX_ENTRY_OVERHEAD > INDEX_BYTE_BUDGET) {
+				full = truncated = true;
+				break;
+			}
+			let text;
 			let row;
 			try {
-				row = JSON.parse(decoder.decode(line));
+				text = decoder.decode(line);
+				row = JSON.parse(text);
 			} catch {
 				continue;
 			}
 			if (!record(row) || typeof row.id !== "string" || entries.has(row.id)) continue;
 			const { id } = row;
-			const slots = validateEntry(row, USAGE_INDEX_MODEL_BUDGET - count);
+			const slots = validateEntry(row, USAGE_INDEX_MODEL_BUDGET - named);
 			// Keep only a pending marker for an identifiable but invalid row.
-			entries.set(id, slots < 0 ? invalidated(id, row) : row);
-			if (slots < 0) continue;
-			count += slots;
-			if (trackWeights) weights.set(id, slots);
+			const entry = slots < 0 ? invalidated(id, row) : row;
+			const size = entryBytes(slots < 0 ? serializeEntry(entry) : text.trimEnd());
+			if (bytes + size > INDEX_BYTE_BUDGET) {
+				full = truncated = true;
+				break;
+			}
+			entries.set(id, entry);
+			bytes += size;
+			if (slots >= 0) named += slots;
+			if (trackWeights) weights.set(id, { slots: slots < 0 ? null : slots, bytes: size });
 		}
-		return { entries, weights, count };
+		return { entries, weights, named, bytes, full, truncated };
 	} catch {
-		return { entries: new Map(), weights: new Map(), count: 0 };
+		return { entries: new Map(), weights: new Map(), named: 0, bytes: 0, full: false, truncated: false };
 	}
 }
 
 /** The index as the dashboard reads it: a Map, empty when absent or the header is invalid. */
-export const readUsageIndex = (file) => loadUsageIndex(file, false).entries;
+export function readUsageIndex(file) {
+	const { entries, full } = loadUsageIndex(file, false);
+	if (full) Object.defineProperty(entries, "full", { value: true });
+	return entries;
+}
