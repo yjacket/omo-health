@@ -324,6 +324,49 @@ test("a restart resumes an interrupted file from the saved offset instead of rec
 	assert.equal(compactUsage(index.get("r1")).total, 600);
 });
 
+test("(gate 11) a previous-writer row with a null overflowed total is recounted from the session", (t) => {
+	const s = setup();
+	const id = "v1-overflow";
+	const file = mainFile(s.paths, id);
+	// 1e308 + 1e308 = Infinity; the previous writer's JSON.stringify stored it as null.
+	writeLines(file, ['{"type":"usage","usage":{"input":1e308,"output":1e308}}']);
+	s.index.update(id, file);
+	s.index.save();
+	const nullTags = (value) => {
+		if (Array.isArray(value)) return value.map(nullTags);
+		if (value && typeof value === "object") {
+			if (Object.keys(value).length === 1 && typeof value.$n === "string") return null;
+			return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, nullTags(item)]));
+		}
+		return value;
+	};
+	const previous = nullTags(JSON.parse(fs.readFileSync(s.paths.health.usageIndexFile, "utf8")));
+	previous.v = 1;
+	fs.writeFileSync(s.paths.health.usageIndexFile, JSON.stringify(previous));
+
+	const index = createUsageIndex({ file: s.paths.health.usageIndexFile, clock: s.clock, log: s.log });
+	const locator = createSessionFileLocator({ paths: s.paths, clock: s.clock, rescanMs: 0 });
+	const tracker = createUsageTracker({ paths: s.paths, index, locator, clock: s.clock, log: s.log });
+	const row = { sessionId: id, kind: "main", cwd: s.cwd, endedMs: T0 };
+	const loaded = index.get(id);
+	assert.equal(loaded.offset, 0, "the lossy cursor is dropped");
+	assert.equal(loaded.complete, false);
+	assert.equal(compactUsage(loaded), null, "nothing is published for the invalidated row");
+	assert.equal(index.fresh(loaded), false);
+
+	assert.equal(tracker.queueLedger([row]), 1, "the row needs a recount");
+	tracker.tick(emptyWorld(s.clock));
+	assert.equal(compactUsage(index.get(id)).total, readUsage(file).effective.total);
+	assert.equal(compactUsage(index.get(id)).total, Infinity);
+
+	fs.appendFileSync(file, '{"type":"usage","usage":{"input":3}}\n');
+	assert.equal(tracker.queueLedger([row]), 1);
+	tracker.tick(emptyWorld(s.clock));
+	assert.equal(compactUsage(index.get(id)).total, Infinity, "an append keeps the overflowing total");
+	assert.equal(index.save(), true);
+	assert.equal(compactUsage(readUsageIndex(s.paths.health.usageIndexFile).get(id)).total, Infinity, "the repaired row reloads as Infinity");
+});
+
 test("a child of a child is located through its grandparent's cwd", () => {
 	const s = setup();
 	writeJsonl(childFile(s.cwd, "st_mid", "mid1"), [E.assistant({ ms: T0, usage: usage(3) })]);

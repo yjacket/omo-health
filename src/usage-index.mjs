@@ -1,6 +1,6 @@
 import { basename } from "node:path";
 import { readUsage } from "./collect/usage.mjs";
-import { atomicWriteJson, readJsonSafe, statSafe } from "./util/fsx.mjs";
+import { atomicWriteFile, readTextSafe, statSafe } from "./util/fsx.mjs";
 
 /**
  * The token index (plan todo 3, GAP-3): one JSON file holding, per session id, the
@@ -25,6 +25,7 @@ const isObject = (value) => typeof value === "object" && value !== null;
 const META_KEYS = ["kind", "taskId", "parentSessionId", "rootSessionId"];
 const MEMORY_ONLY_KEYS = new Set(["scanOffset", "partial", "readError"]);
 const USAGE_KEYS = ["usage", "overlay", "published"];
+const COUNTER_KEYS = ["input", "output", "cacheRead", "cacheWrite", "total", "cost", "turns"];
 const CURSOR_NUMBERS = ["size", "offset", "evaluatedTo", "mtimeMs", "ino", "birthtimeMs", "headLen"];
 const PERSISTED_KEYS = [
 	"id",
@@ -190,29 +191,70 @@ function persisted(entry) {
 	for (const [key, value] of Object.entries(entry)) {
 		if (!Object.hasOwn(out, key) && !MEMORY_ONLY_KEYS.has(key) && value !== undefined) out[key] = value;
 	}
-	for (const key of USAGE_KEYS) out[key] = mapCounters(out[key], encodeCounter);
+	// Non-finite leaves are tagged by the serializer, not by copying the trees here:
+	// a 105k-model entry copied into a second tree of the same size aborts at 96 MiB.
 	return out;
 }
 
-// Counter trees have numeric/boolean leaves (including model totals and diagnostics).
-// Scope the tags to these trees so arbitrary strings in metadata are never decoded.
-function mapCounters(value, mapLeaf) {
-	if (Array.isArray(value)) return value.map((item) => mapCounters(item, mapLeaf));
-	if (isObject(value)) return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, mapCounters(item, mapLeaf)]));
-	return mapLeaf(value);
+const NUMBER_TAG = "$n";
+const NUMBER_TAGS = new Map([["Infinity", Infinity], ["-Infinity", -Infinity], ["NaN", NaN]]);
+
+/** JSON.stringify replacer: a non-finite number becomes an unambiguous tagged object. */
+function encodeNonFinite(key, value) {
+	if (typeof value !== "number" || Number.isFinite(value)) return value;
+	if (Number.isNaN(value)) return { [NUMBER_TAG]: "NaN" };
+	return { [NUMBER_TAG]: value > 0 ? "Infinity" : "-Infinity" };
 }
 
-function encodeCounter(value) {
-	return typeof value === "number" && !Number.isFinite(value) ? `number:${value}` : value;
+/** JSON.parse reviver: decode the tagged shape; ordinary strings (including legacy
+ * `number:Infinity` text) are never touched. */
+function decodeNonFinite(key, value) {
+	if (!isObject(value) || Array.isArray(value)) return value;
+	const tag = value[NUMBER_TAG];
+	if (typeof tag !== "string") return value;
+	// Only the rare tagged value pays for the key-count check.
+	if (Object.keys(value).length !== 1) return value;
+	const decoded = NUMBER_TAGS.get(tag);
+	return decoded === undefined ? value : decoded;
 }
 
-function decodeCounter(value) {
-	switch (value) {
-		case "number:Infinity": return Infinity;
-		case "number:-Infinity": return -Infinity;
-		case "number:NaN": return NaN;
-		default: return value;
+/**
+ * A persisted counter tree may be absent as a whole (a never-read row), but every
+ * numeric leaf must be a number. JSON.stringify turns Infinity/NaN into null, so a
+ * null (or any other non-number) there is data loss; the row must be recounted.
+ */
+function validCounterTree(tree) {
+	if (tree === null || tree === undefined) return true;
+	if (!isObject(tree) || Array.isArray(tree)) return false;
+	for (const key of COUNTER_KEYS) if (key in tree && typeof tree[key] !== "number") return false;
+	if ("costUnknown" in tree && typeof tree.costUnknown !== "boolean") return false;
+	if ("modelsIncomplete" in tree && typeof tree.modelsIncomplete !== "boolean") return false;
+	for (const models of [tree.models, tree.usedModels, tree.diagnostics]) {
+		if (models === null || models === undefined) continue;
+		if (!isObject(models) || Array.isArray(models)) return false;
 	}
+	for (const model of Object.values(tree.models ?? {})) {
+		if (!isObject(model) || typeof model.tokens !== "number" || typeof model.cost !== "number") return false;
+	}
+	for (const flag of Object.values(tree.usedModels ?? {})) if (flag !== true) return false;
+	const diagnostics = tree.diagnostics;
+	if (diagnostics && (typeof diagnostics.badLines !== "number" || typeof diagnostics.skippedLines !== "number")) return false;
+	return true;
+}
+
+function validV1Entry(entry) {
+	return USAGE_KEYS.every((key) => validCounterTree(entry[key]));
+}
+
+/** Drop a lossy cursor and publication so the tracker recounts the session file. */
+function invalidateCursor(entry) {
+	delete entry.usage;
+	delete entry.overlay;
+	delete entry.published;
+	delete entry.evaluatedTo;
+	entry.offset = 0;
+	entry.complete = false;
+	entry.gone = false;
 }
 
 /**
@@ -348,7 +390,7 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			if (!dirty) return false;
 			const out = { v: USAGE_INDEX_VERSION, entries: {} };
 			for (const [id, entry] of entries) out.entries[id] = persisted(entry);
-			atomicWriteJson(file, out);
+			atomicWriteFile(file, `${JSON.stringify(out, encodeNonFinite, 2)}\n`);
 			dirty = false;
 			return true;
 		},
@@ -369,13 +411,23 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 /** The index as the dashboard reads it: a Map of entries, empty when absent, unsupported or corrupt. */
 export function readUsageIndex(file) {
 	const out = new Map();
-	const data = readJsonSafe(file);
+	const text = readTextSafe(file);
+	if (text === undefined) return out;
+	let data;
+	try {
+		const body = text.replace(/^\uFEFF/, "");
+		// V8's reviver path keeps a temporary node array; a tag-free 25 MB index fits the
+		// 96 MiB cap only through the plain parser, and then there is nothing to decode.
+		data = JSON.parse(body, body.includes(`"${NUMBER_TAG}"`) ? decodeNonFinite : undefined);
+	} catch {
+		return out;
+	}
 	if (!isObject(data) || (data.v !== 1 && data.v !== USAGE_INDEX_VERSION) || !isObject(data.entries)) return out;
 	for (const [id, entry] of Object.entries(data.entries)) {
 		if (!isObject(entry)) continue;
-		if (data.v === USAGE_INDEX_VERSION) {
-			for (const key of USAGE_KEYS) if (Object.hasOwn(entry, key)) entry[key] = mapCounters(entry[key], decodeCounter);
-		}
+		// The previous writer serialized an overflowed total as null. Keeping its cursor
+		// would publish a finite sum that disagrees with a one-shot read (IS-1).
+		if (data.v === 1 && !validV1Entry(entry)) invalidateCursor(entry);
 		out.set(id, entry);
 	}
 	return out;

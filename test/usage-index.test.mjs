@@ -1,5 +1,6 @@
 import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
@@ -262,6 +263,42 @@ for (const [expected, appendUsage] of [[-Infinity, use()], [NaN, use({ input: 1e
 		assert.equal(compactUsage(reloaded.get("s1")).total, expected);
 	});
 }
+
+test("(gate 11) a 105,000-model entry saves and reloads under a 96 MiB heap", (t) => {
+	const { dir } = setup(t);
+	const script = path.join(dir, "heap-save.mjs");
+	const indexUrl = new URL("../src/usage-index.mjs", import.meta.url).href;
+	const child = [
+		'import fs from "node:fs";',
+		`import { createUsageIndex, readUsageIndex } from ${JSON.stringify(indexUrl)};`,
+		"const dir = process.argv[2];",
+		'const session = dir + "/session.jsonl";',
+		'const indexFile = dir + "/usage.json";',
+		'const fd = fs.openSync(session, "w");',
+		"for (let i = 0; i < 105000; i += 1000) {",
+		'\tlet chunk = "";',
+		'\tfor (let j = i; j < Math.min(i + 1000, 105000); j += 1) chunk += JSON.stringify({ type: "message", message: { role: "assistant", provider: "p", model: "model-" + j, usage: { input: 1 } } }) + "\\n";',
+		"\tfs.writeSync(fd, chunk);",
+		"}",
+		"fs.closeSync(fd);",
+		"const index = createUsageIndex({ file: indexFile, clock: Date });",
+		'index.update("s1", session);',
+		'const total = index.get("s1").published.total;',
+		'if (total !== 105000) throw new Error("read total " + total);',
+		"index.save();",
+		'const reloaded = readUsageIndex(indexFile).get("s1");',
+		"const models = Object.keys(reloaded.published.models).length;",
+		'console.log("ok " + total + " " + models);',
+	];
+	fs.writeFileSync(script, `${child.join("\n")}\n`);
+	const result = spawnSync(process.execPath, ["--max-old-space-size=96", script, dir], { encoding: "utf8", timeout: 180_000 });
+	assert.equal(result.status, 0, `child exit ${result.status}: ${result.stderr}`);
+	assert.match(result.stdout, /^ok 105000 105000$/m);
+	const reloaded = readUsageIndex(path.join(dir, "usage.json")).get("s1");
+	assert.equal(reloaded.published.total, 105000);
+	assert.equal(reloaded.usage.total, 105000);
+	assert.equal(Object.keys(reloaded.published.models).length, 105000);
+});
 
 test("a three-call first read shows nothing until the file is read to the end", (t) => {
 	const { fileOf, indexOf } = setup(t);
