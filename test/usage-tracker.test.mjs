@@ -10,7 +10,7 @@ import { makeWorld, sessionState } from "./helpers/world.mjs";
 import { compactUsage, createUsageIndex, readUsageIndex, USAGE_TICK_BYTES } from "../src/usage-index.mjs";
 import { endedRow } from "../src/ui/model.mjs";
 import { createUsageTracker } from "../src/usage-tracker.mjs";
-import { appendEnded, streamEnded } from "../src/session-ledger.mjs";
+import { appendEnded, appendEndedLocated, ENDED_LOCATION, streamEnded } from "../src/session-ledger.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 
 const T0 = Date.UTC(2026, 8, 28, 12, 0, 0);
@@ -603,4 +603,59 @@ test("tokensOf reports treeTokens only when a descendant pushes the tree above t
 	s.tracker.tick(emptyWorld(s.clock));
 	assert.deepEqual(s.tracker.tokensOf("p2"), { tokens: compactUsage(s.index.get("p2")), treeTokens: 16 });
 	assert.deepEqual(s.tracker.tokensOf("c2"), { tokens: compactUsage(s.index.get("c2")), treeTokens: null });
+});
+
+test("(gate 20) a 128-child live burst reads each appended ledger line once, not the whole day", (t) => {
+	const s = setup("usage-tracker-live128-");
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	// A populated day makes the old per-child day scan unmistakable.
+	const dayFile = path.join(s.paths.sessionsDir, "ended-2026-09-28.jsonl");
+	fs.mkdirSync(s.paths.sessionsDir, { recursive: true });
+	fs.writeFileSync(dayFile, `${JSON.stringify({ sessionId: "seed", kind: "main", endedMs: T0 - 1000, cwd: s.cwd, reason: "x".repeat(128 * 1024) })}\n`);
+	let ledgerBytes = 0;
+	const countingFs = {
+		...fs,
+		readSync(...args) {
+			const read = fs.readSync(...args);
+			ledgerBytes += read;
+			return read;
+		},
+	};
+	const tracker = createUsageTracker({ paths: s.paths, index: s.index, locator: s.locator, clock: s.clock, log: s.log, ledgerFs: countingFs });
+	const updates = new Map();
+	const update = s.index.update.bind(s.index);
+	s.index.update = (id, ...args) => {
+		updates.set(id, (updates.get(id) ?? 0) + 1);
+		return update(id, ...args);
+	};
+
+	const count = 128;
+	const lineBytes = [];
+	for (let i = 0; i < count; i += 1) {
+		const sessionId = `child-${i}`;
+		const taskId = `st_${i}`;
+		const cwd = path.join(s.root, "proj", `case-${i}`);
+		writeJsonl(childFile(cwd, taskId, sessionId), [E.assistant({ ms: T0, usage: usage(i + 1) })]);
+		const record = { sessionId, kind: "child", taskId, parentSessionId: null, cwd, endedMs: T0 + i };
+		const { appended, location } = appendEndedLocated(s.paths, record, { nowMs: T0 });
+		assert.equal(appended, true, `child-${i} appended`);
+		lineBytes.push(location.length);
+		// The daemon's live shape: the record plus the position of the line it just wrote.
+		tracker.queueLedger([{ ...record, [ENDED_LOCATION]: location }]);
+	}
+	const lineTotal = lineBytes.reduce((sum, bytes) => sum + bytes, 0);
+
+	ledgerBytes = 0;
+	const tick = tracker.tick(emptyWorld(s.clock));
+	assert.ok(lineTotal > 0);
+	assert.equal(ledgerBytes, lineTotal, `tracker read ${ledgerBytes} ledger bytes for ${lineTotal} located line bytes`);
+	assert.equal(tick.missing, 0);
+	for (let i = 0; i < count; i += 1) {
+		const sessionId = `child-${i}`;
+		const entry = s.index.get(sessionId);
+		assert.equal(entry?.state, "ok", sessionId);
+		assert.equal(compactUsage(entry).total, i + 1, sessionId);
+		assert.equal(entry.file, childFile(path.join(s.root, "proj", `case-${i}`), `st_${i}`, sessionId), `${sessionId} resolved its own directory`);
+		assert.equal(updates.get(sessionId), 1, `${sessionId} indexed exactly once`);
+	}
 });

@@ -31,14 +31,14 @@ function ledgerFile(paths, endedMs) {
 	return path.join(paths.health.sessionsDir, `ended-${dayOf(endedMs)}.jsonl`);
 }
 
-function* ledgerLines(file) {
+function* ledgerLines(file, fsImpl = fs) {
 	const chunk = Buffer.allocUnsafe(64 * 1024);
 	let fd;
 	try {
-		fd = fs.openSync(file, "r");
+		fd = fsImpl.openSync(file, "r");
 		let parts = [];
 		let offset = 0;
-		for (let n; (n = fs.readSync(fd, chunk, 0, chunk.length, null));) {
+		for (let n; (n = fsImpl.readSync(fd, chunk, 0, chunk.length, null));) {
 			const bytes = chunk.subarray(0, n);
 			let start = 0;
 			for (let end; (end = bytes.indexOf(10, start)) !== -1; start = end + 1) {
@@ -54,7 +54,7 @@ function* ledgerLines(file) {
 	} catch {
 		// Like the array reader, tolerate a ledger file disappearing during a read.
 	} finally {
-		if (fd !== undefined) fs.closeSync(fd);
+		if (fd !== undefined) fsImpl.closeSync(fd);
 	}
 }
 
@@ -67,8 +67,8 @@ function parseRow(line) {
 	}
 }
 
-function* streamFile(file, sinceMs, withLocation) {
-	for (const { line, offset } of ledgerLines(file)) {
+function* streamFile(file, sinceMs, withLocation, fsImpl = fs) {
+	for (const { line, offset } of ledgerLines(file, fsImpl)) {
 		const row = parseRow(line);
 		if (!row || (Number.isFinite(sinceMs) && !(Number(row.endedMs) >= sinceMs))) continue;
 		if (withLocation) row[ENDED_LOCATION] = { file, offset, length: line.length };
@@ -77,40 +77,41 @@ function* streamFile(file, sinceMs, withLocation) {
 }
 
 /** Ended records in file/line order; callers needing newest-first order sort their selections. */
-export function* streamEnded(paths, { sinceMs, withLocation = false } = {}) {
-	for (const file of ledgerFiles(paths, sinceMs)) yield* streamFile(file, sinceMs, withLocation);
+export function* streamEnded(paths, { sinceMs, withLocation = false, fs: fsImpl = fs } = {}) {
+	for (const file of ledgerFiles(paths, sinceMs)) yield* streamFile(file, sinceMs, withLocation, fsImpl);
 }
 
-/** Resolve a queued row against the append-only ledger without keeping its cwd in memory. */
-export function readEndedCwd(paths, row) {
-	const location = row[ENDED_LOCATION];
+/**
+ * Resolve a queued row against the append-only ledger without keeping its cwd in memory.
+ * The row's byte position is the only read allowed: a day-wide rescan per queued row
+ * turns a burst of live exits into a whole-ledger read per child.
+ */
+export function readEndedCwd(paths, row, { fs: fsImpl = fs } = {}) {
+	const location = row?.[ENDED_LOCATION];
+	if (!location) return undefined;
 	const matches = (rec) => rec?.sessionId === row.sessionId && rec.endedMs === row.endedMs;
-	if (location) {
-		const { file, offset, length } = location;
-		let fd;
-		try {
-			fd = fs.openSync(file, "r");
-			const line = Buffer.allocUnsafe(length);
-			let n = 0;
-			while (n < length) {
-				const read = fs.readSync(fd, line, n, length - n, offset + n);
-				if (!read) break;
-				n += read;
-			}
-			const rec = n === length ? parseRow(line) : undefined;
-			if (matches(rec)) return rec.cwd;
-		} catch {
-			// The ledger may have been rotated since queueing.
-		} finally {
-			if (fd !== undefined) fs.closeSync(fd);
+	const { file, offset, length } = location;
+	let fd;
+	try {
+		fd = fsImpl.openSync(file, "r");
+		const line = Buffer.allocUnsafe(length);
+		let n = 0;
+		while (n < length) {
+			const read = fsImpl.readSync(fd, line, n, length - n, offset + n);
+			if (!read) break;
+			n += read;
 		}
+		const rec = n === length ? parseRow(line) : undefined;
+		if (matches(rec)) return rec.cwd;
+	} catch {
+		// The ledger may have been rotated since queueing.
+	} finally {
+		if (fd !== undefined) fsImpl.closeSync(fd);
 	}
-	// Live exits are queued just after appending, so their date is known but
-	// they do not have a byte position yet.
-	const endedMs = Number(row.endedMs);
-	if (!Number.isFinite(endedMs) || Math.abs(endedMs) > 8.64e15) return undefined;
-	const file = location?.file ?? ledgerFile(paths, endedMs);
-	for (const rec of streamFile(file)) if (matches(rec)) return rec.cwd;
+}
+
+function buildRecord(record) {
+	return { v: 1, ...record, reason: truncate(redact(String(record.reason ?? "")), REASON_MAX) };
 }
 
 /** True when the sessionId appears in the ledger files of the last 30 days. */
@@ -124,11 +125,22 @@ export function hasEnded(paths, sessionId, { nowMs = Date.now() } = {}) {
 }
 
 /** Append one ended record; returns false when the session is already recorded. */
-export function appendEnded(paths, record, { nowMs = Date.now() } = {}) {
-	if (hasEnded(paths, record.sessionId, { nowMs: Math.max(nowMs, Number(record.endedMs) || 0) })) return false;
-	const rec = { v: 1, ...record, reason: truncate(redact(String(record.reason ?? "")), REASON_MAX) };
+export function appendEnded(paths, record, options = {}) {
+	return appendEndedLocated(paths, record, options).appended;
+}
+
+/**
+ * Append one ended record and report where its line landed, so the live token
+ * queue can read that line back without scanning the day. `appended` mirrors
+ * `appendEnded`; `location` is null when nothing was written.
+ */
+export function appendEndedLocated(paths, record, { nowMs = Date.now() } = {}) {
+	if (hasEnded(paths, record.sessionId, { nowMs: Math.max(nowMs, Number(record.endedMs) || 0) })) return { appended: false, location: null };
+	const rec = buildRecord(record);
 	ensureDir(paths.health.sessionsDir);
 	const file = ledgerFile(paths, Number(rec.endedMs));
-	fs.appendFileSync(file, `${JSON.stringify(rec)}\n`);
-	return true;
+	const line = `${JSON.stringify(rec)}\n`;
+	const offset = fs.statSync(file, { throwIfNoEntry: false })?.size ?? 0;
+	fs.appendFileSync(file, line);
+	return { appended: true, location: { file, offset, length: Buffer.byteLength(line) - 1 } };
 }

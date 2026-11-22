@@ -26,8 +26,9 @@ const isNonEmptyString = (value) => typeof value === "string" && value.length > 
  * @param {object} options.locator      createSessionFileLocator() instance
  * @param {object} options.clock        {now()}
  * @param {object} options.log          {info, error}
+ * @param {object} [options.ledgerFs]   fs implementation for located ledger reads (tests count bytes)
  */
-export function createUsageTracker({ paths, index, locator, clock, log } = {}) {
+export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs } = {}) {
 	const nowMs = () => (typeof clock?.now === "function" ? clock.now() : Date.now());
 	/** Compact ledger rows, for the ancestor cwd walk. */
 	const ledgerRows = new Map();
@@ -43,7 +44,10 @@ export function createUsageTracker({ paths, index, locator, clock, log } = {}) {
 		const push = (cwd) => {
 			if (isNonEmptyString(cwd) && !cwds.includes(cwd)) cwds.push(cwd);
 		};
-		const cwdOf = (node) => paths && node && Object.hasOwn(node, ENDED_LOCATION) ? readEndedCwd(paths, node) : node?.cwd;
+		const cwdOf = (node) => {
+			if (!paths || !node) return undefined;
+			return node[ENDED_LOCATION] ? readEndedCwd(paths, node, ledgerFs ? { fs: ledgerFs } : undefined) : node.cwd;
+		};
 		push(cwdOf(row));
 		const seen = new Set();
 		if (isNonEmptyString(row?.sessionId)) seen.add(row.sessionId);
@@ -118,6 +122,9 @@ export function createUsageTracker({ paths, index, locator, clock, log } = {}) {
 				if (!isNonEmptyString(source?.sessionId)) continue;
 				const { sessionId, taskId, kind, endedMs, parentSessionId, rootSessionId } = source;
 				const row = { sessionId, taskId, kind, endedMs, parentSessionId, rootSessionId, [ENDED_LOCATION]: source[ENDED_LOCATION] };
+				// Direct callers that queue without a ledger position keep the cwd they supplied;
+				// located rows (every daemon path) resolve it from the ledger line instead.
+				if (!row[ENDED_LOCATION] && source.cwd !== undefined) row.cwd = source.cwd;
 				ledgerRows.set(row.sessionId, row);
 				const entry = index.get(row.sessionId);
 				const checkedAgo = nowMs() - (Number.isFinite(entry?.checkedMs) ? entry.checkedMs : 0) > DAY_MS;

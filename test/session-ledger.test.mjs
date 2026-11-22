@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { resolvePaths } from "../src/paths.mjs";
-import { appendEnded, hasEnded, readEnded } from "../src/session-ledger.mjs";
+import { appendEnded, appendEndedLocated, ENDED_LOCATION, hasEnded, readEnded, readEndedCwd } from "../src/session-ledger.mjs";
 
 function setup() {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "ledger-"));
@@ -49,4 +49,30 @@ test("day file uses UTC date of endedMs and reason is bounded", () => {
 	appendEnded(p, rec("a", ended, { reason: "가".repeat(1000) }));
 	assert.deepEqual(fs.readdirSync(p.health.sessionsDir), ["ended-2026-01-02.jsonl"]);
 	assert.ok(readEnded(p, {})[0].reason.length <= 300);
+});
+
+test("appendEndedLocated reports the appended line's position and reads only that line", () => {
+	const p = setup();
+	const now = Date.now();
+	const first = appendEndedLocated(p, rec("a", now - 1000));
+	assert.equal(first.appended, true);
+	const text = fs.readFileSync(first.location.file, "utf8");
+	assert.equal(text.slice(first.location.offset, first.location.offset + first.location.length), text.split("\n")[0]);
+
+	const row = readEnded(p, {})[0];
+	row[ENDED_LOCATION] = first.location;
+	let bytes = 0;
+	const countingFs = {
+		...fs,
+		readSync(...args) {
+			const read = fs.readSync(...args);
+			bytes += read;
+			return read;
+		},
+	};
+	assert.equal(readEndedCwd(p, row, { fs: countingFs }), null, "the recorded cwd is null");
+	assert.equal(bytes, first.location.length, "only the located line was read");
+
+	assert.deepEqual(appendEndedLocated(p, rec("a", now)), { appended: false, location: null });
+	assert.equal(appendEnded(p, rec("b", now)), true, "appendEnded still returns a boolean");
 });

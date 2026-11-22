@@ -34,7 +34,7 @@ import { createInvestigations } from "./investigations.mjs";
 import { pruneHome } from "./retention.mjs";
 import { backfillOnce } from "./session-backfill.mjs";
 import { buildSessionSnapshot, detectEnded } from "./session-board.mjs";
-import { appendEnded, streamEnded } from "./session-ledger.mjs";
+import { appendEndedLocated, ENDED_LOCATION, streamEnded } from "./session-ledger.mjs";
 import { createSessionFileLocator } from "./collect/session-files.mjs";
 import { createUsageIndex } from "./usage-index.mjs";
 import { createUsageTracker } from "./usage-tracker.mjs";
@@ -440,7 +440,8 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 					if (result.world.procsFresh !== false) {
 						for (const record of detectEnded(prevBoard, board, result.world, boardNow)) {
 							try {
-								if (appendEnded(paths, record)) usageTracker.queueLedger([record]);
+								const { appended, location } = appendEndedLocated(paths, record);
+								if (appended) usageTracker.queueLedger([{ ...record, [ENDED_LOCATION]: location }]);
 							} catch (error) {
 								log.error("session_ended_write_failed", { sessionId: record.sessionId, error: error.message });
 							}
