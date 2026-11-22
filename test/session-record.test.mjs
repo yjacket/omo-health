@@ -134,6 +134,19 @@ test("a wake-parent action with no investigation joins through its finding's ope
 	assert.ok(record.health.findings.some((item) => item.fp === "fp-wake" && item.event === "opened"));
 });
 
+test("an engine action decision is listed by its action kind, not the finding kind", () => {
+	const { paths } = setup();
+	writeLedger(paths, [{ sessionId: "s-kind", kind: "main", startedMs: T0, endedMs: T0 + HOUR }]);
+	// The shape src/engine.mjs writes for an executed action: the finding's kind at top level, the action's under `action`.
+	writeDecisions(paths, [
+		{ ts: iso(T0 + MIN), fp: "fp-kind", detector: "D1", kind: "stall", cls: "pending-call", action: { key: "k", kind: "kill-pids", params: {} }, result: "execute", outcome: { killed: [{ pid: 1 }], survived: [] }, subject: { sessionId: "s-kind", taskId: null, parentSessionId: null, rootSessionId: null } },
+	]);
+	const record = loadSessionRecord({ paths, id: "s-kind", now: T0 + 2 * HOUR });
+	assert.equal(record.health.actions.length, 1);
+	assert.equal(record.health.actions[0].kind, "kill-pids");
+	assert.equal(record.health.actions[0].findingKind, "stall");
+});
+
 test("a child finding with parentSessionId null is caught through the descendant set", () => {
 	const record = recordForMain();
 	assert.ok(fprs(record, "findings").includes("fp-child"));

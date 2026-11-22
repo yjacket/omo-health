@@ -182,7 +182,9 @@ function actionRow(entry) {
 	return {
 		ts: entry.ts ?? null,
 		detector: clean(entry.detector, 20),
-		kind: clean(entry.kind, 80),
+		// An engine action decision carries the finding's kind at top level and the action's kind under `action`.
+		kind: clean(entry.action.kind, 80),
+		findingKind: clean(entry.kind, 80),
 		result: clean(entry.result, 120),
 		detail: actionDetail(entry),
 		recipient,
