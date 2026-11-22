@@ -267,7 +267,77 @@ function singleRecordModelOracle(file) {
 	} };
 }
 
-test("(IS-2, IS-12) four medium live fragments publish together after an eight-byte append", (t) => {
+for (const spent of [0, 256]) test(`(IS-1, IS-12) an in-place longer replacement discards the torn record (${spent ? "limited" : "full"} budget)`, (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const id = "torn-replacement";
+	const file = mainFile(s.paths, id);
+	const world = makeWorld({ now: s.clock.now(), sessions: [sessionState({ id, file, cwd: s.cwd })] });
+	const prefix = `${bigRecord(5 * 1024, usage(7))}\n`;
+	const torn = bigRecord(512, usage(99)).replace('"model":"m"', '"model":"discarded"').slice(0, -3);
+	writeLines(file, [prefix.slice(0, -1)]);
+	fs.appendFileSync(file, torn);
+
+	assert.equal(s.tracker.tick(world).bytesRead, prefix.length + torn.length);
+	const { offset, scanOffset, ino, birthtimeMs } = s.index.get(key(s, id));
+	assert.equal(offset, prefix.length);
+	assert.equal(scanOffset, prefix.length + torn.length);
+	assert.equal(s.tracker.tokensOf(sub(s, id)).tokens.total, 7);
+	const previous = structuredClone(s.index.get(key(s, id)).published);
+
+	const replacement = `${bigRecord(1024, usage(31, 2)).replace('"model":"m"', '"model":"replacement"')}\n`;
+	assert.ok(replacement.length > torn.length);
+	fs.truncateSync(file, offset);
+	fs.appendFileSync(file, replacement);
+	const stat = fs.statSync(file);
+	assert.deepEqual([stat.ino, stat.birthtimeMs], [ino, birthtimeMs]);
+
+	if (spent) {
+		assert.equal(s.tracker.tick(world, { maxBytes: spent }).bytesRead, spent);
+		const entry = s.index.get(key(s, id));
+		assert.equal(entry.offset, offset);
+		assert.equal(entry.scanOffset, offset + spent);
+		assert.equal(s.tracker.tokensOf(sub(s, id)).pending, true);
+		assert.equal(s.tracker.tokensOf(sub(s, id)).tokens.total, 7);
+		assert.deepEqual(entry.published, previous);
+	}
+	const tick = s.tracker.tick(world);
+	const clean = readUsage(file).effective;
+	assert.equal(clean.total, 40);
+	assert.deepEqual(Object.keys(clean.models).sort(), ["p/m", "p/replacement"]);
+	assert.equal(s.tracker.tokensOf(sub(s, id)).tokens.total, clean.total);
+	assert.deepEqual(s.index.get(key(s, id)).published, clean);
+	assert.equal(tick.bytesRead, replacement.length - spent, "the replacement is scanned once from the committed offset");
+});
+
+test("(IS-1, IS-12) a same-size fragment replacement can overlap the head fingerprint", (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const id = "same-size-replacement";
+	const file = mainFile(s.paths, id);
+	const world = makeWorld({ now: s.clock.now(), sessions: [sessionState({ id, file, cwd: s.cwd })] });
+	const prefix = bigRecord(512, usage(7));
+	const tail = `${bigRecord(512, usage(31))}\n`;
+	writeLines(file, [prefix]);
+	fs.appendFileSync(file, "{".repeat(tail.length));
+	s.tracker.tick(world);
+	const { offset, headLen, size, mtimeMs } = s.index.get(key(s, id));
+	assert.equal(offset, prefix.length + 1);
+	assert.ok(headLen > offset);
+	fs.truncateSync(file, offset);
+	fs.appendFileSync(file, tail);
+	fs.utimesSync(file, new Date(mtimeMs + 5000), new Date(mtimeMs + 5000));
+	assert.equal(fs.statSync(file).size, size);
+
+	assert.equal(s.tracker.tick(world, { maxBytes: 256 }).bytesRead, 256);
+	assert.equal(s.tracker.tokensOf(sub(s, id)).pending, true);
+	assert.equal(s.tracker.tokensOf(sub(s, id)).tokens.total, 7);
+	assert.equal(s.tracker.tick(world).bytesRead, tail.length - 256);
+	assert.deepEqual(s.index.get(key(s, id)).published, readUsage(file).effective);
+	assert.equal(s.tracker.tokensOf(sub(s, id)).tokens.total, 38);
+});
+
+test("(IS-2, IS-12) four medium live fragments publish after budgeted rescans", (t) => {
 	const s = setup();
 	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
 	const bytes = 10 * 1024 * 1024;
@@ -294,14 +364,17 @@ test("(IS-2, IS-12) four medium live fragments publish together after an eight-b
 		actual += n;
 		return n;
 	});
-	const tick = s.tracker.tick(world);
+	const first = s.tracker.tick(world, { maxBytes: 2 * (bytes + 2) });
+	assert.ok(actual <= USAGE_TICK_BYTES, `actual reads: ${actual}`);
+	actual = 0;
+	const second = s.tracker.tick(world);
 	spy.mock.restore();
-	t.diagnostic(`closing tick: ${actual} actual, ${tick.bytesRead} scan bytes`);
+	t.diagnostic(`last closing tick: ${actual} actual, ${second.bytesRead} scan bytes`);
 	const expected = sessions.map(({ file }) => singleRecordModelOracle(file));
 	assert.deepEqual(sessions.map(({ id }) => s.tracker.tokensOf(sub(s, id))?.tokens?.total), expected.map((models) => models["p/m"].tokens));
 	assert.deepEqual(sessions.map(({ id }) => s.index.get(key(s, id)).published.models), expected);
 	assert.deepEqual(sessions.map(({ file }) => usageTimeline(file).totals.models), expected);
-	assert.equal(tick.bytesRead, 8, "only the closing bytes are scanned");
+	assert.equal(first.bytesRead + second.bytesRead, 4 * (bytes + 2), "each changed record is scanned from its start");
 	assert.ok(actual <= USAGE_TICK_BYTES, `actual reads: ${actual}`);
 });
 
@@ -322,15 +395,20 @@ test("(IS-2, IS-12) an over-capture identity waits until the exact reread fits",
 	s.tracker.tick(world);
 	assert.equal(s.index.get(key(s, id)).scanOffset, bytes);
 
-	// Leave only 1 MiB of scan budget when the record completes.
+	// Split the rescan across ticks so the reader must use its bounded scanner,
+	// then leave no room for the exact reread when it reaches the delimiter.
 	const busyLine = bigRecord(1023, usage(1)) + "\n";
-	fs.writeFileSync(busy, busyLine.repeat((USAGE_TICK_BYTES - bytes / 2) / busyLine.length));
+	const rescanBytes = 3 * bytes / 4;
+	const busyBytes = USAGE_TICK_BYTES - rescanBytes;
+	fs.writeFileSync(busy, busyLine.repeat(busyBytes / busyLine.length));
 	fs.appendFileSync(file, "}\n");
-	const tick = s.tracker.tick(world);
+	assert.equal(s.tracker.tick(world).bytesRead, USAGE_TICK_BYTES, "the initial rescan uses the remaining budget");
+	const suffixBytes = bytes - rescanBytes + 2;
+	const tick = s.tracker.tick(world, { maxBytes: suffixBytes });
 	assert.equal(s.tracker.tokensOf(sub(s, id))?.pending, true);
 	assert.equal(s.tracker.tokensOf(sub(s, id))?.tokens, undefined);
 	assert.equal(s.index.get(key(s, id)).offset, 0, "inexact usage is not committed");
-	assert.equal(tick.bytesRead, USAGE_TICK_BYTES - bytes / 2 + 2, "the reread is not partially attempted");
+	assert.equal(tick.bytesRead, suffixBytes, "the exact reread is not partially attempted");
 
 	assert.equal(s.tracker.tick(world).bytesRead, bytes + 1, "reread starts at the record and excludes the already scanned delimiter");
 	const expected = singleRecordModelOracle(file);
@@ -339,7 +417,7 @@ test("(IS-2, IS-12) an over-capture identity waits until the exact reread fits",
 	assert.equal(s.tracker.tokensOf(sub(s, id)).tokens.total, 42);
 });
 
-test("(IS-1, IS-2) four oversized non-numeric counters publish without rereads", (t) => {
+test("(IS-1, IS-2) four oversized non-numeric counters publish without exact rereads", (t) => {
 	const s = setup();
 	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
 	const bytes = 10 * 1024 * 1024;
@@ -368,12 +446,15 @@ test("(IS-1, IS-2) four oversized non-numeric counters publish without rereads",
 		actual += n;
 		return n;
 	});
-	const tick = s.tracker.tick(world);
+	const first = s.tracker.tick(world, { maxBytes: 2 * (bytes + 2) });
+	assert.ok(actual <= USAGE_TICK_BYTES, `actual reads: ${actual}`);
+	actual = 0;
+	const second = s.tracker.tick(world);
 	spy.mock.restore();
-	t.diagnostic(`closing tick: ${actual} actual, ${tick.bytesRead} scan bytes (budget ${USAGE_TICK_BYTES})`);
+	t.diagnostic(`last closing tick: ${actual} actual, ${second.bytesRead} scan bytes (budget ${USAGE_TICK_BYTES})`);
 	assert.ok(actual <= USAGE_TICK_BYTES, `actual reads: ${actual}`);
 	assert.deepEqual(sessions.map(({ id }) => s.tracker.tokensOf(sub(s, id))?.tokens?.total), [42, 42, 42, 42]);
-	assert.equal(tick.bytesRead, 8, "only the closing bytes are scanned");
+	assert.equal(first.bytesRead + second.bytesRead, 4 * (bytes + 2), "no exact reread follows the rescan of each changed record");
 
 	const counter = (value) => typeof value === "number" ? value : 0;
 	for (const { id, file } of sessions) {
@@ -421,10 +502,13 @@ test("(IS-2) a deferred exact reread keeps the last published tokens on the boar
 	assert.equal(s.index.get(key(s, id)).scanOffset, start + bytes);
 
 	const busyLine = bigRecord(1023, usage(1)) + "\n";
-	const busyBytes = USAGE_TICK_BYTES - bytes / 2;
+	const rescanBytes = 3 * bytes / 4;
+	const busyBytes = USAGE_TICK_BYTES - rescanBytes;
 	fs.writeFileSync(busy, busyLine.repeat(busyBytes / busyLine.length));
 	fs.appendFileSync(file, "}\n");
-	assert.equal(s.tracker.tick(world).bytesRead, busyBytes + 2, "the exact reread does not fit this tick");
+	assert.equal(s.tracker.tick(world).bytesRead, USAGE_TICK_BYTES, "the initial rescan uses the remaining budget");
+	const suffixBytes = bytes - rescanBytes + 2;
+	assert.equal(s.tracker.tick(world, { maxBytes: suffixBytes }).bytesRead, suffixBytes, "the exact reread does not fit after the rescan");
 	const deferred = s.index.get(key(s, id));
 	assert.equal(deferred.offset, start, "inexact usage is not committed");
 	assert.equal(deferred.usage.total, 10);
@@ -964,7 +1048,7 @@ test("a tick never reads more than the byte budget: a 40 MiB live record waits w
 });
 
 for (const [label, bytes] of [["40 MiB", 40 * 1024 * 1024], ["small", 512 * 1024]]) {
-	test(`(IS-2, IS-12) a small append resumes a ${label} EOF record without rereading it`, (t) => {
+	test(`(IS-2, IS-12) a small append triggers a budgeted rescan of a ${label} EOF record`, (t) => {
 		const s = setup();
 		t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
 		const id = "resume";
@@ -996,14 +1080,19 @@ for (const [label, bytes] of [["40 MiB", 40 * 1024 * 1024], ["small", 512 * 1024
 		const appendedBytes = Buffer.byteLength(append);
 		fs.appendFileSync(file, append);
 
-		assert.equal(s.tracker.tick(world).bytesRead, appendedBytes, "only the append spends the live tick budget");
+		const coldBytes = bytes + appendedBytes;
+		assert.equal(s.tracker.tick(world).bytesRead, Math.min(coldBytes, USAGE_TICK_BYTES), "the live rescan spends the shared tick budget");
+		if (coldBytes > USAGE_TICK_BYTES) {
+			assert.equal(s.tracker.tokensOf(sub(s, id)).pending, true);
+			assert.equal(s.tracker.tokensOf(sub(s, id)).tokens.total, 7);
+			assert.equal(s.tracker.tick(world).bytesRead, coldBytes - USAGE_TICK_BYTES);
+		}
 		const live = s.tracker.tokensOf(sub(s, id)).tokens;
 		assert.deepEqual([live.total, live.turns], [18, 2]);
 		assert.equal(s.index.get(key(s, id)).overlay.total, 0);
 		assert.equal(s.tracker.tick(world).bytesRead, 0);
 		assert.deepEqual(s.tracker.tokensOf(sub(s, id)).tokens, live);
 
-		const coldBytes = bytes + appendedBytes;
 		assert.equal(restarted.tick(world).bytesRead, Math.min(coldBytes, USAGE_TICK_BYTES), "restart reads from the persisted offset");
 		if (coldBytes > USAGE_TICK_BYTES) assert.equal(restarted.tick(world).bytesRead, coldBytes - USAGE_TICK_BYTES);
 		assert.deepEqual(restarted.tokensOf(sub(s, id)).tokens, live);

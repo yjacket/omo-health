@@ -915,16 +915,23 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 			!Number.isSafeInteger(from.headLen) || from.headLen < 0 || from.headLen > Math.min(from.size, HEAD_LIMIT) ||
 			typeof from.head !== "string" ||
 			typeof from.tail !== "string";
+		// A writer can truncate a torn record in place and regrow past the old
+		// size before we see it. Only the committed prefix can be reused.
+		const rewind = !restart && (size !== from.size || mtimeMs !== from.mtimeMs) &&
+			Number.isSafeInteger(from.scanOffset) && from.scanOffset > from.offset;
+		// If the head overlaps the discarded fragment, the tail covers the
+		// entire committed prefix instead.
+		const refreshHead = rewind && from.headLen > from.offset;
 		if (!restart) {
-			if (size < from.size) {
+			if (size < (rewind ? from.offset : from.size)) {
 				restart = true;
 			} else if (from.ino === undefined || from.birthtimeMs === undefined || ino !== from.ino || birthtimeMs !== from.birthtimeMs) {
 				restart = true;
-			} else if (hashRange(0, from.headLen) !== from.head) {
+			} else if (!refreshHead && hashRange(0, from.headLen) !== from.head) {
 				restart = true;
 			} else if (hashRange(from.offset - Math.min(from.offset, HEAD_LIMIT), Math.min(from.offset, HEAD_LIMIT)) !== from.tail) {
 				restart = true;
-			} else if (size === from.size && from.mtimeMs !== mtimeMs) {
+			} else if (!rewind && size === from.size && from.mtimeMs !== mtimeMs) {
 				restart = true;
 			}
 		}
@@ -937,6 +944,7 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 		let head;
 		let cachedOverlay;
 		const savedUsage = restart ? undefined : cloneUsage(from.usage);
+		const rewound = Boolean(savedUsage && rewind);
 		if (!savedUsage) {
 			usage = emptyUsage();
 			offset = 0;
@@ -947,7 +955,7 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 		} else {
 			usage = savedUsage;
 			offset = from.offset;
-			const resumable = from.partial?.[RECORD_ACCUMULATOR] === true && Number.isInteger(from.scanOffset) && from.partial.start === offset;
+			const resumable = !rewound && from.partial?.[RECORD_ACCUMULATOR] === true && Number.isInteger(from.scanOffset) && from.partial.start === offset;
 			if (resumable && size === from.size && from.evaluatedTo === size) {
 				cachedOverlay = cloneUsage(from.overlay);
 			}
@@ -955,12 +963,13 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 			partial = resumable ? from.partial : undefined;
 			headLen = from.headLen;
 			head = from.head;
-			if (headLen < HEAD_LIMIT && size > headLen) {
+			if (refreshHead || (headLen < HEAD_LIMIT && size > headLen)) {
 				headLen = Math.min(size, HEAD_LIMIT);
 				head = hashRange(0, headLen);
 			}
 		}
 
+		const startOffset = offset;
 		let position = scanOffset;
 		let bytesRead = 0;
 		let acc = partial;
@@ -1016,7 +1025,10 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 		}
 
 		const overlay = cachedOverlay ?? emptyUsage();
-		let pending = acc?.kind === "reread";
+		// Keep a reused publication marked pending until the rescan gets
+		// through its first record (or evaluates the fragment at EOF).
+		let pending = acc?.kind === "reread" || (position < size && offset === startOffset &&
+			(rewound || (partial !== undefined && from.pending === true)));
 		if (acc?.kind === "buffer" && acc.len > USAGE_BUFFER_LIMIT) {
 			// Keep the bounded projection at a budget boundary or EOF. If the
 			// first EOF preview needs full parsing, the bytes are still at hand.
@@ -1055,6 +1067,7 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 		const tailLength = Math.min(offset, HEAD_LIMIT);
 		return {
 			offset,
+			rewound,
 			scanOffset: position,
 			partial: acc,
 			size,

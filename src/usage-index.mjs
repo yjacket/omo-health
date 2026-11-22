@@ -132,6 +132,7 @@ function hasNumericCursor(entry) {
 /** The identity facts `readUsage` resumes on; a change means it recounted from 0. */
 function isRestart(previous, result) {
 	if (!isObject(previous) || previous.state !== "ok" || previous.offset === undefined || previous.usage === undefined) return true;
+	if (result.rewound) return false; // The reader validated and reused the committed prefix.
 	if (result.size < previous.size) return true;
 	if (previous.ino !== undefined && (result.ino !== previous.ino || result.birthtimeMs !== previous.birthtimeMs)) return true;
 	if (previous.headLen === result.headLen && previous.head !== result.head) return true;
