@@ -17,7 +17,7 @@ import { currentDowntime } from "./collect/downtime.mjs";
 import { SessionRegistry } from "./collect/sessions.mjs";
 import { createTranscriptIndex } from "./collect/transcripts.mjs";
 import { createConfigTracker } from "./collect/config-files.mjs";
-import { createConfigReloader } from "./config-reload.mjs";
+import { createConfigReloader, detectorThresholdsHash } from "./config-reload.mjs";
 import { readAuthBlocks } from "./collect/secrets.mjs";
 import { createOmoLoginSource } from "./collect/omo-login.mjs";
 import { createEngine, loadDetectors } from "./engine.mjs";
@@ -360,6 +360,14 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 	let packageSourceMissingMs;
 	let heartbeat;
 	try {
+		try {
+			appendDecision(paths, {
+				ts: new Date(daemonStartedMs).toISOString(), event: "config", result: "startup",
+				thresholdsHash: detectorThresholdsHash(config),
+			});
+		} catch (error) {
+			log.error("config_start_decision_failed", { error: error.message });
+		}
 		while (!stopping) {
 			const started = clock.now();
 			if (statSafe(paths.health.stoppedFile)) {

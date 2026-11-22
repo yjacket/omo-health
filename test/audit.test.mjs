@@ -6,6 +6,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { readUsage, usageTimeline } from "../src/collect/usage.mjs";
 import { DEFAULT_CONFIG } from "../src/config.mjs";
+import { detectorThresholdsHash } from "../src/config-reload.mjs";
 import { appendDecision } from "../src/decisions.mjs";
 import { loadDetectors } from "../src/engine.mjs";
 import { AUDIT_REASON_CODES, reasonCode } from "../src/audit-codes.mjs";
@@ -309,11 +310,11 @@ test("IS-8: D4 findings straddling a config decision use only applicable thresho
 		ts: iso(T0 + offset), fp, event: "opened", detector: "D4", kind: "cache-storm",
 		subject: { sessionId: row.sessionId }, evidence: [`cacheWrite:${cacheWrite}`],
 	});
-	appendDecision(paths, finding(1, "old", 10_000));
-	appendDecision(paths, { ts: iso(T0 + 2), event: "config", result: "applied", changed: ["tokens.cacheStormWrite"] });
-	appendDecision(paths, finding(3, "new", 200_000));
 	const config = structuredClone(DEFAULT_CONFIG);
 	config.tokens.cacheStormWrite = 100_000;
+	appendDecision(paths, finding(1, "old", 10_000));
+	appendDecision(paths, { ts: iso(T0 + 2), event: "config", result: "applied", thresholdsHash: detectorThresholdsHash(config), changed: ["tokens.cacheStormWrite"] });
+	appendDecision(paths, finding(3, "new", 200_000));
 	const now = row.endedMs + 1;
 	const record = loadSessionRecord({ paths, id: row.sessionId, now, auditRetention: true });
 	const bundle = auditBundle(record, timelineShell(), { config, now });
@@ -373,6 +374,7 @@ test("IS-8: the audit bundle keeps warning severity and structured evidence from
 	const subject = { sessionId: row.sessionId };
 	const base = { fp: "fp-rise", detector: "D1", kind: "stall", subject };
 	const ts = iso(T0 + 60_000);
+	appendDecision(paths, { ts: iso(T0), event: "config", result: "startup", thresholdsHash: detectorThresholdsHash(DEFAULT_CONFIG) });
 	appendDecision(paths, { ...base, event: "opened", severity: "info", ts: iso(T0), evidence: ["count:1"] });
 	appendDecision(paths, { ...base, event: "severity", severity: "warn", ts, titleKo: "QA-PRIVATE-TITLE", evidence: ["count:6", "QA-PRIVATE-EVIDENCE"] });
 	const record = loadSessionRecord({ paths, id: row.sessionId, now: row.endedMs, auditRetention: true });

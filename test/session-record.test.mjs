@@ -138,25 +138,27 @@ const ohealth = (ms, text) => ({ type: "custom_message", customType: "omo-health
 const mainRow = (extra = {}) => ({ sessionId: "s-main", kind: "main", parentSessionId: null, taskId: null, title: "main", cwd: "C:/work/a", terminal: { kind: "wt" }, omoVersion: "0.8.0", startedMs: T0, endedMs: T0 + 2 * HOUR, childCount: 2, ...extra });
 const childRow = (sessionId, taskId, parentSessionId, extra = {}) => ({ sessionId, kind: "child", parentSessionId, taskId, title: sessionId, cwd: "C:/work/a", terminal: null, omoVersion: null, startedMs: T0 + 10 * MIN, endedMs: T0 + 70 * MIN, ...extra });
 
-test("IS-8: records retain only config decision times, including reloads after session end", (t) => {
+test("IS-8: records retain only config decision times and hashes, including reloads after session end", (t) => {
 	const { root, paths } = setup();
 	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
 	const row = mainRow();
-	const times = [T0 + MIN, row.endedMs + MIN];
+	const times = [T0 + MIN, row.endedMs + MIN, row.endedMs + 2 * MIN];
+	const thresholdsHash = "a".repeat(64);
 	const decisions = [
-		{ ts: iso(times[0]), event: "config", result: "applied", changed: ["tokens.cacheStormWrite"] },
+		{ ts: iso(times[0]), event: "config", result: "applied", thresholdsHash, changed: ["tokens.cacheStormWrite"] },
 		{ ts: iso(times[0] + 1), event: "coverage", infoFindings: true },
-		{ ts: iso(times[1]), event: "config", result: "rejected", message: "config detail" },
+		{ ts: iso(times[1]), event: "config", result: "applied", thresholdsHash: "b".repeat(64) },
+		{ ts: iso(times[2]), event: "config", result: "rejected", message: "config detail" },
 	];
 	writeLedger(paths, [row]);
 	writeDecisions(paths, decisions);
-	const now = times[1] + MIN;
+	const now = times[2] + MIN;
 	for (const record of [
 		buildSessionRecord({ row, decisions, now }),
 		loadSessionRecord({ paths, id: row.sessionId, now }),
 		loadSessionRecord({ paths, id: row.sessionId, now, auditRetention: true }),
 	]) {
-		assert.deepEqual(record.configDecisionTimes, times);
+		assert.deepEqual(record.configDecisions, [{ ms: times[0], thresholdsHash }, { ms: times[1], thresholdsHash: "b".repeat(64) }, { ms: times[2], thresholdsHash: null }]);
 		assert.deepEqual(record.health.findings, []);
 		assert.doesNotMatch(JSON.stringify(record), /cacheStormWrite|config detail/);
 	}

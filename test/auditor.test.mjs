@@ -11,6 +11,7 @@ import { AUDIT_CONTRACT, REQUEST_TTL_MS, auditsToday, createAuditor, readAuditSt
 import { createSessionFileLocator } from "../src/collect/session-files.mjs";
 import { usageTimeline } from "../src/collect/usage.mjs";
 import { DEFAULT_CONFIG } from "../src/config.mjs";
+import { detectorThresholdsHash } from "../src/config-reload.mjs";
 import { appendDecision } from "../src/decisions.mjs";
 import { createInvestigations } from "../src/investigations.mjs";
 import { AUDIT_LIST_CAPS } from "../src/judge/audit.mjs";
@@ -1571,6 +1572,9 @@ test("request helpers: safeAuditId, the atomic request file and the state a requ
 test("IS-8: a config reload after audit preparation still hides current D4 thresholds", async (t) => {
 	const h = harness();
 	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+	const initialWrite = h.config.tokens.cacheStormWrite;
+	const thresholdsHash = detectorThresholdsHash(h.config);
+	appendDecision(h.paths, { ts: new Date(BASE - 121_000).toISOString(), event: "config", result: "startup", thresholdsHash });
 	appendDecision(h.paths, {
 		ts: new Date(BASE - 120_000).toISOString(), event: "opened", fp: "cache-storm", detector: "D4",
 		kind: "cache-storm", subject: { sessionId: "m1" }, evidence: ["cacheWrite:10000"],
@@ -1579,8 +1583,10 @@ test("IS-8: a config reload after audit preparation still hides current D4 thres
 	h.request("m1");
 	h.tick(auditor);
 	await auditor.preparing();
-	h.config.tokens.cacheStormWrite = 100_000;
-	appendDecision(h.paths, { ts: new Date(h.state.now).toISOString(), event: "config", result: "applied", changed: ["tokens.cacheStormWrite"] });
+	h.config.tokens.cacheStormWrite = initialWrite + 1;
+	appendDecision(h.paths, { ts: new Date(h.state.now - 1).toISOString(), event: "config", result: "applied", thresholdsHash: detectorThresholdsHash(h.config) });
+	h.config.tokens.cacheStormWrite = initialWrite;
+	appendDecision(h.paths, { ts: new Date(h.state.now).toISOString(), event: "config", result: "applied", thresholdsHash });
 	auditor.tick(h.state.now);
 	assert.equal(h.record("m1").status, "running");
 	const document = fs.readFileSync(path.join(h.runner.starts[0].cwd, "bundle.md"), "utf8");

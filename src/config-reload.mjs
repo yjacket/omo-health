@@ -1,8 +1,34 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { applyConfigInPlace, effectiveSwitches, loadConfig } from "./config.mjs";
 import { appendDecision } from "./decisions.mjs";
 import { atomicWriteFile } from "./util/fsx.mjs";
 import { redact, truncate } from "./util/text.mjs";
+
+// Numeric cutoff values in detector config groups, not mode, switches, or action policy.
+const THRESHOLD_GROUPS = [
+	"align", "anomaly", "bootGap", "config", "crashResume", "goalLiveness", "leftovers",
+	"loops", "memory", "monitorOrphans", "omoLogin", "orphans", "provider", "reflectionOrphans",
+	"reload", "respawn", "selfBudget", "stall", "tokens", "tps",
+];
+
+function numericThresholds(value) {
+	const entries = [];
+	for (const key of Object.keys(value ?? {}).sort()) {
+		const item = value[key];
+		if (Number.isFinite(item)) entries.push([key, item]);
+		else if (item && typeof item === "object" && !Array.isArray(item)) {
+			const nested = numericThresholds(item);
+			if (Object.keys(nested).length) entries.push([key, nested]);
+		}
+	}
+	return Object.fromEntries(entries);
+}
+
+export function detectorThresholdsHash(config) {
+	const thresholds = Object.fromEntries(THRESHOLD_GROUPS.map((key) => [key, config?.[key]]));
+	return createHash("sha256").update(JSON.stringify(numericThresholds(thresholds))).digest("hex");
+}
 
 /** "<mtimeMs>:<size>", "absent" (ENOENT) or "error:<code>": one stat per watched file. */
 function signatureOf(file) {
@@ -63,7 +89,7 @@ export function createConfigReloader({ paths, env, config, mode, clock, log, app
 		const error = truncate(redact(message), 200);
 		state.rejected = { source, error, fileMtimeMs, atMs: now };
 		log.warn("config_reload_rejected", { source, file, error });
-		appendDecisionImpl(paths, { event: "config", result: "rejected", message: error, fileMtimeMs });
+		appendDecisionImpl(paths, { ts: new Date(now).toISOString(), event: "config", result: "rejected", message: error, fileMtimeMs });
 	}
 
 	function check() {
@@ -103,7 +129,10 @@ export function createConfigReloader({ paths, env, config, mode, clock, log, app
 				state.rejected = null;
 			}
 			log.info("config_reloaded", { initial, changed, warnings: next.warnings });
-			if (changed.length) appendDecisionImpl(paths, { event: "config", result: "applied", changed: changed.slice(0, 50), fileMtimeMs: state.fileMtimeMs });
+			if (changed.length) appendDecisionImpl(paths, {
+				ts: new Date(now).toISOString(), event: "config", result: "applied",
+				thresholdsHash: detectorThresholdsHash(config), changed: changed.slice(0, 50), fileMtimeMs: state.fileMtimeMs,
+			});
 			if (state.source === "file") writeLastGood(paths);
 		} catch (error) {
 			log.error("config_reload_failed", { error: error.message, stack: String(error.stack).slice(0, 800) });

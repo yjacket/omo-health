@@ -7,7 +7,7 @@ import { createInvestigations } from "./investigations.mjs";
 import { auditBundle, auditDocument, detectorFindingRefs, firedDetectors, hasDetectorCoverage, resolveAuditModel, validateAudit } from "./judge/audit.mjs";
 import { ANALYST_POLL_MS, parseAnalystOutput, unavailableReason } from "./judge/analyst.mjs";
 import { laneArgs } from "./judge/lane.mjs";
-import { collectAnalystDecisionModels, recoverPendingAnalystModels, usageEntryOf } from "./session-record.mjs";
+import { collectAnalystDecisionModels, configDecisionFact, recoverPendingAnalystModels, usageEntryOf } from "./session-record.mjs";
 import { auditReasonLabel } from "./ui/labels.mjs";
 import { fresh, isSpillModelKey, readUsageIndex, relatedUsageEntries } from "./usage-index.mjs";
 import { atomicWriteFile, atomicWriteJson, ensureDir, listDirSafe, readJsonSafe, readTextSafe, removeSafe, statSafe } from "./util/fsx.mjs";
@@ -184,7 +184,7 @@ function launchAuditFacts(paths, investigations, loaded, selectedFps, auditSubje
 	const pending = new Set(loaded.session?.pendingAnalystJobs);
 	if (loaded.session?.analystModelsUnknown && !pending.size) return null;
 	const models = new Set(loaded.analystModels);
-	let latestConfigDecisionMs = -Infinity;
+	const configDecisions = [];
 	const fps = new Set(selectedFps);
 	const add = (model) => { if (typeof model === "string" && model) models.add(model); };
 	const matches = (subject) => {
@@ -223,8 +223,8 @@ function launchAuditFacts(paths, investigations, loaded, selectedFps, auditSubje
 			batch = tail.readNew();
 			for (const row of batch.entries) {
 				if (row?.event === "config") {
-					const ms = Date.parse(row.ts);
-					if (ms > latestConfigDecisionMs) latestConfigDecisionMs = ms;
+					const fact = configDecisionFact(row);
+					if (fact) configDecisions.push(fact);
 				}
 				if (!row || (!fps.has(row.fp) && !matches(row.subject))) continue;
 				if (typeof row.fp === "string" && row.fp) fps.add(row.fp);
@@ -233,7 +233,7 @@ function launchAuditFacts(paths, investigations, loaded, selectedFps, auditSubje
 			}
 		} while (batch.more);
 	}
-	return recoverPendingAnalystModels(models, pending, paths.health.jobsDir) ? { analystModels: models, latestConfigDecisionMs } : null;
+	return recoverPendingAnalystModels(models, pending, paths.health.jobsDir) ? { analystModels: models, configDecisions } : null;
 }
 
 export function readVersionedAuditTimeline(file, tokens, { maxFileBytes = TIMELINE_MAX_BYTES, timeline = usageTimeline, log } = {}) {
@@ -380,13 +380,13 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		if (!facts.sessionModelsKnown) return fail(record, "models-unknown", null, now);
 		const launchFacts = launchAuditFacts(paths, investigations, loaded, selectedFps, auditSubjectIds, analystStart);
 		if (!launchFacts) return fail(record, "analyst-models-unknown", null, now);
-		const { analystModels, latestConfigDecisionMs } = launchFacts;
+		const { analystModels, configDecisions } = launchFacts;
 		const choice = resolveAuditModel(paths, config, { ...facts, analystModels });
 		if (!choice) return fail(record, "no-model", null, now);
 
 		let bundle;
 		try {
-			bundle = auditBundle(loaded, full, { config, now, latestConfigDecisionMs });
+			bundle = auditBundle(loaded, full, { config, now, configDecisions });
 		} catch (error) {
 			return fail(record, error.message === "evidence-too-large" ? "evidence-too-large" : "prepare-error", error.message === "evidence-too-large" ? null : truncate(redact(error.message), 300), now);
 		}

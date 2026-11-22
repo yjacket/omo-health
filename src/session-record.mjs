@@ -46,7 +46,7 @@ export const DECISION_EVENT_SHAPES = Object.freeze({
 	"park-gated": "action",
 	"baseline-deviation": "bookkeeping",
 	"report-expired": "bookkeeping",
-	config: "bookkeeping",
+	config: "bookkeeping", // thresholdsHash is provenance, not a finding or action.
 	coverage: "bookkeeping",
 });
 const FINDING_EVENTS = new Set(Object.keys(DECISION_EVENT_SHAPES).filter((event) => DECISION_EVENT_SHAPES[event] === "finding"));
@@ -59,6 +59,13 @@ const scrub = (value) => redact(String(value ?? "")).replace(/ghp_[A-Za-z0-9]{8,
 const clean = (value, max = LINE_MAX) => (typeof value === "string" && value ? truncate(scrub(value), max) : null);
 const msOf = (value) => (typeof value === "number" && Number.isFinite(value) ? value : typeof value === "string" ? Date.parse(value) : Number.NaN);
 const timeOf = (entry) => msOf(entry?.ts);
+
+export function configDecisionFact(entry) {
+	const ms = timeOf(entry);
+	if (entry?.event !== "config" || !Number.isFinite(ms)) return null;
+	const hash = entry.thresholdsHash;
+	return { ms, thresholdsHash: typeof hash === "string" && /^[a-f0-9]{64}$/.test(hash) ? hash : null };
+}
 
 /** Every string of a stored record through `redact`, every value bounded (a raw investigation keeps its shape). */
 function cleanValue(value, depth = 0) {
@@ -253,10 +260,10 @@ function overlaps(windows, from, to) {
 	return lo < windows.length && windows[lo][0] <= to;
 }
 
-/** Stream machine incidents, coverage and config decision times. */
+/** Stream machine incidents, coverage and config decisions (time and threshold hash only). */
 function scanDecisionHistory(decisions, row, windows, retained) {
 	const open = new Map();
-	const configDecisionTimes = [];
+	const configDecisions = [];
 	const matched = retained ? null : [];
 	const keep = (finding) => retained ? retained.add(finding) : matched.push(finding);
 	const keepRise = ({ rise, riseMs }, end) => {
@@ -277,7 +284,7 @@ function scanDecisionHistory(decisions, row, windows, retained) {
 		const { fp, event, subject } = entry;
 		const ts = timeOf(entry);
 		if (!Number.isFinite(ts)) continue;
-		if (event === "config") configDecisionTimes.push(ts);
+		if (event === "config") configDecisions.push(configDecisionFact(entry));
 		if (event === "coverage" && entry.infoFindings === true && ts < coverageEnd && ts > coverageMs) coverageMs = ts;
 		if (!FINDING_EVENTS.has(event) || !nonEmpty(fp)) continue;
 		const interval = open.get(fp);
@@ -296,7 +303,7 @@ function scanDecisionHistory(decisions, row, windows, retained) {
 		}
 	}
 	for (const interval of open.values()) keepInterval(interval, Infinity);
-	return { machine: matched, infoFindings: Number.isFinite(coverageMs), configDecisionTimes };
+	return { machine: matched, infoFindings: Number.isFinite(coverageMs), configDecisions };
 }
 
 function findingRow(entry, { fp = entry.fp ?? null, ts = entry.ts ?? null, scope = "session", bounded = false } = {}) {
@@ -664,11 +671,11 @@ function joinSessionDecisions(row, descendants, investigations, decisions, bound
 }
 
 function recordHealth(inputs, row, descendants) {
-	if (inputs.auditHealth) return { ...inputs.auditHealth, ...inputs.decisionJoin, configDecisionTimes: inputs.decisionHistory.configDecisionTimes };
+	if (inputs.auditHealth) return { ...inputs.auditHealth, ...inputs.decisionJoin, configDecisions: inputs.decisionHistory.configDecisions };
 	const { decisions, investigations, messages: messagesIn } = inputs;
 	const { selectedInvestigations, fpSet, about, selected, actionEntries, analystModels, analystModelsKnown, pendingAnalystJobs } = inputs.decisionJoin ?? joinSessionDecisions(row, descendants, () => investigations, () => decisions);
 	const findings = selected.filter((entry) => FINDING_EVENTS.has(entry.event)).map((entry) => findingRow(entry));
-	const { machine, infoFindings, configDecisionTimes } = inputs.decisionHistory ?? scanDecisionHistory(
+	const { machine, infoFindings, configDecisions } = inputs.decisionHistory ?? scanDecisionHistory(
 		decisions.filter((entry) => Number.isFinite(timeOf(entry))).sort((a, b) => timeOf(a) - timeOf(b)), row, activeWindows(row, descendants, inputs.now),
 	);
 	const allFindings = [...findings, ...machine].sort(byNewest);
@@ -686,7 +693,7 @@ function recordHealth(inputs, row, descendants) {
 	})).sort(byMessageTime);
 	return {
 		infoFindings,
-		configDecisionTimes,
+		configDecisions,
 		analystModels,
 		analystModelsKnown,
 		pendingAnalystJobs,
@@ -745,7 +752,7 @@ export function buildSessionRecord(inputs = {}) {
 	const endedMs = msOf(row.endedMs);
 	const descendants = inputs.descendants ?? collectDescendants(row, ledger, usage.values());
 	const ambiguous = inputs.ambiguous ?? ambiguousLedgerTaskIds(ledger);
-	const { health, infoFindings, configDecisionTimes, analystModels, analystModelsKnown, pendingAnalystJobs, selectedFps } = recordHealth({ ...inputs, decisions, investigations, messages: messagesIn }, row, descendants);
+	const { health, infoFindings, configDecisions, analystModels, analystModelsKnown, pendingAnalystJobs, selectedFps } = recordHealth({ ...inputs, decisions, investigations, messages: messagesIn }, row, descendants);
 
 	const entry = usageEntryOf(usage, row, ambiguous);
 	const compact = compactUsage(entry);
@@ -812,7 +819,7 @@ export function buildSessionRecord(inputs = {}) {
 		tokens,
 		children,
 		coverage: { infoFindings },
-		configDecisionTimes,
+		configDecisions,
 		analystModels,
 		selectedFps,
 		truncated: { messagesSkipped: Array.isArray(truncated.messagesSkipped) ? truncated.messagesSkipped : [] },

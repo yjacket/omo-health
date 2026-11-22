@@ -1,4 +1,5 @@
 import { AUDIT_REASON_CODES, reasonCode } from "../audit-codes.mjs";
+import { detectorThresholdsHash } from "../config-reload.mjs";
 import { redact, truncate } from "../util/text.mjs";
 import { parseAnalystOutput } from "./analyst.mjs";
 import { laneModels, modelFamily, modelName } from "./lane.mjs";
@@ -186,7 +187,7 @@ export function auditEvidence(evidence) {
 	return { metrics, droppedEvidence };
 }
 
-function findingsOf(list, latestConfigDecisionMs) {
+function findingsOf(list, continuousSinceMs) {
 	return (Array.isArray(list) ? list : []).map((finding, index) => {
 		const { metrics, droppedEvidence } = finding?.auditEvidence ?? auditEvidence(Array.isArray(finding?.evidence) ? finding.evidence : []);
 		const subject = isObject(finding?.subject) ? finding.subject : {};
@@ -199,7 +200,7 @@ function findingsOf(list, latestConfigDecisionMs) {
 			kind: textOf(finding?.kind),
 			severity: textOf(finding?.severity),
 			scope: textOf(finding?.scope),
-			thresholdsKnown: !(ts < latestConfigDecisionMs),
+			thresholdsKnown: Number.isFinite(ts) && ts >= continuousSinceMs,
 			subject: { sessionId: textOf(subject.sessionId), taskId: textOf(subject.taskId) },
 			metrics,
 			droppedEvidence,
@@ -378,6 +379,16 @@ function findingThresholds(config, detector) {
 	return { quietMs: numOf(stall.quietMs), unknownJudgeMs: numOf(stall.unknownJudgeMs), progressingMaxMs: numOf(stall.progressingMaxMs) };
 }
 
+function thresholdsContinuousSince(decisions, currentHash) {
+	const hashed = decisions.filter((row) => Number.isFinite(row?.ms) &&
+		typeof row.thresholdsHash === "string" && /^[a-f0-9]{64}$/.test(row.thresholdsHash));
+	hashed.sort((a, b) => a.ms - b.ms);
+	// Only the uninterrupted suffix matching the current thresholds proves continuity.
+	let since = Infinity;
+	for (let i = hashed.length - 1; i >= 0 && hashed[i].thresholdsHash === currentHash; i--) since = hashed[i].ms;
+	return since;
+}
+
 function assertBundleText(value, key) {
 	if (key === "question" || key === "checks_omo_health_runs") return;
 	if (typeof value === "string") {
@@ -401,7 +412,7 @@ const sizeOf = (bundle) => JSON.stringify(bundle).length;
  * survives only as `key:value` numeric metrics, and analyst reasons only as a
  * recognized code. The final walk rejects any other string.
  */
-export function auditBundle(record, timeline, { config, now, latestConfigDecisionMs = -Infinity } = {}) {
+export function auditBundle(record, timeline, { config, now, configDecisions = [] } = {}) {
 	const session = isObject(record?.session) ? record.session : {};
 	const health = isObject(record?.health) ? record.health : {};
 	const children = Array.isArray(record?.children) ? record.children : [];
@@ -414,10 +425,8 @@ export function auditBundle(record, timeline, { config, now, latestConfigDecisio
 		messages: false,
 		investigations: false,
 	};
-	for (const ms of record?.configDecisionTimes ?? []) {
-		if (Number.isFinite(ms) && ms > latestConfigDecisionMs) latestConfigDecisionMs = ms;
-	}
-	const allFindings = findingsOf(health.findings, latestConfigDecisionMs);
+	const continuousSinceMs = thresholdsContinuousSince([...(record?.configDecisions ?? []), ...configDecisions], detectorThresholdsHash(config));
+	const allFindings = findingsOf(health.findings, continuousSinceMs);
 	// Coverage is judged on every finding, before any cut: an answer cannot be
 	// required to cover more detectors than it has checks.
 	const fired = health.firedDetectors ?? firedDetectorIds(allFindings);
