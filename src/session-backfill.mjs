@@ -3,6 +3,7 @@ import path from "node:path";
 import { entryMs, idFromFileName, readSessionHeader } from "./collect/sessions.mjs";
 import { normalizeTask, senpiTaskStoreDir, taskStoreDir } from "./collect/tasks.mjs";
 import { appendEndedBatch, endedKey, streamEnded } from "./session-ledger.mjs";
+import { projectKeyOf, subjectKey } from "./session-subject.mjs";
 import { atomicWriteJson, ensureDir, listDirSafe, readJsonSafe, readTextSafe, statSafe } from "./util/fsx.mjs";
 import { redact, truncate } from "./util/text.mjs";
 import { kst, toMs } from "./util/time.mjs";
@@ -145,7 +146,8 @@ function readTasks(cwd, errors, agentDir) {
 		try {
 			const raw = JSON.parse(fs.readFileSync(file, "utf8"));
 			if (!raw || typeof raw.task_id !== "string") throw new Error("no task_id");
-			out.push({ ...normalizeTask(raw, storeDir), projectCwd: cwd });
+			const task = normalizeTask(raw, storeDir);
+			out.push({ ...task, cwd: typeof task.spawnCwd === "string" ? task.spawnCwd : cwd, parentProjectKey: projectKeyOf(cwd) });
 		} catch (error) {
 			errors.push(`task ${file}: ${error.message}`);
 		}
@@ -220,9 +222,16 @@ export function backfillOnce(paths, nowMs, { days = 30 } = {}) {
 	for (const m of mains) if (typeof m.header.cwd === "string" && m.header.cwd) cwds.set(m.header.cwd.toLowerCase(), m.header.cwd);
 	const tasks = [];
 	for (const cwd of cwds.values()) tasks.push(...readTasks(cwd, errors, paths.agentDir));
-	const childSessionIds = new Set(tasks.map((t) => t.childSessionId).filter(Boolean));
+	const childSubjects = new Set();
 	const childCount = new Map();
-	for (const t of tasks) if (t.parentSessionId) childCount.set(t.parentSessionId, (childCount.get(t.parentSessionId) ?? 0) + 1);
+	for (const t of tasks) {
+		if (t.childSessionId) childSubjects.add(subjectKey({ projectKey: projectKeyOf(t.cwd), sessionId: t.childSessionId }));
+		// Parent IDs refer to sessions in the task store's project, not the child's spawn cwd.
+		if (t.parentSessionId) {
+			const key = subjectKey({ projectKey: t.parentProjectKey, sessionId: t.parentSessionId });
+			childCount.set(key, (childCount.get(key) ?? 0) + 1);
+		}
+	}
 
 	const crashes = readCrashes(paths, sinceMs, errors);
 	const releases = readReleases(paths, sinceMs, errors);
@@ -238,7 +247,8 @@ export function backfillOnce(paths, nowMs, { days = 30 } = {}) {
 
 	for (const m of mains) {
 		const sessionId = m.header.id;
-		if (childSessionIds.has(sessionId) || m.lastMs < sinceMs) continue;
+		const key = subjectKey({ projectKey: projectKeyOf(m.header.cwd), sessionId });
+		if (childSubjects.has(key) || m.lastMs < sinceMs) continue;
 		if (m.lastMs > liveCutMs) {
 			counts.live += 1;
 			continue;
@@ -273,7 +283,7 @@ export function backfillOnce(paths, nowMs, { days = 30 } = {}) {
 			endedMs: m.lastMs,
 			outcome,
 			reason,
-			childCount: childCount.get(sessionId) ?? 0,
+			childCount: childCount.get(key) ?? 0,
 			estimated: true,
 			source: "backfill",
 		});
@@ -295,14 +305,14 @@ export function backfillOnce(paths, nowMs, { days = 30 } = {}) {
 			parentSessionId: t.parentSessionId ?? null,
 			taskId: t.taskId,
 			title: clean(t.name ?? t.summary ?? t.taskId, TITLE_MAX) || t.taskId,
-			cwd: typeof t.spawnCwd === "string" ? t.spawnCwd : t.projectCwd,
+			cwd: t.cwd,
 			terminal: null,
 			omoVersion: null,
 			startedMs: t.startedAtMs ?? t.createdAtMs ?? null,
 			endedMs,
 			outcome,
 			reason,
-			childCount: childCount.get(t.childSessionId) ?? 0,
+			childCount: childCount.get(subjectKey({ projectKey: projectKeyOf(t.cwd), sessionId: t.childSessionId })) ?? 0,
 			estimated: true,
 			source: "backfill",
 		});

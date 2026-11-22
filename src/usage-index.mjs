@@ -118,6 +118,9 @@ function applyMeta(entry, meta) {
 }
 
 export function parentSubject(entry) {
+	// Empty distinguishes a checked-but-unresolved ledger link from a compact
+	// same-project link (null).
+	if (entry.parentKey === "") return null;
 	return parseSubjectKey(entry.parentKey) ?? (entry.parentSessionId ?
 		{ projectKey: entry.projectKey, sessionId: entry.parentSessionId } : null);
 }
@@ -232,7 +235,7 @@ export function atEnd(entry) {
 export function treeTotals(entries, knownRows = [], treeKey = (key) => key) {
 	const byId = new Map();
 	const childrenByParent = new Map();
-	const unresolvedIds = new Set();
+	const knownIds = new Set();
 	const unresolvedParents = new Set();
 	const link = (id, parentKey) => {
 		if (parentKey == null) return;
@@ -244,9 +247,9 @@ export function treeTotals(entries, knownRows = [], treeKey = (key) => key) {
 		const key = treeKey(row?.key);
 		const parent = treeKey(row?.parentKey);
 		if (key == null) continue;
+		knownIds.add(key);
 		if (!byId.has(key)) byId.set(key, null);
 		if (row.unresolved) {
-			unresolvedIds.add(key);
 			if (parent != null) unresolvedParents.add(parent);
 		} else link(key, parent);
 	}
@@ -254,7 +257,7 @@ export function treeTotals(entries, knownRows = [], treeKey = (key) => key) {
 		const key = treeKey(subjectKey(subjectOf(entry)));
 		if (key == null) continue;
 		byId.set(key, entry);
-		if (!unresolvedIds.has(key)) link(key, treeKey(subjectKey(parentSubject(entry))));
+		if (!knownIds.has(key)) link(key, treeKey(subjectKey(parentSubject(entry))));
 	}
 	const totals = new Map();
 	totals.complete = new Map();
@@ -574,6 +577,17 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 
 	return {
 		file,
+		recordParentLink(subject, meta) {
+			const entry = entries.get(subject);
+			if (!entry || !Object.hasOwn(entry, "parentKey")) return false;
+			const previous = entry.parentKey;
+			applyMeta(entry, { parentKey: meta });
+			if (previous === entry.parentKey) return false;
+			const { slots } = weights.get(subject);
+			unweigh(subject);
+			admit(entry, slots);
+			return true;
+		},
 		get full() { return full; },
 		getExact(key) { return entries.get(key) ?? (full && key ? FULL_ENTRY : undefined); },
 		getForSubject(subject) {

@@ -38,6 +38,15 @@ export function subjectOf(row, parent) {
 export function boardLiveOwners(paths) {
 	const snapshot = readJsonSafe(paths.health.sessionsSnapshotFile);
 	const owners = new Map();
+	if (snapshot?.v === 1 && Array.isArray(snapshot.liveOwners)) {
+		for (const row of snapshot.liveOwners) {
+			if (typeof row?.sessionId !== "string" || !row.sessionId ||
+				(row.projectKey !== null && typeof row.projectKey !== "string")) continue;
+			const owner = subjectOf(row);
+			owners.set(subjectKey(owner), owner);
+		}
+		return sortedOwners(owners);
+	}
 	const walk = (rows, parent, depth = 0) => {
 		if (!Array.isArray(rows) || depth > 8) return;
 		for (const row of rows) {
@@ -52,6 +61,29 @@ export function boardLiveOwners(paths) {
 		for (const group of snapshot.groups) walk(group?.sessions);
 	}
 	return [...owners.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([, owner]) => owner);
+}
+
+function sortedOwners(owners) {
+	return [...owners.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([, owner]) => owner);
+}
+
+export function worldLiveOwners(world) {
+	const rows = [...(world?.sessions?.values?.() ?? [])];
+	return rows.map(sessionSubjects(rows));
+}
+
+/** Track only the requested IDs. Repeated rows of one scoped subject are one owner. */
+export function rememberParentOwner(owners, subject) {
+	const { sessionId, projectKey } = subject;
+	if (!owners.has(sessionId)) owners.set(sessionId, subject);
+	else if (owners.get(sessionId)?.projectKey !== projectKey) owners.set(sessionId, null);
+}
+
+export function ledgerParentSubject(row, owners) {
+	if (!row.parentSessionId) return null;
+	return row.parentProjectKey != null
+		? { sessionId: row.parentSessionId, projectKey: row.parentProjectKey }
+		: owners?.get(row.parentSessionId) ?? null;
 }
 
 export function subjectKey(subject) {
@@ -220,6 +252,7 @@ export function sessionSubjects(rows) {
 	const resolve = (row, remaining = 8) => {
 		const own = subjectOf(row);
 		if (own.projectKey || !remaining || !row?.parentSessionId) return own;
+		if (row.parentProjectKey != null) return subjectOf(row, { projectKey: row.parentProjectKey });
 		const parents = byId.get(row.parentSessionId) ?? [];
 		const keys = new Set(parents.map((parent) => resolve(parent, remaining - 1).projectKey).filter(Boolean));
 		return keys.size === 1 ? subjectOf(row, { projectKey: keys.values().next().value }) : own;

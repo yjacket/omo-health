@@ -1,12 +1,12 @@
 import path from "node:path";
 import { probeSessionHeader } from "./collect/session-files.mjs";
 import { idFromFileName } from "./collect/sessions.mjs";
-import { PACKED_PROJECT, packScopedText, parseSubjectKey, sessionSubjects, SubjectMap, subjectKey, subjectOf, unpackScopedText } from "./session-subject.mjs";
+import { ledgerParentSubject, PACKED_PROJECT, packScopedText, parseSubjectKey, sessionSubjects, SubjectMap, subjectKey, subjectOf, unpackScopedText } from "./session-subject.mjs";
 import { isInside, pathKey } from "./paths.mjs";
 import { boardTaskLinks } from "./session-board.mjs";
-import { ENDED_LOCATION, locateEndedRows, readEndedCwd } from "./session-ledger.mjs";
-import { ledgerUsageSessionId, retainedTreeRows, usageTreeLink } from "./session-record.mjs";
-import { USAGE_TICK_BYTES, compactUsage, fresh as isFresh, isTaskOnlyEntry, treeTotals, usageEntryFor } from "./usage-index.mjs";
+import { ENDED_LOCATION, locateEndedRows, readEndedCwd, streamEnded } from "./session-ledger.mjs";
+import { ledgerUsageSessionId, legacyParentOwners, retainedTreeRows, usageTreeLink } from "./session-record.mjs";
+import { USAGE_TICK_BYTES, compactUsage, fresh as isFresh, isTaskOnlyEntry, parentSubject, treeTotals, usageEntryFor } from "./usage-index.mjs";
 import { statSafe } from "./util/fsx.mjs";
 
 /**
@@ -25,7 +25,10 @@ const ANCESTOR_DEPTH = 8;
 
 const isNonEmptyString = (value) => typeof value === "string" && value.length > 0;
 const needsLedgerCwd = (row) => Object.hasOwn(row, ENDED_LOCATION) && !row[ENDED_LOCATION] && row.cwd === undefined;
-const ledgerIdentity = { get projectKey() { return unpackScopedText(this[PACKED_PROJECT]); } };
+const ledgerIdentity = {
+	get projectKey() { return unpackScopedText(this[PACKED_PROJECT]); },
+	get parentProjectKey() { return unpackScopedText(this.packedParentProject); },
+};
 const packedMap = (ordered = false) => new SubjectMap({ ordered, packed: true });
 
 function treeKeys() {
@@ -70,6 +73,8 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 	const liveHeaders = packedMap();
 	let searched = new WeakSet();
 	let liveTreeRows = [];
+	let parentOwners = new Map();
+	let parentLinksChanged = false;
 	let trees;
 	let treeKey;
 	let backlogLogged = false;
@@ -80,12 +85,22 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 	const exactEntry = (key) => (index.getExact ?? index.get).call(index, key);
 	const liveIdentities = new WeakMap();
 	const identityOf = (row) => liveIdentities.get(row) ?? row;
+	const ledgerParent = (row) => ledgerParentSubject(row, parentOwners);
 	const linkedSubject = (row, field) => {
 		const identity = identityOf(row);
 		const sessionId = row?.[`${field}SessionId`];
+		if (field === "parent") {
+			if (row && Object.hasOwn(row, ENDED_LOCATION)) {
+				const parent = ledgerParent(row);
+				if (parent?.projectKey != null || (parentOwners.has(sessionId) && !parent)) return parent;
+				return resolveLiveCwdParent?.(sessionId) ?? parent;
+			}
+			if (row?.id && !liveIdentities.has(row)) return parentSubject(row);
+		}
 		return parseSubjectKey(identity?.[`${field}Key`]) ??
 			(sessionId ? { projectKey: subjectOf(identity).projectKey, sessionId } : null);
 	};
+	let resolveLiveCwdParent;
 	const cwdChain = function* (row, liveSessions) {
 		yield row;
 		const seen = packedMap();
@@ -116,7 +131,8 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 		taskId: source?.taskId ?? null,
 		parentSessionId: source?.parentSessionId ?? null,
 		rootSessionId: source?.rootSessionId ?? null,
-		parentKey: identityOf(source)?.parentKey ?? null,
+		parentKey: Object.hasOwn(source, ENDED_LOCATION) && source.parentSessionId
+			? subjectKey(ledgerParent(source)) ?? "" : identityOf(source)?.parentKey ?? null,
 		rootKey: identityOf(source)?.rootKey ?? null,
 	});
 
@@ -181,8 +197,8 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 		}
 		treeKey = treeKeys();
 		function* links() {
-			for (const row of ledgerRows.values()) if (ledgerUsageSessionId(row)) yield usageTreeLink(index, row, ambiguous);
-			for (const row of fallbacks()) yield usageTreeLink(index, row, ambiguous);
+			for (const row of ledgerRows.values()) if (ledgerUsageSessionId(row)) yield usageTreeLink(index, row, ambiguous, parentOwners);
+			for (const row of fallbacks()) yield usageTreeLink(index, row, ambiguous, parentOwners);
 			yield* liveTreeRows;
 		}
 		return treeTotals(index.values(), links(), treeKey);
@@ -227,6 +243,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 					sessionId, taskId, kind, endedMs, parentSessionId, rootSessionId, [ENDED_LOCATION]: source[ENDED_LOCATION],
 				});
 				compactProject(row, projectKey);
+				if (source.parentProjectKey != null) row.packedParentProject = packScopedText(source.parentProjectKey);
 				// Unpositioned callers keep any supplied cwd. Daemon rows always
 				// have locations and resolve cwd from the ledger line instead.
 				if (!row[ENDED_LOCATION] && source.cwd !== undefined) row.cwd = source.cwd;
@@ -243,6 +260,22 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 				if (row[PACKED_PROJECT] === null) compactProject(row, resolve(row).projectKey);
 				else row[PACKED_PROJECT] = ledgerRows.canonicalProject(row[PACKED_PROJECT]);
 				ledgerRows.set(row, row);
+			}
+			function* compactRows() {
+				for (const row of ledgerRows.values()) yield row;
+				yield* fallbacks();
+			}
+			const links = () => {
+				const compact = compactRows();
+				return paths ? (function* () { yield* compact; yield* streamEnded(paths); })() : compact;
+			};
+			parentOwners = legacyParentOwners(compactRows(), links);
+			for (const row of ledgerRows.values()) {
+				if (row.parentSessionId && ledgerUsageSessionId(row)) {
+					parentLinksChanged = index.recordParentLink?.(row, metaOf(row).parentKey) || parentLinksChanged;
+				}
+			}
+			for (const row of incoming) {
 				const entry = ledgerUsageSessionId(row) ? index.get(keyOf(row)) : exactEntry(keyOf(row));
 				if (row.kind === "child" && !ledgerUsageSessionId(row) && (entry?.state === "ok" || taskOnlyChecks.has(row))) {
 					taskOnlyChecks.set(row, row);
@@ -274,6 +307,11 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			const sessions = [...(world?.sessions?.values?.() ?? [])];
 			const resolve = sessionSubjects([...sessions, ...ledgerRows.values()]);
 			const liveSubject = sessionSubjects(sessions);
+			resolveLiveCwdParent = (id) => {
+				const row = world?.sessions?.get(id) ?? ledgerRows.getForSubject({ sessionId: id });
+				if (!row) return null;
+				return resolve(row);
+			};
 			const liveSessions = packedMap(true);
 			for (const session of sessions) {
 				if (!isNonEmptyString(session?.id)) continue;
@@ -447,7 +485,8 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			const state = counts();
 			// Persist deletions for history and revocations so removing a competing
 			// file cannot revive the old on-disk cursor before a recount.
-			if (ownershipChanged) index.save();
+			if (ownershipChanged || parentLinksChanged) index.save();
+			parentLinksChanged = false;
 			if (index.full && !fullLogged) {
 				fullLogged = true;
 				log?.warn?.("usage_index_full");

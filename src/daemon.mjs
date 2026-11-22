@@ -35,7 +35,7 @@ import { pruneHome } from "./retention.mjs";
 import { backfillOnce } from "./session-backfill.mjs";
 import { buildSessionSnapshot, detectEnded } from "./session-board.mjs";
 import { appendEndedBatch, ENDED_LOCATION, streamEnded } from "./session-ledger.mjs";
-import { subjectKey } from "./session-subject.mjs";
+import { subjectKey, worldLiveOwners } from "./session-subject.mjs";
 import { createSessionFileLocator } from "./collect/session-files.mjs";
 import { createUsageIndex } from "./usage-index.mjs";
 import { createUsageTracker } from "./usage-tracker.mjs";
@@ -422,6 +422,7 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 				log.error("evidence_failed", { error: error.message, stack: String(error.stack).slice(0, 800) });
 			}
 			// The session board: the live snapshot, and the sessions that ended since the last one.
+			const liveOwners = result?.world ? worldLiveOwners(result.world) : undefined;
 			if (result?.world) {
 				try {
 					const boardNow = clock.now();
@@ -431,16 +432,17 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 						log.error("usage_tick_failed", { error: error.message, stack: String(error.stack).slice(0, 800) });
 					}
 					const board = buildSessionSnapshot(result.world, result.findings ?? [], boardInvestigations.list({ sinceMs: boardNow - 7 * DAY_MS }), boardNow, {
-					tokensOf: usageTracker.tokensOf,
+						tokensOf: usageTracker.tokensOf,
+						liveOwners,
 					});
 					atomicWriteJson(paths.health.sessionsSnapshotFile, board);
 					if (result.world.procsFresh !== false) {
 						const records = detectEnded(prevBoard, board, result.world, boardNow);
 						const queued = [];
-						for (const [i, { appended, location, error }] of appendEndedBatch(paths, records, { nowMs: boardNow }).entries()) {
+						for (const [i, { appended, location, error, row }] of appendEndedBatch(paths, records, { nowMs: boardNow, liveRows: result.world.sessions.values() }).entries()) {
 							const record = records[i];
 							if (error) log.error("session_ended_write_failed", { sessionId: record.sessionId, error: error.message });
-							if (appended) queued.push({ ...record, [ENDED_LOCATION]: location });
+							if (appended) queued.push({ ...row, [ENDED_LOCATION]: location });
 						}
 						if (queued.length) usageTracker.queueLedger(queued);
 						prevBoard = board;
@@ -450,7 +452,7 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 				}
 			}
 			try {
-				auditor.tick(clock.now());
+				auditor.tick(clock.now(), liveOwners);
 			} catch (error) {
 				log.error("audit_tick_failed", { error: error.message, stack: String(error.stack).slice(0, 800) });
 			}

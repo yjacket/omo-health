@@ -1,4 +1,4 @@
-import { subjectKey, subjectOf } from "./session-subject.mjs";
+import { subjectKey, subjectOf, worldLiveOwners } from "./session-subject.mjs";
 import path from "node:path";
 import { endedKey } from "./session-ledger.mjs";
 import { ambiguousLedgerTaskIds } from "./session-record.mjs";
@@ -136,7 +136,7 @@ function countChildren(rows) {
  *   unknown. Task id is a fallback only for an unambiguous visible row without a session id. Rows carry `tokensState: "full"` for refusal
  *   or `tokensState` / `treeTokensState` of `"overflow"` for a non-finite total. A tree total can exist without an own total.
  */
-export function buildSessionSnapshot(world, findings = [], investigations = [], nowMs = world.now, { tokensOf } = {}) {
+export function buildSessionSnapshot(world, findings = [], investigations = [], nowMs = world.now, { tokensOf, liveOwners = worldLiveOwners(world) } = {}) {
 	const tokenFields = (entry) => {
 		const tokens = entry?.tokens ?? null;
 		const tree = entry?.treeTokens ?? null;
@@ -216,6 +216,7 @@ export function buildSessionSnapshot(world, findings = [], investigations = [], 
 	return {
 		v: 1,
 		ts: nowMs,
+		liveOwners,
 		groups: [...groups.entries()]
 			.sort(([a], [b]) => compareVersionsDesc(a, b))
 			.map(([omoVersion, sessions]) => ({ omoVersion, sessions: sessions.sort((a, b) => (a.startedMs ?? 0) - (b.startedMs ?? 0)) })),
@@ -317,7 +318,7 @@ export function detectEnded(prevSnapshot, snapshot, world, nowMs = world.now) {
 				const sessionId = row.sessionId || row.taskId;
 				// The root already scopes both the child ID and the task alias.
 				const key = JSON.stringify([endedKey(root), parentSessionId, sessionId]);
-				children.set(key, { row, sessionId, parentSessionId, root, parentCwd: cwd });
+				children.set(key, { row, sessionId, parentSessionId, root, parentCwd: cwd, parentProjectKey: subjectOf({ cwd }).projectKey });
 				if (byTask && row.sessionId) byTask.set(JSON.stringify([endedKey(root), parentSessionId, row.taskId]), row);
 				visit(row, root, cwd);
 			}
@@ -377,7 +378,7 @@ export function detectEnded(prevSnapshot, snapshot, world, nowMs = world.now) {
 		});
 	}
 
-	for (const [key, { row, sessionId, parentSessionId, root, parentCwd }] of flatten(prevMains)) {
+	for (const [key, { row, sessionId, parentSessionId, root, parentCwd, parentProjectKey }] of flatten(prevMains)) {
 		if (TERMINAL_STATUSES.has(row.status)) continue;
 		// A running task-only child may acquire its session ID between snapshots.
 		const current = curChildren.get(key)?.row ?? (!row.sessionId ? currentByTask.get(key) : undefined);
@@ -415,6 +416,7 @@ export function detectEnded(prevSnapshot, snapshot, world, nowMs = world.now) {
 			sessionId,
 			kind: "child",
 			parentSessionId: parentSessionId ?? null,
+			...(parentProjectKey ? { parentProjectKey } : {}),
 			taskId,
 			title: row.name,
 			cwd: row.cwd || current?.cwd || task?.spawnCwd || parentCwd || world.sessions?.get(parentSessionId)?.cwd || null,

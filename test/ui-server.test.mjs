@@ -1205,7 +1205,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 					startedMs: oldEnd - 1000, endedMs: oldEnd }, { nowMs: now() }), true);
 				assert.equal(readEnded(paths).filter((row) => row.sessionId === sessionId).length, 2);
 				for (let i = 0; i <= 50; i++) {
-					appendEnded(paths, { sessionId: `child-${i}`, parentSessionId: sessionId, kind: "child", cwd: world.dir,
+					appendEnded(paths, { sessionId: `child-${i}`, parentSessionId: sessionId, parentProjectKey: projectKeyOf(world.dir), kind: "child", cwd: world.dir,
 						startedMs: now() - 900, endedMs: now() - 100 + i }, { nowMs: now() });
 				}
 				const { port } = await ui.listen();
@@ -1317,7 +1317,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 						E.assistant({ provider: "openai", model: models[i].split("/")[1], ms: now() - 500, usage: { input: totals[i], output: 0 } })]);
 					index.update(subjects[i], file, { kind: "main" });
 					if (i) appendEnded(paths, { sessionId, cwd, kind: "main", startedMs: now() - 1000, endedMs: now(), outcome: "answered" }, { nowMs: now() });
-					appendEnded(paths, { sessionId: `child-${i}`, parentSessionId: sessionId, taskId: `st_child_${i}`, cwd,
+					appendEnded(paths, { sessionId: `child-${i}`, parentSessionId: sessionId, parentProjectKey: projectKeyOf(cwd), taskId: `st_child_${i}`, cwd,
 						kind: "child", startedMs: now() - 800, endedMs: now() - 400 }, { nowMs: now() });
 				}
 				const unique = "unique-review";

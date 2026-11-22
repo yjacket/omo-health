@@ -149,7 +149,7 @@ function projectCollision(t) {
 		const model = `p/${name}`;
 		writeLines(file, [bigRecord(0, usage(total)).replace('"model":"m"', `"model":"${name}"`)]);
 		const row = { sessionId: "review.1", kind: "main", endedMs: T0 - i, cwd };
-		const child = { sessionId: "child.1", kind: "child", endedMs: T0 - i, taskId: "st_child", parentSessionId: row.sessionId, cwd };
+		const child = { sessionId: "child.1", kind: "child", endedMs: T0 - i, taskId: "st_child", parentSessionId: row.sessionId, parentProjectKey: projectKey, cwd };
 		writeLines(childFile(cwd, child.taskId, child.sessionId), [bigRecord(0, usage(i + 1))]);
 		return { row, child, cwd, projectKey, total, model, file };
 	});
@@ -447,7 +447,7 @@ test("(plan 61) the next tick withdraws a task-only publication and recounts whe
 	} });
 	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
 	const taskId = "st_changing";
-	const row = { sessionId: taskId, taskId, kind: "child", cwd: s.cwd, endedMs: T0, parentSessionId: "parent" };
+	const row = { sessionId: taskId, taskId, kind: "child", cwd: s.cwd, endedMs: T0, parentSessionId: "parent", parentProjectKey: projectKeyOf(s.cwd) };
 	const first = childFile(s.cwd, taskId, "child-first");
 	const second = childFile(s.cwd, taskId, "child-second");
 	const parent = mainFile(s.paths, "parent");
@@ -680,6 +680,45 @@ test("(IS-3) cold backlog shows tokens in history for a backfilled review.jsonl"
 	assert.equal(history.tokens?.total, 42);
 	assert.equal(history.tokensGone, false);
 	assert.equal(saved.get(key(s, id))?.file, file);
+});
+
+test("(IS-1, IS-3) cold backfill keeps a main when another project has a child with its ID", (t) => {
+	const s = setup("backfill-collision-");
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const beta = path.join(s.root, "beta");
+	const id = "review.1";
+	const parent = "parent.1";
+	const taskId = "st_review";
+	const endedMs = T0 - 60 * 60_000;
+	const startedMs = endedMs - 5000;
+	const transcript = (file, cwd, sessionId, total) => {
+		writeJsonl(file, [E.header(sessionId, cwd, startedMs), E.assistant({ ms: endedMs, usage: usage(total) })]);
+	};
+	for (const [cwd, sessionId, total] of [[s.cwd, id, 17], [beta, id, 99], [s.cwd, parent, 1], [beta, parent, 2]]) {
+		transcript(path.join(s.paths.sessionsDir, projectKeyOf(cwd), `2026-09-28_${sessionId}.jsonl`), cwd, sessionId, total);
+	}
+	const taskFile = path.join(beta, ".omo", "senpi-task", "tasks", `${taskId}.json`);
+	fs.mkdirSync(path.dirname(taskFile), { recursive: true });
+	fs.writeFileSync(taskFile, JSON.stringify({
+		task_id: taskId, child_session_id: id, parent_session_id: parent, status: "completed",
+		created_at: iso(startedMs), terminal_at: iso(endedMs), final_response: "done",
+	}));
+	transcript(childFile(beta, taskId, id), beta, id, 29);
+
+	assert.equal(fs.existsSync(s.paths.health.sessionsDir), false, "no preexisting ledger or token index");
+	assert.deepEqual(backfillOnce(s.paths, T0).errors, []);
+	const rows = [...streamEnded(s.paths, { withLocation: true })];
+	assert.deepEqual(rows.filter((row) => row.sessionId === id).map(({ cwd, kind }) => [cwd, kind]).sort(), [
+		[beta, "child"], [s.cwd, "main"],
+	], "keep the other project's main, but not the same-project shadow transcript");
+	assert.deepEqual(rows.filter((row) => row.sessionId === parent).map(({ cwd, childCount }) => [cwd, childCount]).sort(), [
+		[beta, 1], [s.cwd, 0],
+	]);
+	assert.equal(s.tracker.queueLedger(rows.values()), 4);
+	s.tracker.tick(emptyWorld(s.clock));
+	const saved = readUsageIndex(s.paths.health.usageIndexFile);
+	assert.equal(saved.get(key(s, id))?.published?.total, 17);
+	assert.equal(saved.get(key(s, id, beta))?.published?.total, 29);
 });
 
 test("(plan 41) main file verification rejects wrong, missing, and oversized headers but trusts matching filenames", (t) => {
@@ -1519,7 +1558,7 @@ test("tree token completeness follows pending siblings and never counts a missin
 		writeJsonl(counted, [E.assistant({ ms: T0, usage: usage(20) })]);
 		s.index.update(sub(s, child), counted, { kind: "child", parentSessionId: parent });
 	}
-	const ready = { sessionId: "ready-sibling", taskId: "st_ready", kind: "child", parentSessionId: "ready", cwd: s.cwd, endedMs: T0 };
+	const ready = { sessionId: "ready-sibling", taskId: "st_ready", kind: "child", parentSessionId: "ready", parentProjectKey: projectKeyOf(s.cwd), cwd: s.cwd, endedMs: T0 };
 	const missing = { ...ready, sessionId: "missing-sibling", taskId: "st_missing", parentSessionId: "missing" };
 	const transcript = childFile(s.cwd, ready.taskId, ready.sessionId);
 	writeJsonl(transcript, [E.assistant({ ms: T0, usage: usage(5) })]);

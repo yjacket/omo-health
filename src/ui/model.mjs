@@ -1,11 +1,11 @@
-import { sessionSubjects, subjectKey, subjectOf } from "../session-subject.mjs";
+import { ledgerParentSubject, sessionSubjects, subjectKey, subjectOf } from "../session-subject.mjs";
 import path from "node:path";
 import { DEFAULT_CONFIG, loadConfig, SWITCH_KEYS } from "../config.mjs";
 import { getPath, pauseState, SWITCHES } from "../control.mjs";
 import { readDecisions } from "../decisions.mjs";
 import { createInvestigations, RESOLVED } from "../investigations.mjs";
-import { endedSelector, readEnded } from "../session-ledger.mjs";
-import { ambiguousLedgerTaskIds, displayLedgerId, usageEntryOf, usageTreeLink } from "../session-record.mjs";
+import { endedSelector, readEnded, streamEnded } from "../session-ledger.mjs";
+import { ambiguousLedgerTaskIds, displayLedgerId, legacyParentOwners, usageEntryOf, usageTreeLink } from "../session-record.mjs";
 import { compactUsage, publishedUsageView, readUsageIndex, treeTotals } from "../usage-index.mjs";
 import { listDirSafe, readJsonSafe, statSafe } from "../util/fsx.mjs";
 import { redact, truncate } from "../util/text.mjs";
@@ -326,6 +326,7 @@ export function buildEnded(inputs) {
 	const rows = (Array.isArray(inputs.ended) ? inputs.ended : []).filter((r) => isRecord(r) && Number.isFinite(r.endedMs));
 	const resolve = sessionSubjects(rows);
 	const all = rows.map((row) => ({ ...row, ...resolve(row) }));
+	const parentOwners = legacyParentOwners(all, () => inputs.paths ? streamEnded(inputs.paths) : all);
 	const tally = new Map(Object.keys(OUTCOME_LABELS).map((outcome) => [outcome, 0]));
 	const idCounts = new Map();
 	for (const r of all) {
@@ -335,7 +336,8 @@ export function buildEnded(inputs) {
 	}
 	const childRows = new Map();
 	for (const r of all) if (r.kind === "child" && typeof r.parentSessionId === "string") {
-		const parentKey = subjectKey({ ...subjectOf(r), sessionId: r.parentSessionId });
+		const parentKey = subjectKey(ledgerParentSubject(r, parentOwners));
+		if (!parentKey) continue;
 		childRows.set(parentKey, (childRows.get(parentKey) ?? 0) + 1);
 	}
 	// Main and child rows are capped separately, then put back in the ledger's newest-first order.
@@ -349,7 +351,7 @@ export function buildEnded(inputs) {
 	const published = publishedUsageView(usage);
 	// Retained descendants join through published index parent links. Only
 	// visible ledger rows supplement those links (e.g. for pending children).
-	const trees = treeTotals(usage, all.map((row) => usageTreeLink(published, row, ambiguous)));
+	const trees = treeTotals(usage, all.map((row) => usageTreeLink(published, row, ambiguous, parentOwners)));
 	return {
 		sinceMs: inputs.now - ENDED_WINDOW_MS,
 		limit: ENDED_LIMIT,

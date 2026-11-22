@@ -161,14 +161,23 @@ function scopeEndedRow(row, projectKey) {
 }
 
 function scopeEndedRecords(paths, records, liveRows) {
-	if (!records.some((row) => row?.parentSessionId && !subjectOf(row).projectKey)) {
-		return records.map((row) => scopeEndedRow(row, subjectOf(row).projectKey));
-	}
+	if (!records.some((row) => row?.parentSessionId)) return records;
 	liveRows = [...(liveRows ?? [])];
 	const batch = sessionSubjects(records);
 	const current = liveRows.length ? sessionSubjects([...records, ...liveRows]) : batch;
-	const scoped = records.map((row) => scopeEndedRow(row, batch(row).projectKey ?? current(row).projectKey));
-	let parents = new Set(scoped.filter((row) => row?.parentSessionId && !subjectOf(row).projectKey).map((row) => row.parentSessionId));
+	const live = sessionSubjects(liveRows);
+	const liveParent = new Map(liveRows.map((row) => [row.sessionId ?? row.id, row]));
+	const scope = (row, resolve, parentProjectKey = row.parentProjectKey) => {
+		if (!row.parentSessionId) return row;
+		parentProjectKey ??= resolve({ parentSessionId: row.parentSessionId }).projectKey;
+		const linked = parentProjectKey && !row.parentProjectKey ? { ...row, parentProjectKey } : row;
+		return scopeEndedRow(linked, resolve(linked).projectKey);
+	};
+	const scoped = records.map((row) => {
+		const parent = liveParent.get(row.parentSessionId);
+		return scope(row, current, row.parentProjectKey ?? (parent && live(parent).projectKey) ?? batch({ parentSessionId: row.parentSessionId }).projectKey);
+	});
+	let parents = new Set(scoped.filter((row) => row?.parentSessionId && !row.parentProjectKey).map((row) => row.parentSessionId));
 	if (!parents.size) return scoped;
 
 	// Parents may predate the dedupe window. Retain only their identity and
@@ -181,7 +190,7 @@ function scopeEndedRecords(paths, records, liveRows) {
 		const add = (row) => {
 			const sessionId = row?.sessionId ?? row?.id;
 			if (!parents.has(sessionId)) return;
-			const { projectKey } = subjectOf(row);
+			const projectKey = subjectOf(row).projectKey ?? row.parentProjectKey;
 			const parentSessionId = projectKey ? null : row.parentSessionId;
 			family.push({ sessionId, projectKey, parentSessionId });
 			if (parentSessionId && !visited.has(parentSessionId)) next.add(parentSessionId);
@@ -192,7 +201,7 @@ function scopeEndedRecords(paths, records, liveRows) {
 		parents = next;
 	}
 	const resolve = sessionSubjects(family);
-	return scoped.map((row) => scopeEndedRow(row, resolve(row).projectKey));
+	return scoped.map((row) => scope(row, resolve));
 }
 
 /** Look up a record's identity, or any occurrence of a bare session ID, in the last 30 days. */
@@ -289,7 +298,7 @@ export function appendEndedBatch(paths, records, { nowMs = Date.now(), recorded,
 				writtenId = endedKey(readLocatedRow({ file, offset: tail.offset, length: offset - tail.offset + length }));
 			}
 			if (day && candidates.has(writtenId) && day > (newest.get(writtenId) ?? "")) newest.set(writtenId, day);
-			return written;
+			return { ...written, row: record };
 		} catch (error) {
 			return { ...skipped, error };
 		}
