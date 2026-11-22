@@ -2,6 +2,7 @@ import { AUDIT_REASON_CODES, reasonCode } from "../audit-codes.mjs";
 import { detectorThresholdsHash } from "../config-reload.mjs";
 import { errorStormFact } from "../detect/loops.mjs";
 import { imageLevel } from "../detect/tokens.mjs";
+import { safeSubjectId } from "../session-id.mjs";
 import { redact, truncate } from "../util/text.mjs";
 import { parseAnalystOutput } from "./analyst.mjs";
 import { laneModels, modelFamily, modelName } from "./lane.mjs";
@@ -23,7 +24,7 @@ export { AUDIT_REASON_CODES, reasonCode };
 export const AUDIT_OVERALL = Object.freeze(["sound", "exaggerated", "overreach", "missed", "mixed"]);
 export const AUDIT_JUDGMENTS = Object.freeze(["sound", "exaggerated", "overreach", "missed", "unverifiable"]);
 export const AUDIT_TOKEN_JUDGMENTS = Object.freeze(["normal", "high", "wasteful", "unclear"]);
-/** Characters accepted as the bundle's largest string and the audit's largest payload. */
+/** Generic string limit; subject IDs and fixed prose have separate rules. */
 const BUNDLE_STRING_MAX = 120;
 export const BUNDLE_MAX_CHARS = 100_000;
 const HANGUL = /[\uAC00-\uD7A3]/;
@@ -216,6 +217,8 @@ const INFERENCE_CUTOFFS = {
 
 const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 const textOf = (value) => (typeof value === "string" ? redact(value) : null);
+// Missing, malformed or redacted IDs don't identify a subject in reviewer data.
+const subjectIdOf = (value) => safeSubjectId(textOf(value));
 const numOf = (value) => (typeof value === "number" && Number.isFinite(value) ? value : null);
 const boolOf = (value) => (typeof value === "boolean" ? value : null);
 const safeRule = (value) => {
@@ -294,7 +297,7 @@ function findingsOf(list, continuousSinceMs, config) {
 			scope: textOf(finding?.scope),
 			thresholdsKnown: thresholds !== undefined,
 			...(thresholds === undefined ? {} : { thresholds }),
-			subject: { sessionId: textOf(subject.sessionId), taskId: textOf(subject.taskId) },
+			subject: { sessionId: subjectIdOf(subject.sessionId), taskId: subjectIdOf(subject.taskId) },
 			metrics,
 			droppedEvidence,
 		};
@@ -500,18 +503,34 @@ function thresholdsContinuousSince(decisions, currentHash) {
 	return since;
 }
 
-function assertBundleText(value, key) {
+// `children` contains both direct children and deeper descendants.
+const BUNDLE_SUBJECT_ID_PATHS = new Set([
+	"session.sessionId",
+	"session.taskId",
+	"session.parentSessionId",
+	"children[].sessionId",
+	"children[].taskId",
+	"omo_health_record.findings[].subject.sessionId",
+	"omo_health_record.findings[].subject.taskId",
+]);
+
+function assertBundleText(value, key, path = "") {
 	if (key === "question" || key === "checks_omo_health_runs") return;
 	if (typeof value === "string") {
-		if (value.length > BUNDLE_STRING_MAX || /\s/.test(value)) throw new Error("bundle-text");
+		const valid = BUNDLE_SUBJECT_ID_PATHS.has(path)
+			? safeSubjectId(value) !== null
+			: value.length <= BUNDLE_STRING_MAX && !/\s/.test(value);
+		if (!valid) throw new Error("bundle-text");
 		return;
 	}
 	if (Array.isArray(value)) {
-		for (const item of value) assertBundleText(item, key);
+		for (const item of value) assertBundleText(item, key, `${path}[]`);
 		return;
 	}
 	if (isObject(value)) {
-		for (const [childKey, childValue] of Object.entries(value)) assertBundleText(childValue, childKey);
+		for (const [childKey, childValue] of Object.entries(value)) {
+			assertBundleText(childValue, childKey, path ? `${path}.${childKey}` : childKey);
+		}
 	}
 }
 
@@ -521,7 +540,8 @@ const sizeOf = (bundle) => JSON.stringify(bundle).length;
  * The allowlisted evidence bundle for one session record (plan IS-11). Every
  * copied field is an id, enum, number, timestamp or model name; evidence text
  * survives only as `key:value` numeric metrics, and analyst reasons only as a
- * recognized code. The final walk rejects any other string.
+ * recognized code. The final walk applies the shared subject ID grammar at
+ * designated paths and the generic text guard to other non-prose strings.
  */
 export function auditBundle(record, timeline, { config, now, configDecisions = [] } = {}) {
 	const session = isObject(record?.session) ? record.session : {};
@@ -572,10 +592,10 @@ export function auditBundle(record, timeline, { config, now, configDecisions = [
 	if (investigations.some((row) => row?.verdictHistoryTooLarge)) throw new Error("evidence-too-large");
 	const bundle = {
 		session: {
-			sessionId: textOf(session.sessionId),
-			taskId: textOf(session.taskId),
+			sessionId: subjectIdOf(session.sessionId),
+			taskId: subjectIdOf(session.taskId),
 			kind: textOf(session.kind),
-			parentSessionId: textOf(session.parentSessionId),
+			parentSessionId: subjectIdOf(session.parentSessionId),
 			outcome: textOf(session.outcome),
 			estimated: boolOf(session.estimated),
 			source: textOf(session.source),
@@ -588,8 +608,8 @@ export function auditBundle(record, timeline, { config, now, configDecisions = [
 		},
 		tokens: tokensOf(record, timeline, errorStorm),
 		children: children.map((child) => ({
-			sessionId: textOf(child?.sessionId),
-			taskId: textOf(child?.taskId),
+			sessionId: subjectIdOf(child?.sessionId),
+			taskId: subjectIdOf(child?.taskId),
 			depth: numOf(child?.depth),
 			outcome: textOf(child?.outcome),
 			endedMs: numOf(child?.endedMs),

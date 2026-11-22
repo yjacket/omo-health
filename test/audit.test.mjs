@@ -596,6 +596,53 @@ test("a long sentence slipped into an allowlisted slot throws bundle-text", () =
 	assert.throws(() => auditBundle(record, null, { config: DEFAULT_CONFIG, now: T0 }), /bundle-text/);
 });
 
+test("plan79: every designated bundle ID slot accepts the full Senpi ID bound", () => {
+	const id = (suffix) => "x".repeat(1023) + suffix;
+	const session = { sessionId: id("A"), taskId: id("B"), parentSessionId: id("C") };
+	const child = { sessionId: id("D"), taskId: id("E"), depth: 1 };
+	const descendant = { sessionId: id("F"), taskId: id("G"), depth: 2 };
+	const subject = { sessionId: id("H"), taskId: id("I") };
+	const record = emptyRecord({ session, health: { findings: [{ detector: "D1", subject }] } });
+	record.children.push(child, descendant);
+
+	const bundle = auditBundle(record, null, { config: DEFAULT_CONFIG, now: T0 });
+	const { sessionId, taskId, parentSessionId } = bundle.session;
+	assert.deepEqual({ sessionId, taskId, parentSessionId }, session);
+	assert.deepEqual(bundle.children.map(({ sessionId, taskId, depth }) => ({ sessionId, taskId, depth })), [child, descendant]);
+	assert.deepEqual(bundle.omo_health_record.findings[0].subject, subject);
+});
+
+test("plan79: unsafe bundle IDs are omitted as null, not forwarded as reviewer data", () => {
+	const record = emptyRecord({
+		session: { sessionId: "s1", taskId: "x".repeat(1025), parentSessionId: "COM1/.." },
+		health: { findings: [{ detector: "D1", subject: { sessionId: "parent child", taskId: "task:1" } }] },
+	});
+	record.children.push({ sessionId: ".child", taskId: "child." });
+
+	const bundle = auditBundle(record, null, { config: DEFAULT_CONFIG, now: T0 });
+	assert.deepEqual([bundle.session.sessionId, bundle.session.taskId, bundle.session.parentSessionId], ["s1", null, null]);
+	assert.deepEqual([bundle.children[0].sessionId, bundle.children[0].taskId], [null, null]);
+	assert.deepEqual(bundle.omo_health_record.findings[0].subject, { sessionId: null, taskId: null });
+});
+
+test("plan79: a non-ID string and an investigation ID still throw bundle-text past 120 characters", () => {
+	const overLimit = "x".repeat(121);
+	for (const record of [
+		emptyRecord({ session: { source: overLimit } }),
+		emptyRecord({ health: { investigations: [{ id: overLimit }] } }),
+	]) {
+		assert.throws(() => auditBundle(record, null, { config: DEFAULT_CONFIG, now: T0 }), /bundle-text/);
+	}
+});
+
+test("plan79: credential-shaped subject IDs are still redacted from reviewer data", () => {
+	const credentialShapedId = `sk-ant-${"x".repeat(300)}`;
+	const record = emptyRecord({ session: { sessionId: credentialShapedId } });
+	const bundle = auditBundle(record, null, { config: DEFAULT_CONFIG, now: T0 });
+	assert.equal(bundle.session.sessionId, null);
+	assert.ok(!JSON.stringify(bundle).includes(credentialShapedId));
+});
+
 test("IS-7: the audit bundle carries only the audited session's D20 relaunch and gate result", () => {
 	const root = tmpDir("omoh-audit-relaunch-");
 	const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health") });

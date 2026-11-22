@@ -16,6 +16,7 @@ import { resolvePaths } from "../src/paths.mjs";
 import { emptyUsage } from "../src/collect/usage.mjs";
 import { appendDecision } from "../src/decisions.mjs";
 import { BACKFILL_MARKER, backfillOnce } from "../src/session-backfill.mjs";
+import { ANALYST_POLL_MS } from "../src/judge/analyst.mjs";
 import { auditFileKey } from "../src/session-id.mjs";
 import { appendEnded, readEnded } from "../src/session-ledger.mjs";
 import { createDetailWorker, createSessionDetail, createStartAudit } from "../src/ui/cli.mjs";
@@ -801,12 +802,32 @@ describe("ui server", { timeout: 20_000 }, () => {
 			}
 
 			for (const length of [81, 300]) {
-				it(`plan78: ${length}-character history ID opens and queues that exact session`, async (t) => {
+				it(`${length === 300 ? "plan79" : "plan78"}: ${length}-character history ID opens and ${length === 300 ? "completes an audit for" : "queues"} that exact session`, async (t) => {
 					const sessionId = "x".repeat(length - 1) + "Z";
 					const world = makeWorld({ sessionId });
 					const { paths, env, now } = world;
 					const ui = createUiServer({ paths, token: TOKEN, getState: () => STATE, sessionDetail: world.detail, startAudit: world.startAudit, now });
-					const auditor = createAuditor({ paths, config: loadConfig({ paths, env }).config, clock: { now }, runner: {}, env });
+					const starts = [];
+					const result = {
+						overall: "sound",
+						summary: "토큰 사용과 점검이 모두 적절했습니다.",
+						tokens: { judgment: "normal", explanation: "정상 범위입니다." },
+						checks: [{ item: "토큰", judgment: "unverifiable", explanation: "자료가 부족합니다.", evidence: [] }],
+						recommendations: [],
+						confidence: 0.8,
+					};
+					let nowMs = now();
+					const runner = {
+						start(options) {
+							starts.push(options);
+							return { jobId: options.jobId, pid: 5000 };
+						},
+						poll(jobId) {
+							assert.equal(jobId, starts[0].jobId);
+							return { status: "done", result, exitCode: 0 };
+						},
+					};
+					const auditor = createAuditor({ paths, config: loadConfig({ paths, env }).config, clock: { now: () => nowMs }, runner, env });
 					t.after(async () => {
 						await Promise.all([ui.close(), world.detail.close(), auditor.close()]);
 						fs.rmSync(world.dir, { recursive: true, force: true });
@@ -821,8 +842,50 @@ describe("ui server", { timeout: 20_000 }, () => {
 					const state = readAuditState(paths, sessionId);
 					assert.deepEqual([state?.status, state?.sessionId], ["queued", sessionId]);
 					assert.deepEqual(fs.readdirSync(paths.health.auditRequestsDir), []);
+					if (length !== 300) return;
+
+					await auditor.preparing();
+					auditor.tick(nowMs);
+					const running = readAuditState(paths, sessionId);
+					assert.equal(running.status, "running", running.detail ?? running.reason);
+					assert.equal(starts.length, 1);
+					assert.equal(starts[0].jobId, running.jobId);
+					const bundleFile = path.join(starts[0].cwd, "bundle.md");
+					assert.ok(starts[0].args.includes(`@${bundleFile}`));
+					const bundle = JSON.parse(fs.readFileSync(bundleFile, "utf8").split("\n").find((line) => line.startsWith('{"session":')));
+					assert.equal(bundle.session.sessionId, sessionId);
+
+					nowMs += ANALYST_POLL_MS;
+					auditor.tick(nowMs);
+					const done = readAuditState(paths, sessionId);
+					assert.deepEqual([done.status, done.sessionId, done.result?.overall], ["done", sessionId, "sound"]);
 				});
 			}
+
+			it("plan79: COM1 history accepts audit requests but COM1/.. writes no file", async (t) => {
+				const sessionId = "COM1";
+				const world = makeWorld({ sessionId });
+				const { paths, now } = world;
+				const ui = createUiServer({ paths, token: TOKEN, getState: () => STATE, sessionDetail: world.detail, startAudit: world.startAudit, now });
+				t.after(async () => {
+					await Promise.all([ui.close(), world.detail.close()]);
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				});
+				const { port } = await ui.listen();
+				const invalidId = "COM1/..";
+				const invalid = { status: 422, body: { error: "invalid" } };
+				assert.deepEqual(await getAt(port, `/api/session?id=${encodeURIComponent(invalidId)}`), invalid);
+				assert.deepEqual(await postAt(port, "/api/audit", { sessionId: invalidId }), invalid);
+				for (const dir of [paths.health.auditRequestsDir, paths.health.auditsDir]) {
+					assert.deepEqual(fs.existsSync(dir) ? fs.readdirSync(dir) : [], [], dir);
+				}
+				const detail = await getAt(port, `/api/session?id=${sessionId}`);
+				const posted = await postAt(port, "/api/audit", { sessionId });
+				assert.deepEqual([detail.status, posted.status], [200, 202]);
+				assert.equal(detail.body.session.sessionId, sessionId);
+				assert.equal(posted.body.audit.sessionId, sessionId);
+				assert.deepEqual(fs.readdirSync(paths.health.auditRequestsDir), [`${auditFileKey(sessionId)}.json`]);
+			});
 
 			it("plan78: the dashboard shows each case-distinct row its own saved verdict", async (t) => {
 				const ids = ["Review.1", "review.1"];
