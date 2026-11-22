@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { entryMs, idFromFileName, readSessionHeader } from "./collect/sessions.mjs";
 import { normalizeTask, senpiTaskStoreDir, taskStoreDir } from "./collect/tasks.mjs";
-import { appendEnded, readEnded } from "./session-ledger.mjs";
+import { appendEnded, streamEnded } from "./session-ledger.mjs";
 import { atomicWriteJson, ensureDir, listDirSafe, readJsonSafe, readTextSafe, statSafe } from "./util/fsx.mjs";
 import { redact, truncate } from "./util/text.mjs";
 import { kst, toMs } from "./util/time.mjs";
@@ -226,7 +226,8 @@ export function backfillOnce(paths, nowMs, { days = 30 } = {}) {
 
 	const crashes = readCrashes(paths, sinceMs, errors);
 	const releases = readReleases(paths, sinceMs, errors);
-	const recorded = new Set(readEnded(paths, { sinceMs }).map((r) => r.sessionId));
+	const recorded = new Set();
+	for (const row of streamEnded(paths, { sinceMs })) recorded.add(row.sessionId);
 
 	const write = (record) => {
 		counts[record.kind] += 1;

@@ -21,8 +21,8 @@ const FULL_HEADER = JSON.stringify({ v: USAGE_INDEX_VERSION, full: true });
 const FULL_ENTRY = Object.freeze({ state: "full" });
 /** Fixed per-row allowance for V8 objects, map entries and writer bookkeeping. */
 export const INDEX_ENTRY_OVERHEAD = 1536;
-// Leave room for the streamed ledger and a tracker scan on the 66 MiB gate.
-export const INDEX_BYTE_BUDGET = 36 * 1024 * 1024;
+// The index must fit in the delta between the 80 MiB control and the 96 MiB daemon.
+export const INDEX_BYTE_BUDGET = 16 * 1024 * 1024;
 // Separate from resident rows: only one serialized/decoded line is processed at a time.
 const INDEX_LINE_BYTE_BUDGET = 8 * 1024 * 1024;
 /** Per-tick byte budget for live appends, first reads and the backlog. */

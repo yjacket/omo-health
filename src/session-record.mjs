@@ -487,7 +487,7 @@ function cwdsOf(node, ancestors) {
 	return out;
 }
 
-function recordLedger(rows, id, usage) {
+function recordLedger(rows, id, usage, descendantScanMax) {
 	// First pass: keep only identities, links and ordering. In particular, an
 	// unrelated row's cwd must not stay resident alongside the usage index.
 	const links = [];
@@ -500,6 +500,8 @@ function recordLedger(rows, id, usage) {
 	const subject = byId.get(id);
 	if (!subject) return null;
 	const descendants = collectDescendants(subject, links, usage.values());
+	const newest = [...descendants].sort((a, b) => (b.endedMs ?? 0) - (a.endedMs ?? 0));
+	const scanned = Number.isFinite(descendantScanMax) ? newest.slice(0, descendantScanMax) : newest;
 	const selected = new Map();
 	const select = (link) => {
 		if (!selected.has(link.sessionId)) selected.set(link.sessionId, new Set());
@@ -513,7 +515,10 @@ function recordLedger(rows, id, usage) {
 		children.set(node.ledgerRow, node);
 	}
 	const ancestors = new Map();
-	for (const node of [subject, ...descendants]) {
+	const directories = new Set();
+	for (const node of [subject, ...scanned]) {
+		if (!nonEmpty(node.taskId)) continue;
+		directories.add(node.ledgerRow ?? node);
 		let parentId = node.parentSessionId;
 		const seen = new Set();
 		for (let depth = 1; depth < DEPTH_MAX && nonEmpty(parentId) && !seen.has(parentId); depth += 1) {
@@ -521,6 +526,7 @@ function recordLedger(rows, id, usage) {
 			const parent = byId.get(parentId);
 			if (!parent) break;
 			select(parent);
+			directories.add(parent);
 			ancestors.set(parentId, parent);
 			parentId = parent.parentSessionId;
 		}
@@ -535,14 +541,18 @@ function recordLedger(rows, id, usage) {
 			if (link.endedMs !== rec.endedMs || link.taskId !== rec.taskId || link.parentSessionId !== rec.parentSessionId) continue;
 			candidates.delete(link);
 			if (link === subject) row = rec;
-			link.cwd = rec.cwd;
+			if (directories.has(link)) link.cwd = rec.cwd;
 			const child = children.get(link);
-			if (child) Object.assign(child, { title: rec.title ?? null, outcome: rec.outcome ?? null, cwd: rec.cwd ?? null });
+			if (child) {
+				child.title = rec.title ?? null;
+				child.outcome = rec.outcome ?? null;
+				if (directories.has(link)) child.cwd = rec.cwd;
+			}
 		}
 		if (!candidates.size) selected.delete(rec.sessionId);
 		if (!selected.size) break;
 	}
-	return row ? { row, descendants, ancestors } : null;
+	return row ? { row, descendants, ancestors, scanned } : null;
 }
 
 /**
@@ -554,13 +564,12 @@ function recordLedger(rows, id, usage) {
 export function loadSessionRecord({ paths, id, now = Date.now(), messageScanMaxBytes = Infinity, descendantScanMax = Infinity, scanMessages = scanOmoHealthMessages, locator, index } = {}) {
 	if (!nonEmpty(id)) return { found: false, id };
 	const usage = index ?? readUsageIndex(paths.health.usageIndexFile);
-	const joined = recordLedger(() => streamEnded(paths, { sinceMs: now - 30 * DAY_MS }), id, usage);
+	const joined = recordLedger(() => streamEnded(paths, { sinceMs: now - 30 * DAY_MS }), id, usage, descendantScanMax);
 	if (!joined) return { found: false, id };
-	const { row, descendants, ancestors } = joined;
+	const { row, descendants, ancestors, scanned } = joined;
 	const startedMs = msOf(row.startedMs);
 	const decisions = readDecisions(paths, (Number.isFinite(startedMs) ? startedMs : now) - 30 * DAY_MS);
 	const investigations = readAllInvestigations(paths);
-	const newest = [...descendants].sort((a, b) => (b.endedMs ?? 0) - (a.endedMs ?? 0));
 	const loc = locator ?? createSessionFileLocator({ paths, clock: { now: () => now } });
 
 	const files = [];
@@ -568,7 +577,7 @@ export function loadSessionRecord({ paths, id, now = Date.now(), messageScanMaxB
 		? loc.childFile({ taskId: row.taskId, sessionId: row.sessionId, cwds: cwdsOf(row, ancestors) })
 		: loc.mainFile(row.sessionId);
 	if (own) files.push({ sessionId: row.sessionId, file: own });
-	for (const node of newest.slice(0, Number.isFinite(descendantScanMax) ? descendantScanMax : newest.length)) {
+	for (const node of scanned) {
 		const file = nonEmpty(node.taskId) ? loc.childFile({ taskId: node.taskId, sessionId: node.sessionId, cwds: cwdsOf(node, ancestors) }) : loc.mainFile(node.sessionId);
 		if (file) files.push({ sessionId: node.sessionId, file });
 	}

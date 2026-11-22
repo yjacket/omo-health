@@ -466,7 +466,7 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 					log.error("session_backfill_failed", { error: error.message });
 				}
 				try {
-					usageTracker.queueLedger(streamEnded(paths, { sinceMs: clock.now() - 30 * DAY_MS }));
+					usageTracker.queueLedger(streamEnded(paths, { sinceMs: clock.now() - 30 * DAY_MS, withLocation: true }));
 				} catch (error) {
 					log.error("usage_queue_failed", { error: error.message });
 				}
@@ -476,7 +476,7 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 				runRetention(paths, lastRetentionMs, log);
 				try {
 					usageIndex.prune(lastRetentionMs);
-					usageTracker.queueLedger(streamEnded(paths, { sinceMs: lastRetentionMs - 30 * DAY_MS }));
+					usageTracker.queueLedger(streamEnded(paths, { sinceMs: lastRetentionMs - 30 * DAY_MS, withLocation: true }));
 				} catch (error) {
 					log.error("usage_queue_failed", { error: error.message });
 				}

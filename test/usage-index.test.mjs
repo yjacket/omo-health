@@ -368,7 +368,7 @@ test("(gate 16) fresh 96 MiB reader stops at the byte budget in an oversized val
 	runLongPath("dashboard", file);
 });
 
-test("(gate 15) 12000 one-model sessions under a Korean project save and resave at 96 MiB", (t) => {
+test("12000 one-model sessions saturate the 16 MiB budget and every admitted row saves and resaves at 96 MiB", (t) => {
 	const { dir, fileOf } = setup(t);
 	const file = fileOf("usage.json");
 	const program = `
@@ -376,7 +376,7 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { createUsageIndex } from ${JSON.stringify(new URL("../src/usage-index.mjs", import.meta.url).href)};
+import { createUsageIndex, INDEX_BYTE_BUDGET } from ${JSON.stringify(new URL("../src/usage-index.mjs", import.meta.url).href)};
 const [mode, file, root] = process.argv.slice(1);
 const index = createUsageIndex({ file, clock: { now: () => 1 } });
 if (mode === "write") {
@@ -390,14 +390,17 @@ if (mode === "write") {
 	}
 }
 const rows = index.entries();
-assert.equal(rows.length, 12000);
+assert.equal(INDEX_BYTE_BUDGET, 16 * 1024 * 1024);
+assert.equal(index.full, true);
+assert.ok(rows.length >= 4000 && rows.length < 12000);
+assert.deepEqual(index.get("01aaa000-0000-7000-8000-000000011999"), { state: "full" });
 const hash = crypto.createHash("sha256");
 for (const row of rows) {
 	assert.equal(row.published.total, 1);
 	assert.equal(row.published.cost, 0.25);
 	hash.update(JSON.stringify([row.id, row.published]));
 }
-if (mode === "reload") index.markMissing("unlocated");
+if (mode === "reload") index.update(rows[0].id, rows[0].file, { kind: "main" });
 console.error(mode, "before save", rows.length, "rows", process.memoryUsage().heapUsed, "heap bytes");
 assert.equal(index.save(), true);
 console.error(mode, "after save", fs.statSync(file).size, "file bytes", process.memoryUsage().heapUsed, "heap bytes", process.resourceUsage().maxRSS, "KiB peak RSS");

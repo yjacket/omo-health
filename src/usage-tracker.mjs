@@ -1,5 +1,6 @@
 import { idFromFileName } from "./collect/sessions.mjs";
 import { pathKey } from "./paths.mjs";
+import { ENDED_LOCATION, readEndedCwd } from "./session-ledger.mjs";
 import { USAGE_TICK_BYTES, compactUsage, fresh as isFresh, treeTotals } from "./usage-index.mjs";
 
 /**
@@ -42,7 +43,8 @@ export function createUsageTracker({ paths, index, locator, clock, log } = {}) {
 		const push = (cwd) => {
 			if (isNonEmptyString(cwd) && !cwds.includes(cwd)) cwds.push(cwd);
 		};
-		push(row?.cwd);
+		const cwdOf = (node) => paths && node && Object.hasOwn(node, ENDED_LOCATION) ? readEndedCwd(paths, node) : node?.cwd;
+		push(cwdOf(row));
 		const seen = new Set();
 		if (isNonEmptyString(row?.sessionId)) seen.add(row.sessionId);
 		let current = row;
@@ -52,7 +54,7 @@ export function createUsageTracker({ paths, index, locator, clock, log } = {}) {
 			seen.add(parentId);
 			const parent = ledgerRows.get(parentId) ?? index.get(parentId) ?? liveSessions?.get?.(parentId);
 			if (!parent) break;
-			push(parent.cwd);
+			push(cwdOf(parent));
 			current = parent;
 		}
 		return cwds;
@@ -102,7 +104,6 @@ export function createUsageTracker({ paths, index, locator, clock, log } = {}) {
 		 */
 		queueLedger(rows) {
 			const cutoff = nowMs() - 30 * DAY_MS;
-			const sharedCwds = new Map();
 			// The daemon passes a stream for the daily window and a one-row
 			// array for live exits. Only sweep the old window on refresh.
 			if (!Array.isArray(rows)) {
@@ -110,15 +111,13 @@ export function createUsageTracker({ paths, index, locator, clock, log } = {}) {
 					if (row.endedMs < cutoff) {
 						ledgerRows.delete(id);
 						queue.delete(id);
-					} else if (row.cwd) sharedCwds.set(row.cwd, row.cwd);
+					}
 				}
 			}
 			for (const source of rows ?? []) {
 				if (!isNonEmptyString(source?.sessionId)) continue;
-				const { sessionId, taskId, kind, cwd, endedMs, parentSessionId, rootSessionId } = source;
-				// Many sessions share a workspace; do not retain a decoded copy per row.
-				if (isNonEmptyString(cwd) && !sharedCwds.has(cwd)) sharedCwds.set(cwd, cwd);
-				const row = { sessionId, taskId, kind, cwd: sharedCwds.get(cwd), endedMs, parentSessionId, rootSessionId };
+				const { sessionId, taskId, kind, endedMs, parentSessionId, rootSessionId } = source;
+				const row = { sessionId, taskId, kind, endedMs, parentSessionId, rootSessionId, [ENDED_LOCATION]: source[ENDED_LOCATION] };
 				ledgerRows.set(row.sessionId, row);
 				const entry = index.get(row.sessionId);
 				const checkedAgo = nowMs() - (Number.isFinite(entry?.checkedMs) ? entry.checkedMs : 0) > DAY_MS;

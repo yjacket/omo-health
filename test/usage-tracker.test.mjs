@@ -10,6 +10,7 @@ import { makeWorld, sessionState } from "./helpers/world.mjs";
 import { compactUsage, createUsageIndex, readUsageIndex, USAGE_TICK_BYTES } from "../src/usage-index.mjs";
 import { endedRow } from "../src/ui/model.mjs";
 import { createUsageTracker } from "../src/usage-tracker.mjs";
+import { appendEnded, streamEnded } from "../src/session-ledger.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 
 const T0 = Date.UTC(2026, 8, 28, 12, 0, 0);
@@ -288,6 +289,7 @@ test("a completed backlog file deleted after its read keeps the published total 
 test("a missing child is retried after a day of fake clock on the next queueLedger", () => {
 	const s = setup();
 	const row = { sessionId: "c9", kind: "child", taskId: "st_9", parentSessionId: "p9", cwd: s.cwd, endedMs: T0 };
+	appendEnded(s.paths, row, { nowMs: T0 });
 	s.tracker.queueLedger([row]);
 	s.tracker.tick(emptyWorld(s.clock));
 	assert.equal(s.index.get("c9").state, "missing");
@@ -299,7 +301,7 @@ test("a missing child is retried after a day of fake clock on the next queueLedg
 
 	writeJsonl(childFile(s.cwd, "st_9", "c9"), [E.assistant({ ms: T0, usage: usage(42) })]);
 	s.advance(DAY + 1);
-	s.tracker.queueLedger([row]);
+	s.tracker.queueLedger(streamEnded(s.paths, { withLocation: true }));
 	const tick = s.tracker.tick(emptyWorld(s.clock));
 	assert.ok(tick.bytesRead > 0);
 	assert.equal(compactUsage(s.index.get("c9")).total, 42);
@@ -312,8 +314,9 @@ test("an ended file that grew after a complete read is requeued and its tree tot
 	writeJsonl(parent, [E.assistant({ ms: T0, usage: usage(10) })]);
 	writeJsonl(childFile(s.cwd, "st_c", "c1"), [E.assistant({ ms: T0, usage: usage(5) })]);
 	const parentRow = { sessionId: "p1", kind: "main", cwd: s.cwd, endedMs: T0 + 10 };
-	const rows = [parentRow, { sessionId: "c1", kind: "child", taskId: "st_c", parentSessionId: "p1", cwd: s.cwd, endedMs: T0 + 20 }];
-	s.tracker.queueLedger(rows);
+	const childRow = { sessionId: "c1", kind: "child", taskId: "st_c", parentSessionId: "p1", endedMs: T0 + 20 };
+	for (const row of [parentRow, childRow]) appendEnded(s.paths, row, { nowMs: T0 });
+	s.tracker.queueLedger(streamEnded(s.paths, { withLocation: true }));
 	s.tracker.tick(emptyWorld(s.clock));
 	assert.equal(s.tracker.tokensOf("p1").treeTokens, 15);
 
@@ -540,10 +543,12 @@ test("a child of a child is located through its grandparent's cwd", () => {
 	const s = setup();
 	writeJsonl(childFile(s.cwd, "st_mid", "mid1"), [E.assistant({ ms: T0, usage: usage(3) })]);
 	writeJsonl(childFile(s.cwd, "st_deep", "deep1"), [E.assistant({ ms: T0, usage: usage(4) })]);
-	s.tracker.queueLedger([
-		{ sessionId: "mid1", kind: "child", taskId: "st_mid", parentSessionId: "root1", cwd: s.cwd, endedMs: T0 + 1 },
+	for (const row of [
+		{ sessionId: "root1", kind: "main", cwd: s.cwd, endedMs: T0 },
+		{ sessionId: "mid1", kind: "child", taskId: "st_mid", parentSessionId: "root1", endedMs: T0 + 1 },
 		{ sessionId: "deep1", kind: "child", taskId: "st_deep", parentSessionId: "mid1", cwd: null, endedMs: T0 + 2 },
-	]);
+	]) appendEnded(s.paths, row, { nowMs: T0 });
+	s.tracker.queueLedger(streamEnded(s.paths, { withLocation: true }));
 	s.tracker.tick(emptyWorld(s.clock));
 	assert.equal(compactUsage(s.index.get("deep1")).total, 4);
 	assert.equal(s.tracker.tokensOf("mid1").treeTokens, 7);
@@ -588,10 +593,13 @@ test("tokensOf reports treeTokens only when a descendant pushes the tree above t
 	const s = setup();
 	writeLines(mainFile(s.paths, "p2"), [JSON.stringify(E.assistant({ ms: T0, usage: usage(10) }))]);
 	writeJsonl(childFile(s.cwd, "st_x", "c2"), [E.assistant({ ms: T0, usage: usage(6) })]);
-	s.tracker.queueLedger([
+	for (const row of [
 		{ sessionId: "p2", kind: "main", cwd: s.cwd, endedMs: T0 + 1 },
 		{ sessionId: "c2", kind: "child", taskId: "st_x", parentSessionId: "p2", cwd: s.cwd, endedMs: T0 + 2 },
-	]);
+	]) {
+		appendEnded(s.paths, row, { nowMs: T0 });
+		s.tracker.queueLedger([row]);
+	}
 	s.tracker.tick(emptyWorld(s.clock));
 	assert.deepEqual(s.tracker.tokensOf("p2"), { tokens: compactUsage(s.index.get("p2")), treeTokens: 16 });
 	assert.deepEqual(s.tracker.tokensOf("c2"), { tokens: compactUsage(s.index.get("c2")), treeTokens: null });
