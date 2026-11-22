@@ -32,6 +32,7 @@ export function sessionRecordPage(record, name, offset) {
 	const pages = Object.fromEntries(SESSION_LISTS.map((key) => [key, sessionRecordPage(record, key, 0)]));
 	return {
 		found, id, session: session ? sessionFields : session, tokens, coverage,
+		...(record.truncated?.unattributedHealth ? { truncated: { unattributedHealth: record.truncated.unattributedHealth } } : {}),
 		children: pages.children.items,
 		health: { counts: health?.counts, findings: pages.findings.items, actions: pages.actions.items, investigations: pages.investigations.items, messages: pages.messages.items },
 		counts: Object.fromEntries(SESSION_LISTS.map((key) => [key, pages[key].total])),

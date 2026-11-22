@@ -7,8 +7,11 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
+import { prepareAudit } from "../src/audit-prepare-worker.mjs";
 import { DEFAULT_CONFIG } from "../src/config.mjs";
-import { AUDIT_LIST_CAPS, auditBundle } from "../src/judge/audit.mjs";
+import { appendDecision } from "../src/decisions.mjs";
+import { createInvestigations } from "../src/investigations.mjs";
+import { AUDIT_LIST_CAPS, auditBundle, resolveAuditModel } from "../src/judge/audit.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 import { appendEnded } from "../src/session-ledger.mjs";
 import { buildSessionRecord, loadSessionRecord, scanOmoHealthMessages } from "../src/session-record.mjs";
@@ -143,6 +146,78 @@ let messageSeq = 0;
 const ohealth = (ms, text) => ({ type: "custom_message", customType: "omo-health", id: `oh-${++messageSeq}`, timestamp: iso(ms), content: text, details: { kind: "self-notice" } });
 const mainRow = (extra = {}) => ({ sessionId: "s-main", kind: "main", parentSessionId: null, taskId: null, title: "main", cwd: "C:/work/a", terminal: { kind: "wt" }, omoVersion: "0.8.0", startedMs: T0, endedMs: T0 + 2 * HOUR, childCount: 2, ...extra });
 const childRow = (sessionId, taskId, parentSessionId, extra = {}) => ({ sessionId, kind: "child", parentSessionId, taskId, title: sessionId, cwd: "C:/work/a", terminal: null, omoVersion: null, startedMs: T0 + 10 * MIN, endedMs: T0 + 70 * MIN, ...extra });
+
+function sharedHealthFixture(t) {
+	const { root, paths } = setup();
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const now = T0 + 27 * HOUR;
+	const models = ["openai/gpt-5-5", "google/gemini-3-pro"];
+	const rows = [...models, "xai/grok-5"].map((model, i) => {
+		const startedMs = T0 + (i === 1 ? 24 * HOUR : 0);
+		const sessionId = i < 2 ? "review.1" : "review.unique";
+		const row = mainRow({ sessionId, cwd: path.join(root, `project-${i}`), startedMs, endedMs: startedMs + HOUR });
+		assert.ok(appendEnded(paths, row, { nowMs: now }));
+		mainSessionFile(paths, sessionId, [{ type: "session", id: sessionId, cwd: row.cwd }, ohealth(startedMs + MIN, `notice ${i}`)], row.cwd);
+		const fp = `finding${i}`;
+		const subject = { sessionId };
+		const ts = iso(startedMs + MIN);
+		const finding = { fp, detector: "D1", kind: "stalled", severity: "warn", ts, subject };
+		appendDecision(paths, { ...finding, event: "opened" });
+		// Exercise a record that only joins through the investigation/lifecycle fingerprint.
+		appendDecision(paths, { fp, ts, detector: "D1", action: { kind: "notice" }, result: "execute", outcome: { delivered: true } });
+		appendDecision(paths, { fp, ts, event: "investigation", analyst: { verdict: "act" }, usedModels: [model] });
+		createInvestigations({ paths, clock: { now: () => startedMs + MIN } }).open({ id: fp, subject, detector: "D1", model });
+		return row;
+	});
+	appendDecision(paths, { event: "opened", fp: "machine", detector: "D3", kind: "memory", severity: "warn", ts: iso(T0), subject: {} });
+	return { paths, now, rows, models };
+}
+
+test("IS-1/7/8 shared session IDs withhold health rows in detail and mark audit lists incomplete", (t) => {
+	const { paths, now, rows } = sharedHealthFixture(t);
+	const detail = createDetailOperations({ paths, auditDetail: () => null });
+	assert.equal(loadSessionRecord({ paths, id: "review.1", now }).error, "ambiguous-session");
+	for (const [i, row] of rows.entries()) {
+		const subject = subjectOf(row);
+		const view = buildSessionView(detail({ kind: "detail", id: row.sessionId, row: expectedSelector(row), now, pagination: { list: null, offset: 0 } }).record);
+		const retained = loadSessionRecord({ paths, subject, now, auditRetention: true });
+		const bundle = auditBundle(retained, null, { config: DEFAULT_CONFIG, now });
+		const shared = i < 2;
+		assert.deepEqual(view.health.findings.map(({ fp }) => fp).sort(), shared ? ["machine"] : ["finding2", "machine"], `detail project ${i}`);
+		assert.equal(view.health.actions.length, shared ? 0 : 1);
+		assert.equal(view.health.investigations.length, shared ? 0 : 1);
+		assert.deepEqual(view.health.messages.map(({ text }) => text), [`notice ${i}`]);
+		assert.equal(bundle.omo_health_record.findings.length, shared ? 1 : 2);
+		assert.equal(bundle.omo_health_record.actions.length, shared ? 0 : 1);
+		assert.equal(bundle.omo_health_record.investigations.length, shared ? 0 : 1);
+		assert.equal(bundle.omo_health_record.messages.length, 1);
+		const withheld = shared ? { findings: 2, actions: 2, verdicts: 2, investigations: 2 } : undefined;
+		assert.deepEqual(view.truncated?.unattributedHealth, withheld);
+		assert.deepEqual(retained.truncated.unattributedHealth, withheld);
+		assert.deepEqual(bundle.truncated.unattributedHealth, withheld);
+		assert.deepEqual([bundle.truncated.findings, bundle.truncated.actions, bundle.truncated.investigations, bundle.truncated.messages], [shared, shared, shared, false]);
+		if (!shared) assert.equal(view.health.investigations[0].verdictHistory.length, 1);
+	}
+});
+
+test("IS-8 audit worker still excludes both projects' analysts for either shared session", (t) => {
+	const { paths, now, rows, models } = sharedHealthFixture(t);
+	fs.mkdirSync(path.dirname(paths.authFile), { recursive: true });
+	fs.writeFileSync(paths.authFile, JSON.stringify({ openai: {}, google: {}, xai: {} }));
+	fs.writeFileSync(paths.omoJsonc, JSON.stringify({ "[native]": { categories: { ultrabrain: { models: [...models, "xai/grok-5"] } } } }));
+	const config = { audit: { lanes: ["ultrabrain"] }, analyst: { lane: "architect" } };
+	for (const row of rows.slice(0, 2)) {
+		const { loaded, selectedFps, auditSubjectIds } = prepareAudit({
+			subject: subjectOf(row), now, indexEntries: [], bounds: {
+				messageScanMaxBytes: 4096, messageScanTotalBytes: 4096, preparationMaxBytes: 65536,
+			},
+		}, { paths });
+		assert.deepEqual(loaded.analystModels.sort(), [...models].sort());
+		assert.deepEqual(selectedFps.sort(), ["finding0", "finding1"]);
+		assert.ok(auditSubjectIds.sessionIds.has(row.sessionId));
+		assert.equal(resolveAuditModel(paths, config, { sessionModelsKnown: true, analystModels: loaded.analystModels }).model, "xai/grok-5");
+	}
+});
 
 test("cwd-less detail keeps the ledger subject and joins only unique index entries and transcripts", (t) => {
 	const { root, paths } = setup();

@@ -559,15 +559,18 @@ export function auditBundle(record, timeline, { config, now, configDecisions = [
 	const children = Array.isArray(record?.children) ? record.children : [];
 	const messagesSkipped = Array.isArray(record?.truncated?.messagesSkipped) ? record.truncated.messagesSkipped.length : 0;
 	const descendantsSkipped = numOf(record?.truncated?.descendantsSkipped) ?? 0;
+	const unattributedHealth = Object.fromEntries(["findings", "actions", "verdicts", "investigations"].map((key) =>
+		[key, numOf(record?.truncated?.unattributedHealth?.[key]) ?? 0]));
 	const truncated = {
 		messagesSkipped,
 		...(descendantsSkipped > 0 ? { descendantsSkipped } : {}),
+		...(Object.values(unattributedHealth).some((count) => count > 0) ? { unattributedHealth } : {}),
 		hours: false,
 		topTurns: false,
-		findings: false,
-		actions: false,
+		findings: unattributedHealth.findings > 0,
+		actions: unattributedHealth.actions > 0,
 		messages: messagesSkipped > 0 || descendantsSkipped > 0,
-		investigations: false,
+		investigations: unattributedHealth.investigations > 0 || unattributedHealth.verdicts > 0,
 	};
 	const decisions = [...(record?.configDecisions ?? []), ...configDecisions];
 	const continuousSinceMs = thresholdsContinuousSince(
@@ -590,7 +593,7 @@ export function auditBundle(record, timeline, { config, now, configDecisions = [
 	// required to cover more detectors than it has checks.
 	const fired = health.firedDetectors ?? firedDetectorIds(allFindings);
 	const findings = selectFindings(allFindings, fired);
-	truncated.findings = findings.length < Math.max(health.counts?.findings ?? 0, allFindings.length);
+	truncated.findings ||= findings.length < Math.max(health.counts?.findings ?? 0, allFindings.length);
 	// The record supplies newest-first lists and (when retained) their original counts.
 	const capped = (key) => {
 		const list = Array.isArray(health[key]) ? health[key] : [];
