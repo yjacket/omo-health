@@ -582,7 +582,7 @@ it("(IS-3) deleted task-only usage keeps its history label but blocks audit like
 	const world = makeWorld({ now: NOW, sessions: [] });
 	const subjects = [["st_deleted", "st_deleted"], ["st_exact", "child-exact"]].map(([taskId, sessionId]) => {
 		const row = { sessionId, taskId, kind: "child", cwd, startedMs: NOW - HOUR, endedMs: NOW, outcome: "completed" };
-		const file = path.join(cwd, ".omo", "senpi-task", "children", taskId, "sessions", taskId, `first_${sessionId}.jsonl`);
+		const file = path.join(cwd, ".omo", "senpi-task", "children", taskId, "sessions", taskId, `2026-09-28T12-00-00-000Z_${sessionId}.jsonl`);
 		write(file, '{"type":"usage","provider":"p","model":"m","usage":{"input":42}}\n');
 		appendEnded(paths, row, { nowMs: NOW });
 		return { row, file };

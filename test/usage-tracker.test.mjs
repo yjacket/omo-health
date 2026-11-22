@@ -11,7 +11,8 @@ import { E, iso, tmpDir, writeJsonl } from "./helpers/fixtures.mjs";
 import { makeWorld, sessionState, taskRecord } from "./helpers/world.mjs";
 import { compactUsage, createUsageIndex, readUsageIndex, USAGE_TICK_BYTES } from "../src/usage-index.mjs";
 import * as usageIndex from "../src/usage-index.mjs";
-import { endedRow } from "../src/ui/model.mjs";
+import { buildEnded, endedRow, loadUiInputs } from "../src/ui/model.mjs";
+import { loadSessionRecord } from "../src/session-record.mjs";
 import { createUsageTracker } from "../src/usage-tracker.mjs";
 import { backfillOnce } from "../src/session-backfill.mjs";
 import { appendEnded, appendEndedLocated, ENDED_LOCATION, streamEnded } from "../src/session-ledger.mjs";
@@ -72,6 +73,21 @@ function writeLines(file, lines) {
 }
 
 const emptyWorld = (clock) => makeWorld({ now: clock.now(), sessions: [] });
+
+test("(IS-1, IS-4, IS-7) a cold usage index counts only the exact transcript filename ID", (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const rows = [["review.1", 7], ["run_review.1", 53], ["a_b", 11]];
+	for (const [id, tokens] of rows) {
+		// Without header IDs, filename ownership alone determines what gets counted.
+		writeLines(mainFile(s.paths, id), ['{"type":"session"}', bigRecord(0, usage(tokens))]);
+	}
+
+	s.tracker.queueLedger(rows.map(([sessionId]) => ({ sessionId, kind: "main", endedMs: T0 })));
+	s.tracker.tick(emptyWorld(s.clock));
+	assert.deepEqual(rows.map(([id]) => [s.index.get(id)?.file, s.tracker.tokensOf(id)?.tokens?.total]),
+		rows.map(([id, tokens]) => [mainFile(s.paths, id), tokens]));
+});
 
 function singleRecordModelOracle(file) {
 	const { message } = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -712,8 +728,9 @@ test("(IS-4, IS-12) live header probes share the tick budget and deferred sessio
 	assert.deepEqual(totals(), expected);
 });
 
-test("a tick never reads more than the byte budget: a 40 MiB live record waits while a backlog waits", () => {
+test("a tick never reads more than the byte budget: a 40 MiB live record waits while a backlog waits", (t) => {
 	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
 	const live = mainFile(s.paths, "m1");
 	writeJsonl(live, [E.assistant({ ms: T0, usage: usage(10) })]);
 	const backlog = mainFile(s.paths, "b1");
@@ -812,8 +829,9 @@ test("a verified live session waiting for its first read is pending on the board
 	assert.deepEqual([boardRow().tokensPending, boardRow().tokens.total], [false, 42]);
 });
 
-test("a 32 MiB budget drains three 20 MiB files in two ticks and logs usage_backlog once after saving", () => {
+test("a 32 MiB budget drains three 20 MiB files in two ticks and logs usage_backlog once after saving", (t) => {
 	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
 	const rows = [];
 	for (let i = 1; i <= 3; i += 1) {
 		writeLines(mainFile(s.paths, `f${i}`), [bigRecord(20 * 1024 * 1024, usage(100 * i))]);
@@ -835,8 +853,9 @@ test("a 32 MiB budget drains three 20 MiB files in two ticks and logs usage_back
 	assert.equal(saved.get("f3").complete, true, "the log came after the save");
 });
 
-test("a 96 MiB file shows pending for three ticks, then its full total", () => {
+test("a 96 MiB file shows pending for three ticks, then its full total", (t) => {
 	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
 	const lines = [];
 	for (let i = 0; i < 96; i += 1) lines.push(bigRecord(1024 * 1024, usage(10)));
 	writeLines(mainFile(s.paths, "big"), lines);
@@ -1263,6 +1282,56 @@ test("tokensOf reports a raised tree total for a parent and no tree total for a 
 	s.tracker.tick(emptyWorld(s.clock));
 	assert.deepEqual(s.tracker.tokensOf("p2"), { tokens: compactUsage(s.index.get("p2")), treeTokens: 16, treeTokensComplete: true });
 	assert.deepEqual(s.tracker.tokensOf("c2"), { tokens: compactUsage(s.index.get("c2")), treeTokens: null, treeTokensComplete: true });
+});
+
+test("(IS-3, IS-7) history includes a retained older child in its parent's detail and token tree, not as a list row", (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const parentEnd = T0 - 29 * DAY;
+	const childEnd = T0 - 31 * DAY;
+	const message = "notice delivered to the retained child";
+	writeJsonl(mainFile(s.paths, "p-old"), [E.assistant({ ms: parentEnd - 1, usage: usage(10) })]);
+	// Child lookup must use the retained parent link and the parent's cwd.
+	writeJsonl(childFile(s.cwd, "st_old", "c-old"), [
+		{ type: "session", id: "c-old" },
+		{ type: "custom_message", customType: "omo-health", id: "oh-old", timestamp: iso(childEnd - 2), content: message, details: { kind: "self-notice" } },
+		E.assistant({ ms: childEnd - 1, usage: usage(6) }),
+	]);
+	for (const row of [
+		{ sessionId: "p-old", kind: "main", cwd: s.cwd, startedMs: T0 - 32 * DAY, endedMs: parentEnd },
+		{ sessionId: "c-old", kind: "child", taskId: "st_old", parentSessionId: "p-old", startedMs: childEnd - 1000, endedMs: childEnd },
+		{ sessionId: "unrelated-old", kind: "main", cwd: s.cwd, startedMs: childEnd - 1000, endedMs: childEnd },
+	]) appendEnded(s.paths, row, { nowMs: T0 });
+	const load = () => loadSessionRecord({ paths: s.paths, id: "p-old", now: T0, locator: s.locator });
+	const cold = load();
+	// Match the daemon's startup and daily history refresh, including the 30-day input stream.
+	const queued = s.tracker.queueLedger(streamEnded(s.paths, { sinceMs: T0 - 30 * DAY, withLocation: true }));
+	s.tracker.tick(emptyWorld(s.clock));
+	const published = load();
+	const inputs = loadUiInputs({ paths: s.paths, env: {}, now: T0 });
+	const history = buildEnded(inputs);
+	const parentOnly = buildEnded({ ...inputs, usage: new Map([["p-old", inputs.usage.get("p-old")]]) });
+	assert.deepEqual({
+		coldChildren: cold.children.map((c) => c.sessionId),
+		coldMessages: cold.health.messages.map((m) => [m.recipient, m.text]),
+		queued,
+		publishedChildTokens: published.children[0]?.tokens?.total,
+		detailTree: [published.tokens?.treeTotal, published.tokens?.treeTokensComplete],
+		trackerTree: [s.tracker.tokensOf("p-old")?.treeTokens, s.tracker.tokensOf("p-old")?.treeTokensComplete],
+		historyBeforeChildPublished: [parentOnly.rows[0].treeTokens, parentOnly.rows[0].treeTokensComplete],
+		historyTotal: history.total,
+		historyRows: history.rows.map((r) => [r.sessionId, r.treeTokens, r.treeTokensComplete]),
+	}, {
+		coldChildren: ["c-old"],
+		coldMessages: [["c-old", message]],
+		queued: 2,
+		publishedChildTokens: 6,
+		detailTree: [16, true],
+		trackerTree: [16, true],
+		historyBeforeChildPublished: [null, false],
+		historyTotal: 1,
+		historyRows: [["p-old", 16, true]],
+	});
 });
 
 test("(plan 51) board marks a pending parent tree partial until its read finishes", () => {

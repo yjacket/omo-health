@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { createSessionFileLocator } from "../src/collect/session-files.mjs";
+import { idFromFileName } from "../src/collect/sessions.mjs";
 import { projectStoreName, senpiTaskStoreDir } from "../src/collect/tasks.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 import { createUsageIndex } from "../src/usage-index.mjs";
@@ -45,6 +46,14 @@ test("mainFile finds a main session file by the id in its file name", (t) => {
 	const file = writeMain(paths, "sess-main");
 	assert.equal(locator.mainFile("sess-main"), file);
 	assert.equal(locator.mainFile("sess-unknown"), undefined);
+});
+
+test("(IS-1, IS-4, IS-7) filename IDs strip only the senpi timestamp", () => {
+	assert.deepEqual(["review.1", "run_review.1", "a_b"].map((id) => idFromFileName(`${STAMP}_${id}.jsonl`)),
+		["review.1", "run_review.1", "a_b"]);
+	for (const name of ["review.1.jsonl", "prefix_review.1.jsonl", `${STAMP}_a?.jsonl`, `${STAMP}_a_.jsonl`, `${STAMP}_a_b.txt`]) {
+		assert.equal(idFromFileName(name), undefined, name);
+	}
 });
 
 test("(IS-3) mainFile maps cold files by their headers, not a conflicting name", (t) => {
@@ -115,6 +124,15 @@ test("childFile finds a child by its exact session id", (t) => {
 	const { paths, locator, proj } = setup(t);
 	const file = writeChild(paths, proj, "t-exact", `${STAMP}_child-exact.jsonl`);
 	assert.equal(locator.childFile({ taskId: "t-exact", sessionId: "child-exact", cwds: [proj] }), file);
+});
+
+test("(IS-1, IS-4, IS-7) childFile skips a suffix collision that sorts first", (t) => {
+	const { paths, locator, proj } = setup(t);
+	const taskId = "t-review";
+	const other = writeChild(paths, proj, taskId, `${STAMP}_run_review.1.jsonl`);
+	const own = writeChild(paths, proj, taskId, "2026-11-21T09-01-00-000Z_review.1.jsonl");
+	assert.equal(locator.childFile({ taskId, sessionId: "review.1", cwds: [proj] }), own);
+	assert.equal(locator.childFile({ taskId, sessionId: "run_review.1", cwds: [proj] }), other);
 });
 
 test("childFile with no id returns the only file, and treats the task id as no id", (t) => {

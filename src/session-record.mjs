@@ -5,7 +5,7 @@ import { senpiTaskStoreDir } from "./collect/tasks.mjs";
 import { DEFAULT_CONFIG } from "./config.mjs";
 import { streamDecisions } from "./decisions.mjs";
 import { streamInvestigations } from "./investigations.mjs";
-import { endedKey, endedSelector, streamEnded } from "./session-ledger.mjs";
+import { ENDED_LOCATION, endedKey, endedSelector, streamEnded } from "./session-ledger.mjs";
 import { compactUsage, fresh, readUsageIndex, usageEntryFor } from "./usage-index.mjs";
 import { reasonCode } from "./audit-codes.mjs";
 import { AUDIT_CHECK_MAX, AUDIT_DETECTOR_ID, AUDIT_LIST_CAPS, BUNDLE_MAX_CHARS, auditEvidence, auditHistoryRow, auditMessageKind } from "./judge/audit.mjs";
@@ -556,6 +556,30 @@ export function usageTreeLink(usage, row, ambiguous) {
 	return id ? { id, parentSessionId } : { id: row.taskId, parentSessionId, unresolved: true };
 }
 
+/** Add older ledger links only below a supplied row, not as new history roots. */
+export function* retainedTreeRows(paths, rows, { beforeMs, withLocation } = {}) {
+	const parents = new Set();
+	for (const row of rows ?? []) {
+		if (nonEmpty(row?.sessionId)) parents.add(row.sessionId);
+		yield row;
+	}
+	if (!parents.size) return;
+	const children = new Map();
+	for (const row of streamEnded(paths, { beforeMs, withLocation })) {
+		const { sessionId, taskId, kind, endedMs, parentSessionId, rootSessionId } = row;
+		if (!nonEmpty(parentSessionId)) continue;
+		if (!children.has(parentSessionId)) children.set(parentSessionId, []);
+		children.get(parentSessionId).push({ sessionId, taskId, kind, endedMs, parentSessionId, rootSessionId, [ENDED_LOCATION]: row[ENDED_LOCATION] });
+	}
+	// Set iteration visits ids added below, once each even for cyclic links.
+	for (const parentId of parents) {
+		for (const child of children.get(parentId) ?? []) {
+			yield child;
+			parents.add(child.sessionId);
+		}
+	}
+}
+
 const FULL_USAGE = Object.freeze({ state: "full" });
 
 function joinSessionDecisions(row, descendants, investigations, decisions, bounded, jobsDir) {
@@ -1067,8 +1091,8 @@ function recordDescendants(subject, rows, usage) {
 	return [...nodes.values()];
 }
 
-function recordLedger(rows, id, selector, usage, descendantScanMax) {
-	const subject = ledgerLookup(rows, new Set([id]), selector).get(id);
+function recordLedger(visibleRows, rows, id, selector, usage, descendantScanMax) {
+	const subject = ledgerLookup(visibleRows, new Set([id]), selector).get(id);
 	if (!subject) return null;
 	const descendants = recordDescendants(subject, rows, usage);
 	const newest = [...descendants].sort((a, b) => (b.endedMs ?? 0) - (a.endedMs ?? 0));
@@ -1106,7 +1130,10 @@ function recordLedger(rows, id, selector, usage, descendantScanMax) {
 export function loadSessionRecord({ paths, id, row: selector, now = Date.now(), messageScanMaxBytes = Infinity, messageScanTotalBytes = Infinity, descendantScanMax = Infinity, scanMessages, auditRetention = false, locator, index } = {}) {
 	if (!nonEmpty(id)) return { found: false, id };
 	const usage = index ?? readUsageIndex(paths.health.usageIndexFile);
-	const joined = recordLedger(() => streamEnded(paths, { sinceMs: now - 30 * DAY_MS }), id, selector, usage, descendantScanMax);
+	const joined = recordLedger(
+		() => streamEnded(paths, { sinceMs: now - 30 * DAY_MS }),
+		() => streamEnded(paths), id, selector, usage, descendantScanMax,
+	);
 	if (!joined) return { found: false, id };
 	const { row, descendants, ancestors, scanned, descendantsSkipped, ambiguous } = joined;
 	const startedMs = msOf(row.startedMs);

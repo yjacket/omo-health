@@ -4,7 +4,7 @@ import { getPath, pauseState, SWITCHES } from "../control.mjs";
 import { readDecisions } from "../decisions.mjs";
 import { createInvestigations, RESOLVED } from "../investigations.mjs";
 import { endedSelector, readEnded } from "../session-ledger.mjs";
-import { ambiguousLedgerTaskIds, usageEntryOf, usageTreeLink } from "../session-record.mjs";
+import { ambiguousLedgerTaskIds, retainedTreeRows, usageEntryOf, usageTreeLink } from "../session-record.mjs";
 import { compactUsage, publishedUsageView, readUsageIndex, treeTotals } from "../usage-index.mjs";
 import { listDirSafe, readJsonSafe, statSafe } from "../util/fsx.mjs";
 import { redact, truncate } from "../util/text.mjs";
@@ -95,8 +95,11 @@ export function loadUiInputs({ paths, env, now = Date.now() }) {
 		decisions = { error: error.message };
 	}
 	let ended;
+	let treeRows;
 	try {
-		ended = readEnded(paths, { sinceMs: now - ENDED_WINDOW_MS });
+		const sinceMs = now - ENDED_WINDOW_MS;
+		ended = readEnded(paths, { sinceMs });
+		treeRows = [...retainedTreeRows(paths, ended, { beforeMs: sinceMs })];
 	} catch (error) {
 		ended = { error: error.message };
 	}
@@ -115,6 +118,7 @@ export function loadUiInputs({ paths, env, now = Date.now() }) {
 		// Read-only: the daemon writes the board snapshot each tick and the ledger when a session ends.
 		sessionsSnapshot: readJsonSafe(paths.health.sessionsSnapshotFile) ?? null,
 		ended,
+		treeRows,
 		usage,
 		prefs: readUiPrefs(paths),
 		stopped,
@@ -333,9 +337,10 @@ export function buildEnded(inputs) {
 	const shownChildren = children.slice(0, ENDED_LIMIT);
 	const selected = new Set([...shownMains, ...shownChildren]);
 	const usage = inputs.usage instanceof Map ? inputs.usage : new Map();
-	const ambiguous = ambiguousLedgerTaskIds(all);
+	const treeRows = inputs.treeRows ?? all;
+	const ambiguous = ambiguousLedgerTaskIds(treeRows);
 	const published = publishedUsageView(usage);
-	const trees = treeTotals(usage, all.map((row) => usageTreeLink(published, row, ambiguous)));
+	const trees = treeTotals(usage, treeRows.map((row) => usageTreeLink(published, row, ambiguous)));
 	return {
 		sinceMs: inputs.now - ENDED_WINDOW_MS,
 		limit: ENDED_LIMIT,

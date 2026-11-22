@@ -1133,7 +1133,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 				const usage = (input) => ({ type: "message", message: { role: "assistant", provider: "anthropic", model: "claude-used", usage: { input }, stopReason: "stop" } });
 				const dir = path.dirname(sessionFile);
 				const childFile = path.join(dir, "custom-child.jsonl");
-				const unindexedFile = path.join(dir, `2026-11-22_${unindexed}.jsonl`);
+				const unindexedFile = path.join(dir, `2026-11-22T08-06-20-378Z_${unindexed}.jsonl`);
 				appendJsonl(sessionFile, [message("selected message"), usage(42)]);
 				writeJsonl(childFile, [{ type: "session", id: child }, message("child message"), usage(7)]);
 				writeJsonl(unindexedFile, [{ type: "session", id: unindexed }, message("filename message")]);

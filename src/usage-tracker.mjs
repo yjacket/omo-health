@@ -3,7 +3,7 @@ import { idFromFileName } from "./collect/sessions.mjs";
 import { pathKey } from "./paths.mjs";
 import { boardTaskLinks } from "./session-board.mjs";
 import { ENDED_LOCATION, endedKey, locateEndedRows, readEndedCwd } from "./session-ledger.mjs";
-import { ambiguousLedgerTaskIds, ledgerUsageSessionId, usageTreeLink } from "./session-record.mjs";
+import { ambiguousLedgerTaskIds, ledgerUsageSessionId, retainedTreeRows, usageTreeLink } from "./session-record.mjs";
 import { USAGE_TICK_BYTES, compactUsage, fresh as isFresh, isTaskOnlyEntry, treeTotals } from "./usage-index.mjs";
 import { statSafe } from "./util/fsx.mjs";
 
@@ -155,8 +155,8 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			searched = new WeakSet();
 			trees = undefined;
 			const cutoff = nowMs() - 30 * DAY_MS;
-			// The daemon passes a stream for the daily window and an array
-			// for live exits. Only sweep the old window on refresh.
+			// Refresh from the daemon's window stream plus its retained descendants.
+			// Live exits arrive as arrays; don't rescan the ledger for each exit.
 			if (!Array.isArray(rows)) {
 				for (const [key, row] of fallbackRows) if (row.endedMs < cutoff) fallbackRows.delete(key);
 				for (const [id, row] of ledgerRows) {
@@ -166,6 +166,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 						taskOnlyChecks.delete(id);
 					}
 				}
+				rows = retainedTreeRows(paths, rows, { beforeMs: cutoff, withLocation: true });
 			}
 			for (const source of rows ?? []) {
 				if (!isNonEmptyString(source?.sessionId)) continue;

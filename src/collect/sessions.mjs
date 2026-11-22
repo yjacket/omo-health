@@ -3,6 +3,7 @@ import path from "node:path";
 import { promotedTodo } from "../align/steps.mjs";
 import { redirectTargets } from "../detect/classify.mjs";
 import { refreshFailureOf } from "../detect/provider.mjs";
+import { safeSubjectId } from "../session-id.mjs";
 import { listDirSafe, statSafe } from "../util/fsx.mjs";
 import { JsonlTail } from "../util/tail.mjs";
 import { redact, sha1, truncate } from "../util/text.mjs";
@@ -478,10 +479,11 @@ export function entryMs(entry) {
 	return toMs(entry?.timestamp) ?? (Number.isFinite(entry?.message?.timestamp) ? entry.message.timestamp : undefined);
 }
 
+// Senpi replaces ":" and "." in the ISO timestamp with "-" before appending the ID.
+const SESSION_FILE_NAME = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_(.+)\.jsonl$/;
+
 export function idFromFileName(file) {
-	const base = path.basename(file, ".jsonl");
-	const index = base.lastIndexOf("_");
-	return index >= 0 ? base.slice(index + 1) : base;
+	return safeSubjectId(SESSION_FILE_NAME.exec(path.basename(file))?.[1]) ?? undefined;
 }
 
 /**

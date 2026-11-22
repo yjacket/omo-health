@@ -13,10 +13,10 @@ function dayOf(ms) {
 	return new Date(ms).toISOString().slice(0, 10);
 }
 
-function ledgerFiles(paths, sinceDay) {
+function ledgerFiles(paths, sinceDay, beforeDay) {
 	return listDirSafe(paths.health.sessionsDir)
 		.map((name) => ({ name, m: FILE_RE.exec(name) }))
-		.filter((f) => f.m && (!sinceDay || f.m[1] >= sinceDay))
+		.filter((f) => f.m && (!sinceDay || f.m[1] >= sinceDay) && (!beforeDay || f.m[1] <= beforeDay))
 		.sort((a, b) => (a.m[1] < b.m[1] ? 1 : -1))
 		.map((f) => path.join(paths.health.sessionsDir, f.name));
 }
@@ -66,19 +66,21 @@ function parseRow(line) {
 	}
 }
 
-function* streamFile(file, sinceMs, withLocation, fsImpl = fs) {
+function* streamFile(file, sinceMs, withLocation, fsImpl = fs, beforeMs) {
 	for (const { line, offset } of ledgerLines(file, fsImpl)) {
 		const row = parseRow(line);
-		if (!row || (Number.isFinite(sinceMs) && !(Number(row.endedMs) >= sinceMs))) continue;
+		if (!row || (Number.isFinite(sinceMs) && !(Number(row.endedMs) >= sinceMs))
+			|| (Number.isFinite(beforeMs) && !(Number(row.endedMs) < beforeMs))) continue;
 		if (withLocation) row[ENDED_LOCATION] = { file, offset, length: line.length };
 		yield row;
 	}
 }
 
-/** Ended records in file/line order; callers needing newest-first order sort their selections. */
-export function* streamEnded(paths, { sinceMs, withLocation = false, fs: fsImpl = fs } = {}) {
+/** Ended records in file/line order, with optional inclusive lower and exclusive upper bounds. */
+export function* streamEnded(paths, { sinceMs, beforeMs, withLocation = false, fs: fsImpl = fs } = {}) {
 	const sinceDay = Number.isFinite(sinceMs) ? dayOf(sinceMs) : "";
-	for (const file of ledgerFiles(paths, sinceDay)) yield* streamFile(file, sinceMs, withLocation, fsImpl);
+	const beforeDay = Number.isFinite(beforeMs) ? dayOf(beforeMs) : "";
+	for (const file of ledgerFiles(paths, sinceDay, beforeDay)) yield* streamFile(file, sinceMs, withLocation, fsImpl, beforeMs);
 }
 
 /**

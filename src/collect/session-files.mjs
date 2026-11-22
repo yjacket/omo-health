@@ -167,7 +167,7 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 				const sole = soleChildSessionFile(dir);
 				if (sole !== undefined) return sole;
 			} else {
-				const exact = listDirSafe(dir).find((name) => name.endsWith(`_${wantId}.jsonl`));
+				const exact = listDirSafe(dir).find((name) => idFromFileName(name) === wantId);
 				if (exact) return path.join(dir, exact);
 			}
 		}
