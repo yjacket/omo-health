@@ -289,6 +289,28 @@ test("maxConcurrent queues the rest; a finished job frees the slot for the next"
 	assert.equal(t.runner.starts[1].jobId, second.jobId);
 });
 
+for (const code of [0, 1]) test(`IS-9 provenance: analyst records fallback models on exit ${code}`, () => {
+	const t = sandbox();
+	writeLane(t.paths, { models: ["p/a"], providers: ["p"] });
+	const { spawnImpl } = createRecordingSpawn();
+	const runner = createRunner({ paths: t.paths, clock: t.clock, spawnImpl, identify: () => null });
+	t.analyst = createAnalyst({ ...t, runner, env: {} });
+	const job = ask(t, finding());
+	const dir = runner.jobDir(job.jobId);
+	fs.writeFileSync(path.join(dir, "err.log"), [
+		"Model fallback: p/a -> p/b (transient)",
+		"Model fallback: p/b -> p/c:high (rate limit)",
+		"Model fallback: p/c:high -> p/b (transient)",
+		"Model fallback: p/b -> not a model",
+		"",
+	].join("\r\n"));
+	fs.writeFileSync(path.join(dir, "out.txt"), JSON.stringify(answer()));
+	fs.writeFileSync(path.join(dir, "exit.json"), JSON.stringify({ code }));
+	const verdict = poll(t, job);
+	assert.equal(Boolean(verdict.failed), code !== 0);
+	assert.deepEqual(verdict.usedModels, ["p/a", "p/b", "p/c:high"]);
+});
+
 test("failed argv lookups for an unverified analyst free its slot at the deadline", () => {
 	const t = sandbox({ maxConcurrent: 1, perFinding: 5, perHour: 5 });
 	const { spawnImpl, calls } = createRecordingSpawn();

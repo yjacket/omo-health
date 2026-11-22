@@ -967,6 +967,45 @@ describe("ui server", { timeout: 20_000 }, () => {
 				}
 			});
 
+			for (const source of ["recorded", "retained", "missing", "no-job-id"]) it(`IS-9 provenance: preview and POST check ${source} analyst evidence`, async () => {
+				const fallback = "openai/alpha-review";
+				const next = "openai/beta-review";
+				const requested = "openai/other-analyst";
+				const world = makeWorld({ lanes: { ultrabrain: [fallback], architect: [next] } });
+				try {
+					const jobId = "analyst-fallback";
+					const ts = new Date(world.nowMs - 120_000).toISOString();
+					const fp = "fallback-fp";
+					const rows = [
+						{ ts, fp, jobId, event: "investigation", status: "analyzing", subject: { sessionId: AUDIT_ID }, model: requested },
+						{ ts, fp, event: "investigation", status: "failed", analyst: { verdict: "escalate" },
+							...(source === "no-job-id" ? {} : { jobId }),
+							...(source === "recorded" ? { usedModels: [requested, fallback] } : {}) },
+					];
+					fs.mkdirSync(world.paths.health.decisionsDir, { recursive: true });
+					fs.writeFileSync(path.join(world.paths.health.decisionsDir, "2026-11-22.jsonl"), rows.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+					if (source === "retained") {
+						const dir = path.join(world.paths.health.jobsDir, jobId);
+						fs.mkdirSync(dir, { recursive: true });
+						fs.writeFileSync(path.join(dir, "err.log"), `Model fallback: ${requested} -> ${fallback} (transient)\n`);
+					}
+					const unknown = source === "missing" || source === "no-job-id";
+					for (const pass of ["initial", "cached"]) {
+						const { blocked, planned } = (await world.detail(AUDIT_ID)).audit;
+						assert.deepEqual([blocked, planned?.model ?? null], unknown ? ["models-unknown", null] : [null, next], pass);
+					}
+					const [status, body] = await world.startAudit(AUDIT_ID);
+					if (unknown) {
+						assert.deepEqual([status, body.error], [409, "models-unknown"]);
+						assert.equal(fs.existsSync(requestFileOf(world)), false);
+						assert.equal(fs.existsSync(world.paths.health.auditBudgetFile), false);
+					} else assert.deepEqual([status, body.audit.planned.model], [202, next]);
+				} finally {
+					await world.detail.close();
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				}
+			});
+
 			it("excludes a decision-only fp's analyzing model from the detail and the POST", async () => {
 				const world = makeWorld({ lanes: { ultrabrain: ["openai/alpha-review"], architect: ["openai/beta-review"] } });
 				try {

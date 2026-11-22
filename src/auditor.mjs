@@ -7,7 +7,7 @@ import { createInvestigations } from "./investigations.mjs";
 import { auditBundle, auditDocument, detectorFindingRefs, firedDetectors, hasDetectorCoverage, resolveAuditModel, validateAudit } from "./judge/audit.mjs";
 import { ANALYST_POLL_MS, parseAnalystOutput, unavailableReason } from "./judge/analyst.mjs";
 import { laneArgs } from "./judge/lane.mjs";
-import { usageEntryOf } from "./session-record.mjs";
+import { collectAnalystDecisionModels, usageEntryOf } from "./session-record.mjs";
 import { auditReasonLabel } from "./ui/labels.mjs";
 import { fresh, isSpillModelKey, readUsageIndex, relatedUsageEntries } from "./usage-index.mjs";
 import { atomicWriteFile, atomicWriteJson, ensureDir, listDirSafe, readJsonSafe, readTextSafe, removeSafe, statSafe } from "./util/fsx.mjs";
@@ -181,6 +181,7 @@ function auditFileVersions(dir, suffix) {
 }
 
 function launchAnalystModels(paths, investigations, loaded, selectedFps, auditSubjectIds, analystStart) {
+	if (loaded.session?.analystModelsUnknown) return null;
 	const models = new Set(loaded.analystModels);
 	const fps = new Set(selectedFps);
 	const add = (model) => { if (typeof model === "string" && model) models.add(model); };
@@ -217,7 +218,10 @@ function launchAnalystModels(paths, investigations, loaded, selectedFps, auditSu
 		do {
 			batch = tail.readNew();
 			for (const row of batch.entries) {
-				if (row?.event === "investigation" && row.status === "analyzing" && (fps.has(row.fp) || matches(row.subject))) add(row.model);
+				if (!row || (!fps.has(row.fp) && !matches(row.subject))) continue;
+				if (typeof row.fp === "string" && row.fp) fps.add(row.fp);
+				if (row.status !== "analyzing" && !row.analyst?.verdict && !row.jobId && row.usedModels === undefined) continue;
+				if (!collectAnalystDecisionModels(models, row, paths.health.jobsDir)) return null;
 			}
 		} while (batch.more);
 	}
@@ -366,6 +370,7 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		// The resident index may have learned identities since the worker prepared the evidence.
 		const facts = auditModelFacts(index ? usageEntryOf(index, loaded.session ?? {}) : null, full);
 		const analystModels = launchAnalystModels(paths, investigations, loaded, selectedFps, auditSubjectIds, analystStart);
+		if (!analystModels) return fail(record, "models-unknown", null, now);
 		const choice = resolveAuditModel(paths, config, { ...facts, analystModels });
 		if (choice?.blocked === "models-unknown") return fail(record, "models-unknown", null, now);
 		if (!choice) return fail(record, "no-model", null, now);

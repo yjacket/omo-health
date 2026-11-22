@@ -16,7 +16,7 @@ function auditFactsFor(paths, session, tokens) {
 	const usage = readUsageIndex(paths.health.usageIndexFile);
 	const entry = usageEntryOf(usage, session ?? {});
 	// Do not queue against an index row the daemon still has to finish or refresh.
-	if (!fresh(entry)) return { ...auditModelFacts(entry, null), sessionModelsKnown: false };
+	if (session?.analystModelsUnknown || !fresh(entry)) return { ...auditModelFacts(entry, null), sessionModelsKnown: false };
 	return auditModelFacts(entry, readAuditTimeline(entry.file, tokens));
 }
 

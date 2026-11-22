@@ -24,6 +24,35 @@ const ADOPT_SKEW_MS = 5_000;
 const GUARDED_KINDS = new Set(["analyst", "audit"]);
 // Print mode writes this prefix only for an applied switch, not exhaustion or reversion.
 const APPLIED_FALLBACK = /^Model fallback:/m;
+const FALLBACK_LOG_MAX = 256 * 1024;
+const FALLBACK_TARGET = /^Model fallback: [A-Za-z0-9][\w./:@+-]* -> ([A-Za-z0-9][\w./:@+-]*)(?=[ \t]+\(|[ \t]*\r?$)/gm;
+
+function readFallbackLog(file) {
+	let fd;
+	try {
+		fd = fs.openSync(file, "r");
+		const stat = fs.fstatSync(fd);
+		if (!stat.isFile() || stat.size > FALLBACK_LOG_MAX) return null;
+		const bytes = Buffer.alloc(stat.size + 1);
+		let filled = 0;
+		while (filled < bytes.length) {
+			const n = fs.readSync(fd, bytes, filled, bytes.length - filled, null);
+			if (!n) break;
+			filled += n;
+		}
+		if (filled !== stat.size) return null;
+		return bytes.toString("utf8", 0, filled);
+	} catch {
+		return null;
+	} finally {
+		if (fd !== undefined) fs.closeSync(fd);
+	}
+}
+
+/** null means the whole log could not be inspected; an empty array means no switch. */
+export function readFallbackTargets(file, stderr = readFallbackLog(file)) {
+	return stderr === null ? null : [...new Set(Array.from(stderr.matchAll(FALLBACK_TARGET), (match) => match[1]))];
+}
 
 const STRIP_ENV = /^(CLAUDE_CODE_|ANTHROPIC_|PI_|SENPI_|OMO_)/;
 const STRIP_EXACT = new Set(["GITHUB_TOKEN", "GH_TOKEN"]);
@@ -148,13 +177,15 @@ export function createRunner({ paths, spawnImpl = spawn, clock, env = process.en
 		};
 	};
 
-	function finish(f, meta, outcome) {
+	function finish(f, meta, outcome, stderr) {
+		// An unverified timeout releases the slot without establishing that stderr is final.
+		if (meta.kind === "analyst" && outcome.reason !== "unverified") outcome = { ...outcome, fallbackTargets: readFallbackTargets(f.err, stderr) };
 		writeJson(f.meta, { ...meta, final: outcome });
 		return outcome;
 	}
 
-	function fallbackFailure(f, meta, exitCode, holdUntilExit = false, stderr) {
-		if (meta.kind !== "audit" || !APPLIED_FALLBACK.test(stderr ?? readTextSafe(f.err, ""))) return null;
+	function fallbackFailure(f, meta, exitCode, holdUntilExit = false) {
+		if (meta.kind !== "audit" || !APPLIED_FALLBACK.test(readTextSafe(f.err, ""))) return null;
 		return finish(f, meta, {
 			status: "failed", reason: "model-fallback", result: null, exitCode,
 			...(holdUntilExit ? { holdUntilExit: true } : {}),
@@ -165,20 +196,20 @@ export function createRunner({ paths, spawnImpl = spawn, clock, env = process.en
 	function ended(f, meta, exit) {
 		const handler = handlers.get(path.basename(f.dir)) ?? contracts[meta.kind] ?? {};
 		const stdout = readTextSafe(f.out, "");
-		const stderr = readTextSafe(f.err, "");
 		const exitCode = exit?.code ?? null;
-		const fallback = fallbackFailure(f, meta, exitCode, false, stderr);
+		const fallback = fallbackFailure(f, meta, exitCode);
 		if (fallback) return fallback;
-		const text = `${stderr}\n${stdout}`;
 		if (exitCode === 0 || (!exit && handler.parse?.(stdout) != null)) return finish(f, meta, { status: "done", result: handler.parse ? handler.parse(stdout) : stdout, exitCode });
+		const stderr = meta.kind === "analyst" ? readFallbackLog(f.err) : undefined;
+		const text = `${stderr ?? readTextSafe(f.err, "")}\n${stdout}`;
 		const detail = truncate(redact(text.trim()), 300);
 		// A child error alone is not proof: Node can also emit it after assigning a pid.
 		const errored = Boolean(exit?.error) && exitCode === null;
 		const notSpawned = errored && (meta.pid === undefined || meta.pid === null);
 		const reason = notSpawned ? null : handler.unavailableReason?.(text) ?? null;
-		if (reason) return finish(f, meta, { status: "unavailable", reason, detail, result: null, exitCode });
-		if (errored) return finish(f, meta, { status: "failed", reason: `spawn-error:${exit.error}`, ...(notSpawned ? { spawned: false } : {}), detail, result: null, exitCode });
-		return finish(f, meta, { status: "failed", reason: exit ? `exit-${exitCode}` : "no-result", detail, result: null, exitCode });
+		if (reason) return finish(f, meta, { status: "unavailable", reason, detail, result: null, exitCode }, stderr);
+		if (errored) return finish(f, meta, { status: "failed", reason: `spawn-error:${exit.error}`, ...(notSpawned ? { spawned: false } : {}), detail, result: null, exitCode }, stderr);
+		return finish(f, meta, { status: "failed", reason: exit ? `exit-${exitCode}` : "no-result", detail, result: null, exitCode }, stderr);
 	}
 
 	/** The verified timeout path: kill the job's own tree (the one documented /T exception) and end as timeout. */
@@ -275,6 +306,7 @@ export function createRunner({ paths, spawnImpl = spawn, clock, env = process.en
 			let meta = readJsonSafe(f.meta);
 			if (!meta) return { status: "failed", reason: "no-job", result: null, exitCode: null };
 			if (meta.final) {
+				if (meta.kind === "analyst" && meta.final.reason !== "unverified" && !("fallbackTargets" in meta.final)) return finish(f, meta, meta.final);
 				// A runner from before the fallback guard may have finalized before the auditor saved the outcome.
 				return meta.final.reason === "model-fallback" ? meta.final :
 					fallbackFailure(f, meta, meta.final.exitCode, meta.final.status === "timeout") ?? meta.final;

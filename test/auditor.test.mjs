@@ -1539,6 +1539,40 @@ test("two looks at one investigation exclude every analyst model through the pro
 	assert.deepEqual([h.record("m1").model, h.record("m1").independence], ["xai/grok-5", "family"], "the first look's model is excluded too");
 });
 
+for (const source of ["recorded", "retained", "missing", "late", "late-missing"]) test(`IS-9 provenance: daemon checks ${source} analyst evidence before launching or charging`, async () => {
+	const h = harness();
+	const fp = "fallback-fp";
+	const jobId = "analyst-fallback";
+	const requested = "openai/other-analyst";
+	const fallback = LANES.ultrabrain[0];
+	const ts = new Date(BASE - 60_000).toISOString();
+	const terminal = {
+		ts, fp, jobId, event: "investigation", status: "verdict", analyst: { verdict: "act" },
+		...(["recorded", "late"].includes(source) ? { usedModels: [requested, fallback] } : {}),
+	};
+	appendDecision(h.paths, { ts, fp, jobId, event: "investigation", status: "analyzing", subject: { sessionId: "m1" }, model: requested });
+	if (source === "retained") {
+		const dir = path.join(h.paths.health.jobsDir, jobId);
+		fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(path.join(dir, "err.log"), `Model fallback: ${requested} -> ${fallback} (transient)\n`);
+	}
+	if (source.startsWith("late")) {
+		await prepareWithFrozenRecord(h, () => appendDecision(h.paths, terminal));
+	} else {
+		appendDecision(h.paths, terminal);
+		const a = h.auditor();
+		h.request("m1");
+		await h.prepare(a);
+	}
+	if (source.endsWith("missing")) {
+		assert.deepEqual([h.record("m1").status, h.record("m1").reason, h.runner.starts.length, h.budget()], ["failed", "models-unknown", 0, undefined]);
+	} else {
+		assert.equal(h.runner.starts.length, 1);
+		assert.equal(modelOf(h.runner.starts[0]), LANES.architect[0]);
+		assert.equal(h.budget().count, 1);
+	}
+});
+
 test("a decision-only fp's analyzing model is excluded from the daemon's model choice", async () => {
 	const h = harness();
 	assert.equal([...LANES.ultrabrain][0], "openai/gpt-5-5", "the analyst model is the first lane candidate");

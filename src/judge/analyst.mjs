@@ -310,7 +310,7 @@ export function createAnalyst({ config, paths, clock, runner, log, env = process
 		} catch (error) {
 			running.delete(entry.jobId);
 			refund(entry.token);
-			startFailures.set(entry.jobId, failed({ reason: `spawn-error:${error.message}`, jobId: entry.jobId, notReached: true }));
+			startFailures.set(entry.jobId, { ...failed({ reason: `spawn-error:${error.message}`, jobId: entry.jobId, notReached: true }), usedModels: [entry.model] });
 		}
 	}
 	/** Promote queued jobs while there is a free slot (`analyst.maxConcurrent`). */
@@ -400,7 +400,9 @@ export function createAnalyst({ config, paths, clock, runner, log, env = process
 				return undefined;
 			}
 			running.delete(jobId);
-			const extra = { jobId, ...(model ? { model } : {}), ...(sessionId ? { sessionId } : {}) };
+			const usedModels = out.spawned === false ? (model ? [model] : []) :
+				model && Array.isArray(out.fallbackTargets) ? [...new Set([model, ...out.fallbackTargets])] : undefined;
+			const extra = { jobId, ...(model ? { model } : {}), ...(sessionId ? { sessionId } : {}), ...(usedModels ? { usedModels } : {}) };
 			let verdict;
 			if (out.status === "done") {
 				verdict = validateAnalyst(out.result, candidates, config);

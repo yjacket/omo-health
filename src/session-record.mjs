@@ -9,6 +9,7 @@ import { endedKey, endedSelector, streamEnded } from "./session-ledger.mjs";
 import { compactUsage, readUsageIndex, usageEntryFor } from "./usage-index.mjs";
 import { reasonCode } from "./audit-codes.mjs";
 import { AUDIT_CHECK_MAX, AUDIT_DETECTOR_ID, AUDIT_LIST_CAPS, BUNDLE_MAX_CHARS, auditEvidence, auditHistoryRow, auditMessageKind } from "./judge/audit.mjs";
+import { readFallbackTargets } from "./runner.mjs";
 import { statSafe } from "./util/fsx.mjs";
 import { redact, truncate } from "./util/text.mjs";
 
@@ -407,6 +408,21 @@ function verdictFacts(entry) {
 	};
 }
 
+/** Add models from a related analyst decision; false means a terminal row lacks provenance. */
+export function collectAnalystDecisionModels(models, entry, jobsDir) {
+	if (entry.event !== "investigation") return true;
+	if (nonEmpty(entry.model)) models.add(entry.model);
+	// A late answer to a closed investigation keeps its earlier status on the decision row.
+	if (!nonEmpty(entry.analyst?.verdict) && entry.usedModels === undefined &&
+		!(entry.jobId && (entry.status === "verdict" || entry.status === "failed"))) return true;
+	const used = Array.isArray(entry.usedModels) && entry.usedModels.every(nonEmpty) ? entry.usedModels :
+		jobsDir && typeof entry.jobId === "string" && /^[A-Za-z0-9][\w-]{0,127}$/.test(entry.jobId)
+			? readFallbackTargets(path.join(jobsDir, entry.jobId, "err.log")) : null;
+	if (!used) return false;
+	for (const model of used) models.add(model);
+	return true;
+}
+
 const byVerdictTime = (a, b) => (msOf(a.ts) || 0) - (msOf(b.ts) || 0);
 
 function verdictRows(decisions, fp) {
@@ -493,7 +509,7 @@ export function usageTreeLink(usage, row, ambiguous) {
 
 const FULL_USAGE = Object.freeze({ state: "full" });
 
-function joinSessionDecisions(row, descendants, investigations, decisions, bounded) {
+function joinSessionDecisions(row, descendants, investigations, decisions, bounded, jobsDir) {
 	const nodes = [row, ...descendants];
 	const sessionAllowed = new Set(nodes.map((node) => node.sessionId).filter(nonEmpty));
 	// D8 addresses the parent session but names the affected child by its task id.
@@ -524,18 +540,18 @@ function joinSessionDecisions(row, descendants, investigations, decisions, bound
 	const selectedInvestigations = [];
 	const fpSet = new Set();
 	const analystModels = new Set();
-	const addModel = (model) => { if (nonEmpty(model)) analystModels.add(model); };
+	let analystModelsKnown = true;
 	for (const record of investigations()) {
 		if (!isRecord(record) || !subjectMatches(record.subject)) continue;
 		if (nonEmpty(record.id)) fpSet.add(record.id);
+		if (nonEmpty(record.model)) analystModels.add(record.model);
 		if (bounded) {
-			addModel(record.model);
 			bounded.investigations.add({ ...investigationFacts(record), historyId: record.id });
 		} else selectedInvestigations.push(record);
 	}
 
 	// 2. the fp set: selected investigations plus lifecycle rows whose subject matches
-	for (const entry of decisions()) if (isRecord(entry) && FINDING_EVENTS.has(entry.event) && nonEmpty(entry.fp) && subjectMatches(entry.subject)) fpSet.add(entry.fp);
+	for (const entry of decisions()) if (isRecord(entry) && (FINDING_EVENTS.has(entry.event) || entry.event === "investigation") && nonEmpty(entry.fp) && subjectMatches(entry.subject)) fpSet.add(entry.fp);
 
 	// 3. decisions about the session; 4. decisions delivered to it or its descendants.
 	// Scan again so an action written before the lifecycle row can still join by fp.
@@ -559,6 +575,7 @@ function joinSessionDecisions(row, descendants, investigations, decisions, bound
 		if (pending && !acted) addAction(pending.entry, pending.deliveredOnly);
 		pending = undefined;
 		if (!selected) continue;
+		if (related && !collectAnalystDecisionModels(analystModels, entry, jobsDir)) analystModelsKnown = false;
 		if (entry.event === "investigation" && nonEmpty(entry.fp) && nonEmpty(entry.acted?.key) && nonEmpty(entry.acted?.kind)) {
 			pending = { entry, deliveredOnly: !related };
 		} else addAction(entry, !related, acted);
@@ -568,7 +585,6 @@ function joinSessionDecisions(row, descendants, investigations, decisions, bound
 		}
 		if (FINDING_EVENTS.has(entry.event)) bounded.findings.add({ ...findingRow(entry, { bounded: true }), deliveredOnly: !related });
 		if (related && entry.event === "investigation") {
-			if (fpSet.has(entry.fp)) addModel(entry.model);
 			const history = histories.get(entry.fp);
 			const facts = history?.rows && verdictFacts(entry);
 			if (!facts) continue;
@@ -590,23 +606,17 @@ function joinSessionDecisions(row, descendants, investigations, decisions, bound
 		}
 		const taskIds = new Set(nodes.map((node) => node.taskId).filter(nonEmpty));
 		return {
-			analystModels: [...analystModels], selectedFps: [...fpSet],
+			analystModels: [...analystModels], analystModelsKnown, selectedFps: [...fpSet],
 			auditSubjectIds: { sessionIds: sessionAllowed, taskIds, childTasksByParent },
 		};
 	}
-	return { selectedInvestigations, fpSet, about, selected: [...new Set([...about, ...delivered])], actionEntries };
+	return { selectedInvestigations, fpSet, about, selected: [...new Set([...about, ...delivered])], actionEntries, analystModels: [...analystModels], analystModelsKnown };
 }
 
 function recordHealth(inputs, row, descendants) {
 	if (inputs.auditHealth) return { ...inputs.auditHealth, ...inputs.decisionJoin };
 	const { decisions, investigations, messages: messagesIn } = inputs;
-	const { selectedInvestigations, fpSet, about, selected, actionEntries } = inputs.decisionJoin ?? joinSessionDecisions(row, descendants, () => investigations, () => decisions);
-	const analystModels = new Set();
-	const addModel = (model) => { if (nonEmpty(model)) analystModels.add(model); };
-	for (const record of selectedInvestigations) addModel(record.model);
-	for (const entry of about) {
-		if (entry.event === "investigation" && fpSet.has(entry.fp)) addModel(entry.model);
-	}
+	const { selectedInvestigations, fpSet, about, selected, actionEntries, analystModels, analystModelsKnown } = inputs.decisionJoin ?? joinSessionDecisions(row, descendants, () => investigations, () => decisions);
 	const findings = selected.filter((entry) => FINDING_EVENTS.has(entry.event)).map((entry) => findingRow(entry));
 	const { machine, infoFindings } = inputs.decisionHistory ?? scanDecisionHistory(
 		decisions.filter((entry) => Number.isFinite(timeOf(entry))).sort((a, b) => timeOf(a) - timeOf(b)), row, activeWindows(row, descendants, inputs.now),
@@ -626,7 +636,8 @@ function recordHealth(inputs, row, descendants) {
 	})).sort(byMessageTime);
 	return {
 		infoFindings,
-		analystModels: [...analystModels],
+		analystModels,
+		analystModelsKnown,
 		selectedFps: [...fpSet],
 		health: {
 			findings: allFindings, actions, investigations: investigationRows, messages,
@@ -682,7 +693,7 @@ export function buildSessionRecord(inputs = {}) {
 	const endedMs = msOf(row.endedMs);
 	const descendants = inputs.descendants ?? collectDescendants(row, ledger, usage.values());
 	const ambiguous = inputs.ambiguous ?? ambiguousLedgerTaskIds(ledger);
-	const { health, infoFindings, analystModels, selectedFps } = recordHealth({ ...inputs, decisions, investigations, messages: messagesIn }, row, descendants);
+	const { health, infoFindings, analystModels, analystModelsKnown, selectedFps } = recordHealth({ ...inputs, decisions, investigations, messages: messagesIn }, row, descendants);
 
 	const entry = usageEntryOf(usage, row, ambiguous);
 	const compact = compactUsage(entry);
@@ -737,6 +748,8 @@ export function buildSessionRecord(inputs = {}) {
 	const session = cleanValue(row);
 	// Cached previews and audit preparation re-read the index from this session alone.
 	if (!ledgerUsageSessionId(row) && ambiguous.has(row.taskId)) session.usageTaskIdAmbiguous = true;
+	// Cached previews only receive session metadata and the model list.
+	if (!analystModelsKnown) session.analystModelsUnknown = true;
 	session.durationMs = Number.isFinite(startedMs) && Number.isFinite(endedMs) && endedMs >= startedMs ? endedMs - startedMs : null;
 
 	return {
@@ -1036,7 +1049,7 @@ export function loadSessionRecord({ paths, id, row: selector, now = Date.now(), 
 		messages: newest(AUDIT_LIST_CAPS.messages, byMessageTime),
 	} : null;
 	const decisionHistory = scanDecisionHistory(streamDecisions(paths), row, activeWindows(row, descendants, now), retained?.machine);
-	const decisionJoin = joinSessionDecisions(row, descendants, () => streamInvestigations(paths), () => streamDecisions(paths, sinceMs), retained);
+	const decisionJoin = joinSessionDecisions(row, descendants, () => streamInvestigations(paths), () => streamDecisions(paths, sinceMs), retained, paths.health.jobsDir);
 	const files = findRecordFiles(paths, [row, ...scanned], ancestors, locator);
 
 	const messages = [];

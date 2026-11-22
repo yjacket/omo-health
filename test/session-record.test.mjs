@@ -1012,6 +1012,19 @@ test("analystModels collects decision-only fps' analyzing models plus the invest
 	assert.deepEqual(record.analystModels, ["openai/file-review", "openai/first-review", "openai/second-review"], "the unrelated fp's model stays out");
 });
 
+test("IS-9 provenance: analystModels includes all related terminal decisions but not unrelated ones", () => {
+	const row = corpus().rows[0];
+	const subject = { sessionId: row.sessionId };
+	const decisions = [
+		{ event: "investigation", status: "analyzing", fp: "same", subject, model: "p/a" },
+		{ event: "investigation", status: "verdict", fp: "same", analyst: { verdict: "act" }, usedModels: ["p/a", "p/b"] },
+		{ event: "investigation", status: "failed", fp: "same", analyst: { verdict: "escalate" }, usedModels: ["p/a", "p/c"] },
+		{ event: "investigation", status: "verdict", fp: "other", subject: { sessionId: "unrelated" }, analyst: { verdict: "act" }, usedModels: ["p/unrelated"] },
+	];
+	const record = buildSessionRecord({ id: row.sessionId, row, ledger: [row], decisions });
+	assert.deepEqual(record.analystModels, ["p/a", "p/b", "p/c"]);
+});
+
 const MIB = 1024 * 1024;
 const FILLER_LINE = '{"type":"message","id":"f"}\n';
 const FILLER_BLOCK = Buffer.from(FILLER_LINE.repeat(Math.floor(MIB / FILLER_LINE.length)));

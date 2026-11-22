@@ -293,8 +293,10 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 		const jobId = job.jobId ?? answer.jobId ?? null;
 		const analyst = { verdict: answer.verdict, assessment: answer.assessment ?? null, actionId: answer.actionId ?? null, confidence: answer.confidence ?? null, cause: answer.cause ?? null, reason: answer.reason ?? null, diagnosis: answer.diagnosis ?? null, advice: answer.advice ?? null, costUsd: answer.costUsd ?? null, repeatStall: Boolean(answer.repeatStall), elapsedMs: job.startedMs === undefined ? null : now - job.startedMs };
 		const retryAtMs = acts ? null : record.nextLookMs;
-		if (answered) investigate(finding, record, { status: "verdict", verdict: summarizeVerdict(answer, now, record), ...(jobId ? { jobId } : {}), retryAtMs }, { row: { jobId, step: job.step, analyst } });
-		else investigate(finding, record, { status: "failed", verdict: summarizeVerdict(answer, now, record), ...(jobId ? { jobId } : {}), failures: "+1", retryAtMs }, { row: { jobId, step: job.step, result: answer.notReached ? "skipped:analyst-unavailable" : "analyst-failed", reason: answer.reason ?? null, detail: answer.detail ?? null, analyst } });
+		const usedModels = answer.usedModels ?? (answer.notReached && !job.jobId ? [] : undefined);
+		const row = { jobId, step: job.step, analyst, ...(usedModels ? { usedModels } : {}) };
+		if (answered) investigate(finding, record, { status: "verdict", verdict: summarizeVerdict(answer, now, record), ...(jobId ? { jobId } : {}), retryAtMs }, { row });
+		else investigate(finding, record, { status: "failed", verdict: summarizeVerdict(answer, now, record), ...(jobId ? { jobId } : {}), failures: "+1", retryAtMs }, { row: { ...row, result: answer.notReached ? "skipped:analyst-unavailable" : "analyst-failed", reason: answer.reason ?? null, detail: answer.detail ?? null } });
 	}
 
 	/** Read a running analyst job's answer (at most every ANALYST_POLL_MS) and keep it for the planner; it is recorded either way. */
