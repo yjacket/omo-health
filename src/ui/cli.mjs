@@ -107,8 +107,8 @@ export function createSessionDetail({ paths, env = process.env, now = Date.now, 
 
 	const signatureOf = (file) => JSON.stringify([fileStamp(file), recordsStamp(paths)]);
 
-	function sessionDetail(id, endedMs) {
-		const key = endedMs === undefined ? id : `${id}:${endedMs}`;
+	function sessionDetail(id, row) {
+		const key = row === undefined ? id : `${id}:${row}`;
 		const cached = cache.get(key);
 		if (cached && signatureOf(cached.file) === cached.signature) {
 			cache.delete(key);
@@ -120,7 +120,7 @@ export function createSessionDetail({ paths, env = process.env, now = Date.now, 
 			return detailWorker ? detailWorker.run(job).then(view) : view(local(job));
 		}
 		if (cached) cache.delete(key);
-		const job = { kind: "detail", id, endedMs, now: now() };
+		const job = { kind: "detail", id, row, now: now() };
 		const remember = ({ record, file, audit }) => {
 			cache.delete(key);
 			cache.set(key, { record, file, signature: signatureOf(file) });

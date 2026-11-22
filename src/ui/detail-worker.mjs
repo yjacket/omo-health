@@ -37,7 +37,7 @@ export function createDetailOperations({
 } = {}) {
 	let at;
 	const locator = createSessionFileLocator({ paths, clock: { now: () => at } });
-	const loadRecord = ({ id, endedMs, now }) => load({ paths, id, endedMs, now, locator });
+	const loadRecord = ({ id, row, now }) => load({ paths, id, row, now, locator });
 	const plan = (config, facts, analystModels) =>
 		facts.sessionModelsKnown ? resolveModel(paths, config, { ...facts, analystModels: Array.isArray(analystModels) ? analystModels : [] }) : null;
 

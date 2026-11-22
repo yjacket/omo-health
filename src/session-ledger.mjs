@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir, listDirSafe } from "./util/fsx.mjs";
-import { redact, truncate } from "./util/text.mjs";
+import { redact, sha1, truncate } from "./util/text.mjs";
 
 const DAY_MS = 86_400_000;
 const DEDUPE_DAYS = 30;
@@ -144,6 +144,10 @@ export function endedKey(row) {
 	if (typeof row?.sessionId !== "string") return undefined;
 	const parent = row.parentSessionId || null;
 	return JSON.stringify([row.sessionId, parent, parent ? null : row.cwd || null]);
+}
+
+export function endedSelector(row) {
+	return sha1(JSON.stringify([endedKey(row), row.endedMs])).slice(0, 16);
 }
 
 /** Look up a record's identity, or any occurrence of a bare session ID, in the last 30 days. */

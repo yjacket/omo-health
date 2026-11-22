@@ -10,6 +10,7 @@ import { resolvePaths } from "../src/paths.mjs";
 import { buildSessionRecord, loadSessionRecord, scanOmoHealthMessages } from "../src/session-record.mjs";
 import * as sessionRecord from "../src/session-record.mjs";
 import { buildSessionView } from "../src/ui/session-view.mjs";
+import { expectedSelector } from "./helpers/ended-selector.mjs";
 import { tmpDir, writeJsonl, writeTask } from "./helpers/fixtures.mjs";
 
 const T0 = Date.parse("2026-10-10T00:00:00.000Z");
@@ -272,7 +273,7 @@ test("IS-10: bounded scan keeps oldest detector representatives and exact histor
 	assert.ok(["findings", "actions", "messages", "investigations"].every((key) => bundle.truncated[key]));
 });
 
-test("(plan 35) loadSessionRecord selects the exact ledger session ID and endedMs", () => {
+test("(plan 35) loadSessionRecord selects the exact ledger session ID and row selector", () => {
 	const { paths } = setup();
 	const id = "st_shared";
 	const a = childRow(id, id, "parent-a", { title: "older" });
@@ -281,16 +282,16 @@ test("(plan 35) loadSessionRecord selects the exact ledger session ID and endedM
 	writeLedger(paths, [a, b, c]);
 	const options = { paths, id, now: T0 + 2 * HOUR };
 	const selected = (overrides) => loadSessionRecord({ ...options, ...overrides });
-	assert.deepEqual([a, b].map(({ endedMs }) => {
-		const { session, tokens } = selected({ endedMs });
+	assert.deepEqual([a, b].map((row) => {
+		const { session, tokens } = selected({ row: expectedSelector(row) });
 		return [session.title, session.parentSessionId, session.endedMs, tokens, session.usageTaskIdAmbiguous];
 	}), [
 		[a.title, a.parentSessionId, a.endedMs, null, true],
 		[b.title, b.parentSessionId, b.endedMs, null, true],
 	]);
 	assert.equal(selected().session.title, b.title);
-	assert.deepEqual(selected({ endedMs: b.endedMs + 1 }), { found: false, id });
-	assert.deepEqual(selected({ id: c.taskId, endedMs: c.endedMs }), { found: false, id: c.taskId });
+	assert.deepEqual(selected({ row: expectedSelector({ ...b, endedMs: b.endedMs + 1 }) }), { found: false, id });
+	assert.deepEqual(selected({ id: c.taskId, row: expectedSelector(c) }), { found: false, id: c.taskId });
 });
 
 function baseRows() {

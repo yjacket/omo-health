@@ -3,7 +3,7 @@ import { DEFAULT_CONFIG, loadConfig, SWITCH_KEYS } from "../config.mjs";
 import { getPath, pauseState, SWITCHES } from "../control.mjs";
 import { readDecisions } from "../decisions.mjs";
 import { createInvestigations, RESOLVED } from "../investigations.mjs";
-import { readEnded } from "../session-ledger.mjs";
+import { endedSelector, readEnded } from "../session-ledger.mjs";
 import { ambiguousLedgerTaskIds, ledgerUsageSessionId } from "../session-record.mjs";
 import { compactUsage, readUsageIndex, treeTotals, usageEntryFor } from "../usage-index.mjs";
 import { listDirSafe, readJsonSafe, statSafe } from "../util/fsx.mjs";
@@ -342,7 +342,7 @@ export function buildEnded(inputs) {
 		totals: { main: mains.length, child: children.length },
 		rows: all.filter((r) => selected.has(r)).map((r) => {
 			const row = endedRow(r, childRows.get(r.sessionId), usage, trees, usage.full === true, ambiguous);
-			if (idCounts.get(r.sessionId) > 1) row.detailEndedMs = r.endedMs;
+			if (idCounts.get(r.sessionId) > 1) row.detailRow = endedSelector(r);
 			return row;
 		}),
 	};

@@ -718,12 +718,12 @@
 	}
 
 	function endedDetailId(r) {
-		return r.detailEndedMs === undefined ? r.sessionId : `${r.sessionId}:${r.detailEndedMs}`;
+		return r.detailRow === undefined ? r.sessionId : `${r.sessionId}:${r.detailRow}`;
 	}
 
 	function endedDetailUrl(r) {
 		const url = `/api/session?id=${encodeURIComponent(r.sessionId)}`;
-		return r.detailEndedMs === undefined ? url : `${url}&ended=${r.detailEndedMs}`;
+		return r.detailRow === undefined ? url : `${url}&row=${r.detailRow}`;
 	}
 
 	function endedTokenSignature(r) {

@@ -4,7 +4,7 @@ import { idFromFileName } from "./collect/sessions.mjs";
 import { senpiTaskStoreDir } from "./collect/tasks.mjs";
 import { streamDecisions } from "./decisions.mjs";
 import { streamInvestigations } from "./investigations.mjs";
-import { streamEnded } from "./session-ledger.mjs";
+import { endedSelector, streamEnded } from "./session-ledger.mjs";
 import { compactUsage, readUsageIndex, treeTotals, usageEntryFor } from "./usage-index.mjs";
 import { reasonCode } from "./audit-codes.mjs";
 import { AUDIT_CHECK_MAX, AUDIT_DETECTOR_ID, AUDIT_LIST_CAPS, BUNDLE_MAX_CHARS, auditEvidence, auditHistoryRow, auditMessageKind } from "./judge/audit.mjs";
@@ -787,12 +787,12 @@ function cwdsOf(node, ancestors) {
 
 const later = (a, b) => !b || Number(a.endedMs) > Number(b.endedMs);
 
-function ledgerLookup(rows, ids, endedMs) {
+function ledgerLookup(rows, ids, selector) {
 	const exact = new Map();
 	const aliases = new Map();
 	for (const row of rows()) {
-		if (ids.has(row.sessionId) && (endedMs === undefined || row.endedMs === endedMs) && later(row, exact.get(row.sessionId))) exact.set(row.sessionId, row);
-		if (endedMs !== undefined || !ids.has(row.taskId)) continue;
+		if (ids.has(row.sessionId) && (selector === undefined || endedSelector(row) === selector) && later(row, exact.get(row.sessionId))) exact.set(row.sessionId, row);
+		if (selector !== undefined || !ids.has(row.taskId)) continue;
 		const prior = aliases.get(row.taskId);
 		if (prior === null) continue;
 		if (prior && prior.sessionId !== row.sessionId) aliases.set(row.taskId, null);
@@ -854,8 +854,8 @@ function recordDescendants(subject, rows, usage) {
 	return nodes;
 }
 
-function recordLedger(rows, id, endedMs, usage, descendantScanMax) {
-	const subject = ledgerLookup(rows, new Set([id]), endedMs).get(id);
+function recordLedger(rows, id, selector, usage, descendantScanMax) {
+	const subject = ledgerLookup(rows, new Set([id]), selector).get(id);
 	if (!subject) return null;
 	const descendants = recordDescendants(subject, rows, usage);
 	const newest = [...descendants].sort((a, b) => (b.endedMs ?? 0) - (a.endedMs ?? 0));
@@ -898,10 +898,10 @@ function recordLedger(rows, id, endedMs, usage, descendantScanMax) {
  * listed in `truncated.messagesSkipped`. `auditRetention` keeps only the
  * daemon's audit samples; the dashboard defaults to no retention limit.
  */
-export function loadSessionRecord({ paths, id, endedMs, now = Date.now(), messageScanMaxBytes = Infinity, messageScanTotalBytes = Infinity, descendantScanMax = Infinity, scanMessages, auditRetention = false, locator, index } = {}) {
+export function loadSessionRecord({ paths, id, row: selector, now = Date.now(), messageScanMaxBytes = Infinity, messageScanTotalBytes = Infinity, descendantScanMax = Infinity, scanMessages, auditRetention = false, locator, index } = {}) {
 	if (!nonEmpty(id)) return { found: false, id };
 	const usage = index ?? readUsageIndex(paths.health.usageIndexFile);
-	const joined = recordLedger(() => streamEnded(paths, { sinceMs: now - 30 * DAY_MS }), id, endedMs, usage, descendantScanMax);
+	const joined = recordLedger(() => streamEnded(paths, { sinceMs: now - 30 * DAY_MS }), id, selector, usage, descendantScanMax);
 	if (!joined) return { found: false, id };
 	const { row, descendants, ancestors, scanned, ambiguous } = joined;
 	const startedMs = msOf(row.startedMs);

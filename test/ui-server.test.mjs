@@ -17,6 +17,7 @@ import { createDetailWorker, createSessionDetail, createStartAudit } from "../sr
 import { buildEnded, daemonStatus, loadDaemonInputs, uiState } from "../src/ui/model.mjs";
 import { createUiServer } from "../src/ui/server.mjs";
 import { createUsageIndex, USAGE_INDEX_VERSION } from "../src/usage-index.mjs";
+import { expectedSelector } from "./helpers/ended-selector.mjs";
 import { writeJsonl, writeTask } from "./helpers/fixtures.mjs";
 
 const TOKEN = "test-token-abc_123";
@@ -751,12 +752,12 @@ describe("ui server", { timeout: 20_000 }, () => {
 				}
 			});
 
-			function writeTaskOnlyCollision(world) {
+			function writeTaskOnlyCollision(world, { sameTick = false } = {}) {
 				const taskId = "st_shared";
 				const children = ["a", "b"].map((id, i) => ({
 					v: 1, kind: "child", sessionId: taskId, taskId, parentSessionId: `main-${id}`,
 					title: `task ${id}`, cwd: path.join(world.dir, id), outcome: "answered",
-					startedMs: world.nowMs - 2000, endedMs: world.nowMs + i, reason: "", source: "live",
+					startedMs: world.nowMs - 2000, endedMs: world.nowMs + (sameTick ? 0 : i), reason: "", source: "live",
 				}));
 				// Seed both rows directly to isolate read-side collision behavior.
 				const ledger = path.join(world.paths.health.sessionsDir, "ended-2026-11-22.jsonl");
@@ -790,7 +791,42 @@ describe("ui server", { timeout: 20_000 }, () => {
 				}
 			});
 
-			it("(plan 35) HTTP ended selector isolates shared-ID details and cached audit previews", async () => {
+			it("(plan 46) HTTP selects same-tick rows and paginates each row's own messages", async () => {
+				const world = makeWorld();
+				const ui = createUiServer({ paths: world.paths, token: TOKEN, getState: () => STATE, sessionDetail: world.detail, now: world.now });
+				try {
+					const rows = writeTaskOnlyCollision(world, { sameTick: true });
+					for (const row of rows) {
+						writeTask(row.cwd, { task_id: row.taskId, status: "completed" }, Array.from({ length: 51 }, (_, i) => ({
+							type: "custom_message", customType: "omo-health", id: `msg-${i}`,
+							timestamp: new Date(row.startedMs + i).toISOString(),
+							content: `${row.title} notice ${i}`,
+						})));
+					}
+					const { port } = await ui.listen();
+					for (const row of [...rows, rows[0]]) {
+						const url = `/api/session?id=${row.sessionId}&row=${expectedSelector(row)}`;
+						const { status, body } = await getAt(port, url);
+						assert.deepEqual([status, body.session?.title, body.session?.parentSessionId, body.tokens, body.audit?.blocked, body.audit?.planned], [
+							200, row.title, row.parentSessionId, null, "models-unknown", null,
+						]);
+						assert.equal(body.counts.messages, 51);
+						assert.equal(body.health.messages.length, 50);
+						assert.equal(body.health.messages[0].text, `${row.title} notice 50`);
+						const page = await getAt(port, `${url}&list=messages&offset=50`);
+						assert.equal(page.status, 200);
+						assert.deepEqual([page.body.list, page.body.offset, page.body.total, page.body.items.map((item) => item.text)], [
+							"messages", 50, 51, [`${row.title} notice 0`],
+						]);
+					}
+				} finally {
+					await ui.close();
+					await world.detail.close();
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				}
+			});
+
+			it("(plan 35) HTTP row selector isolates shared-ID details and cached audit previews", async () => {
 				const world = makeWorld();
 				const ui = createUiServer({ paths: world.paths, token: TOKEN, getState: () => STATE, sessionDetail: world.detail, now: world.now });
 				try {
@@ -800,15 +836,18 @@ describe("ui server", { timeout: 20_000 }, () => {
 					const facts = ({ status, body }) => [status, body.session?.title, body.session?.parentSessionId, body.tokens, body.audit?.blocked, body.audit?.planned];
 					const expect = (row) => [200, row.title, row.parentSessionId, null, "models-unknown", null];
 					assert.deepEqual(facts(await get()), expect(b));
-					assert.deepEqual(facts(await get(`&ended=${a.endedMs}`)), expect(a));
-					assert.deepEqual(facts(await get(`&ended=${b.endedMs}`)), expect(b));
-					assert.deepEqual(facts(await get(`&ended=${a.endedMs}`)), expect(a), "cached detail and preview");
+					assert.deepEqual(facts(await get(`&row=${expectedSelector(a)}`)), expect(a));
+					assert.deepEqual(facts(await get(`&row=${expectedSelector(b)}`)), expect(b));
+					assert.deepEqual(facts(await get(`&row=${expectedSelector(a)}`)), expect(a), "cached detail and preview");
 					assert.deepEqual(facts(await get()), expect(b), "unqualified cache entry still selects the newest");
-					assert.deepEqual(await get(`&ended=${a.endedMs}&list=children&offset=0`), {
+					assert.deepEqual(await get(`&row=${expectedSelector(a)}&list=children&offset=0`), {
 						status: 200, body: { list: "children", offset: 0, total: 0, items: [] },
 					});
-					assert.deepEqual(await get("&ended=0"), { status: 404, body: { error: "not-found" } });
-					for (const query of ["&ended=", "&ended=-1", "&ended=1.5", "&ended=1e3", "&ended=9007199254740993", "&Ended=1", "&ended=0&ended=-1"]) {
+					assert.deepEqual(await get("&row=0000000000000000"), { status: 404, body: { error: "not-found" } });
+					const duplicate = expectedSelector(a);
+					for (const query of ["&row=", "&row=0123456789abcde", "&row=0123456789abcdef0", "&row=0123456789abcdeg",
+						"&row=0123456789ABCDEF", "&row=0123456789abcdef%0A", `&Row=${duplicate}`, `&row=${duplicate}&row=${duplicate}`,
+						`&ended=${a.endedMs}`, "&ended=", "&ended=-1", "&ended=1.5", "&ended=1e3", "&ended=9007199254740993", "&Ended=1", "&ended=0&ended=-1"]) {
 						assert.deepEqual(await get(query), { status: 422, body: { error: "invalid" } }, query);
 					}
 				} finally {
@@ -818,7 +857,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 				}
 			});
 
-			it("(plan 45) backfill writes both task-only children for history and HTTP ended selection", async () => {
+			it("(plan 45) backfill writes both task-only children for history and HTTP row selection", async () => {
 				const world = makeWorld();
 				const { paths, now, nowMs } = world;
 				const ui = createUiServer({ paths, token: TOKEN, getState: () => STATE, sessionDetail: world.detail, now });
@@ -849,10 +888,11 @@ describe("ui server", { timeout: 20_000 }, () => {
 					assert.equal(repeated.counts.written, 0);
 					assert.deepEqual(ledger().filter((row) => row.sessionId === taskId).map(facts), expected);
 					const history = buildEnded({ ended: ledger(), now: nowMs }).rows.filter((row) => row.sessionId === taskId);
-					assert.deepEqual(history.map((row) => [row.sessionId, row.parentSessionId, row.title, row.detailEndedMs]), expected);
+					assert.deepEqual(history.map(facts), expected);
+					assert.deepEqual(history.map((row) => row.detailRow), children.map((row) => expectedSelector({ ...row, sessionId: taskId })));
 					const { port } = await ui.listen();
 					for (const row of history) {
-						const { status, body } = await getAt(port, `/api/session?id=${row.sessionId}&ended=${row.detailEndedMs}`);
+						const { status, body } = await getAt(port, `/api/session?id=${row.sessionId}&row=${row.detailRow}`);
 						assert.equal(status, 200);
 						assert.deepEqual(facts(body.session), facts(row));
 					}

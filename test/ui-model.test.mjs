@@ -18,6 +18,7 @@ import { buildEnded, buildOverview, buildSessions, buildSettings, buildUiState, 
 import { buildSessionView } from "../src/ui/session-view.mjs";
 import { buildSessionSnapshot } from "../src/session-board.mjs";
 import { createUsageTracker } from "../src/usage-tracker.mjs";
+import { expectedSelector } from "./helpers/ended-selector.mjs";
 import { makeWorld, sessionState, taskRecord } from "./helpers/world.mjs";
 
 const NOW = Date.parse("2026-09-29T03:00:00.000Z"); // 12:00 KST
@@ -57,15 +58,37 @@ const running = (home, hbExtra, overrides = {}) => inputsOf(home, { heartbeat: h
 
 it("(plan 35) history adds a detail selector only to shared session IDs", () => {
 	const shared = { sessionId: "st_shared", taskId: "st_shared", kind: "child" };
-	const { rows } = buildEnded({ now: NOW, ended: [
+	const ended = [
 		{ ...shared, endedMs: NOW, parentSessionId: "b" },
 		{ sessionId: "unique", endedMs: NOW - 1 },
 		{ ...shared, endedMs: NOW - 2, parentSessionId: "a" },
-	] });
-	assert.deepEqual(rows.map((r) => [r.sessionId, r.detailEndedMs]), [
-		["st_shared", NOW], ["unique", undefined], ["st_shared", NOW - 2],
+	];
+	const { rows } = buildEnded({ now: NOW, ended });
+	assert.deepEqual(rows.map((r) => [r.sessionId, r.detailRow]), [
+		["st_shared", expectedSelector(ended[0])], ["unique", undefined], ["st_shared", expectedSelector(ended[2])],
 	]);
-	assert.equal(Object.hasOwn(rows[1], "detailEndedMs"), false);
+	assert.equal(Object.hasOwn(rows[1], "detailRow"), false);
+});
+
+it("(plan 46) same-tick history rows have distinct selectors and browser keys by parent or cwd", () => {
+	const shared = { sessionId: "st_parent", kind: "child", endedMs: NOW };
+	const ended = [
+		{ ...shared, parentSessionId: "parent-a" },
+		{ ...shared, parentSessionId: "parent-b" },
+		{ ...shared, sessionId: "st_cwd", cwd: "C:/store-a" },
+		{ ...shared, sessionId: "st_cwd", cwd: "C:/store-b" },
+		{ sessionId: "unique", endedMs: NOW },
+	];
+	const { rows } = buildEnded({ now: NOW, ended });
+	const expected = ended.slice(0, -1).map(expectedSelector);
+	assert.deepEqual(rows.slice(0, -1).map((row) => row.detailRow), expected);
+	assert.equal(new Set(expected).size, 4);
+	assert.equal(Object.hasOwn(rows.at(-1), "detailRow"), false);
+	const h = endedRefreshHarness();
+	assert.deepEqual(rows.map((row) => h.endedItem(row).children[0].children[0].children[0]["data-key"]), [
+		`ended:st_parent:${expected[0]}`, `ended:st_parent:${expected[1]}`,
+		`ended:st_cwd:${expected[2]}`, `ended:st_cwd:${expected[3]}`, "ended:unique",
+	]);
 });
 
 it("(plan 35) browser history toggles and requests each row independently", async () => {
@@ -88,22 +111,24 @@ it("(plan 35) browser history toggles and requests each row independently", asyn
 			gone: false, busy: new Set(), errors: new Map(), detailList: (data, name) => data[name],
 		},
 	);
+	const a = "0123456789abcdef";
+	const b = "fedcba9876543210";
 	const rows = [
-		{ sessionId: "st_shared", endedMs: NOW, detailEndedMs: NOW },
-		{ sessionId: "st_shared", endedMs: NOW - 1, detailEndedMs: NOW - 1 },
+		{ sessionId: "st_shared", endedMs: NOW, detailRow: a },
+		{ sessionId: "st_shared", endedMs: NOW - 1, detailRow: b },
 		{ sessionId: "unique", endedMs: NOW },
 	];
 	const items = rows.map(endedItem);
 	assert.deepEqual(items.map(({ children: [row] }) => row.children[0].children[0]["data-key"]),
-		[`ended:st_shared:${NOW}`, `ended:st_shared:${NOW - 1}`, "ended:unique"]);
+		[`ended:st_shared:${a}`, `ended:st_shared:${b}`, "ended:unique"]);
 	for (const { children: [row] } of items) row.onclick();
 	await Promise.resolve();
 	await loadEndedPage(rows[1], "messages");
 	assert.deepEqual(urls, [
-		`/api/session?id=st_shared&ended=${NOW}`,
-		`/api/session?id=st_shared&ended=${NOW - 1}`,
+		`/api/session?id=st_shared&row=${a}`,
+		`/api/session?id=st_shared&row=${b}`,
 		"/api/session?id=unique",
-		`/api/session?id=st_shared&ended=${NOW - 1}&list=messages&offset=0`,
+		`/api/session?id=st_shared&row=${b}&list=messages&offset=0`,
 	]);
 	assert.equal(openEnded.size, 3);
 	assert.equal(endedDetails.size, 3);
@@ -174,7 +199,7 @@ function endedRefreshHarness(recordsStamp) {
 		render(state) { globals.lastState = state; },
 		document: { querySelectorAll: () => [] }, // The old audit poll has no active audit to read.
 		fetch: async () => ({ ok: true, json: async () => ({ recordsStamp, ended: { rows: globals.rows } }) }),
-		el: (tag, attrs, ...children) => ({ tag, ...attrs, children, classList: { toggle() {} }, setAttribute() {} }),
+		el: (tag, attrs, ...children) => ({ tag, ...attrs, children: children.flat(), classList: { toggle() {} }, setAttribute() {} }),
 		ENDED_COLUMNS: Array(6).fill("column"), cellClass() {},
 		when() {}, endedSessionCell() {}, outcomeMark() {}, endedTokenCell() {}, show() {}, endedDetailView() {},
 		append: (body, children) => Object.assign(body, { children }),
@@ -207,17 +232,17 @@ function endedRefreshHarness(recordsStamp) {
 
 it("(plan 36) state refresh re-reads a changed open detail and only drops a changed closed detail", async () => {
 	const h = endedRefreshHarness();
-	const openRow = { sessionId: "shared", detailEndedMs: NOW, ...pendingTokens };
-	const closedRow = { ...openRow, detailEndedMs: NOW - 1 };
-	const openId = `shared:${NOW}`;
-	const closedId = `shared:${NOW - 1}`;
+	const openRow = { sessionId: "shared", detailRow: "0123456789abcdef", ...pendingTokens };
+	const closedRow = { ...openRow, detailRow: "fedcba9876543210" };
+	const openId = `shared:${openRow.detailRow}`;
+	const closedId = `shared:${closedRow.detailRow}`;
 	const old = { audit: { blocked: "models-unknown" } };
 	h.openEnded.add(openId);
 	await h.seed(openRow, old);
 	await h.seed(closedRow, old);
 
 	await h.tick({ ...openRow, ...readyTokens }, { ...closedRow, ...readyTokens });
-	assert.deepEqual(h.requests.map(({ url }) => url), [`/api/session?id=shared&ended=${NOW}`]);
+	assert.deepEqual(h.requests.map(({ url }) => url), [`/api/session?id=shared&row=${openRow.detailRow}`]);
 	assert.equal(h.requests[0].headers["x-omo-health-auto"], "1");
 	assert.equal(h.endedDetails.has(closedId), false);
 	assert.equal(h.endedDetails.get(openId).data, old);
