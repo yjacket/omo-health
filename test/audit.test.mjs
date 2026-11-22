@@ -57,7 +57,7 @@ function timelineShell(over = {}) {
 		topTurns: over.topTurns ?? [],
 		cache: over.cache ?? { hitRate: 1, stormTurns: 0 },
 		errors: over.errors ?? { count: 0, byClass: {} },
-		tools: over.tools ?? [],
+		tools: over.tools ?? { rows: [], incomplete: false },
 		images: over.images ?? { peakCount: 0, peakMiB: 0 },
 	};
 }
@@ -197,6 +197,26 @@ test("the bundle built from the timeline carries tokens.total 17", () => {
 	assert.equal(bundle.tokens.total, 17);
 });
 
+test("(IS-8) the audit bundle and prompt distinguish incomplete statistics from zero", () => {
+	const timeline = {
+		...timelineShell({
+			errors: { count: 0, byClass: {}, incomplete: true },
+			tools: { rows: [{ name: "bash", calls: 1, errors: 1 }], incomplete: true },
+			images: { peakCount: 0, peakMiB: 0, incomplete: true },
+		}),
+		largeRecords: 1,
+	};
+	const bundle = auditBundle(emptyRecord(), timeline, { config: DEFAULT_CONFIG, now: T0 });
+	const { tokens } = JSON.parse(JSON.stringify(bundle));
+	assert.equal(tokens.largeRecords, 1);
+	assert.equal(tokens.images.incomplete, true);
+	assert.deepEqual(tokens.tools, timeline.tools);
+	assert.equal(tokens.errors.incomplete, true);
+	const document = auditDocument(bundle);
+	assert.match(document, /Treat incomplete statistics as unknown, not zero\./);
+	assert.match(document, /aggregates suggest should have fired \(D10\)/);
+});
+
 /* ---------------------------------------------------------------- allowlist */
 
 test("the bundle carries no seeded secret text but keeps the numeric metric count:6", () => {
@@ -212,8 +232,38 @@ test("the bundle carries no seeded secret text but keeps the numeric metric coun
 	const text = JSON.stringify(bundle);
 	for (const secret of ["QA-SECRET-REASON", "QA-SECRET-EVIDENCE", "QA-SECRET-MESSAGE", "QA-SECRET-DIAGNOSIS", "QA-SECRET-TITLE"]) assert.equal(text.includes(secret), false, secret);
 	assert.equal(bundle.omo_health_record.findings[0].metrics.count, "6");
-	assert.equal(bundle.omo_health_record.findings[0].metrics.pending, "70m");
-	assert.equal(bundle.omo_health_record.findings[0].droppedEvidence, 1);
+	assert.equal(bundle.omo_health_record.findings[0].metrics.pending, undefined);
+	assert.equal(bundle.omo_health_record.findings[0].droppedEvidence, 2);
+});
+
+test("(IS-11) numeric-looking error text is omitted while the D10 count is kept", () => {
+	const record = emptyRecord({ health: { findings: [{ detector: "D10", evidence: ["error:123456", "count:6"] }] } });
+	const bundle = auditBundle(record, null, { config: DEFAULT_CONFIG, now: T0 });
+	const [finding] = bundle.omo_health_record.findings;
+	assert.deepEqual(finding.metrics, { count: "6" });
+	assert.equal(finding.droppedEvidence, 1);
+	assert.equal(JSON.stringify(bundle).includes("123456"), false);
+});
+
+test("(IS-11) allowlisted metric keys occur in detector sources and exclude the loop error key", () => {
+	const detectDir = new URL("../src/detect/", import.meta.url);
+	const loops = fs.readFileSync(new URL("loops.mjs", detectDir), "utf8");
+	const errorEvidence = loops.match(/evidence:\s*\[\s*`(error):\$\{head\}`/);
+	assert.ok(errorEvidence, "D10 still puts its error head in evidence");
+	assert.ok(audit.AUDIT_METRIC_KEYS?.length, "the bundle exports a nonempty metric allowlist");
+	for (const key of [errorEvidence[1], "cmd", "command", "path", "cwd", "title", "message", "reason", "text", "tool", "head"]) {
+		assert.equal(audit.AUDIT_METRIC_KEYS.includes(key), false, key);
+	}
+	const sources = [
+		...fs.readdirSync(detectDir).filter((name) => name.endsWith(".mjs")).map((name) => new URL(name, detectDir)),
+		new URL("../src/engine.mjs", import.meta.url),
+	];
+	// Include indirect evidence builders in classify, runaway, and self.
+	const evidenceSites = /^[\t ]*evidence:[\t ]*\[\r?\n[\s\S]*?^[\t ]*\],|^.*(?:evidence:\s*\[|const evidence = \[|evidence\.push\(|reasons\.push\(|simple\(world,|\.\.\.\(over(?:Rss|Cpu)).*$/gm;
+	const emitted = new Set(sources.flatMap((file) =>
+		(fs.readFileSync(file, "utf8").match(evidenceSites) ?? []).flatMap((site) =>
+			[...site.matchAll(/(?:`([\w.-]+):\$\{|["']([\w.-]+):-?\d+["'])/g)].map((match) => match[1] ?? match[2]))));
+	for (const key of audit.AUDIT_METRIC_KEYS) assert.ok(emitted.has(key), `no detector evidence literal for ${key}`);
 });
 
 test("a long sentence slipped into an allowlisted slot throws bundle-text", () => {
@@ -425,7 +475,7 @@ test("more than 40 fired detectors throw evidence-too-large even when the bundle
 });
 
 test("a bundle still over 100,000 after every trim throws evidence-too-large", () => {
-	const record = emptyRecord({ health: { findings: Array.from({ length: 50 }, (_, i) => finding(i, 2000)) } });
+	const record = { ...emptyRecord(), children: Array.from({ length: 1000 }, (_, i) => ({ sessionId: `child-${i}` })) };
 	assert.throws(() => auditBundle(record, timelineShell(), { config: DEFAULT_CONFIG, now: T0 }), /evidence-too-large/);
 });
 

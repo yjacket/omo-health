@@ -876,7 +876,9 @@ describe("ui server", { timeout: 20_000 }, () => {
 					assert.equal(accepted.body.ok, true);
 					assert.equal(accepted.body.audit.status, "queued");
 					assert.equal(accepted.body.audit.planned.model, "openai/gpt-review:high");
-					assert.deepEqual(JSON.parse(fs.readFileSync(requestFileOf(world), "utf8")), { v: 1, sessionId: AUDIT_ID, requestedMs: world.nowMs });
+					const pending = JSON.parse(fs.readFileSync(requestFileOf(world), "utf8"));
+					assert.deepEqual(pending, { v: 1, sessionId: AUDIT_ID, requestedMs: world.nowMs, claimId: pending.claimId });
+					assert.equal(typeof pending.claimId, "string");
 					const again = await postAt(auditPort, "/api/audit", { sessionId: AUDIT_ID });
 					assert.deepEqual([again.status, again.body.error], [409, "running"]);
 					assert.deepEqual(fs.readdirSync(world.paths.health.auditRequestsDir), [`${AUDIT_ID}.json`]);
@@ -926,6 +928,47 @@ describe("ui server", { timeout: 20_000 }, () => {
 				assert.equal(starts.length, 1);
 				assert.equal(readAuditState(paths, AUDIT_ID).status, "running");
 				assert.equal(fs.existsSync(requestFileOf(world)), false);
+				assert.deepEqual(JSON.parse(fs.readFileSync(paths.health.auditBudgetFile, "utf8")), {
+					day: "2026-11-22", count: 1, jobs: [starts[0].jobId],
+				});
+			});
+
+			it("accepts the dashboard's own claim when the daemon takes it before the dashboard rereads", async (t) => {
+				const world = makeWorld();
+				const { paths, env, now } = world;
+				const { config } = loadConfig({ paths, env });
+				const starts = [];
+				const auditor = createAuditor({ paths, env, config, clock: { now }, runner: { start: (job) => starts.push(job) } });
+				let claimed;
+				const startA = createStartAudit({
+					paths, env, now,
+					request: (...args) => {
+						const claim = requestAudit(...args);
+						assert.equal(claim.created, true);
+						claimed = claim.request;
+						auditor.tick(now());
+						assert.equal(readAuditState(paths, AUDIT_ID).status, "running");
+						assert.equal(fs.existsSync(requestFileOf(world)), false);
+						return claim;
+					},
+				});
+				const dashboard = (startAudit) => createUiServer({ paths, token: TOKEN, getState: () => STATE, now, startAudit });
+				const a = dashboard(startA);
+				const b = dashboard(world.startAudit);
+				t.after(async () => {
+					await Promise.all([a.close(), b.close(), world.detail.close()]);
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				});
+				const [{ port: aPort }, { port: bPort }] = await Promise.all([a.listen(), b.listen()]);
+				const accepted = await postAt(aPort, "/api/audit", { sessionId: AUDIT_ID });
+				assert.equal(accepted.status, 202);
+				assert.equal(accepted.body.audit.sessionId, AUDIT_ID);
+				assert.equal(readAuditState(paths, AUDIT_ID).claimId, claimed.claimId);
+				const refused = await postAt(bPort, "/api/audit", { sessionId: AUDIT_ID });
+				assert.deepEqual([refused.status, refused.body], [409, { error: "running", reasonKo: "이미 조사 중입니다" }]);
+				auditor.tick(now());
+				assert.equal(fs.existsSync(requestFileOf(world)), false);
+				assert.equal(starts.length, 1);
 				assert.deepEqual(JSON.parse(fs.readFileSync(paths.health.auditBudgetFile, "utf8")), {
 					day: "2026-11-22", count: 1, jobs: [starts[0].jobId],
 				});

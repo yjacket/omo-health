@@ -1065,7 +1065,8 @@ test("a duplicate audit request cannot replace the first claim", (t) => {
 	const before = fs.readFileSync(file);
 	const second = requestAudit(h.paths, "m1", BASE + 1);
 	assert.deepEqual(fs.readFileSync(file), before, "the second call must leave the first claim unchanged");
-	assert.deepEqual(first, { created: true, request: { v: 1, sessionId: "m1", requestedMs: BASE } });
+	assert.deepEqual(first, { created: true, request: { v: 1, sessionId: "m1", requestedMs: BASE, claimId: first.request.claimId } });
+	assert.match(first.request.claimId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 	assert.deepEqual(second, { created: false });
 	assert.deepEqual(fs.readdirSync(dir), ["m1.json"]);
 });
@@ -1076,8 +1077,8 @@ test("request helpers: safeAuditId, the atomic request file and the state a requ
 	for (const bad of ["", "../x", "a/b", "a b", "_budget", 5, null, "x".repeat(200)]) assert.equal(safeAuditId(bad), null, String(bad));
 	assert.throws(() => requestAudit(h.paths, "../x", BASE));
 	assert.equal(readAuditState(h.paths, "m1"), null);
-	requestAudit(h.paths, "m1", BASE);
-	assert.deepEqual(readJsonSafe(path.join(h.paths.health.auditRequestsDir, "m1.json")), { v: 1, sessionId: "m1", requestedMs: BASE });
+	const { request: { claimId } } = requestAudit(h.paths, "m1", BASE);
+	assert.deepEqual(readJsonSafe(path.join(h.paths.health.auditRequestsDir, "m1.json")), { v: 1, sessionId: "m1", requestedMs: BASE, claimId });
 	assert.equal(readAuditState(h.paths, "m1").status, "requested");
 	const a = h.auditor();
 	h.tick(a);

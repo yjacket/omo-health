@@ -1522,14 +1522,14 @@ test("(gate 8) timeline recognizes stats-only tool errors with separator whitesp
 	const { file } = setup(t);
 	const line = '{"type":"message","message":{"role":"toolResult","toolName":"bash","isError" : true}}';
 	const timeline = gate8Parity(file(), `${line}\n`);
-	assert.deepEqual(timeline.tools, [{ name: "bash", calls: 0, errors: 1 }]);
+	assert.deepEqual(timeline.tools, { rows: [{ name: "bash", calls: 0, errors: 1 }], incomplete: false });
 	assert.deepEqual(timeline.totals.diagnostics, readUsage(file()).effective.diagnostics);
 });
 
 test("(gate 8) timeline recognizes an escaped image type", (t) => {
 	const { file } = setup(t);
 	const image = '{"type":"message","message":{"role":"user","content":[{"type":"im\\u0061ge","bytes":1048576}]}}';
-	assert.deepEqual(gate8Parity(file(), image).images, { peakCount: 1, peakMiB: 1 });
+	assert.deepEqual(gate8Parity(file(), image).images, { peakCount: 1, peakMiB: 1, incomplete: false });
 });
 
 test("(gate 8) an error turn with non-text error detail is classified without coercion", (t) => {
@@ -1537,7 +1537,7 @@ test("(gate 8) an error turn with non-text error detail is classified without co
 	const line = gate8Message({ stopReason: "error", errorMessage: { toString: "usage limit" } });
 	const timeline = gate8Parity(file(), `${line}\n`);
 	assert.equal(timeline.totals.total, 13);
-	assert.deepEqual(timeline.errors, { count: 1, byClass: { other: 1 } });
+	assert.deepEqual(timeline.errors, { count: 1, byClass: { other: 1 }, incomplete: false });
 });
 
 test("(gate 9) timeline classifies coercible JSON error detail like the provider detector", (t) => {
@@ -1545,7 +1545,7 @@ test("(gate 9) timeline classifies coercible JSON error detail like the provider
 	const line = gate8Message({ stopReason: "error", errorMessage: ["usage limit"] });
 	const cls = classifyProviderError(JSON.parse(line).message.errorMessage);
 	assert.equal(cls, "usage-limit");
-	assert.deepEqual(gate8Parity(file(), `${line}\n`).errors, { count: 1, byClass: { [cls]: 1 } });
+	assert.deepEqual(gate8Parity(file(), `${line}\n`).errors, { count: 1, byClass: { [cls]: 1 }, incomplete: false });
 });
 
 test("(gate 9) timeline preserves a parseable JSON timestamp ahead of the message fallback", (t) => {
@@ -1687,11 +1687,28 @@ test("usageTimeline reports buckets, turns, cache, errors, tools and images equa
 	);
 	assert.equal(timeline.cache.stormTurns, 1);
 	assert.ok(Math.abs(timeline.cache.hitRate - 802 / 986) < 1e-12);
-	assert.deepEqual(timeline.errors, { count: 1, byClass: { "usage-limit": 1 } });
-	assert.deepEqual(timeline.tools, [{ name: "bash", calls: 1, errors: 1 }]);
+	assert.deepEqual(timeline.errors, { count: 1, byClass: { "usage-limit": 1 }, incomplete: false });
+	assert.deepEqual(timeline.tools, { rows: [{ name: "bash", calls: 1, errors: 1 }], incomplete: false });
 	assert.equal(timeline.images.peakCount, 2);
 	assert.ok(Math.abs(timeline.images.peakMiB - 6 / MiB) < 1e-12);
 	assert.equal(typeof timeline.prepMs, "number");
+});
+
+test("(IS-8) an oversized tool-result image marks statistics incomplete without changing usage", (t) => {
+	const { file } = setup(t);
+	const reply = assistant({ usage: use({ input: 10, output: 7, cacheRead: 0, cacheWrite: 0, cost: 1 }) });
+	const image = toolResult();
+	image.message.content = [{ type: "image", data: "A".repeat(16 * MiB), mimeType: "image/png" }];
+	for (const trailingNewline of [true, false]) {
+		writeRecords(file(), [reply, image], { trailingNewline });
+		const timeline = usageTimeline(file());
+		assert.deepEqual(timeline.totals, readUsage(file()).effective);
+		assert.equal(timeline.totals.total, 17);
+		assert.equal(timeline.largeRecords, 1);
+		assert.equal(timeline.images.incomplete, true);
+		assert.equal(timeline.tools.incomplete, true);
+		assert.equal(timeline.errors.incomplete, true);
+	}
 });
 
 test("usageTimeline returns null above maxFileBytes", (t) => {

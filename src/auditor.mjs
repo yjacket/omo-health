@@ -52,10 +52,10 @@ function readBudget(paths, now) {
 export function requestAudit(paths, sessionId, nowMs) {
 	const id = safeAuditId(sessionId);
 	if (!id) throw new Error("invalid session id");
-	const request = { v: 1, sessionId: id, requestedMs: nowMs };
+	const request = { v: 1, sessionId: id, requestedMs: nowMs, claimId: crypto.randomUUID() };
 	const dir = ensureDir(paths.health.auditRequestsDir);
 	const file = path.join(dir, `${id}.json`);
-	const temp = path.join(dir, `.${crypto.randomUUID()}.tmp`);
+	const temp = path.join(dir, `.${request.claimId}.tmp`);
 	try {
 		fs.writeFileSync(temp, `${JSON.stringify(request, null, 2)}\n`, { flag: "wx" });
 		try {
@@ -70,13 +70,13 @@ export function requestAudit(paths, sessionId, nowMs) {
 	}
 }
 
-/** Withdraw a claim only if the pending request still has its timestamp. */
-export function withdrawAuditRequest(paths, sessionId, requestedMs) {
+/** Withdraw a claim only if the pending request still belongs to that caller. */
+export function withdrawAuditRequest(paths, sessionId, claimId) {
 	const id = safeAuditId(sessionId);
-	if (!id) return;
+	if (!id || typeof claimId !== "string") return;
 	const file = path.join(paths.health.auditRequestsDir, `${id}.json`);
 	const pending = readJsonSafe(file);
-	if (pending?.v === 1 && pending.sessionId === id && pending.requestedMs === requestedMs) removeSafe(file);
+	if (pending?.v === 1 && pending.sessionId === id && pending.claimId === claimId) removeSafe(file);
 }
 
 /** The session's audit record; an active one wins, else a waiting request, else the last finished record, else null. */
@@ -87,7 +87,10 @@ export function readAuditState(paths, sessionId) {
 	const held = record?.holdUntilExit === true;
 	if (!record || (!ACTIVE.has(record.status) && !held)) {
 		const request = readJsonSafe(path.join(paths.health.auditRequestsDir, `${id}.json`));
-		if (request?.v === 1 && request.sessionId === id) return { v: 1, sessionId: id, status: "requested", requestedMs: request.requestedMs };
+		if (request?.v === 1 && request.sessionId === id) {
+			const { requestedMs, claimId } = request;
+			return { v: 1, sessionId: id, status: "requested", requestedMs, ...(typeof claimId === "string" ? { claimId } : {}) };
+		}
 	}
 	if (record?.status === "failed" && record.reason) return { ...record, reasonKo: auditReasonLabel(record.reason) };
 	return record ?? null;
@@ -241,6 +244,7 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 				continue;
 			}
 			const record = blankRecord(id, request.requestedMs);
+			if (typeof request.claimId === "string") record.claimId = request.claimId;
 			if (now - request.requestedMs > REQUEST_TTL_MS) {
 				record.status = "failed";
 				record.reason = "expired";

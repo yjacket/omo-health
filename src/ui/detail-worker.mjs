@@ -73,10 +73,10 @@ export function createDetailOperations({
 		if (!choice || choice.blocked) return refuse(409, "no-model");
 		const claim = request(paths, canonicalId, at);
 		if (!claim.created) return refuse(409, "running");
-		// Intake may have published another dashboard's record and freed its claim since the first read.
+		// Intake may have published this claim, or another dashboard's, since the first read.
 		const state = readState(paths, canonicalId);
-		if (isAuditActive(state) && state.status !== "requested") {
-			withdrawAuditRequest(paths, canonicalId, claim.request.requestedMs);
+		if (isAuditActive(state) && state.claimId !== claim.request.claimId) {
+			withdrawAuditRequest(paths, canonicalId, claim.request.claimId);
 			return refuse(409, "running");
 		}
 		return [202, { ok: true, audit: { sessionId: canonicalId, status: "queued", statusKo: auditStatusLabel("queued"), planned: choice } }];

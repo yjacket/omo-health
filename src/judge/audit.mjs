@@ -25,8 +25,26 @@ const BUNDLE_STRING_MAX = 120;
 const BUNDLE_MAX_CHARS = 100_000;
 const HANGUL = /[\uAC00-\uD7A3]/;
 const REF_TOKEN = /\b(?:[FAIM]\d+|T)\b/g;
-const METRIC_KEY = /^[A-Za-z][\w.-]{0,40}$/;
-const METRIC_VALUE = /^-?\d+(\.\d+)?(ms|s|m|h|%|KiB|MiB|GiB|B)?$/;
+const METRIC_VALUE = /^-?\d+(\.\d+)?(ms|s|m|h|%|MB\/min|MB|KiB|MiB|GiB|B)?$/;
+
+// Only detector evidence with a numeric value by construction, optionally
+// followed by a fixed unit. Text carriers are unsafe even if they look numeric.
+export const AUDIT_METRIC_KEYS = Object.freeze([
+	"tree", "treeCpu", "treePrivMB", "bound", "commit", "writes", "quiet", // classify
+	"not-configured", // config, provider
+	"count", // crashes, loops
+	"ageDays", "daysLeft", "slots", "cleared", // omo-login
+	"idleMs", "errors", "executingTools", // orphans (idleMs also in tps)
+	"blocked", "accounts", "cooldown", "fallback", "lastingMs", // provider
+	"orphans", // refusal
+	"durMs", "events", "deferralsPerMin", "stuckMs", // reload
+	"survivors", // respawn
+	"private", "growth", "cpu", // runaway (growth also in tokens, cpu also in self)
+	"bad", "lines", "unknown", "tickLagMs", "restarts", "rss", "failures", // self
+	"cacheWrite", "cacheRead", "turns", "rewrites", "images", "imageMiB",
+	"tokens1h", "median1h", "flatten", "context", // tokens
+	"medianTps", "sessions", // tps
+]);
 const RULE_ID = /^R\d+[a-z]*$/;
 const DETECTOR_ID = /^D\d+$/;
 /** The answer's check limit and the most fired detectors one answer can require. */
@@ -159,7 +177,7 @@ function metricsOf(evidence) {
 		}
 		const key = line.slice(0, colon);
 		const value = line.slice(colon + 1);
-		if (!METRIC_KEY.test(key) || !METRIC_VALUE.test(value)) {
+		if (!AUDIT_METRIC_KEYS.includes(key) || !METRIC_VALUE.test(value)) {
 			droppedEvidence += 1;
 			continue;
 		}
@@ -318,6 +336,7 @@ function tokensOf(record, timeline) {
 		cost: numOf(totals.cost),
 		costUnknown: boolOf(totals.costUnknown) ?? false,
 		turns: numOf(totals.turns),
+		largeRecords: numOf(timeline?.largeRecords),
 		models: modelsOf(record, totals),
 		hours: (Array.isArray(timeline?.hours) ? timeline.hours : []).map((hour) => ({ hourMs: numOf(hour?.hourMs), tokens: numOf(hour?.tokens), turns: numOf(hour?.turns) })),
 		topTurns: (Array.isArray(timeline?.topTurns) ? timeline.topTurns : []).map((turn) => ({
@@ -330,9 +349,12 @@ function tokensOf(record, timeline) {
 			total: numOf(turn?.total),
 		})),
 		cache: { hitRate: numOf(timeline?.cache?.hitRate), stormTurns: numOf(timeline?.cache?.stormTurns) },
-		errors: { count: numOf(timeline?.errors?.count), byClass: Object.fromEntries(Object.entries(isObject(timeline?.errors?.byClass) ? timeline.errors.byClass : {}).map(([key, value]) => [key, numOf(value)])) },
-		tools: (Array.isArray(timeline?.tools) ? timeline.tools : []).map((tool) => ({ name: textOf(tool?.name), calls: numOf(tool?.calls), errors: numOf(tool?.errors) })),
-		images: { peakCount: numOf(timeline?.images?.peakCount), peakMiB: numOf(timeline?.images?.peakMiB) },
+		errors: { count: numOf(timeline?.errors?.count), byClass: Object.fromEntries(Object.entries(isObject(timeline?.errors?.byClass) ? timeline.errors.byClass : {}).map(([key, value]) => [key, numOf(value)])), incomplete: boolOf(timeline?.errors?.incomplete) },
+		tools: {
+			rows: (Array.isArray(timeline?.tools?.rows) ? timeline.tools.rows : []).map((tool) => ({ name: textOf(tool?.name), calls: numOf(tool?.calls), errors: numOf(tool?.errors) })),
+			incomplete: boolOf(timeline?.tools?.incomplete),
+		},
+		images: { peakCount: numOf(timeline?.images?.peakCount), peakMiB: numOf(timeline?.images?.peakMiB), incomplete: boolOf(timeline?.images?.incomplete) },
 	};
 }
 
@@ -483,7 +505,7 @@ function suggestedDetectors(bundle) {
 	const tokens = bundle.tokens ?? {};
 	const out = [];
 	if ((tokens.cache?.stormTurns ?? 0) > 0 || (tokens.cache?.hitRate !== null && tokens.cache?.hitRate < 0.25) || (tokens.errors?.count ?? 0) > 0) out.push("D4");
-	if ((tokens.tools ?? []).some((tool) => (tool.errors ?? 0) > 0)) out.push("D10");
+	if ((tokens.tools?.rows ?? []).some((tool) => (tool.errors ?? 0) > 0)) out.push("D10");
 	if ((tokens.cache?.stormTurns ?? 0) > 0) out.push("D5");
 	return [...new Set(out)];
 }
@@ -500,6 +522,7 @@ export function auditDocument(bundle) {
 		"Write your free text in Korean, for the machine owner.",
 		"Judge every record against its structured facts and the thresholds: severity, metrics, the actions taken and the analyst's verdict with its confidence. A missing finding alone is not a miss, and a high count alone is not waste; answer `unclear` when the data cannot decide.",
 		"When coverage.infoFindings is false, info findings were not being recorded before the session started, so their absence is not a miss.",
+		"Treat incomplete statistics as unknown, not zero.",
 		`Fired detectors: ${fired.length ? fired.join(", ") : "none"}. Write at least one check per fired detector. Set item to its detector ID or one of its finding refs.`,
 		`Also write one check for each detector whose conditions the aggregates suggest should have fired${suggested.length ? ` (${suggested.join(", ")})` : ""}, and one for token usage.`,
 		"Cite ref ids (F1 for findings, A1 for actions, I1 for investigations, M1 for messages, T for tokens) for every claim you can.",

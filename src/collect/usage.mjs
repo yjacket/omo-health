@@ -1089,6 +1089,7 @@ function consumeTimelineStats(stats, entry, options) {
 
 function consumeTimelineRecord(totals, stats, acc, options) {
 	if (acc.kind === "scanner") {
+		stats.largeRecords += 1;
 		consumeScannerRecord(totals, acc.scanner);
 		return;
 	}
@@ -1118,6 +1119,7 @@ function consumeTimelineRecord(totals, stats, acc, options) {
 
 function consumeTimelineFragment(totals, stats, acc, options) {
 	if (acc.kind === "scanner") {
+		stats.largeRecords += 1;
 		consumeScannerRecord(totals, acc.scanner, true);
 		return;
 	}
@@ -1157,6 +1159,7 @@ export function usageTimeline(file, { cacheStormWrite = Infinity, cacheStormRead
 		if (size > maxFileBytes) return null;
 		const totals = emptyUsage();
 		const stats = {
+			largeRecords: 0,
 			hours: new Map(),
 			topTurns: [],
 			errors: { count: 0, byClass: {} },
@@ -1195,20 +1198,26 @@ export function usageTimeline(file, { cacheStormWrite = Infinity, cacheStormRead
 		stats.peakCount = Math.max(stats.peakCount, stats.segmentCount);
 		stats.peakBytes = Math.max(stats.peakBytes, stats.segmentBytes);
 		const denominator = totals.input + totals.cacheRead + totals.cacheWrite;
+		// The scanner preserves accounting but does not parse the full record for statistics.
+		const incomplete = stats.largeRecords > 0;
 		return {
 			totals,
+			largeRecords: stats.largeRecords,
 			hours: [...stats.hours.values()].sort((a, b) => a.hourMs - b.hourMs).slice(-240),
 			topTurns: stats.topTurns,
 			cache: {
 				hitRate: denominator > 0 ? totals.cacheRead / denominator : null,
 				stormTurns: stats.stormTurns,
 			},
-			errors: stats.errors,
-			tools: [...stats.tools]
-				.map(([name, value]) => ({ name, calls: value.calls, errors: value.errors }))
-				.sort((a, b) => b.calls - a.calls || b.errors - a.errors || a.name.localeCompare(b.name))
-				.slice(0, 20),
-			images: { peakCount: stats.peakCount, peakMiB: stats.peakBytes / (1024 * 1024) },
+			errors: { ...stats.errors, incomplete },
+			tools: {
+				rows: [...stats.tools]
+					.map(([name, value]) => ({ name, calls: value.calls, errors: value.errors }))
+					.sort((a, b) => b.calls - a.calls || b.errors - a.errors || a.name.localeCompare(b.name))
+					.slice(0, 20),
+				incomplete,
+			},
+			images: { peakCount: stats.peakCount, peakMiB: stats.peakBytes / (1024 * 1024), incomplete },
 			prepMs: performance.now() - started,
 		};
 	} finally {
