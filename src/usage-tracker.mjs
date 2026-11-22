@@ -101,18 +101,21 @@ export function createUsageTracker({ paths, index, locator, clock, log } = {}) {
 		 * Queue ledger rows that need bytes, newest first: unindexed rows, rows whose
 		 * first read was interrupted, complete rows whose file moved past the indexed
 		 * end (an append or a same-length rewrite, which `readUsage` recounts), and
-		 * missing rows checked more than a day ago.
+		 * missing rows checked more than a day ago, and gone rows (deleted after a
+		 * complete read) checked more than a day ago.
 		 */
 		queueLedger(rows) {
 			for (const row of rows ?? []) {
 				if (!isNonEmptyString(row?.sessionId)) continue;
 				ledgerRows.set(row.sessionId, row);
 				const entry = index.get(row.sessionId);
+				const checkedAgo = nowMs() - (Number.isFinite(entry?.checkedMs) ? entry.checkedMs : 0) > DAY_MS;
 				let need = false;
 				if (!entry) need = true;
 				else if (entry.state === "ok" && entry.complete !== true) need = true;
+				else if (entry.gone === true) need = checkedAgo;
 				else if (entry.complete === true && !isFresh(entry)) need = true;
-				else if (entry.state === "missing" && nowMs() - (Number.isFinite(entry.checkedMs) ? entry.checkedMs : 0) > DAY_MS) need = true;
+				else if (entry.state === "missing" && checkedAgo) need = true;
 				if (need) queue.set(row.sessionId, row);
 			}
 			queue = new Map([...queue.entries()].sort((a, b) => (Number(b[1]?.endedMs) || 0) - (Number(a[1]?.endedMs) || 0)));

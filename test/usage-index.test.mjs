@@ -298,6 +298,32 @@ test("deleting a complete file marks it gone and keeps its total", (t) => {
 	assert.equal(index.fresh(entry), false);
 });
 
+test("markMissing keeps a complete entry's published total and marks it gone, while a never-found row stays missing", (t) => {
+	const { dir, fileOf, indexOf } = setup(t);
+	const index = indexOf();
+	const file = fileOf();
+	writeText(file, `${line()}\n`);
+	index.update("s1", file);
+
+	const gone = index.markMissing("s1");
+	assert.equal(gone.state, "ok");
+	assert.equal(gone.complete, true);
+	assert.equal(gone.gone, true);
+	assert.equal(compactUsage(gone).total, 10, "the last published total survives the deletion");
+
+	const never = index.markMissing("s2");
+	assert.equal(never.state, "missing");
+	assert.equal(never.complete, false);
+	assert.equal(never.gone, false);
+	assert.equal(compactUsage(never), null);
+
+	index.save();
+	const saved = readUsageIndex(path.join(dir, "usage.json"));
+	assert.equal(saved.get("s1").gone, true);
+	assert.equal(saved.get("s1").state, "ok");
+	assert.equal(saved.get("s1").published.total, 10);
+});
+
 test("get and has resolve the taskId alias", (t) => {
 	const { fileOf, indexOf } = setup(t);
 	const file = fileOf();

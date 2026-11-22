@@ -8,6 +8,7 @@ import { readUsage } from "../src/collect/usage.mjs";
 import { E, iso, tmpDir, writeJsonl } from "./helpers/fixtures.mjs";
 import { makeWorld, sessionState } from "./helpers/world.mjs";
 import { compactUsage, createUsageIndex, readUsageIndex, USAGE_TICK_BYTES } from "../src/usage-index.mjs";
+import { endedRow } from "../src/ui/model.mjs";
 import { createUsageTracker } from "../src/usage-tracker.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 
@@ -167,6 +168,43 @@ test("a 96 MiB file shows pending for three ticks, then its full total", () => {
 	assert.equal(compactUsage(s.index.get("big")).total, 960);
 	assert.equal(s.tracker.tokensOf("big").tokens.total, 960);
 	assert.equal(s.tracker.tokensOf("big").treeTokens, null);
+});
+
+test("a completed backlog file deleted after its read keeps the published total and marks the row gone", () => {
+	const s = setup();
+	const file = mainFile(s.paths, "d1");
+	writeJsonl(file, [E.assistant({ ms: T0, usage: usage(42) })]);
+	const row = { sessionId: "d1", kind: "main", cwd: s.cwd, endedMs: T0 };
+	s.tracker.queueLedger([row]);
+	s.tracker.tick(emptyWorld(s.clock));
+	assert.equal(compactUsage(s.index.get("d1")).total, 42);
+
+	// The locator now finds no path at all, the shape of a deleted file (not a null read).
+	fs.rmSync(file);
+	s.tracker.queueLedger([row]);
+	assert.equal(s.tracker.tick(emptyWorld(s.clock)).bytesRead, 0);
+	const entry = s.index.get("d1");
+	assert.equal(entry.state, "ok");
+	assert.equal(entry.complete, true);
+	assert.equal(entry.gone, true);
+	assert.equal(compactUsage(entry).total, 42);
+	assert.equal(s.tracker.tokensOf("d1").tokens.total, 42);
+
+	const dashboard = endedRow({ sessionId: "d1", kind: "main", startedMs: T0 - 1000, endedMs: T0 }, 0, new Map([["d1", entry]]));
+	assert.equal(dashboard.tokensState, "ok");
+	assert.equal(dashboard.tokens.total, 42);
+	assert.equal(dashboard.tokensGone, true);
+	assert.equal(s.tracker.queueLedger([row]), 0, "a gone row is not retried again the same day");
+
+	// A row whose file was never found is the only one that reads missing.
+	s.tracker.queueLedger([{ sessionId: "never", kind: "main", cwd: s.cwd, endedMs: T0 }]);
+	s.tracker.tick(emptyWorld(s.clock));
+	assert.equal(s.index.get("never").state, "missing");
+	assert.equal(s.index.get("never").complete, false);
+	assert.equal(s.tracker.tokensOf("never"), null);
+	const neverRow = endedRow({ sessionId: "never", kind: "main", startedMs: T0 - 1000, endedMs: T0 }, 0, new Map([["never", s.index.get("never")]]));
+	assert.equal(neverRow.tokensState, "missing");
+	assert.equal(neverRow.tokens, null);
 });
 
 test("a missing child is retried after a day of fake clock on the next queueLedger", () => {

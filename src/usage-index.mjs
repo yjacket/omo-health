@@ -287,14 +287,22 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			dirty = true;
 			return result.bytesRead;
 		},
-		/** No session file was located for `id`. */
+		/**
+		 * No session file was located for `id`. A never-found row becomes `missing`;
+		 * a row whose complete read already published a total keeps that total and
+		 * turns `gone`, exactly like the read-null path above (IS-3).
+		 */
 		markMissing(id, meta = {}) {
 			const entry = ensure(id);
 			applyMeta(entry, meta);
 			if (meta?.file) entry.file = meta.file;
-			entry.state = "missing";
-			entry.complete = false;
-			entry.gone = false;
+			if (entry.state === "ok" && entry.complete === true) {
+				entry.gone = true;
+			} else {
+				entry.state = "missing";
+				entry.complete = false;
+				entry.gone = false;
+			}
 			entry.checkedMs = clock.now();
 			dirty = true;
 			return entry;
