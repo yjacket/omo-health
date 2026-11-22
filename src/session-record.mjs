@@ -4,7 +4,7 @@ import { idFromFileName } from "./collect/sessions.mjs";
 import { createSessionFileLocator } from "./collect/session-files.mjs";
 import { senpiTaskStoreDir } from "./collect/tasks.mjs";
 import { DEFAULT_CONFIG } from "./config.mjs";
-import { streamDecisions } from "./decisions.mjs";
+import { maskedSubjectKey, streamDecisions, subjectIdJoinKey } from "./decisions.mjs";
 import { streamInvestigations } from "./investigations.mjs";
 import { safeSubjectId } from "./session-id.mjs";
 import { pathKey } from "./paths.mjs";
@@ -273,7 +273,7 @@ function findingRow(entry, { fp = entry.fp ?? null, ts = entry.ts ?? null, scope
 		severity: clean(entry.severity, 20),
 		scope,
 		...(bounded ? {
-			subject: cleanValue({ sessionId: subject.sessionId, taskId: subject.taskId }),
+			subject: cleanValue({ sessionId: subject.sessionId, taskId: subject.taskId, sessionKey: subject.sessionKey, taskKey: subject.taskKey }),
 			auditEvidence: auditEvidence((function* () {
 				for (const line of Array.isArray(entry.evidence) ? entry.evidence : []) {
 					const cleaned = cleanDetail(line);
@@ -580,22 +580,48 @@ function joinSessionDecisions(row, descendants, investigations, decisions, block
 		childTasksByParent.get(parentSessionId).add(taskId);
 	}
 	const taskOnly = new Set(nodes.filter((node) => !nonEmpty(node.sessionId)).map((node) => node.taskId).filter(nonEmpty));
+	// Resolve keys only against this tree's exact IDs. Keep the raw-ID sets for
+	// ordinary rows and for the audit launch recheck.
+	const byJoinKey = (ids) => {
+		const byKey = new Map();
+		for (const id of ids) {
+			const key = subjectIdJoinKey(id);
+			if (key) trackOwner(byKey, key, id);
+		}
+		return byKey;
+	};
+	const sessionsByKey = byJoinKey([...sessionAllowed, ...blockedIds]);
+	const tasksByKey = byJoinKey(nodes.map((node) => node.taskId));
+	const exactId = (byKey, id, key) => {
+		const maskedKey = maskedSubjectKey(id, key);
+		return maskedKey ? byKey.get(maskedKey) : id;
+	};
+	const sessionOf = (subject) => exactId(sessionsByKey, subject?.sessionId, subject?.sessionKey);
+	const taskOf = (subject) => exactId(tasksByKey, subject.taskId, subject.taskKey);
 	const taskSubjects = new Map();
 	if (taskOnly.size) {
 		const countSubject = ({ subject } = {}) => {
-			if (!isRecord(subject) || !taskOnly.has(subject.taskId)) return;
-			const identity = nonEmpty(subject.sessionId) ? `session:${subject.sessionId}` : `parent:${subject.parentSessionId ?? subject.rootSessionId ?? ""}`;
-			trackOwner(taskSubjects, subject.taskId, identity);
+			if (!isRecord(subject)) return;
+			const taskId = taskOf(subject);
+			if (!taskOnly.has(taskId)) return;
+			const sessionKey = maskedSubjectKey(subject.sessionId, subject.sessionKey) ?? subjectIdJoinKey(subject.sessionId);
+			const identity = sessionKey ? `masked-session:${sessionKey}` : nonEmpty(subject.sessionId)
+				? `session:${subject.sessionId}` : `parent:${subject.parentSessionId ?? subject.rootSessionId ?? ""}`;
+			trackOwner(taskSubjects, taskId, identity);
 		};
 		// A competing owner can veto a task-only match, even if its row would not be retained.
 		for (const entry of decisions()) if (isRecord(entry)) countSubject(entry);
 		for (const record of investigations()) if (isRecord(record)) countSubject(record);
 	}
-	const subjectMatches = (subject) => isRecord(subject) && (sessionAllowed.has(subject.sessionId) ||
-		childTasksByParent.get(subject.sessionId)?.has(subject.taskId) ||
-		(typeof taskSubjects.get(subject.taskId) === "string") ||
-		sessionAllowed.has(subject.parentSessionId) || sessionAllowed.has(subject.rootSessionId));
-	const subjectBlocked = (subject) => blockedIds.has(subject?.sessionId) ||
+	const subjectMatches = (subject) => {
+		if (!isRecord(subject)) return false;
+		const sessionId = sessionOf(subject);
+		const taskId = taskOf(subject);
+		return sessionAllowed.has(sessionId) || childTasksByParent.get(sessionId)?.has(taskId) ||
+			typeof taskSubjects.get(taskId) === "string" ||
+			sessionAllowed.has(subject.parentSessionId) || sessionAllowed.has(subject.rootSessionId);
+	};
+	const subjectBlocked = (subject) => blockedIds.has(sessionOf(subject)) ||
 		blockedIds.has(subject?.parentSessionId) || blockedIds.has(subject?.rootSessionId);
 	const unattributedHealth = { findings: 0, actions: 0, verdicts: 0, investigations: 0 };
 

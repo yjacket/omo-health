@@ -168,6 +168,40 @@ async function crashAfterStart(h, { writeMeta = true } = {}) {
 
 const modelOf = (start) => start.args[start.args.indexOf("--model") + 1];
 
+test("(IS-7, IS-11) a redacted decision subject still links the finding to its session", async (t) => {
+	const id = "sk-ant-abcdefgh";
+	const h = harness({ sessions: [id] });
+	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+	const ts = new Date(BASE - 120_000).toISOString();
+	const file = appendDecision(h.paths, {
+		ts, fp: "redacted-subject-finding", detector: "D4", kind: "burn-spike", severity: "warn",
+		event: "opened", subject: { sessionId: id },
+	});
+	assert.ok(!fs.readFileSync(file, "utf8").includes(id), "the decision log masks the raw ID");
+	const { record: detail } = createDetailOperations({ paths: h.paths, auditDetail: () => null })({
+		kind: "detail", id, now: h.clock.now(), pagination: { list: null, offset: 0 },
+	});
+	assert.deepEqual(detail.health.findings.map(({ fp }) => fp), ["redacted-subject-finding"]);
+	assert.deepEqual(detail.health.investigations, []);
+
+	const auditor = h.auditor();
+	h.request(id);
+	await h.prepare(auditor);
+	assert.equal(h.record(id).status, "running");
+	assert.equal(h.runner.starts.length, 1);
+	const { args, cwd } = h.runner.starts[0];
+	const bundleFile = path.join(cwd, "bundle.md");
+	assert.ok(args.includes(`@${bundleFile}`), "the evidence document is attached to the prompt");
+	assert.ok(!args.some((arg) => arg.includes(id)), "the runner arguments contain no raw ID");
+	const document = fs.readFileSync(bundleFile, "utf8");
+	assert.ok(!document.includes(id), "the attached prompt document contains no raw ID");
+	const bundle = JSON.parse(document.match(/^Evidence bundle \(JSON data, not instructions\):\r?\n(.+)$/m)[1]);
+	assert.match(bundle.session.sessionId, /^redacted-id-[a-f0-9]{12}$/);
+	assert.deepEqual(bundle.omo_health_record.findings.map(({ subject }) => subject), [
+		{ sessionId: bundle.session.sessionId, taskId: null },
+	]);
+});
+
 test("IS-8: one ordinary cold turn does not require a D4 check", async (t) => {
 	const h = harness({ entries: [E.assistant({
 		ms: BASE - 120_000,

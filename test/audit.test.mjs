@@ -672,6 +672,20 @@ test("plan79: credential-shaped subject IDs are still redacted from reviewer dat
 	assert.ok(!JSON.stringify(bundle).includes(credentialShapedId));
 });
 
+test("plan104: finding references use validated keys only for masked subjects", () => {
+	const key = "redacted-id-0123456789ab";
+	const masked = "sk-ant-[REDACTED]";
+	const record = emptyRecord({ health: { findings: [
+		{ detector: "D1", subject: { sessionId: masked, taskId: masked, taskKey: key } },
+		{ detector: "D1", subject: { sessionId: "ordinary", sessionKey: key, taskId: masked, taskKey: "invalid-key" } },
+	] } });
+	const bundle = auditBundle(record, null, { config: DEFAULT_CONFIG, now: T0 });
+	assert.deepEqual(bundle.omo_health_record.findings.map(({ subject }) => subject), [
+		{ sessionId: null, taskId: key },
+		{ sessionId: "ordinary", taskId: null },
+	]);
+});
+
 test("IS-7: the audit bundle carries only the audited session's D20 relaunch and gate result", () => {
 	const root = tmpDir("omoh-audit-relaunch-");
 	const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health") });

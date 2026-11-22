@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { appendJsonl, listDirSafe } from "./util/fsx.mjs";
@@ -11,6 +12,34 @@ import { redact } from "./util/text.mjs";
 const isRecord = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const detail = (parts) => parts.filter(Boolean).join("; ").slice(0, 200);
 
+export const redactedIdKey = (id) => `redacted-id-${createHash("sha256").update(id).digest("hex").slice(0, 12)}`;
+
+/** Only a masked ID can use the stored reference; never treat a key as an exact ID. */
+export function maskedSubjectKey(id, key) {
+	return typeof id === "string" && /\[REDACTED(?:-JWT)?\]/.test(id) &&
+		typeof key === "string" && /^redacted-id-[a-f0-9]{12}$/.test(key) ? key : null;
+}
+
+/** Match the writer's redaction of a JSON string, not the detail's display scrub. */
+export function subjectIdJoinKey(id) {
+	if (typeof id !== "string") return null;
+	const serialized = JSON.stringify(id);
+	return redact(serialized) !== serialized ? redactedIdKey(id) : null;
+}
+
+export function redactSubjectRecord(record) {
+	const { subject } = record;
+	let keys;
+	if (isRecord(subject)) {
+		for (const field of ["session", "task"]) {
+			const key = subjectIdJoinKey(subject[`${field}Id`]);
+			if (key) (keys ??= {})[`${field}Key`] = key;
+		}
+	}
+	const stored = keys ? { ...record, subject: { ...subject, ...keys } } : record;
+	return JSON.parse(redact(JSON.stringify(stored)));
+}
+
 /** The one-line outcome of an action decision, as the history samples and the session record show it. */
 export function actionDetail(entry) {
 	const o = isRecord(entry.outcome) ? entry.outcome : {};
@@ -21,7 +50,7 @@ export function actionDetail(entry) {
 export function appendDecision(paths, entry) {
 	const ts = entry.ts ?? new Date().toISOString();
 	const file = path.join(paths.health.decisionsDir, `${ts.slice(0, 10)}.jsonl`);
-	appendJsonl(file, JSON.parse(redact(JSON.stringify({ ...entry, ts }))));
+	appendJsonl(file, redactSubjectRecord({ ...entry, ts }));
 	return file;
 }
 

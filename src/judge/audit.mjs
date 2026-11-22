@@ -1,7 +1,7 @@
-import { createHash } from "node:crypto";
 import { AUDIT_REASON_CODES, reasonCode } from "../audit-codes.mjs";
 import { MODEL_KEY_LENGTH } from "../collect/usage.mjs";
 import { detectorThresholdsHash } from "../config-reload.mjs";
+import { maskedSubjectKey, redactedIdKey } from "../decisions.mjs";
 import { errorStormFact } from "../detect/loops.mjs";
 import { imageLevel } from "../detect/tokens.mjs";
 import { safeSubjectId } from "../session-id.mjs";
@@ -220,9 +220,7 @@ const INFERENCE_CUTOFFS = {
 
 const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 const textOf = (value) => (typeof value === "string" ? redact(value) : null);
-const outboundId = (id) => isRedactedLedgerId(id)
-	? `redacted-id-${createHash("sha256").update(id).digest("hex").slice(0, 12)}`
-	: id;
+const outboundId = (id) => isRedactedLedgerId(id) ? redactedIdKey(id) : id;
 // Validate first: a display placeholder is not an exact subject ID and must never be hashed.
 const subjectIdOf = (value) => outboundId(safeSubjectId(value));
 const numOf = (value) => (typeof value === "number" && Number.isFinite(value) ? value : null);
@@ -303,7 +301,10 @@ function findingsOf(list, continuousSinceMs, config) {
 			scope: textOf(finding?.scope),
 			thresholdsKnown: thresholds !== undefined,
 			...(thresholds === undefined ? {} : { thresholds }),
-			subject: { sessionId: subjectIdOf(subject.sessionId), taskId: subjectIdOf(subject.taskId) },
+			subject: {
+				sessionId: maskedSubjectKey(subject.sessionId, subject.sessionKey) ?? subjectIdOf(subject.sessionId),
+				taskId: maskedSubjectKey(subject.taskId, subject.taskKey) ?? subjectIdOf(subject.taskId),
+			},
 			metrics,
 			droppedEvidence,
 		};
