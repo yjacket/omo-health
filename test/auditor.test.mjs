@@ -473,6 +473,21 @@ function indexed(h, id, { maxBytes } = {}) {
 	return index;
 }
 
+test("(gate 15) the auditor excludes an identity missing only from published.usedModels", () => {
+	const h = harness({ entries: [openaiLine()] });
+	const index = indexed(h, "m1");
+	const file = index.file;
+	const [header, row] = fs.readFileSync(file, "utf8").split("\n");
+	const entry = JSON.parse(row);
+	delete entry.published.usedModels["openai/gpt-5-5"];
+	fs.writeFileSync(file, `${header}\n${JSON.stringify(entry)}\n`);
+
+	const a = h.auditor({ timelineMaxBytes: fs.statSync(h.files.m1).size - 1 });
+	h.request("m1");
+	h.tick(a);
+	assert.equal(modelOf(h.runner.starts[0]), "google/gemini-3-pro");
+});
+
 test("without a full timeline, an incomplete entry and a complete entry that is not at the end both end models-unknown without a charge", () => {
 	const h = harness();
 	const index = indexed(h, "m1", { maxBytes: 10 });
@@ -526,9 +541,10 @@ for (const incomplete of ["timeline", "index"]) {
 		indexed(h, "m1");
 		if (incomplete === "index") {
 			const file = h.paths.health.usageIndexFile;
-			const saved = JSON.parse(fs.readFileSync(file, "utf8"));
-			saved.entries.m1.published.modelsIncomplete = true;
-			fs.writeFileSync(file, JSON.stringify(saved));
+			const [header, row] = fs.readFileSync(file, "utf8").split("\n");
+			const entry = JSON.parse(row);
+			entry.published.modelsIncomplete = true;
+			fs.writeFileSync(file, `${header}\n${JSON.stringify(entry)}\n`);
 		}
 		const a = h.auditor({
 			timeline: (...args) => {

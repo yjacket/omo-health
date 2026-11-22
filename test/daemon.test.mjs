@@ -423,10 +423,10 @@ test("the daemon indexes a live session's tokens into sessions/usage.json and pu
 	});
 	await runDaemon({ proc: fakeProc(), paths, config: { ...DEFAULT_CONFIG, idleExitMs: 2 * 60_000 }, clock, overrides: { procs: { kind: "fake" }, createEngine: engine, env: {} } });
 
-	const index = JSON.parse(fs.readFileSync(paths.health.usageIndexFile, "utf8"));
-	assert.equal(index.entries.m1.complete, true);
-	assert.equal(index.entries.m1.published.total, 15);
-	assert.equal(index.entries.m1.published.input, 10);
+	const entry = (await import("../src/usage-index.mjs")).readUsageIndex(paths.health.usageIndexFile).get("m1");
+	assert.equal(entry.complete, true);
+	assert.equal(entry.published.total, 15);
+	assert.equal(entry.published.input, 10);
 	const board = JSON.parse(fs.readFileSync(paths.health.sessionsSnapshotFile, "utf8"));
 	const row = board.groups.flatMap((g) => g.sessions).find((session) => session.sessionId === "m1");
 	assert.equal(row.tokens.total, 15, "status/_sessions.json carries the token total");

@@ -6,7 +6,7 @@ import { auditBundle, auditDocument, resolveAuditModel, validateAudit } from "./
 import { ANALYST_POLL_MS, parseAnalystOutput, unavailableReason } from "./judge/analyst.mjs";
 import { laneArgs } from "./judge/lane.mjs";
 import { loadSessionRecord } from "./session-record.mjs";
-import { fresh, readUsageIndex } from "./usage-index.mjs";
+import { fresh, isSpillModelKey, readUsageIndex } from "./usage-index.mjs";
 import { atomicWriteFile, atomicWriteJson, ensureDir, listDirSafe, readJsonSafe, readTextSafe, removeSafe, statSafe } from "./util/fsx.mjs";
 import { redact, truncate } from "./util/text.mjs";
 
@@ -99,12 +99,20 @@ const refsOf = (bundle) => {
  * can veto the choice if it lost identities; even a stale publication supplies
  * identities to exclude, but cannot establish coverage on its own. */
 export function auditModelFacts(entry, full) {
-	const indexed = entry?.published;
+	const indexed = entry ? [entry.usage, entry.overlay, entry.published] : [];
 	const totals = full?.totals;
-	const indexComplete = indexed?.modelsIncomplete === false;
+	const indexComplete = Boolean(entry) && indexed.every((tree) => tree?.modelsIncomplete === false);
 	const timelineComplete = totals?.modelsIncomplete === false;
+	const sessionModels = new Set();
+	for (const tree of [totals, ...indexed]) {
+		for (const map of [tree?.usedModels, tree?.models]) {
+			for (const key of Object.keys(map ?? {})) {
+				if (!isSpillModelKey(key)) sessionModels.add(key);
+			}
+		}
+	}
 	return {
-		sessionModels: [...new Set([...Object.keys(totals?.usedModels ?? {}), ...Object.keys(indexed?.usedModels ?? {})])],
+		sessionModels: [...sessionModels],
 		sessionModelsKnown: (!entry || indexComplete) && (!full || timelineComplete) &&
 			(timelineComplete || (indexComplete && fresh(entry))),
 	};

@@ -68,6 +68,62 @@ function setup(t) {
 }
 
 const writeText = (file, text) => fs.writeFileSync(file, text);
+function parseIndex(text) {
+	const [header, ...lines] = text.trimEnd().split("\n");
+	return { ...JSON.parse(header), entries: Object.fromEntries(lines.map((line) => {
+		const entry = JSON.parse(line);
+		return [entry.id, entry];
+	})) };
+}
+
+function indexText({ v, entries }) {
+	return [JSON.stringify({ v }), ...Object.values(entries).map((entry) => JSON.stringify(entry))].join("\n") + "\n";
+}
+
+test("(gate 15) 12000 one-model sessions under a Korean project save and resave at 96 MiB", (t) => {
+	const { dir, fileOf } = setup(t);
+	const file = fileOf("usage.json");
+	const program = `
+import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { createUsageIndex } from ${JSON.stringify(new URL("../src/usage-index.mjs", import.meta.url).href)};
+const [mode, file, root] = process.argv.slice(1);
+const index = createUsageIndex({ file, clock: { now: () => 1 } });
+if (mode === "write") {
+	const project = path.join(root, "작업");
+	fs.mkdirSync(project);
+	for (let i = 0; i < 12000; i++) {
+		const id = "01aaa000-0000-7000-8000-" + String(i).padStart(12, "0");
+		const transcript = path.join(project, "2026-11-22_" + id + ".jsonl");
+		fs.writeFileSync(transcript, '{"type":"usage","model":"m","provider":"p","usage":{"input":1,"cost":{"total":0.25}}}\\n');
+		index.update(id, transcript, { kind: "main" });
+	}
+}
+const rows = index.entries();
+assert.equal(rows.length, 12000);
+const hash = crypto.createHash("sha256");
+for (const row of rows) {
+	assert.equal(row.published.total, 1);
+	assert.equal(row.published.cost, 0.25);
+	hash.update(JSON.stringify([row.id, row.published]));
+}
+if (mode === "reload") index.markMissing("unlocated");
+console.error(mode, "before save", rows.length, "rows", process.memoryUsage().heapUsed, "heap bytes");
+assert.equal(index.save(), true);
+console.error(mode, "after save", fs.statSync(file).size, "file bytes", process.memoryUsage().heapUsed, "heap bytes", process.resourceUsage().maxRSS, "KiB peak RSS");
+console.log(hash.digest("hex"));
+`;
+	const digests = [];
+	for (const mode of ["write", "reload"]) {
+		const result = spawnSync(process.execPath, ["--max-old-space-size=96", "--input-type=module", "--eval", program, mode, file, dir], { encoding: "utf8" });
+		assert.equal(result.status, 0, `${mode}:\n${result.stderr}\n${result.error ?? ""}`);
+		t.diagnostic(result.stderr.trim());
+		digests.push(result.stdout.trim());
+	}
+	assert.equal(digests[0], digests[1], "every published tree survived the round trip");
+});
 
 test("(gate 14) 138 sessions with 1000 overflowing models save and reload in capped children", (t) => {
 	const { fileOf } = setup(t);
@@ -112,7 +168,7 @@ test("(gate 14) exact budget, spill, and a previously oversized persisted row", 
 	assert.deepEqual(beforeSave.models, { "(other models)": { tokens: 5120, cost: beforeSave.cost } });
 	assert.equal(beforeSave.modelsIncomplete, true);
 	index.save();
-	const data = JSON.parse(fs.readFileSync(saved, "utf8"));
+	const data = parseIndex(fs.readFileSync(saved, "utf8"));
 	const rows = Object.values(data.entries);
 	const slots = rows.flatMap((row) => [row.usage, row.overlay, row.published]).flatMap((tree) =>
 		[...Object.keys(tree.models), ...Object.keys(tree.usedModels)]).filter((key) => !key.startsWith("("));
@@ -120,7 +176,7 @@ test("(gate 14) exact budget, spill, and a previously oversized persisted row", 
 	assert.equal(readUsageIndex(saved).get("s1").published.modelsIncomplete, false);
 	assert.equal(readUsageIndex(saved).get("s2").published.total, 5120);
 	data.entries.s2 = { ...data.entries.s0, id: "s2" };
-	writeText(saved, JSON.stringify(data));
+	writeText(saved, indexText(data));
 	const loaded = readUsageIndex(saved);
 	assert.equal(compactUsage(loaded.get("s1")).total, 5120);
 	assert.equal(compactUsage(loaded.get("s2")), null);
@@ -161,7 +217,7 @@ test("save and load round-trip the entries without the in-memory fields", (t) =>
 	assert.equal(index.update("s2", second, { kind: "child", taskId: "st_2", parentSessionId: "s1" }), fs.statSync(second).size);
 	assert.equal(index.save(), true);
 	assert.equal(index.save(), false);
-	const raw = JSON.parse(fs.readFileSync(path.join(dir, "usage.json"), "utf8"));
+	const raw = parseIndex(fs.readFileSync(path.join(dir, "usage.json"), "utf8"));
 	assert.equal(raw.v, USAGE_INDEX_VERSION);
 	for (const entry of Object.values(raw.entries)) {
 		assert.equal("scanOffset" in entry, false);
@@ -236,9 +292,9 @@ test("constructing an index over a corrupt, different-version or absent file sta
 	const writer = createUsageIndex({ file, clock, log });
 	writer.update("s1", session);
 	writer.save();
-	const saved = JSON.parse(fs.readFileSync(file, "utf8"));
+	const saved = parseIndex(fs.readFileSync(file, "utf8"));
 	Object.assign(saved.entries.s1, { scanOffset: 5, partial: { start: 0 }, readError: true });
-	writeText(file, JSON.stringify(saved));
+	writeText(file, indexText(saved));
 	const loaded = createUsageIndex({ file, clock, log });
 	assert.equal(loaded.get("s1").state, "ok");
 	assert.equal(loaded.get("s1").offset, 12);
@@ -320,7 +376,7 @@ test("(gate 10) finite records that overflow survive a reload and a resumable ap
 });
 
 for (const [expected, appendUsage] of [[-Infinity, use()], [NaN, use({ input: 1e308, output: 1e308 })]]) {
-	test(`(gate 10) ${expected} from a legacy index survives save, reload and append`, (t) => {
+	test(`(gate 10) ${expected} from a tagged index survives save, reload and append`, (t) => {
 		const { fileOf, indexOf } = setup(t);
 		const file = fileOf();
 		const savedFile = fileOf("usage.json");
@@ -328,15 +384,15 @@ for (const [expected, appendUsage] of [[-Infinity, use()], [NaN, use({ input: 1e
 		const index = indexOf();
 		index.update("s1", file);
 		index.save();
-		const legacy = JSON.parse(fs.readFileSync(savedFile, "utf8"));
-		legacy.v = 1;
-		// A legacy file may contain an exponent that JSON.parse converts to -Infinity.
-		writeText(savedFile, JSON.stringify(legacy).replaceAll('"total":10', '"total":-1e999'));
+		const tagged = parseIndex(fs.readFileSync(savedFile, "utf8"));
+		tagged.entries.s1.usage.total = { $n: "-Infinity" };
+		tagged.entries.s1.published.total = { $n: "-Infinity" };
+		writeText(savedFile, indexText(tagged));
 		const migrated = indexOf();
 		assert.equal(migrated.get("s1").usage.total, -Infinity);
 		const appended = `${JSON.stringify(assistant({ usage: appendUsage }))}\n`;
 		fs.appendFileSync(file, appended);
-		assert.equal(migrated.update("s1", file), Buffer.byteLength(appended), "resume the v1 cursor");
+		assert.equal(migrated.update("s1", file), Buffer.byteLength(appended), "resume the tagged cursor");
 		assert.equal(compactUsage(migrated.get("s1")).total, expected);
 		assert.equal(migrated.save(), true);
 
@@ -482,28 +538,25 @@ if (process.argv[3] === "save") {
 	}
 });
 
-for (const version of [1, 2]) {
-	test(`(gate 13) a v${version} markMissing row keeps all its writer fields`, (t) => {
-		const { clock, fileOf, indexOf } = setup(t);
-		const file = fileOf("usage.json");
-		const meta = { kind: "child", taskId: "st_missing", file: fileOf("not-found.jsonl") };
-		const index = indexOf();
-		index.markMissing("s", meta);
-		index.save();
-		const original = fs.readFileSync(file, "utf8");
-		if (version === 1) writeText(file, original.replace('"v": 2', '"v": 1'));
-		const loaded = readUsageIndex(file).get("s");
-		assert.equal(JSON.stringify(loaded), JSON.stringify(JSON.parse(original).entries.s));
-		const restarted = indexOf();
-		assert.deepEqual(restarted.get("s"), loaded);
-		// Dirty the index without rewriting the missing row itself.
-		restarted.markMissing("other");
-		assert.equal(restarted.save(), true);
-		const saved = fs.readFileSync(file, "utf8");
-		assert.equal(saved.slice(0, saved.indexOf(',\n    "other"')), original.slice(0, original.lastIndexOf("\n  }")));
-		assert.equal(loaded.checkedMs, clock.now());
-	});
-}
+test("(gate 13) a markMissing row keeps all its writer fields", (t) => {
+	const { clock, fileOf, indexOf } = setup(t);
+	const file = fileOf("usage.json");
+	const meta = { kind: "child", taskId: "st_missing", file: fileOf("not-found.jsonl") };
+	const index = indexOf();
+	index.markMissing("s", meta);
+	index.save();
+	const original = fs.readFileSync(file, "utf8");
+	const loaded = readUsageIndex(file).get("s");
+	assert.equal(JSON.stringify(loaded), JSON.stringify(parseIndex(original).entries.s));
+	const restarted = indexOf();
+	assert.deepEqual(restarted.get("s"), loaded);
+	// Dirty the index without rewriting the missing row itself.
+	restarted.markMissing("other");
+	assert.equal(restarted.save(), true);
+	const saved = fs.readFileSync(file, "utf8");
+	assert.equal(saved.slice(0, original.length), original);
+	assert.equal(loaded.checkedMs, clock.now());
+});
 
 for (const treeName of ["usage", "overlay", "published"]) {
 	test(`(gate 13) reload rejects oversized model maps in ${treeName}`, (t) => {
@@ -518,13 +571,13 @@ for (const treeName of ["usage", "overlay", "published"]) {
 		const original = fs.readFileSync(indexFile, "utf8");
 		for (const mapName of ["models", "usedModels"]) {
 			for (const failure of ["count", "length"]) {
-				const data = JSON.parse(original);
+				const data = parseIndex(original);
 				const map = data.entries.s[treeName][mapName];
 				const sample = Object.values(map)[0];
 				if (failure === "count") {
 					for (let i = 0; i < 1000; i += 1) map[`p/${i}`] = sample;
 				} else map[`p/${"x".repeat(255)}`] = sample;
-				writeText(indexFile, JSON.stringify(data));
+				writeText(indexFile, indexText(data));
 				const loaded = readUsageIndex(indexFile).get("s");
 				const label = `${treeName}.${mapName}: ${failure}`;
 				assert.equal(loaded.offset, 0, label);
@@ -546,28 +599,25 @@ for (const treeName of ["usage", "overlay", "published"]) {
 		index.update("s", file);
 		index.save();
 		const original = fs.readFileSync(indexFile, "utf8");
-		for (const version of [1, 2]) {
-			for (const leaf of ["total", "input", "output", "cacheRead", "cacheWrite", "cost", "turns", "models.tokens", "models.cost"]) {
-				for (const malformed of [false, true]) {
-					const data = JSON.parse(original);
-					data.v = version;
-					const tree = data.entries.s[treeName];
-					const [head, tail] = leaf.split(".");
-					const node = tail ? Object.values(tree.models)[0] : tree;
-					if (malformed) node[tail ?? head] = null;
-					else delete node[tail ?? head];
-					writeText(indexFile, JSON.stringify(data));
-					const loaded = readUsageIndex(indexFile).get("s");
-					const label = `v${version} ${treeName}.${leaf}: ${malformed ? "null" : "absent"}`;
-					assert.equal(loaded.offset, 0, label);
-					assert.equal(compactUsage(loaded), null, label);
-				}
+		for (const leaf of ["total", "input", "output", "cacheRead", "cacheWrite", "cost", "turns", "models.tokens", "models.cost"]) {
+			for (const malformed of [false, true]) {
+				const data = parseIndex(original);
+				const tree = data.entries.s[treeName];
+				const [head, tail] = leaf.split(".");
+				const node = tail ? Object.values(tree.models)[0] : tree;
+				if (malformed) node[tail ?? head] = null;
+				else delete node[tail ?? head];
+				writeText(indexFile, indexText(data));
+				const loaded = readUsageIndex(indexFile).get("s");
+				const label = `${treeName}.${leaf}: ${malformed ? "null" : "absent"}`;
+				assert.equal(loaded.offset, 0, label);
+				assert.equal(compactUsage(loaded), null, label);
 			}
 		}
 	});
 }
 
-test("(gate 12) malformed numeric fields invalidate a row at load: v2 null, v1 tag, malformed tag, string", (t) => {
+test("(gate 12) malformed numeric fields invalidate a row at load: null, malformed tags, string", (t) => {
 	const { dir, fileOf, indexOf } = setup(t);
 	const file = fileOf();
 	writeText(file, `${line()}\n`);
@@ -577,15 +627,15 @@ test("(gate 12) malformed numeric fields invalidate a row at load: v2 null, v1 t
 	const savedFile = path.join(dir, "usage.json");
 	const template = fs.readFileSync(savedFile, "utf8");
 	const cases = [
-		["v2 published.total null", (data) => { data.entries.s1.published.total = null; }],
-		["v1 published.total tag", (data) => { data.v = 1; data.entries.s1.published.total = { $n: "Infinity" }; }],
-		["v2 malformed tag", (data) => { data.entries.s1.published.total = { $n: "Bogus" }; }],
-		["v2 string numeric field", (data) => { data.entries.s1.published.input = "number:Infinity"; }],
+		["published.total null", (data) => { data.entries.s1.published.total = null; }],
+		["tag with an extra field", (data) => { data.entries.s1.published.total = { $n: "Infinity", extra: true }; }],
+		["malformed tag", (data) => { data.entries.s1.published.total = { $n: "Bogus" }; }],
+		["string numeric field", (data) => { data.entries.s1.published.input = "number:Infinity"; }],
 	];
 	for (const [name, mutate] of cases) {
-		const data = JSON.parse(template);
+		const data = parseIndex(template);
 		mutate(data);
-		writeText(savedFile, JSON.stringify(data));
+		writeText(savedFile, indexText(data));
 		const loaded = readUsageIndex(savedFile).get("s1");
 		assert.equal(loaded.offset, 0, name);
 		assert.equal(loaded.complete, false, name);
@@ -595,7 +645,7 @@ test("(gate 12) malformed numeric fields invalidate a row at load: v2 null, v1 t
 	}
 });
 
-test("(gate 12) valid v1 and v2 files load unchanged", (t) => {
+test("(gate 12) a valid current file loads and legacy files start empty", (t) => {
 	const { dir, fileOf, indexOf } = setup(t);
 	const file = fileOf();
 	writeText(file, `${line()}\n`);
@@ -603,16 +653,15 @@ test("(gate 12) valid v1 and v2 files load unchanged", (t) => {
 	index.update("s1", file);
 	index.save();
 	const savedFile = path.join(dir, "usage.json");
-	const v2 = readUsageIndex(savedFile).get("s1");
-	assert.equal(compactUsage(v2).total, 10);
-	assert.equal(fresh(v2), true);
-	const v1Data = JSON.parse(fs.readFileSync(savedFile, "utf8"));
-	v1Data.v = 1;
-	writeText(savedFile, JSON.stringify(v1Data));
-	const v1 = readUsageIndex(savedFile).get("s1");
-	assert.deepEqual(v1, v2);
-	assert.equal(compactUsage(v1).total, 10);
-	assert.equal(fresh(v1), true);
+	const current = readUsageIndex(savedFile).get("s1");
+	assert.equal(compactUsage(current).total, 10);
+	assert.equal(fresh(current), true);
+	const { entries } = parseIndex(fs.readFileSync(savedFile, "utf8"));
+	for (const v of [1, 2]) {
+		writeText(savedFile, JSON.stringify({ v, entries }));
+		assert.equal(readUsageIndex(savedFile).size, 0);
+		assert.deepEqual(indexOf().entries(), []);
+	}
 });
 
 test("a three-call first read shows nothing until the file is read to the end", (t) => {

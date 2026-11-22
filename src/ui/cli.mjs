@@ -36,7 +36,7 @@ function auditFactsFor(paths, record, id, tokens) {
 	const entry = usageEntryFor(readUsageIndex(paths.health.usageIndexFile), record, id);
 	// Keep the dashboard's existing freshness gate: do not queue a request
 	// against an index row the daemon still has to finish or refresh.
-	if (!fresh(entry)) return { sessionModels: [], sessionModelsKnown: false };
+	if (!fresh(entry)) return { ...auditModelFacts(entry, null), sessionModelsKnown: false };
 	return auditModelFacts(entry, readAuditTimeline(entry.file, tokens));
 }
 

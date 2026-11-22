@@ -610,6 +610,11 @@ describe("ui server", { timeout: 20_000 }, () => {
 				fs.writeFileSync(file, JSON.stringify(value));
 			}
 
+			function writeIndexRow(file, row) {
+				fs.mkdirSync(path.dirname(file), { recursive: true });
+				fs.writeFileSync(file, `{"v":3}\n${JSON.stringify(row)}\n`);
+			}
+
 			function makeWorld({ daemon = "running", enabled = true, usedModels = { "anthropic/claude-used": true }, lanes = { ultrabrain: ["anthropic/claude-used"], architect: ["openai/gpt-review:high"] }, growFile = false, budgetCount = null } = {}) {
 				const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omoh-audit-ui-"));
 				const env = { USERPROFILE: dir, OMO_HEALTH_HOME: path.join(dir, "health") };
@@ -625,10 +630,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 					path.join(worldPaths.health.sessionsDir, "ended-2026-11-22.jsonl"),
 					`${JSON.stringify({ v: 1, sessionId: AUDIT_ID, taskId: null, kind: "main", outcome: "answered", startedMs: nowMs - 1_000, endedMs: nowMs })}\n`,
 				);
-				writeJson(worldPaths.health.usageIndexFile, {
-					v: 1,
-					entries: {
-						[AUDIT_ID]: {
+				writeIndexRow(worldPaths.health.usageIndexFile, {
 							id: AUDIT_ID,
 							file: sessionFile,
 							kind: "main",
@@ -651,8 +653,6 @@ describe("ui server", { timeout: 20_000 }, () => {
 							usage: emptyUsage(),
 							overlay: emptyUsage(),
 							published: { ...emptyUsage(), usedModels },
-						},
-					},
 				});
 				writeJson(worldPaths.omoJsonc, { "[native]": { categories: Object.fromEntries(Object.entries(lanes).map(([lane, models]) => [lane, { models }])) } });
 				writeJson(worldPaths.authFile, { anthropic: {}, openai: {} });
@@ -774,10 +774,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 				fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
 				fs.writeFileSync(sessionFile, `${JSON.stringify({ type: "session", id: sessionId })}\n`);
 				const stat = fs.statSync(sessionFile);
-				writeJson(worldPaths.health.usageIndexFile, {
-					v: 1,
-					entries: {
-						[sessionId]: {
+				writeIndexRow(worldPaths.health.usageIndexFile, {
 							id: sessionId,
 							file: sessionFile,
 							kind: "child",
@@ -800,8 +797,6 @@ describe("ui server", { timeout: 20_000 }, () => {
 							usage: emptyUsage(),
 							overlay: emptyUsage(),
 							published: { ...emptyUsage(), usedModels: { "anthropic/claude-used": true } },
-						},
-					},
 				});
 				writeJson(worldPaths.omoJsonc, { "[native]": { categories: { ultrabrain: { models: ["openai/gpt-review:high"] } } } });
 				writeJson(worldPaths.authFile, { anthropic: {}, openai: {} });
@@ -932,13 +927,30 @@ describe("ui server", { timeout: 20_000 }, () => {
 				}
 			});
 
+			it("(gate 15) preview and POST exclude an identity missing only from published.usedModels", () => {
+				const world = makeWorld({
+					usedModels: { "openai/alpha-review": true },
+					lanes: { ultrabrain: ["openai/alpha-review"], architect: ["openai/beta-review"] },
+				});
+				try {
+					const file = world.paths.health.usageIndexFile;
+					const entry = JSON.parse(fs.readFileSync(file, "utf8").split("\n")[1]);
+					entry.usage.usedModels = { ...entry.published.usedModels };
+					delete entry.published.usedModels["openai/alpha-review"];
+					writeIndexRow(file, entry);
+					assert.equal(world.detail(AUDIT_ID).audit.planned.model, "openai/beta-review");
+					assert.equal(world.startAudit(AUDIT_ID)[1].audit.planned.model, "openai/beta-review");
+				} finally {
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				}
+			});
+
 			for (const incomplete of ["timeline", "index"]) {
 				it(`(gate 14) preview and POST refuse when only the ${incomplete} lost model identities`, () => {
 					const world = makeWorld();
 					try {
 						const indexFile = world.paths.health.usageIndexFile;
-						const saved = JSON.parse(fs.readFileSync(indexFile, "utf8"));
-						const entry = saved.entries[AUDIT_ID];
+						const entry = JSON.parse(fs.readFileSync(indexFile, "utf8").split("\n")[1]);
 						if (incomplete === "index") entry.published.modelsIncomplete = true;
 						else {
 							const row = { type: "message", message: { role: "assistant", provider: "openai", model: "x".repeat(257) } };
@@ -948,7 +960,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 							entry.size = entry.offset = entry.evaluatedTo = stat.size;
 							entry.mtimeMs = stat.mtimeMs;
 						}
-						writeJson(indexFile, saved);
+						writeIndexRow(indexFile, entry);
 						const detail = world.detail(AUDIT_ID).audit;
 						assert.equal(detail.blocked, "models-unknown");
 						assert.equal(detail.planned, null);

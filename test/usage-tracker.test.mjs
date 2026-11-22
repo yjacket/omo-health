@@ -16,6 +16,8 @@ const T0 = Date.UTC(2026, 8, 28, 12, 0, 0);
 const DAY = 86_400_000;
 
 const usage = (input, output = 0, cacheRead = 0, cacheWrite = 0, cost = 0) => ({ input, output, cacheRead, cacheWrite, cost: { total: cost } });
+const indexRow = (text) => JSON.parse(text.split("\n")[1]);
+const writeIndexRow = (file, original, row) => fs.writeFileSync(file, `${original.split("\n")[0]}\n${JSON.stringify(row)}\n`);
 
 function makeClock(start = T0) {
 	let now = start;
@@ -340,19 +342,15 @@ test("(gate 11) a previous-writer row with a null overflowed total is recounted 
 		}
 		return value;
 	};
-	const previous = nullTags(JSON.parse(fs.readFileSync(s.paths.health.usageIndexFile, "utf8")));
-	previous.v = 1;
+	const previous = { v: 1, entries: { [id]: nullTags(indexRow(fs.readFileSync(s.paths.health.usageIndexFile, "utf8"))) } };
 	fs.writeFileSync(s.paths.health.usageIndexFile, JSON.stringify(previous));
 
 	const index = createUsageIndex({ file: s.paths.health.usageIndexFile, clock: s.clock, log: s.log });
 	const locator = createSessionFileLocator({ paths: s.paths, clock: s.clock, rescanMs: 0 });
 	const tracker = createUsageTracker({ paths: s.paths, index, locator, clock: s.clock, log: s.log });
 	const row = { sessionId: id, kind: "main", cwd: s.cwd, endedMs: T0 };
-	const loaded = index.get(id);
-	assert.equal(loaded.offset, 0, "the lossy cursor is dropped");
-	assert.equal(loaded.complete, false);
-	assert.equal(compactUsage(loaded), null, "nothing is published for the invalidated row");
-	assert.equal(index.fresh(loaded), false);
+	assert.deepEqual(index.entries(), [], "the legacy file starts empty");
+	assert.equal(readUsageIndex(s.paths.health.usageIndexFile).size, 0);
 
 	assert.equal(tracker.queueLedger([row]), 1, "the row needs a recount");
 	tracker.tick(emptyWorld(s.clock));
@@ -377,16 +375,16 @@ test("(gate 12) malformed numeric fields keep a row pending until the tracker re
 	s.index.save();
 	const savedText = fs.readFileSync(s.paths.health.usageIndexFile, "utf8");
 	const cases = [
-		["v2 published.total null", (data) => { data.entries[id].published.total = null; }],
-		["v1 published.total tag", (data) => { data.v = 1; data.entries[id].published.total = { $n: "Infinity" }; }],
-		["v2 malformed tag", (data) => { data.entries[id].published.total = { $n: "Bogus" }; }],
-		["v2 string numeric field", (data) => { data.entries[id].published.input = "number:Infinity"; }],
+		["published.total null", (entry) => { entry.published.total = null; }],
+		["tag with an extra field", (entry) => { entry.published.total = { $n: "Infinity", extra: true }; }],
+		["malformed tag", (entry) => { entry.published.total = { $n: "Bogus" }; }],
+		["string numeric field", (entry) => { entry.published.input = "number:Infinity"; }],
 	];
 	const row = { sessionId: id, kind: "main", cwd: s.cwd, endedMs: T0 };
 	for (const [name, mutate] of cases) {
-		const data = JSON.parse(savedText);
+		const data = indexRow(savedText);
 		mutate(data);
-		fs.writeFileSync(s.paths.health.usageIndexFile, JSON.stringify(data));
+		writeIndexRow(s.paths.health.usageIndexFile, savedText, data);
 		const index = createUsageIndex({ file: s.paths.health.usageIndexFile, clock: s.clock, log: s.log });
 		const loaded = index.get(id);
 		assert.equal(loaded.offset, 0, name);
@@ -403,9 +401,8 @@ test("(gate 12) malformed numeric fields keep a row pending until the tracker re
 	}
 });
 
-for (const version of [1, 2]) {
-	for (const treeName of ["usage", "published"]) {
-		test(`(gate 13) v${version} missing ${treeName}.total stays pending and recounts through an append`, (t) => {
+for (const treeName of ["usage", "published"]) {
+		test(`(gate 13) missing ${treeName}.total stays pending and recounts through an append`, (t) => {
 			const s = setup();
 			t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
 			const id = "omitted";
@@ -414,10 +411,10 @@ for (const version of [1, 2]) {
 			writeJsonl(file, [E.assistant({ ms: T0, usage: usage(42) })]);
 			s.index.update(id, file);
 			s.index.save();
-			const data = JSON.parse(fs.readFileSync(indexFile, "utf8"));
-			data.v = version;
-			delete data.entries[id][treeName].total;
-			fs.writeFileSync(indexFile, JSON.stringify(data));
+			const saved = fs.readFileSync(indexFile, "utf8");
+			const entry = indexRow(saved);
+			delete entry[treeName].total;
+			writeIndexRow(indexFile, saved, entry);
 
 			const index = createUsageIndex({ file: indexFile, clock: s.clock, log: s.log });
 			const tracker = createUsageTracker({ paths: s.paths, index, locator: s.locator, clock: s.clock, log: s.log });
@@ -432,7 +429,6 @@ for (const version of [1, 2]) {
 			assert.equal(tracker.tokensOf(id).tokens.total, 45);
 			assert.equal(endedRow(row, 0, readUsageIndex(indexFile)).tokens.total, readUsage(file).effective.total);
 		});
-	}
 }
 
 test("(gate 14) deletion of each written field unpublishes the row until a one-shot-equivalent recount", async (t) => {
@@ -454,17 +450,20 @@ test("(gate 14) deletion of each written field unpublishes the row until a one-s
 	const row = { sessionId: id, kind: "main", endedMs: T0 };
 	const expected = readUsage(file).effective;
 	assert.equal(expected.total, 84);
-	for (const field of fields(JSON.parse(saved).entries[id])) {
+	// Deleting a whole model entry leaves a well-formed row with a wrong value, which the plan (IS-1) puts out of scope
+	// since the sum check was dropped (floating-point order); its leaves are still covered below.
+	for (const field of fields(indexRow(saved)).filter((path) => path.at(-2) !== "models")) {
 		await t.test(field.join("."), () => {
-			const data = JSON.parse(saved);
-			const object = field.slice(0, -1).reduce((node, key) => node[key], data.entries[id]);
+			const data = indexRow(saved);
+			const object = field.slice(0, -1).reduce((node, key) => node[key], data);
 			delete object[field.at(-1)];
-			fs.writeFileSync(indexFile, JSON.stringify(data));
+			writeIndexRow(indexFile, saved, data);
 			const loaded = readUsageIndex(indexFile);
 			const index = createUsageIndex({ file: indexFile, clock: s.clock, log: s.log });
 			const tracker = createUsageTracker({ paths: s.paths, index, locator: s.locator, clock: s.clock, log: s.log });
 			assert.equal(endedRow(row, 0, loaded).tokensState, "pending");
-			assert.deepEqual(tracker.tokensOf(id), { pending: true });
+			// A v3 line without its id cannot be attributed to a session, so it is dropped: the session is unindexed, not pending.
+			assert.deepEqual(tracker.tokensOf(id), field.join(".") === "id" ? null : { pending: true });
 			assert.equal(tracker.queueLedger([row]), 1);
 			assert.equal(tracker.tick(emptyWorld(s.clock)).bytesRead, fs.statSync(file).size);
 			assert.deepEqual(readUsageIndex(indexFile).get(id).published, expected);
@@ -472,24 +471,47 @@ test("(gate 14) deletion of each written field unpublishes the row until a one-s
 	}
 });
 
-test("(gate 14) a mismatched billing token map forces a recount without publishing", (t) => {
+for (const v of [1, 2]) {
+	test(`(gate 15) a v${v} index starts empty and the tracker recounts`, (t) => {
+		const s = setup();
+		t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+		const id = "legacy";
+		const file = mainFile(s.paths, id);
+		const indexFile = s.paths.health.usageIndexFile;
+		writeJsonl(file, [E.assistant({ ms: T0, usage: usage(42) })]);
+		s.index.update(id, file);
+		s.index.save();
+		const entry = indexRow(fs.readFileSync(indexFile, "utf8"));
+		fs.writeFileSync(indexFile, JSON.stringify({ v, entries: { [id]: entry } }));
+
+		const index = createUsageIndex({ file: indexFile, clock: s.clock, log: s.log });
+		const tracker = createUsageTracker({ paths: s.paths, index, locator: s.locator, clock: s.clock, log: s.log });
+		assert.equal(readUsageIndex(indexFile).size, 0);
+		assert.deepEqual(index.entries(), []);
+		assert.equal(tracker.queueLedger([{ sessionId: id, kind: "main", endedMs: T0 }]), 1);
+		assert.equal(tracker.tick(emptyWorld(s.clock)).bytesRead, fs.statSync(file).size);
+		assert.equal(compactUsage(readUsageIndex(indexFile).get(id)).total, readUsage(file).effective.total);
+	});
+}
+
+test("(gate 15) fractional writer output is accepted and published after recount", (t) => {
 	const s = setup();
 	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
-	const id = "mismatch";
+	const id = "fraction";
 	const file = mainFile(s.paths, id);
 	const indexFile = s.paths.health.usageIndexFile;
-	writeJsonl(file, [E.assistant({ ms: T0, usage: usage(42) })]);
-	s.index.update(id, file);
-	s.index.save();
-	const data = JSON.parse(fs.readFileSync(indexFile, "utf8"));
-	Object.values(data.entries[id].usage.models)[0].tokens--;
-	fs.writeFileSync(indexFile, JSON.stringify(data));
+	writeJsonl(file, [[2 ** 52, "a"], [0.5, "b"], [0.5, "b"]].map(([input, model]) =>
+		({ type: "usage", provider: "p", model, usage: { input, cost: { total: 1 } } })));
 	const index = createUsageIndex({ file: indexFile, clock: s.clock, log: s.log });
 	const tracker = createUsageTracker({ paths: s.paths, index, locator: s.locator, clock: s.clock, log: s.log });
-	assert.deepEqual(tracker.tokensOf(id), { pending: true });
-	assert.equal(tracker.queueLedger([{ sessionId: id, kind: "main", endedMs: T0 }]), 1);
+	const row = { sessionId: id, kind: "main", endedMs: T0 };
+	assert.equal(tracker.queueLedger([row]), 1);
 	assert.equal(tracker.tick(emptyWorld(s.clock)).bytesRead, fs.statSync(file).size);
-	assert.deepEqual(readUsageIndex(indexFile).get(id).published, readUsage(file).effective);
+	const loaded = readUsageIndex(indexFile);
+	assert.deepEqual(loaded.get(id).published, readUsage(file).effective);
+	assert.equal(endedRow(row, 0, loaded).tokensState, "ok");
+	assert.equal(endedRow(row, 0, loaded).tokens.total, 2 ** 52);
+	assert.equal(loaded.get(id).published.models["p/b"].tokens, 1);
 });
 
 test("a child of a child is located through its grandparent's cwd", () => {

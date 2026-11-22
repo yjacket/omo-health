@@ -1,10 +1,10 @@
 import fs from "node:fs";
 import { basename } from "node:path";
 import { MODEL_KEY_LENGTH, MODEL_KEY_LIMIT, readUsage } from "./collect/usage.mjs";
-import { atomicWriteFile, statSafe } from "./util/fsx.mjs";
+import { atomicWriteChunks, statSafe } from "./util/fsx.mjs";
 
 /**
- * The token index (plan todo 3, GAP-3): one JSON file holding, per session id, the
+ * The token index (plan todo 3, GAP-3): one JSON Lines file holding, per session id, the
  * resumable `readUsage` cursor plus the totals of the last read that reached the
  * end of the file (`published`). The daemon owns the file; the dashboard only
  * reads it through `readUsageIndex`.
@@ -15,7 +15,8 @@ import { atomicWriteFile, statSafe } from "./util/fsx.mjs";
  * advances record by record, while `published` only moves when a read ends
  * `done`, so a partial append never shows an intermediate sum (IS-1, IS-3, IS-12).
  */
-export const USAGE_INDEX_VERSION = 2;
+export const USAGE_INDEX_VERSION = 3;
+const INDEX_HEADER = JSON.stringify({ v: USAGE_INDEX_VERSION });
 /** Per-tick byte budget for live appends, first reads and the backlog. */
 export const USAGE_TICK_BYTES = 32 * 1024 * 1024;
 /** Total named model slots, including repeats between rows or counter maps. */
@@ -30,6 +31,7 @@ const MEMORY_ONLY_KEYS = ["scanOffset", "partial", "readError"];
 const USAGE_KEYS = ["usage", "overlay", "published"];
 const OTHER_MODELS = "(other models)";
 const SPILL_KEYS = new Set([OTHER_MODELS, "(model id too long)", "(model id unreadable)"]);
+export const isSpillModelKey = (key) => SPILL_KEYS.has(key);
 const COUNTER_KEYS = ["input", "output", "cacheRead", "cacheWrite", "total", "cost", "turns"];
 const CURSOR_NUMBERS = ["size", "offset", "evaluatedTo", "mtimeMs", "ino", "birthtimeMs", "headLen"];
 const PERSISTED_KEYS = [
@@ -256,23 +258,17 @@ function taggedNumber(value) {
 }
 
 /**
- * Validate one persisted numeric slot in place. A v1 file only ever held plain
- * numbers (an exponent that parses to -Infinity stays a number); a v2 file may
- * also hold a well-formed tag, decoded here so the rest of the loader never sees
- * the tagged shape. Null, strings, plain objects and malformed tags are invalid.
+ * Validate one persisted numeric slot in place, decoding any well-formed tag.
+ * Null, strings, plain objects and malformed tags are invalid.
  */
-function normalizeNumber(node, key, version) {
+function normalizeNumber(node, key) {
 	if (!Object.hasOwn(node, key)) return false;
 	const value = node[key];
 	if (typeof value === "number") return true;
-	if (version !== 1) {
-		const decoded = taggedNumber(value);
-		if (decoded !== INVALID_NUMBER) {
-			node[key] = decoded;
-			return true;
-		}
-	}
-	return false;
+	const decoded = taggedNumber(value);
+	if (decoded === INVALID_NUMBER) return false;
+	node[key] = decoded;
+	return true;
 }
 
 const ENTRY_NUMBERS = [...CURSOR_NUMBERS, "checkedMs"];
@@ -286,10 +282,10 @@ const MODEL_COUNTERS = ["tokens", "cost"];
 const TREE_KEYS = [...COUNTER_KEYS, "costUnknown", "modelsIncomplete", "models", "usedModels", "diagnostics"];
 
 /** Validate and decode a whole row atomically; -1 means recount, never publish. */
-function validateEntry(entry, id, version, remaining) {
+function validateEntry(entry, remaining) {
 	if (entry.state === "ok") for (const key of MEMORY_ONLY_KEYS) delete entry[key];
 	if (!hasShape(entry, PERSISTED_KEYS)) return -1;
-	if (entry.id !== id || !META_KEYS.every((key) => nullableString(entry[key]))) return -1;
+	if (typeof entry.id !== "string" || !META_KEYS.every((key) => nullableString(entry[key]))) return -1;
 	if (!Number.isFinite(entry.checkedMs) || typeof entry.complete !== "boolean" || typeof entry.gone !== "boolean") return -1;
 	if (entry.state === "missing") {
 		return nullableString(entry.file) && !entry.complete && !entry.gone &&
@@ -306,9 +302,8 @@ function validateEntry(entry, id, version, remaining) {
 		const tree = entry[name];
 		if (!hasShape(tree, TREE_KEYS) || typeof tree.costUnknown !== "boolean" || typeof tree.modelsIncomplete !== "boolean") return -1;
 		const { models, usedModels, diagnostics } = tree;
-		if (!record(models) || !record(usedModels) || !COUNTER_KEYS.every((key) => normalizeNumber(tree, key, version))) return -1;
-		if (!hasShape(diagnostics, DIAGNOSTICS_KEYS) || !DIAGNOSTICS_KEYS.every((key) => normalizeNumber(diagnostics, key, version))) return -1;
-		let sum = Number.isSafeInteger(tree.total) ? 0n : null;
+		if (!record(models) || !record(usedModels) || !COUNTER_KEYS.every((key) => normalizeNumber(tree, key))) return -1;
+		if (!hasShape(diagnostics, DIAGNOSTICS_KEYS) || !DIAGNOSTICS_KEYS.every((key) => normalizeNumber(diagnostics, key))) return -1;
 		for (const map of [models, usedModels]) {
 			let count = 0;
 			for (const key in map) {
@@ -318,13 +313,10 @@ function validateEntry(entry, id, version, remaining) {
 				if (map === usedModels) {
 					if (value !== true) return -1;
 				} else {
-					if (!hasShape(value, MODEL_COUNTERS) || !MODEL_COUNTERS.every((field) => normalizeNumber(value, field, version))) return -1;
-					if (sum !== null) sum = Number.isSafeInteger(value.tokens) ? sum + BigInt(value.tokens) : null;
+					if (!hasShape(value, MODEL_COUNTERS) || !MODEL_COUNTERS.every((field) => normalizeNumber(value, field))) return -1;
 				}
 			}
 		}
-		// Costs are grouped in a different floating-point order than the owner total.
-		if (sum !== null && sum !== BigInt(tree.total)) return -1;
 	}
 	return named;
 }
@@ -340,10 +332,18 @@ function invalidated(id, row) {
 	return entry;
 }
 
+function* indexChunks(entries, weights) {
+	yield `${INDEX_HEADER}\n`;
+	for (const [id, entry] of entries) {
+		if (entry.state === "ok" && !weights.has(id)) continue; // Recount still pending.
+		yield `${JSON.stringify(persisted(entry), encodeNonFinite)}\n`;
+	}
+}
+
 /**
  * `{file, clock, log, read}`: `file` is the only path ever written, and only
  * `save()` writes it. The file is loaded here, so a fresh process resumes every
- * persisted cursor; an unsupported version or a corrupt file starts empty, and the
+ * persisted cursor; an unsupported or corrupt header starts the index empty, and the
  * memory-only keys are never taken from disk. `read` defaults to `readUsage` and
  * lets tests inject a read failure.
  */
@@ -473,12 +473,7 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 		/** Write the index when anything changed; returns whether it wrote. */
 		save() {
 			if (!dirty) return false;
-			const out = { v: USAGE_INDEX_VERSION, entries: Object.create(null) };
-			for (const [id, entry] of entries) {
-				if (entry.state === "ok" && !weights.has(id)) continue; // Recount still pending.
-				out.entries[id] = persisted(entry);
-			}
-			atomicWriteFile(file, `${JSON.stringify(out, encodeNonFinite, 2)}\n`);
+			atomicWriteChunks(file, indexChunks(entries, weights));
 			dirty = false;
 			return true;
 		},
@@ -500,115 +495,66 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 	};
 }
 
+function* indexLines(file) {
+	const fd = fs.openSync(file, "r");
+	try {
+		const buffer = Buffer.allocUnsafe(64 * 1024);
+		let parts = [];
+		let header = true;
+		let size;
+		while ((size = fs.readSync(fd, buffer, 0, buffer.length, null)) > 0) {
+			const chunk = buffer.subarray(0, size);
+			let start = 0;
+			for (let end; (end = chunk.indexOf(10, start)) !== -1; start = end + 1) {
+				const tail = chunk.subarray(start, end);
+				yield parts.length ? Buffer.concat([...parts, tail]) : tail;
+				parts = [];
+				header = false;
+			}
+			if (start < size) {
+				if (header && start === 0 && size > INDEX_HEADER.length + 1) return;
+				parts.push(Buffer.from(chunk.subarray(start)));
+			}
+		}
+		if (parts.length) yield Buffer.concat(parts);
+	} finally {
+		fs.closeSync(fd);
+	}
+}
+
 function loadUsageIndex(file, trackWeights = true) {
 	const entries = new Map();
 	const weights = new Map();
 	let count = 0;
-	const clear = () => {
-		entries.clear();
-		weights.clear();
-		return { entries, weights, count: 0 };
-	};
 	try {
-		// Keep the source bytes outside the V8 heap and materialize one row at a
-		// time. Old writers' oversized indexes can OOM before whole-file JSON.parse
-		// completes, too early for a post-parse budget check.
-		const bytes = fs.readFileSync(file);
-		let i = bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf ? 3 : 0;
-		const fail = () => { throw new SyntaxError("invalid usage index"); };
-		const peek = () => {
-			while (bytes[i] === 32 || bytes[i] === 9 || bytes[i] === 10 || bytes[i] === 13) i++;
-			return bytes[i];
-		};
-		const expect = (byte) => {
-			if (peek() !== byte) fail();
-			i++;
-		};
-		const stringEnd = () => {
-			while (++i < bytes.length) {
-				if (bytes[i] === 92) i++;
-				else if (bytes[i] === 34) {
-					i++;
-					return;
-				}
+		const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+		let header = true;
+		for (const line of indexLines(file)) {
+			if (header) {
+				if (line.toString("utf8").replace(/\r$/, "") !== INDEX_HEADER) break;
+				header = false;
+				continue;
 			}
-			fail();
-		};
-		// Locate a value's byte span; JSON.parse still checks its actual grammar.
-		const skipValue = () => {
-			const first = peek();
-			if (first === 34) return stringEnd();
-			if (first !== 123 && first !== 91) {
-				while (i < bytes.length && bytes[i] !== 44 && bytes[i] !== 125 && bytes[i] !== 93) i++;
-				return;
+			let row;
+			try {
+				row = JSON.parse(decoder.decode(line));
+			} catch {
+				continue;
 			}
-			let depth = 0;
-			while (i < bytes.length) {
-				const byte = bytes[i];
-				if (byte === 34) {
-					stringEnd();
-					continue;
-				}
-				i++;
-				if (byte === 123 || byte === 91) depth++;
-				else if ((byte === 125 || byte === 93) && --depth === 0) return;
-			}
-			fail();
-		};
-		const fields = (visit) => {
-			expect(123);
-			if (peek() !== 125) {
-				for (;;) {
-					if (peek() !== 34) fail();
-					const start = i;
-					stringEnd();
-					const key = JSON.parse(bytes.toString("utf8", start, i));
-					expect(58);
-					visit(key);
-					if (peek() !== 44) break;
-					i++;
-				}
-			}
-			expect(125);
-		};
-		const parseValue = () => {
-			peek();
-			const start = i;
-			skipValue();
-			return JSON.parse(bytes.toString("utf8", start, i));
-		};
-		// Find the version before validating rows, including old compact files
-		// with `entries` before `v`. Do not decode the entries object itself.
-		let version;
-		let entriesStart;
-		fields((key) => {
-			if (key === "entries") {
-				peek();
-				entriesStart = i;
-				skipValue();
-			} else {
-				const value = parseValue();
-				if (key === "v") version = value;
-			}
-		});
-		if (peek() !== undefined || entriesStart === undefined || (version !== 1 && version !== USAGE_INDEX_VERSION)) return clear();
-		i = entriesStart;
-		fields((id) => {
-			const row = parseValue();
-			if (!record(row)) return;
-			if (entries.has(id)) fail();
-			const slots = validateEntry(row, id, version, USAGE_INDEX_MODEL_BUDGET - count);
+			if (!record(row) || typeof row.id !== "string" || entries.has(row.id)) continue;
+			const { id } = row;
+			const slots = validateEntry(row, USAGE_INDEX_MODEL_BUDGET - count);
+			// Keep only a pending marker for an identifiable but invalid row.
 			entries.set(id, slots < 0 ? invalidated(id, row) : row);
-			if (slots >= 0) {
-				count += slots;
-				if (trackWeights) weights.set(id, slots);
-			}
-		});
+			if (slots < 0) continue;
+			count += slots;
+			if (trackWeights) weights.set(id, slots);
+		}
 		return { entries, weights, count };
 	} catch {
-		return clear();
+		return { entries: new Map(), weights: new Map(), count: 0 };
 	}
 }
 
-/** The index as the dashboard reads it: a Map of entries, empty when absent, unsupported or corrupt. */
+/** The index as the dashboard reads it: a Map, empty when absent or the header is invalid. */
 export const readUsageIndex = (file) => loadUsageIndex(file, false).entries;
