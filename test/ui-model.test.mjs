@@ -17,6 +17,7 @@ import { buildHistory } from "../src/ui/history.mjs";
 import { buildOverview, buildSessions, buildSettings, buildUiState, daemonStatus, endedRow, loadDaemonInputs, loadUiInputs, uiState } from "../src/ui/model.mjs";
 import { buildSessionView } from "../src/ui/session-view.mjs";
 import { buildSessionSnapshot } from "../src/session-board.mjs";
+import { createUsageTracker } from "../src/usage-tracker.mjs";
 import { makeWorld, sessionState, taskRecord } from "./helpers/world.mjs";
 
 const NOW = Date.parse("2026-09-29T03:00:00.000Z"); // 12:00 KST
@@ -85,7 +86,7 @@ it("(gate 16b) the board keeps a refused token state from the snapshot through t
 	const app = fs.readFileSync(new URL("../src/ui/static/app.js", import.meta.url), "utf8");
 	const el = (tag, attrs, ...children) => ({ tag, ...attrs, children: children.flat(Infinity).filter((child) => child != null) });
 	const format = runInNewContext(
-		["tokenReading", "boardTokenMarks", "childMeta", "tree"].map((name) => app.match(new RegExp(`function ${name}\\([^]*?\\n\\t\\}`))[0]).join("\n") +
+		["tokenReading", "treeTokenMark", "boardTokenMarks", "childMeta", "tree"].map((name) => app.match(new RegExp(`function ${name}\\([^]*?\\n\\t\\}`))?.[0]).join("\n") +
 			"\n({ tokenReading, boardTokenMarks, childMeta, tree })",
 		{ el, lastState: {}, compactCount: (n) => String(n), fullCount: (n) => String(n), elapsedText: () => "1m", childTone: () => "idle" },
 	);
@@ -96,6 +97,70 @@ it("(gate 16b) the board keeps a refused token state from the snapshot through t
 	assert.equal(childMeta.text.endsWith("토큰 -"), true, "the child row's line is a dash");
 	assert.equal(childMeta.title, tooltip, "the child row carries the full-index title");
 	assert.equal(format.childMeta(board.children[0]).includes("토큰 계산 중"), false, "a full state never reads as 계산 중");
+});
+
+const overflowTitle = "토큰 합계가 표시할 수 있는 범위를 넘었습니다";
+
+function overflowIndex(paths, rows) {
+	const file = paths.health.usageIndexFile;
+	const index = createUsageIndex({ file, clock: createFakeClock(NOW) });
+	for (const [id, input, parentSessionId] of rows) {
+		const transcript = path.join(path.dirname(file), `${id}.jsonl`);
+		write(transcript, `{"type":"usage","provider":"p","model":"m","usage":{"input":${input}}}\n`);
+		index.update(id, transcript, { parentSessionId: parentSessionId ?? null });
+	}
+	index.save();
+	return index;
+}
+
+function tokenFormatters(...names) {
+	const app = fs.readFileSync(new URL("../src/ui/static/app.js", import.meta.url), "utf8");
+	const fn = (name) => app.match(new RegExp(`function ${name}\\([^]*?\\n\\t\\}`))?.[0];
+	const el = (tag, attrs, ...children) => ({ tag, ...attrs, children: children.flat(Infinity).filter((child) => child != null) });
+	return runInNewContext(
+		["tokenReading", "treeTokenMark", "compactCount", ...names].map(fn).join("\n") + `\n({ ${names.join(", ")} })`,
+		{ el, lastState: {}, fullCount: (n) => Number.isFinite(n) ? String(n) : "-", childTone: () => "idle" },
+	);
+}
+
+it("board overflow survives snapshot JSON and renders on the card and child row", () => {
+	const { paths } = makeHome();
+	const index = overflowIndex(paths, [["main", "1e309"], ["child", "1e309", "main"], ["finite", "5"], ["negative", "-1e309", "finite"]]);
+	const tracker = createUsageTracker({ paths, index, clock: createFakeClock(NOW) });
+	assert.equal(tracker.tokensOf("main").tokens.total, Infinity);
+	const world = makeWorld({
+		now: NOW,
+		sessions: ["main", "finite"].map((id) => sessionState({ id, startedMs: NOW - 5000 })),
+		tasks: [taskRecord({ taskId: "st_x", childSessionId: "child", parentSessionId: "main" })],
+		sensors: ["main", "finite"].map((sessionId) => ({ sessionId, pid: 100, ts: NOW - 1000, idle: true, executingTools: 0 })),
+		procsFresh: true,
+	});
+	const snapshot = buildSessionSnapshot(world, [], [], NOW, { tokensOf: (sessionId, taskId) => tracker.tokensOf(sessionId, taskId) });
+	const model = buildSessions({ now: NOW, sessionsSnapshot: JSON.parse(JSON.stringify(snapshot)) });
+	const [main, finite] = model.groups[0].sessions;
+	const format = tokenFormatters("boardTokenMarks", "childMeta", "tree");
+	const own = format.boardTokenMarks(main)[0];
+	const child = format.tree(main.children).children[0].children[0].children[2];
+	const tree = format.boardTokenMarks(finite)[1];
+	assert.deepEqual([main.tokens.total, main.tokensState, own.text, own.title], [null, "overflow", "토큰 -", overflowTitle]);
+	assert.deepEqual([main.children[0].tokens.total, main.children[0].tokensState, child.text.split(" · ").at(-1), child.title],
+		[null, "overflow", "토큰 -", overflowTitle]);
+	assert.deepEqual([finite.tokens.total, finite.treeTokens, finite.treeTokensState, tree?.text, tree?.title],
+		[5, null, "overflow", "자식 포함 -", overflowTitle]);
+});
+
+it("history overflow survives /api/state serialization and renders for own and NaN tree totals", () => {
+	const { paths, env } = makeHome();
+	const row = { sessionId: "root", kind: "main", startedMs: NOW - HOUR, endedMs: NOW, outcome: "completed" };
+	appendEnded(paths, row);
+	overflowIndex(paths, [["root", "1e309"], ["child", "-1e309", "root"]]);
+	const history = JSON.parse(JSON.stringify(uiState({ paths, env, now: NOW }))).ended.rows[0];
+	const format = tokenFormatters("endedTokenCell");
+	const cell = format.endedTokenCell(history);
+	assert.deepEqual([history.tokens.total, history.tokensState, cell.children[0].text, cell.children[0].title],
+		[null, "overflow", "-", overflowTitle]);
+	assert.deepEqual([history.treeTokens, history.treeTokensState, cell.children[1]?.text, cell.children[1]?.title],
+		[null, "overflow", "자식 포함 -", overflowTitle]);
 });
 
 it("(gate 17) the disk-backed full state renders a dash in history, detail, and child rows until recount", () => {

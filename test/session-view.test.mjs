@@ -1,8 +1,16 @@
 import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 import { describe, it } from "node:test";
+import { runInNewContext } from "node:vm";
+import { resolvePaths } from "../src/paths.mjs";
+import { appendEnded } from "../src/session-ledger.mjs";
+import { loadSessionRecord } from "../src/session-record.mjs";
+import { createUsageIndex } from "../src/usage-index.mjs";
 import { OUTCOME_LABELS, TERMINAL_LABELS } from "../src/ui/labels.mjs";
 import { buildSessionView } from "../src/ui/session-view.mjs";
+import { tmpDir } from "./helpers/fixtures.mjs";
 
 const T0 = Date.parse("2026-10-10T00:00:00.000Z");
 const iso = (ms) => new Date(ms).toISOString();
@@ -80,6 +88,39 @@ function record(overrides = {}) {
 }
 
 describe("session view", () => {
+	it("detail overflow survives index reload and JSON, and renders on the token block and child row", () => {
+		const root = tmpDir("session-view-overflow-");
+		const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health") });
+		const row = { sessionId: "s-main", kind: "main", outcome: "completed", startedMs: T0 - 1000, endedMs: T0 };
+		appendEnded(paths, row, { nowMs: T0 });
+		appendEnded(paths, { ...row, sessionId: "s-child", kind: "child", taskId: "st_a", parentSessionId: "s-main", outcome: "answered" }, { nowMs: T0 });
+		const index = createUsageIndex({ file: paths.health.usageIndexFile, clock: { now: () => T0 } });
+		for (const [id, value, parentSessionId] of [["s-main", "1e309"], ["s-child", "-1e309", "s-main"]]) {
+			const file = path.join(root, `${id}.jsonl`);
+			fs.writeFileSync(file, `{"type":"usage","provider":"p","model":"m","usage":{"input":${value}}}\n`);
+			index.update(id, file, { parentSessionId: parentSessionId ?? null });
+		}
+		index.save();
+		const record = loadSessionRecord({ paths, id: row.sessionId, now: T0 });
+		assert.equal(record.tokens.total, Infinity);
+		assert.equal(record.tokens.treeTotal, NaN);
+		const detail = JSON.parse(JSON.stringify(buildSessionView(record)));
+		const app = fs.readFileSync(new URL("../src/ui/static/app.js", import.meta.url), "utf8");
+		const names = ["tokenReading", "endedTokenFacts", "endedChild"];
+		const el = (tag, attrs, ...children) => ({ tag, ...attrs, children });
+		const format = runInNewContext(
+			names.map((name) => app.match(new RegExp(`function ${name}\\([^]*?\\n\\t\\}`))[0]).join("\n") + `\n({ ${names.join(", ")} })`,
+			{ el, empty: (text) => el("p", { text }), note: (text) => el("p", { text }), OUTCOME_TONE: {}, lastState: {}, compactCount: () => "-", fullCount: () => "-" },
+		);
+		const own = format.endedTokenFacts(detail.tokens);
+		const child = format.endedChild(detail.children[0]).children[0].children[2].children[1];
+		const title = "토큰 합계가 표시할 수 있는 범위를 넘었습니다";
+		assert.deepEqual([detail.tokens.total, detail.tokens.tokensState, own.text, own.title], [null, "overflow", "-", title]);
+		assert.deepEqual([detail.tokens.treeTotal, detail.tokens.treeTokensState], [null, "overflow"]);
+		assert.deepEqual([detail.children[0].tokens.total, detail.children[0].tokensState, child.text, child.title],
+			[null, "overflow", "토큰 -", title]);
+	});
+
 	it("labels the session, findings, actions and children, falling back to the raw key for unknown kinds", () => {
 		const raw = record();
 		const view = buildSessionView(raw);

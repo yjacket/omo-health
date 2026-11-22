@@ -127,19 +127,25 @@ function countChildren(rows) {
  * @param {object[]} findings open findings of this tick
  * @param {object[]} investigations investigation records (createInvestigations().list())
  * @param {number} nowMs
- * @param {{tokensOf?: (id: string) => ({tokens?: object, treeTokens?: number, pending?: boolean} | null | undefined)}} [options]
+ * @param {{tokensOf?: (sessionId: string | null, taskId: string | null) => ({tokens?: object, treeTokens?: number | null, pending?: boolean, state?: "full"} | null | undefined)}} [options]
  *   tokensOf is the injected token index lookup: `{tokens, treeTokens}` for an indexed session, `{state:"full"}` when the
  *   index refused the session, `{pending:true}` while its first read has not reached the end of the file, null when it is
- *   unknown. Every row carries the result; a refused row also carries `tokensState: "full"`.
+ *   unknown. Task id is a fallback only when session id is absent. Rows carry `tokensState: "full"` for refusal
+ *   or `tokensState` / `treeTokensState` of `"overflow"` for a non-finite total.
  */
 export function buildSessionSnapshot(world, findings = [], investigations = [], nowMs = world.now, { tokensOf } = {}) {
-	const tokenFields = (id) => {
-		const entry = tokensOf?.(id);
+	const tokenFields = (sessionId, taskId) => {
+		const entry = tokensOf?.(sessionId, taskId);
+		const tokens = entry?.tokens ?? null;
+		const tree = entry?.treeTokens ?? null;
+		const overflow = typeof tokens?.total === "number" && !Number.isFinite(tokens.total);
+		const treeOverflow = typeof tree === "number" && !Number.isFinite(tree);
 		return {
-			tokens: entry?.tokens ?? null,
-			treeTokens: entry?.treeTokens ?? null,
+			tokens: overflow ? { ...tokens, total: null } : tokens,
+			treeTokens: treeOverflow ? null : tree,
 			tokensPending: entry?.pending === true,
-			...(entry?.state === "full" ? { tokensState: "full" } : {}),
+			...(overflow ? { tokensState: "overflow" } : entry?.state === "full" ? { tokensState: "full" } : {}),
+			...(treeOverflow ? { treeTokensState: "overflow" } : {}),
 		};
 	};
 	const openInvestigations = (investigations ?? []).filter((inv) => !RESOLVED_INVESTIGATIONS.has(inv.status));
@@ -174,7 +180,7 @@ export function buildSessionSnapshot(world, findings = [], investigations = [], 
 				startedMs: finite(task.startedAtMs ?? task.createdAtMs),
 				endedMs: finite(task.terminalAtMs),
 				health: healthFor({ sessionId: task.childSessionId, taskId: task.taskId }),
-				...tokenFields(task.childSessionId ?? task.taskId),
+				...tokenFields(task.childSessionId ?? null, task.taskId ?? null),
 				children: task.childSessionId ? childrenOf(task.childSessionId, depth + 1, next) : [],
 			}))
 			.sort((a, b) => (a.startedMs ?? 0) - (b.startedMs ?? 0));
@@ -200,7 +206,7 @@ export function buildSessionSnapshot(world, findings = [], investigations = [], 
 			todo,
 			lastInputMs: finite(toMs(hb?.lastInputAt)),
 			health: healthFor({ sessionId: session.id }),
-			...tokenFields(session.id),
+			...tokenFields(session.id, null),
 			children: childrenOf(session.id, 1, new Set()),
 		};
 		if (!groups.has(omoVersion)) groups.set(omoVersion, []);

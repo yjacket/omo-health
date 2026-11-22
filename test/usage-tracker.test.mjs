@@ -6,12 +6,13 @@ import { test } from "node:test";
 import { createSessionFileLocator } from "../src/collect/session-files.mjs";
 import { readUsage } from "../src/collect/usage.mjs";
 import { E, iso, tmpDir, writeJsonl } from "./helpers/fixtures.mjs";
-import { makeWorld, sessionState } from "./helpers/world.mjs";
+import { makeWorld, sessionState, taskRecord } from "./helpers/world.mjs";
 import { compactUsage, createUsageIndex, readUsageIndex, USAGE_TICK_BYTES } from "../src/usage-index.mjs";
 import { endedRow } from "../src/ui/model.mjs";
 import { createUsageTracker } from "../src/usage-tracker.mjs";
 import { appendEnded, appendEndedLocated, ENDED_LOCATION, streamEnded } from "../src/session-ledger.mjs";
 import { resolvePaths } from "../src/paths.mjs";
+import { buildSessionSnapshot } from "../src/session-board.mjs";
 
 const T0 = Date.UTC(2026, 8, 28, 12, 0, 0);
 const DAY = 86_400_000;
@@ -75,6 +76,33 @@ test("tracker tokens resolve by session id or by a unique task id when the sessi
 	assert.equal(s.tracker.tokensOf("child-a").tokens.total, 42);
 	assert.deepEqual([s.tracker.tokensOf("child-b", "st_x"), s.tracker.tokensOf("st_x")], [null, null]);
 	assert.equal(s.tracker.tokensOf(null, "st_x").tokens.total, 42);
+});
+
+test("board uses a unique task-only token match but never an ambiguous or wrong-session match", () => {
+	const s = setup();
+	const task = { taskId: "st_shared", parentSessionId: "main" };
+	const first = taskRecord({ ...task, uid: "store-a/st_shared", spawnCwd: s.cwd, childSessionId: null });
+	const second = taskRecord({ ...task, uid: "store-b/st_shared", spawnCwd: path.join(s.root, "other"), childSessionId: null });
+	function indexChild({ spawnCwd, taskId }, id, total) {
+		const file = childFile(spawnCwd, taskId, id);
+		writeLines(file, [bigRecord(0, usage(total))]);
+		s.index.update(id, file, { kind: "child", taskId });
+	}
+	function totals(tasks) {
+		const world = makeWorld({
+			now: T0,
+			sessions: [sessionState({ id: "main", startedMs: T0 - 5000 })],
+			tasks,
+			sensors: [{ sessionId: "main", pid: 100, ts: T0 - 1000, idle: true, executingTools: 0 }],
+			procsFresh: true,
+		});
+		const snapshot = buildSessionSnapshot(world, [], [], T0, { tokensOf: (sessionId, taskId) => s.tracker.tokensOf(sessionId, taskId) });
+		return snapshot.groups[0].sessions[0].children.map((child) => child.tokens?.total ?? null);
+	}
+	indexChild(first, "indexed-a", 42);
+	assert.deepEqual(totals([first, { ...second, childSessionId: "not-indexed" }]), [42, null]);
+	indexChild(second, "indexed-b", 73);
+	assert.deepEqual(totals([first, second]), [null, null]);
 });
 
 test("(gate 16) saturation marks uncounted rows full, logs once, and prune lets the backlog count again", (t) => {

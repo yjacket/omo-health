@@ -11,6 +11,7 @@ import { investigationRow } from "./model.mjs";
 
 const isRecord = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const list = (v) => (Array.isArray(v) ? v.filter(isRecord) : []);
+const overflows = (value) => typeof value === "number" && !Number.isFinite(value);
 
 function labelledSession(session) {
 	if (!isRecord(session)) return null;
@@ -42,7 +43,21 @@ function labelledInvestigation(investigation) {
 }
 
 function labelledChild(child) {
-	return { ...child, outcomeKo: outcomeLabel(child.outcome) };
+	const overflow = overflows(child.tokens?.total);
+	return {
+		...child,
+		...(overflow ? { tokens: { ...child.tokens, total: null }, tokensState: "overflow" } : {}),
+		outcomeKo: outcomeLabel(child.outcome),
+	};
+}
+
+function detailTokens(tokens) {
+	if (!tokens) return tokens;
+	return {
+		...tokens,
+		...(overflows(tokens.total) ? { total: null, tokensState: "overflow" } : {}),
+		...(overflows(tokens.treeTotal) ? { treeTotal: null, treeTokensState: "overflow" } : {}),
+	};
 }
 
 function labelledAuditResult(result) {
@@ -89,6 +104,7 @@ export function buildSessionView(record, extras = {}) {
 	return {
 		...record,
 		session: labelledSession(record.session),
+		...("tokens" in record ? { tokens: detailTokens(record.tokens) } : {}),
 		children: list(record.children).map(labelledChild),
 		health: {
 			...health,

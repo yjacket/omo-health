@@ -204,9 +204,9 @@ test("buildSessionSnapshot puts the injected token totals on every main and chil
 		["no-session", { tokens: { total: 7, input: 5, output: 2 }, treeTokens: null }],
 	]);
 	const asked = [];
-	const tokensOf = (id) => {
-		asked.push(id);
-		return seen.get(id);
+	const tokensOf = (sessionId, taskId) => {
+		asked.push([sessionId, taskId]);
+		return seen.get(sessionId ?? taskId);
 	};
 	const world = boardWorld({
 		tasks: [
@@ -228,7 +228,9 @@ test("buildSessionSnapshot puts the injected token totals on every main and chil
 	assert.equal(child("t0").treeTokens, null);
 	assert.deepEqual(child("no-session").tokens, { total: 7, input: 5, output: 2 }, "a child without a session id is looked up by task id");
 	assert.equal(child("t1").children[0].tokens, null, "a child the stub does not know carries null tokens");
-	assert.ok(asked.includes("m1") && asked.includes("c1") && asked.includes("c0") && asked.includes("no-session"), "the main id, the child session id and the task id fallback are asked");
+	assert.deepEqual(asked.filter(([sessionId]) => !["m2", "m3", "m4", "m5"].includes(sessionId)), [
+		["m1", null], ["c0", "t0"], ["c1", "t1"], ["c2", "t2"], [null, "no-session"],
+	], "main and child lookups pass session and task ids in separate slots");
 	assert.equal(rows.get("m2").tokens, null);
 });
 

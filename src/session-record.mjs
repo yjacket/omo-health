@@ -228,11 +228,14 @@ function investigationRow(record, decisions) {
 	};
 }
 
+const sortRank = (tokens) => (Number.isNaN(tokens) ? Infinity : tokens);
+
 function modelRows(published) {
 	const models = isRecord(published?.models) ? published.models : {};
 	return Object.entries(models)
-		.map(([key, value]) => ({ key: clean(key, 120) ?? key, tokens: Number.isFinite(value?.tokens) ? value.tokens : 0, cost: Number.isFinite(value?.cost) ? value.cost : 0 }))
-		.sort((a, b) => b.tokens - a.tokens || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+		// A non-finite value (counters are added as supplied) is kept; JSON and the dashboard show it as "-".
+		.map(([key, value]) => ({ key: clean(key, 120) ?? key, tokens: typeof value?.tokens === "number" ? value.tokens : 0, cost: typeof value?.cost === "number" ? value.cost : 0 }))
+		.sort((a, b) => sortRank(b.tokens) - sortRank(a.tokens) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
 }
 
 function usageEntryOf(usage, row) {

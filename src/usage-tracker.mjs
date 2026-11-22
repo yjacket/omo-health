@@ -225,7 +225,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 
 		/**
 		 * The board's lookup: `{tokens, treeTokens}` for a complete entry
-		 * (`treeTokens` only when descendants push it above the session's own total),
+		 * (`treeTokens` when descendants raise the total or produce a distinct non-finite total),
 		 * `{pending:true}` while an entry's first full read has not finished, and
 		 * null when nothing is known.
 		 */
@@ -238,7 +238,8 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			if (!tokens) return entry.state === "ok" ? { pending: true } : null;
 			const totals = trees ?? treeTotals(index.entries());
 			const tree = totals.get(entry.id) ?? tokens.total;
-			return { tokens, treeTokens: tree > tokens.total ? tree : null };
+			const showTree = tree > tokens.total || (!Number.isFinite(tree) && !Object.is(tree, tokens.total));
+			return { tokens, treeTokens: showTree ? tree : null };
 		},
 	};
 }

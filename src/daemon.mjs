@@ -422,7 +422,7 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 						log.error("usage_tick_failed", { error: error.message, stack: String(error.stack).slice(0, 800) });
 					}
 					const board = buildSessionSnapshot(result.world, result.findings ?? [], boardInvestigations.list({ sinceMs: boardNow - 7 * DAY_MS }), boardNow, {
-						tokensOf: (id) => usageTracker.tokensOf(id),
+					tokensOf: (sessionId, taskId) => usageTracker.tokensOf(sessionId, taskId),
 					});
 					atomicWriteJson(paths.health.sessionsSnapshotFile, board);
 					if (result.world.procsFresh !== false) {

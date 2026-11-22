@@ -208,6 +208,21 @@ test("an unindexed main session does not inherit another main's tokens through a
 	assert.equal(unindexedRecord.tokens, null, "a null task id is not an alias for another main session");
 });
 
+test("a non-finite per-model value stays non-finite instead of becoming 0", () => {
+	const fixture = corpus();
+	const row = fixture.rows[0];
+	const models = { "a/finite": { tokens: 10, cost: 0.5 }, "b/huge": { tokens: Infinity, cost: Infinity }, "c/nan": { tokens: NaN, cost: 1 } };
+	const published = { total: Infinity, input: Infinity, output: 0, cacheRead: 0, cacheWrite: 0, cost: Infinity, costUnknown: false, turns: 2, models };
+	const usage = new Map([[row.sessionId, { id: row.sessionId, taskId: null, state: "ok", complete: true, published }]]);
+	const record = buildSessionRecord({ id: row.sessionId, row, ledger: fixture.rows, decisions: [], investigations: [], usage });
+	const rows = record.tokens.models;
+	assert.deepEqual(rows.map((m) => m.key), ["b/huge", "c/nan", "a/finite"], "non-finite rows sort first, then by key");
+	assert.equal(rows[0].tokens, Infinity);
+	assert.ok(Number.isNaN(rows[1].tokens));
+	assert.equal(rows[2].tokens, 10);
+	assert.deepEqual(JSON.parse(JSON.stringify(rows)).map((m) => m.tokens), [null, null, 10], "the dashboard receives null and shows -");
+});
+
 test("task-only record rows join one decision subject, not two subjects sharing a task id", () => {
 	const row = childRow(null, "st_x", "s-main");
 	const a = { fp: "a", event: "opened", subject: { sessionId: "child-a", taskId: row.taskId }, ts: iso(T0 + MIN) };

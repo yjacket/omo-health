@@ -130,6 +130,16 @@ function boardTokens(tokens) {
 	return out;
 }
 
+function boardTokenFields(row) {
+	return {
+		tokens: boardTokens(row.tokens),
+		treeTokens: num(row.treeTokens),
+		tokensPending: row.tokensPending === true,
+		...(["full", "overflow"].includes(row.tokensState) ? { tokensState: row.tokensState } : {}),
+		...(row.treeTokensState === "overflow" ? { treeTokensState: "overflow" } : {}),
+	};
+}
+
 /** A folder as the board shows it: the whole path when short, else its last two segments after an ellipsis. */
 function shortPath(cwd) {
 	if (!cwd || cwd.length <= PATH_SHORT_MAX) return cwd ?? null;
@@ -175,10 +185,7 @@ function childRow(c, depth = 0) {
 		startedMs: num(c.startedMs),
 		endedMs: num(c.endedMs),
 		health: healthOf(c.health),
-		tokens: boardTokens(c.tokens),
-		treeTokens: num(c.treeTokens),
-		tokensPending: c.tokensPending === true,
-		...(c.tokensState === "full" ? { tokensState: "full" } : {}),
+		...boardTokenFields(c),
 		children,
 	};
 }
@@ -204,10 +211,7 @@ function sessionRow(s) {
 		todo: isRecord(s.todo) ? { open: num(s.todo.open), total: num(s.todo.total) } : null,
 		lastInputMs: num(s.lastInputMs),
 		health: healthOf(s.health),
-		tokens: boardTokens(s.tokens),
-		treeTokens: num(s.treeTokens),
-		tokensPending: s.tokensPending === true,
-		...(s.tokensState === "full" ? { tokensState: "full" } : {}),
+		...boardTokenFields(s),
 		children,
 		childCount: children.length,
 	};
@@ -244,6 +248,8 @@ export function endedRow(r, childRows = 0, usage = null, trees = null, full = us
 	const entry = usageEntryFor(usage, r.sessionId, r.taskId);
 	const tokens = compactUsage(entry);
 	const tree = entry && trees instanceof Map ? trees.get(entry.id) ?? null : null;
+	const overflow = tokens !== null && !Number.isFinite(tokens.total);
+	const treeOverflow = tree !== null && !Number.isFinite(tree) && !Object.is(tree, tokens?.total);
 	return {
 		sessionId: text(r.sessionId, 80),
 		sessionShort: short(r.sessionId),
@@ -265,10 +271,11 @@ export function endedRow(r, childRows = 0, usage = null, trees = null, full = us
 		childCount: Math.max(num(r.childCount) ?? 0, childRows),
 		estimated: r.estimated === true,
 		source: r.source === "backfill" ? "backfill" : "live",
-		tokens,
-		tokensState: tokens ? "ok" : entry?.state === "missing" ? "missing" : entry?.state === "full" || (!entry && full) ? "full" : "pending",
+		tokens: overflow ? { ...tokens, total: null } : tokens,
+		tokensState: overflow ? "overflow" : tokens ? "ok" : entry?.state === "missing" ? "missing" : entry?.state === "full" || (!entry && full) ? "full" : "pending",
 		tokensGone: entry?.gone === true,
-		treeTokens: tree !== null && tree > (tokens?.total ?? 0) ? tree : null,
+		treeTokens: !treeOverflow && tree !== null && tree > (tokens?.total ?? 0) ? tree : null,
+		...(treeOverflow ? { treeTokensState: "overflow" } : {}),
 	};
 }
 
