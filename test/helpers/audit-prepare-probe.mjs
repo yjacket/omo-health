@@ -50,13 +50,13 @@ parentPort.on("message", (job) => {
 				if (mode === "scans") options.scanMessages = (file) => (observed.scans.push(file), []);
 				const record = loadSessionRecord(options);
 				if (mode === "block-after-record") block();
-				if (mode === "oversized") record.tokens = { models: Array.from({ length: 3000 }, (_, i) => ({ key: `${"m".repeat(60)}${i}`, tokens: 1, cost: 0 })) };
 				return record;
 			},
 			timeline(...args) {
 				observed.timelines.push(args);
 				const full = usageTimeline(...args);
 				if (mode === "timeline") full.totals.modelsIncomplete = true;
+				if (mode === "oversized") full.totals.models = Object.fromEntries(Array.from({ length: 3000 }, (_, i) => [`${"m".repeat(60)}${i}`, { tokens: 1, cost: 0 }]));
 				return full;
 			},
 		});

@@ -329,14 +329,13 @@ function messagesOf(list) {
 	}));
 }
 
-function modelsOf(record, totals) {
-	const fromRecord = Array.isArray(record?.tokens?.models) ? record.tokens.models : null;
-	const rows = fromRecord ?? Object.entries(isObject(totals?.models) ? totals.models : {}).map(([key, value]) => ({ key, ...value }));
+function modelsOf(models) {
+	const rows = Array.isArray(models) ? models : Object.entries(isObject(models) ? models : {}).map(([key, value]) => ({ key, ...value }));
 	return rows.map((model) => ({ key: textOf(model?.key), tokens: numOf(model?.tokens), cost: numOf(model?.cost) }));
 }
 
 function tokensOf(record, timeline) {
-	const totals = isObject(timeline?.totals) ? timeline.totals : isObject(record?.tokens) ? record.tokens : {};
+	const totals = timeline?.totals?.modelsIncomplete === false ? timeline.totals : isObject(record?.tokens) ? record.tokens : {};
 	return {
 		total: numOf(totals.total),
 		input: numOf(totals.input),
@@ -347,7 +346,7 @@ function tokensOf(record, timeline) {
 		costUnknown: boolOf(totals.costUnknown) ?? false,
 		turns: numOf(totals.turns),
 		largeRecords: numOf(timeline?.largeRecords),
-		models: modelsOf(record, totals),
+		models: modelsOf(totals.models),
 		hours: (Array.isArray(timeline?.hours) ? timeline.hours : []).map((hour) => ({ hourMs: numOf(hour?.hourMs), tokens: numOf(hour?.tokens), turns: numOf(hour?.turns) })),
 		topTurns: (Array.isArray(timeline?.topTurns) ? timeline.topTurns : []).map((turn) => ({
 			key: textOf(turn?.key),

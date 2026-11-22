@@ -647,25 +647,73 @@ test("IS-7: a parent's machine incidents include the child's active interval, no
 	}
 });
 
-test("IS-7: a live child's transcript start opens a machine overlap window through now", () => {
+test("IS-7: a live child extends its parent's machine overlap window through now", () => {
 	const { root, paths } = setup();
 	const parent = mainRow({ cwd: root });
 	const childId = "s-live-child";
 	const taskId = "st_live";
-	const startedMs = T0 + 3 * HOUR;
+	const startedMs = parent.endedMs - MIN;
 	const now = T0 + 4 * HOUR;
 	const file = childSessionFile(root, taskId, childId, [{ type: "session", id: childId, timestamp: iso(startedMs) }]);
 	const index = new Map([[childId, { id: childId, taskId, parentSessionId: parent.sessionId, file, checkedMs: startedMs + MIN, complete: false }]]);
 	writeLedger(paths, [parent]);
 	const incident = { subject: { key: "machine" }, detector: "D6", kind: "provider-down", severity: "warn" };
 	writeDecisions(paths, [
-		{ ...incident, fp: "gap", event: "opened", ts: iso(startedMs - 2 * MIN) },
-		{ ...incident, fp: "gap", event: "resolved", ts: iso(startedMs - MIN) },
+		{ ...incident, fp: "gap", event: "opened", ts: iso(parent.startedMs - 2 * MIN) },
+		{ ...incident, fp: "gap", event: "resolved", ts: iso(parent.startedMs - MIN) },
 		{ ...incident, fp: "live", event: "opened", ts: iso(startedMs + 2 * MIN) },
 		{ ...incident, fp: "future", event: "opened", ts: iso(now + MIN) },
 	]);
 	const results = [false, true].map((auditRetention) => loadSessionRecord({ paths, id: parent.sessionId, now, index, auditRetention }).health.findings.map(({ fp }) => fp));
 	assert.deepEqual(results, [["live"], ["live"]]);
+});
+
+test("IS-10: bounded preparation stays within the session-file allowance with 55 index-only descendants", (t) => {
+	const { paths } = setup();
+	const parent = mainRow();
+	const now = parent.endedMs + HOUR;
+	const parentFile = mainSessionFile(paths, parent.sessionId);
+	const index = new Map();
+	const sessionFiles = new Set([parentFile]);
+	writeLedger(paths, [parent]);
+	for (let i = 0; i < 55; i += 1) {
+		const id = `s-live-${i}`;
+		const startedMs = T0 + (i + 1) * MIN;
+		const file = mainSessionFile(paths, id, [{ type: "session", id, timestamp: iso(startedMs), padding: "x".repeat(63 * 1024) }]);
+		sessionFiles.add(file);
+		index.set(id, { id, parentSessionId: parent.sessionId, file, checkedMs: startedMs + MIN, complete: false });
+	}
+	writeDecisions(paths, [
+		{ fp: "during-latest", subject: { key: "machine" }, detector: "D6", kind: "provider-down", severity: "warn", event: "opened", ts: iso(parent.endedMs + MIN) },
+	]);
+
+	const sessionFds = new Set();
+	const { openSync, closeSync, readSync } = fs;
+	let sessionBytesRead = 0;
+	t.mock.method(fs, "openSync", (...args) => {
+		const fd = openSync(...args);
+		if (sessionFiles.has(args[0])) sessionFds.add(fd);
+		return fd;
+	});
+	t.mock.method(fs, "closeSync", (fd) => {
+		sessionFds.delete(fd);
+		return closeSync(fd);
+	});
+	t.mock.method(fs, "readSync", (fd, ...args) => {
+		const bytes = readSync(fd, ...args);
+		if (sessionFds.has(fd)) sessionBytesRead += bytes;
+		return bytes;
+	});
+
+	const messageScanTotalBytes = 128 * 1024;
+	const record = loadSessionRecord({
+		paths, id: parent.sessionId, now, index, auditRetention: true,
+		descendantScanMax: 50, messageScanTotalBytes, messageScanMaxBytes: messageScanTotalBytes,
+	});
+	assert.equal(record.children.length, 55);
+	assert.deepEqual(record.health.findings.filter(({ scope }) => scope === "machine").map(({ fp }) => fp), ["during-latest"]);
+	assert.ok(sessionBytesRead >= 63 * 1024, `the spy should observe a real message scan (${sessionBytesRead} bytes)`);
+	assert.ok(sessionBytesRead <= messageScanTotalBytes, `read ${sessionBytesRead} session-file bytes with a ${messageScanTotalBytes}-byte allowance`);
 });
 
 test("IS-7: a severity rise is a finding row with its own evidence, not a new incident", () => {

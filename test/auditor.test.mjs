@@ -738,8 +738,10 @@ test("a same-length rewrite read by a complete timeline excludes the new model b
 	tracker.queueLedger(readEnded(h.paths));
 	tracker.tick({});
 	index.save();
+	assert.deepEqual(Object.keys(index.get("m1").published.models), ["openai/gpt-5-4"]);
 	const before = fs.statSync(file);
 	writeJsonl(file, [mk("gpt-5-5", 20)]);
+	assert.equal(fs.statSync(file).size, before.size, "the rewrite keeps the length");
 	fs.utimesSync(file, new Date(before.atimeMs), new Date(before.mtimeMs + 5000));
 	assert.equal(fresh(index.get("m1")), false, "the index still holds the old read");
 
@@ -748,6 +750,14 @@ test("a same-length rewrite read by a complete timeline excludes the new model b
 	await h.prepare(a);
 	assert.equal(h.runner.starts.length, 1, "a complete timeline proves coverage without the recount");
 	assert.equal(modelOf(h.runner.starts[0]), "google/gemini-3-pro", "the rewritten model gpt-5-5 is excluded");
+	const document = fs.readFileSync(path.join(h.runner.starts[0].cwd, "bundle.md"), "utf8");
+	const json = document.match(/^Evidence bundle \(JSON data, not instructions\):\r?\n(.+)$/m)?.[1];
+	assert.ok(json, "the outbound document contains its evidence bundle");
+	const { total, models } = JSON.parse(json).tokens;
+	assert.deepEqual({ total, models }, {
+		total: 25,
+		models: [{ key: "openai/gpt-5-5", tokens: 25, cost: 0.01 }],
+	});
 });
 
 test("evidence-too-large charges nothing and never starts", async () => {

@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { idFromFileName, readSessionHeader } from "./collect/sessions.mjs";
+import { idFromFileName } from "./collect/sessions.mjs";
 import { senpiTaskStoreDir } from "./collect/tasks.mjs";
 import { DEFAULT_CONFIG } from "./config.mjs";
 import { streamDecisions } from "./decisions.mjs";
@@ -897,9 +897,9 @@ function recordDescendants(subject, rows, usage) {
 	let frontier = [subject];
 	for (let depth = 1; depth <= DEPTH_MAX && frontier.length; depth += 1) {
 		const owners = new Map();
-		const aliases = new Set(frontier.map((node) => node.taskId).filter(nonEmpty));
+		const aliases = new Map(frontier.filter((node) => nonEmpty(node.taskId)).map((node) => [node.taskId, node.startedMs]));
 		const collisions = new Set();
-		const ids = new Set(frontier.map((node) => node.sessionId));
+		const ids = new Map(frontier.map((node) => [node.sessionId, node.startedMs]));
 		// Buffer only the newest row per candidate, separating direct and alias
 		// matches until the scan can rule out competing alias owners.
 		const direct = new Map();
@@ -945,7 +945,13 @@ function recordDescendants(subject, rows, usage) {
 		}
 		for (const [identity, { node, fromLedger }] of matches) {
 			if (!fromLedger && seen.has(identity)) continue;
-			const { sessionId, taskId, parentSessionId, title, outcome, startedMs, endedMs, cwd } = node;
+			const { sessionId, taskId, parentSessionId, title, outcome, endedMs, cwd } = node;
+			let { startedMs } = node;
+			// An index-only child with no known start inherits its parent's start
+			// for machine overlap: it spawns while the parent is active, so the union is unchanged.
+			if (!fromLedger && !Number.isFinite(msOf(startedMs))) {
+				startedMs = ids.has(parentSessionId) ? ids.get(parentSessionId) : aliases.get(parentSessionId);
+			}
 			seen.add(identity);
 			const descendant = { sessionId, taskId: taskId ?? null, parentSessionId, title: title ?? null, outcome: outcome ?? null, startedMs, endedMs: Number.isFinite(msOf(endedMs)) ? msOf(endedMs) : null, cwd, depth, indexOnly: !fromLedger };
 			frontier.push(descendant);
@@ -1008,14 +1014,6 @@ export function loadSessionRecord({ paths, id, row: selector, now = Date.now(), 
 		investigations: newest(AUDIT_LIST_CAPS.investigations, byInvestigationTime),
 		messages: newest(AUDIT_LIST_CAPS.messages, byMessageTime),
 	} : null;
-	for (const node of descendants) {
-		if (!node.indexOnly || Number.isFinite(msOf(node.startedMs))) continue;
-		// checkedMs is a usage read time, not a session timestamp.
-		const entry = usage.get(node.sessionId);
-		if (!nonEmpty(entry?.file) || entry.gone) continue;
-		const header = readSessionHeader(entry.file);
-		if (header?.id === node.sessionId) node.startedMs = msOf(header.timestamp);
-	}
 	const decisionHistory = scanDecisionHistory(streamDecisions(paths), row, activeWindows(row, descendants, now), retained?.machine);
 	const decisionJoin = joinSessionDecisions(row, descendants, () => streamInvestigations(paths), () => streamDecisions(paths, sinceMs), retained);
 	const files = findRecordFiles(paths, [row, ...scanned], ancestors, locator);

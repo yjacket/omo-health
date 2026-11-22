@@ -218,6 +218,25 @@ test("the bundle built from the timeline carries tokens.total 17", () => {
 	assert.equal(bundle.tokens.total, 17);
 });
 
+test("(IS-1, IS-8) bundle token totals and models use one complete source", () => {
+	const indexed = { total: 10, input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.01, costUnknown: false, turns: 1, models: [{ key: "fake/model-a", tokens: 10, cost: 0.01 }] };
+	const rewritten = { total: 30, input: 6, output: 7, cacheRead: 8, cacheWrite: 9, cost: 0.02, costUnknown: true, turns: 2 };
+	const record = { ...emptyRecord(), tokens: indexed };
+	const totals = { ...rewritten, models: { "fake/model-b": { tokens: 30, cost: 0.02 } } };
+	const usage = (timeline) => {
+		const { total, input, output, cacheRead, cacheWrite, cost, costUnknown, turns, models } = auditBundle(record, timeline, { config: DEFAULT_CONFIG, now: T0 }).tokens;
+		return { total, input, output, cacheRead, cacheWrite, cost, costUnknown, turns, models };
+	};
+	assert.deepEqual(usage(null), indexed, "no timeline uses the published index");
+	assert.deepEqual([
+		usage(timelineShell({ totals })),
+		usage(timelineShell({ totals: { ...totals, modelsIncomplete: true } })),
+	], [
+		{ ...rewritten, models: [{ key: "fake/model-b", tokens: 30, cost: 0.02 }] },
+		indexed,
+	], "a complete timeline supplies all usage; an incomplete one supplies none");
+});
+
 test("(IS-8) the audit bundle and prompt distinguish incomplete statistics from zero", () => {
 	const timeline = {
 		...timelineShell({
