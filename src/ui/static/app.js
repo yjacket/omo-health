@@ -774,6 +774,7 @@
 				el(
 					"div",
 					{ class: "ended__log" },
+					d.health.unattributedKo ? note(d.health.unattributedKo) : null,
 					// Info-level findings are logged only since a daemon recorded a coverage event before the session started.
 					subBlock("감지", d.coverage.infoFindings ? null : note("이 기간에는 정보 수준 감지를 기록하지 않았습니다."), paged("findings", samples(endedFinding), "감지 기록이 없습니다")),
 					subBlock("조치", paged("actions", samples(endedAction), "조치 기록이 없습니다")),

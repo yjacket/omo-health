@@ -187,6 +187,9 @@ export const SESSION_STATE_LABELS = Object.freeze({ busy: "응답 중", tool: "�
 /** Ended-session ledger (src/session-ledger.mjs EndedRecord.outcome): how a session ended. */
 export const OUTCOME_LABELS = Object.freeze({ "goal-complete": "목표 완료", answered: "응답 후 종료", crash: "비정상 종료", cancelled: "취소됨", failed: "실패", released: "omo-health 해제", closed: "종료됨", unknown: "알 수 없음" });
 
+/** Ended-session detail: health records withheld because a session ID is shared across projects. */
+export const unattributedHealthLabel = (count) => `다른 프로젝트와 id가 같아 붙이지 못한 기록 ${count}건`;
+
 /** The terminal a main session runs in (SessionRow.terminal.kind), as the board's chip names it. */
 export const TERMINAL_LABELS = Object.freeze({ orca: "Orca", herdr: "herdr", other: "기타" });
 

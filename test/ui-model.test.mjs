@@ -13,14 +13,14 @@ import { SWITCHES } from "../src/control.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 import { appendEnded } from "../src/session-ledger.mjs";
 import { createSessionFileLocator } from "../src/collect/session-files.mjs";
-import { loadSessionRecord } from "../src/session-record.mjs";
+import { buildSessionRecord, loadSessionRecord } from "../src/session-record.mjs";
 import { createFakeClock } from "../src/util/time.mjs";
 import { createUsageIndex, readUsageIndex, USAGE_INDEX_VERSION } from "../src/usage-index.mjs";
 import { ACTION_LABELS, EXIT_REASON_LABELS, GOAL_STATUS_LABELS, INVESTIGATION_STATUS_LABELS, OUTCOME_LABELS, SESSION_STATE_LABELS, TASK_STATUS_LABELS, TERMINAL_LABELS, TRIGGER_LABELS } from "../src/ui/labels.mjs";
 import { buildHistory } from "../src/ui/history.mjs";
 import { createDetailOperations } from "../src/ui/detail-worker.mjs";
 import { buildEnded, buildOverview, buildSessions, buildSettings, buildUiState, daemonStatus, endedRow, loadDaemonInputs, loadUiInputs, uiState } from "../src/ui/model.mjs";
-import { buildSessionView } from "../src/ui/session-view.mjs";
+import { buildSessionView, sessionRecordPage } from "../src/ui/session-view.mjs";
 import { buildSessionSnapshot } from "../src/session-board.mjs";
 import { createUsageTracker } from "../src/usage-tracker.mjs";
 import { expectedSelector } from "./helpers/ended-selector.mjs";
@@ -169,6 +169,47 @@ it("plan78: 81- and 300-character history IDs survive browser keys, detail URLs 
 	assert.deepEqual(rendered.map(({ children: [row] }) => row.children[0].children[0]["data-key"]), ids.map((id) => `ended:${id}`));
 	assert.deepEqual(rows.map(endedDetailUrl), ids.map((id, i) => `/api/session?id=${id}&row=${selectors[i]}`));
 	assert.deepEqual(posts, ids.map((id, i) => ["/api/audit", id, selectors[i]]));
+});
+
+it("IS-7: the app detail distinguishes withheld health records from an empty history", () => {
+	const el = (tag, attrs, ...children) => ({ tag, ...attrs, children: children.flat(Infinity).filter(Boolean) });
+	const { endedRecord } = endedDetailFunctions(["endedRecord", "detailTextNodes", "endedDetailId"], {
+		el, block: (title, ...children) => el("div", { title }, children), subBlock: (title, ...children) => el("div", { title }, children),
+		note: (text, tone) => el("p", { text, tone }), empty: (text) => el("p", { text }),
+		detailList: (d, name) => name === "children" ? d.children : d.health[name],
+		endedFacts() {}, endedTokenBlock() {}, endedModels() {}, endedChild() {}, errorSlot() {}, auditBlock() {},
+		endedFinding: (finding) => finding.titleKo, endedAction: (action) => action.fp, endedInvestigation: (investigation) => investigation.fp,
+	});
+	const row = { sessionId: "shared-health", kind: "main", cwd: "C:/project-a", startedMs: NOW - HOUR, endedMs: NOW };
+	const ledger = [row, { ...row, cwd: "C:/project-b" }];
+	const noHistory = buildSessionRecord({ row, ledger });
+	const fp = "withheld-record-sentinel";
+	const ts = new Date(NOW - 1000).toISOString();
+	const subject = { sessionId: row.sessionId };
+	const sharedHistory = buildSessionRecord({
+		row, ledger,
+		decisions: [
+			{ event: "opened", fp, ts, subject, detector: "D1", kind: "stalled", severity: "warn", titleKo: fp },
+			{ fp, ts, detector: "D1", action: { kind: "notice" }, result: "execute", outcome: { delivered: true } },
+			{ event: "investigation", fp, ts, analyst: { verdict: "act" } },
+		],
+		investigations: [{ id: fp, subject, detector: "D1" }],
+	});
+	const render = (record) => endedRecord(row, buildSessionView(sessionRecordPage(record, null, 0)));
+	const label = "다른 프로젝트와 id가 같아 붙이지 못한 기록";
+	const zeroCounts = { findings: 0, actions: 0, verdicts: 0, investigations: 0 };
+	for (const record of [noHistory, { ...noHistory, truncated: { unattributedHealth: zeroCounts } }]) {
+		const rendered = JSON.stringify(render(record));
+		assert.ok(rendered.includes("감지 기록이 없습니다"));
+		assert.ok(!rendered.includes(label));
+	}
+
+	assert.deepEqual(sharedHistory.truncated.unattributedHealth, { findings: 1, actions: 1, verdicts: 1, investigations: 1 });
+	const detail = render(sharedHistory);
+	assert.ok(!JSON.stringify(detail).includes(fp), "withheld record text must not be rendered");
+	const healthLog = detail.find((block) => block.title === "omo-health 기록").children[0];
+	assert.ok(healthLog.children.some((node) => node.tag === "p" && node.text === `${label} 4건` && node.tone === undefined), "the health area should show a muted notice with the total");
+	assert.equal(JSON.stringify(detail).split(label).length - 1, 1, "the notice should appear once per detail");
 });
 
 it("IS-10 unconfirmed: the app audit block renders the overdue status when flagged", () => {

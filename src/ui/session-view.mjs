@@ -1,5 +1,5 @@
 import { displayLedgerId } from "../session-record.mjs";
-import { actionLabel, analystVerdictLabel, auditJudgmentLabel, auditOverallLabel, auditReasonLabel, auditStatusLabel, auditTokenLabel, causeLabel, findingLabel, outcomeLabel, resultLabel, severityLabel, terminalLabel } from "./labels.mjs";
+import { actionLabel, analystVerdictLabel, auditJudgmentLabel, auditOverallLabel, auditReasonLabel, auditStatusLabel, auditTokenLabel, causeLabel, findingLabel, outcomeLabel, resultLabel, severityLabel, terminalLabel, unattributedHealthLabel } from "./labels.mjs";
 import { investigationRow } from "./model.mjs";
 
 /**
@@ -167,6 +167,7 @@ export function buildSessionView(record, extras = {}) {
 	const audit = labelledAudit(auditExtra !== undefined ? auditExtra : record.audit ?? null);
 	if (record.found === false) return { ...record, audit, ...rest };
 	const health = isRecord(record.health) ? record.health : {};
+	const unattributedTotal = Object.values(record.truncated?.unattributedHealth ?? {}).reduce((total, count) => total + count, 0);
 	return {
 		...record,
 		session: labelledSession(record.session),
@@ -174,6 +175,7 @@ export function buildSessionView(record, extras = {}) {
 		children: sessionItems(record, "children").map(ITEM_LABELS.children),
 		health: {
 			...health,
+			...(unattributedTotal > 0 ? { unattributedKo: unattributedHealthLabel(unattributedTotal) } : {}),
 			...Object.fromEntries(SESSION_LISTS.slice(1).map((name) => [name, sessionItems(record, name).map(ITEM_LABELS[name])])),
 		},
 		audit,

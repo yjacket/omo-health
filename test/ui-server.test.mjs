@@ -24,7 +24,7 @@ import { appendDecision } from "../src/decisions.mjs";
 import { BACKFILL_MARKER, backfillOnce } from "../src/session-backfill.mjs";
 import { ANALYST_POLL_MS } from "../src/judge/analyst.mjs";
 import { auditFileKey } from "../src/session-subject.mjs";
-import { appendEnded, readEnded } from "../src/session-ledger.mjs";
+import { appendEnded, appendEndedBatch, readEnded } from "../src/session-ledger.mjs";
 import { createDetailWorker, createSessionDetail, createStartAudit } from "../src/ui/cli.mjs";
 import { buildEnded, daemonStatus, loadDaemonInputs, uiState } from "../src/ui/model.mjs";
 import { createUiServer } from "../src/ui/server.mjs";
@@ -1733,6 +1733,54 @@ describe("ui server", { timeout: 20_000 }, () => {
 						"&row=0123456789ABCDEF", "&row=0123456789abcdef%0A", `&Row=${duplicate}`, `&row=${duplicate}&row=${duplicate}`,
 						`&ended=${a.endedMs}`, "&ended=", "&ended=-1", "&ended=1.5", "&ended=1e3", "&ended=9007199254740993", "&Ended=1", "&ended=0&ended=-1"]) {
 						assert.deepEqual(await get(query), { status: 422, body: { error: "invalid" } }, query);
+					}
+				} finally {
+					await ui.close();
+					await world.detail.close();
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				}
+			});
+
+			it("(plan 90) batch append preserves shared parent and child IDs across projects in history and detail", async () => {
+				const world = makeWorld();
+				const { paths, now, nowMs } = world;
+				const ui = createUiServer({ paths, token: TOKEN, getState: () => STATE, sessionDetail: world.detail, now });
+				try {
+					const index = createUsageIndex({ file: paths.health.usageIndexFile, clock: { now } });
+					const children = [42, 73].map((total, i) => {
+						const cwd = path.join(world.dir, `project-${i}`);
+						const endedMs = nowMs - (i + 1) * 86_400_000;
+						const parent = { sessionId: "review.1", kind: "main", cwd, endedMs };
+						const child = {
+							sessionId: "check.1", parentSessionId: parent.sessionId, kind: "child",
+							taskId: "st_check", title: `child ${i}`, cwd, endedMs, outcome: "answered",
+						};
+						appendEndedBatch(paths, [parent, child], { nowMs });
+						const file = writeTask(cwd, { task_id: child.taskId, child_session_id: child.sessionId, status: "completed" }, [
+							{ type: "session", id: child.sessionId },
+							{ type: "message", message: { role: "assistant", provider: "anthropic", model: "claude-used", usage: { input: total }, stopReason: "stop" } },
+						]);
+						index.update(subjectOf(child), file, { kind: "child", taskId: child.taskId });
+						return child;
+					});
+					index.save();
+					const facts = ({ title, endedMs }) => [title, endedMs];
+					const ledgerChildren = () => readEnded(paths).filter(({ sessionId }) => sessionId === "check.1");
+					assert.deepEqual(ledgerChildren().map(facts), children.map(facts));
+					assert.equal(appendEndedBatch(paths, [{ ...children[0], endedMs: nowMs }], { nowMs })[0].appended, false);
+					assert.deepEqual(ledgerChildren().map(facts), children.map(facts));
+
+					const history = uiState({ paths, env: world.env, now: nowMs }).ended.rows.filter(({ sessionId }) => sessionId === "check.1");
+					assert.deepEqual(history.map(facts), children.map(facts));
+					assert.notEqual(history[0].detailRow, history[1].detailRow);
+					assert.deepEqual(history.map(({ detailRow, rowSelector }) => detailRow === rowSelector && /^[a-f0-9]{16}$/.test(detailRow)), [true, true]);
+					assert.deepEqual(history.map(({ tokens }) => tokens?.total), [42, 73]);
+					const { port } = await ui.listen();
+					for (const [i, row] of history.entries()) {
+						const { status, body } = await getAt(port, `/api/session?id=${row.sessionId}&row=${row.detailRow}`);
+						assert.equal(status, 200);
+						assert.deepEqual(facts(body.session), facts(children[i]));
+						assert.equal(body.tokens?.total, [42, 73][i]);
 					}
 				} finally {
 					await ui.close();
