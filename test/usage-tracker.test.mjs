@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
 import { createSessionFileLocator } from "../src/collect/session-files.mjs";
+import { SessionRegistry } from "../src/collect/sessions.mjs";
 import { readUsage } from "../src/collect/usage.mjs";
 import { E, iso, tmpDir, writeJsonl } from "./helpers/fixtures.mjs";
 import { makeWorld, sessionState, taskRecord } from "./helpers/world.mjs";
@@ -12,7 +13,7 @@ import { endedRow } from "../src/ui/model.mjs";
 import { createUsageTracker } from "../src/usage-tracker.mjs";
 import { appendEnded, appendEndedLocated, ENDED_LOCATION, streamEnded } from "../src/session-ledger.mjs";
 import { resolvePaths } from "../src/paths.mjs";
-import { buildSessionSnapshot } from "../src/session-board.mjs";
+import { buildSessionSnapshot, detectEnded } from "../src/session-board.mjs";
 
 const T0 = Date.UTC(2026, 8, 28, 12, 0, 0);
 const DAY = 86_400_000;
@@ -175,6 +176,70 @@ test("a complete live session reads only appended bytes each tick", () => {
 	assert.equal(second.bytesRead, Buffer.byteLength(appended), "the second tick reads only the appended bytes");
 	assert.equal(compactUsage(s.index.get("m1")).total, 25);
 	assert.equal(s.index.get("m1").published.total, 25);
+});
+
+test("(plan 41) a sensor-reported review.jsonl keeps the live token total in history", (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const id = "review-session";
+	const file = path.join(s.cwd, "review.jsonl");
+	writeJsonl(file, [E.header(id, s.cwd, T0 - 5000), E.assistant({ ms: T0 - 1000, usage: usage(38, 4) })]);
+	const sensor = { sessionId: id, sessionFile: file, cwd: s.cwd, pid: 100, ts: T0 - 1000 };
+	const registry = new SessionRegistry({ paths: s.paths, clock: s.clock });
+	const { sessions } = registry.refresh({ sensors: new Map([[id, sensor]]) });
+	assert.equal(sessions.get(id)?.file, file, "the file is outside the normal sessions directory");
+	const live = makeWorld({ now: T0, sessions: [...sessions.values()], sensors: [sensor], procsFresh: true });
+	const board = (world) => buildSessionSnapshot(world, [], [], world.now, { tokensOf: s.tracker.tokensOf });
+	s.tracker.tick(live);
+	const snapshot = board(live);
+	const liveRow = snapshot.groups.flatMap((g) => g.sessions).find((row) => row.sessionId === id);
+	assert.equal(liveRow?.tokens?.total, 42);
+
+	s.advance(1000);
+	const ended = makeWorld({ now: s.clock.now(), procsFresh: true });
+	const [row] = detectEnded(snapshot, board(ended), ended);
+	assert.equal(row?.sessionId, id);
+	assert.equal(appendEnded(s.paths, row, { nowMs: s.clock.now() }), true);
+	// A non-usage append makes the ended row stale and forces a path lookup after restart.
+	s.index.save();
+	fs.appendFileSync(file, `${JSON.stringify(E.user("one last note", s.clock.now()))}\n`);
+	const index = createUsageIndex({ file: s.paths.health.usageIndexFile, clock: s.clock });
+	const locator = createSessionFileLocator({ paths: s.paths, clock: s.clock });
+	const tracker = createUsageTracker({ paths: s.paths, index, locator, clock: s.clock });
+	assert.equal(tracker.queueLedger(streamEnded(s.paths, { withLocation: true })), 1);
+	assert.ok(tracker.tick(ended).bytesRead > 0, "reopens the custom path from the saved index");
+	const saved = readUsageIndex(s.paths.health.usageIndexFile);
+	const history = endedRow(row, 0, saved);
+	assert.equal(saved.get(id)?.file, file);
+	assert.equal(history.tokensGone, false);
+	assert.equal(history.tokens?.total, liveRow.tokens.total);
+});
+
+test("(plan 41) main file verification rejects wrong, missing, and oversized headers but trusts matching filenames", (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const message = E.assistant({ ms: T0, usage: usage(42) });
+	const cases = [
+		["wrong-id", path.join(s.cwd, "wrong.jsonl"), [E.header("other", s.cwd, T0), message]],
+		["no-header", path.join(s.cwd, "missing.jsonl"), [message, E.header("no-header", s.cwd, T0)]],
+		["too-long", path.join(s.cwd, "long.jsonl"), [{ ...E.header("too-long", s.cwd, T0), cwd: "x".repeat(64 * 1024) }, message]],
+		["named", mainFile(s.paths, "named"), [message]],
+	];
+	for (const [, file, records] of cases) writeJsonl(file, records);
+	const world = makeWorld({
+		now: T0,
+		sessions: cases.map(([id, file]) => sessionState({ id, file, startedMs: T0 - 1000, cwd: s.cwd })),
+		sensors: cases.map(([sessionId, sessionFile], i) => ({ sessionId, sessionFile, pid: 100 + i, ts: T0 })),
+		procsFresh: true,
+	});
+	s.tracker.tick(world);
+	const snapshot = buildSessionSnapshot(world, [], [], T0, { tokensOf: s.tracker.tokensOf });
+	const rows = new Map(snapshot.groups.flatMap((g) => g.sessions.map((row) => [row.sessionId, row])));
+	for (const [id] of cases.slice(0, -1)) {
+		assert.equal(rows.get(id).tokens, null, id);
+		assert.equal(s.index.has(id), false, id);
+	}
+	assert.equal(rows.get("named").tokens?.total, 42);
 });
 
 test("a live child attached to another session's file gets no tokens, and its row ends missing", () => {

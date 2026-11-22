@@ -7,6 +7,7 @@ import test from "node:test";
 import { createSessionFileLocator } from "../src/collect/session-files.mjs";
 import { projectStoreName, senpiTaskStoreDir } from "../src/collect/tasks.mjs";
 import { resolvePaths } from "../src/paths.mjs";
+import { createUsageIndex } from "../src/usage-index.mjs";
 import { createFakeClock } from "../src/util/time.mjs";
 
 const STAMP = "2026-11-21T09-00-00-000Z";
@@ -44,6 +45,21 @@ test("mainFile finds a main session file by the id in its file name", (t) => {
 	const file = writeMain(paths, "sess-main");
 	assert.equal(locator.mainFile("sess-main"), file);
 	assert.equal(locator.mainFile("sess-unknown"), undefined);
+});
+
+test("(plan 41) mainFile uses a saved custom path only while its first line matches", (t) => {
+	const { paths, root, clock, locator } = setup(t);
+	const id = "sess-review";
+	const file = path.join(root, "review.jsonl");
+	assert.equal(locator.mainFile(id), undefined, "no index yet");
+	fs.writeFileSync(file, `{"type":"session","id":"${id}"}\n`);
+	const index = createUsageIndex({ file: paths.health.usageIndexFile, clock });
+	index.update(id, file, { kind: "main" });
+	assert.equal(index.save(), true);
+	assert.equal(locator.mainFile(id), file, "a saved custom path supersedes the cached filename miss");
+
+	fs.writeFileSync(file, '{"type":"session","id":"replacement"}\n');
+	assert.equal(locator.mainFile(id), undefined, "a stale persisted path must not open a different session");
 });
 
 test("mainFile finds a file created after a miss only once the fake clock passes rescanMs", (t) => {

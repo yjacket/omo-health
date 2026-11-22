@@ -1,7 +1,12 @@
 import path from "node:path";
 import { listDirSafe, statSafe } from "../util/fsx.mjs";
-import { idFromFileName } from "./sessions.mjs";
+import { readUsageIndex } from "../usage-index.mjs";
+import { idFromFileName, readSessionHeader } from "./sessions.mjs";
 import { senpiTaskStoreDir } from "./tasks.mjs";
+
+export function mainSessionFileMatches(file, sessionId) {
+	return idFromFileName(file) === sessionId || readSessionHeader(file)?.id === sessionId;
+}
 
 /**
  * Locate the session JSONL behind an ended-session ledger row (GAP-2).
@@ -18,6 +23,24 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000 } = {
 	const nowMs = typeof clock?.now === "function" ? () => clock.now() : () => Date.now();
 	let mainFiles = new Map();
 	let mainScannedMs = -Infinity;
+	let usageStamp;
+	let customMainFiles = new Map();
+
+	const indexedMainFile = (sessionId) => {
+		const file = paths.health?.usageIndexFile;
+		const stat = file && statSafe(file);
+		const stamp = stat?.isFile() ? `${stat.ino}:${stat.birthtimeMs}:${stat.mtimeMs}:${stat.size}` : null;
+		if (stamp !== usageStamp) {
+			usageStamp = stamp;
+			customMainFiles = new Map();
+			if (stamp !== null) {
+				for (const [id, entry] of readUsageIndex(file)) {
+					if (entry.kind === "main" && entry.file && idFromFileName(entry.file) !== id) customMainFiles.set(id, entry.file);
+				}
+			}
+		}
+		return customMainFiles.get(sessionId);
+	};
 
 	const scanMain = () => {
 		const found = new Map();
@@ -33,9 +56,10 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000 } = {
 		mainScannedMs = nowMs();
 	};
 
-	/** `<sessionsDir>/<slug>/*.jsonl` keyed by the id in the file name; on a miss rescan once per `rescanMs`. */
-	const mainFile = (sessionId) => {
+	/** Prefer the indexed custom path; otherwise look up the filename id. The tracker supplies its in-memory path (or null). */
+	const mainFile = (sessionId, indexedFile = indexedMainFile(sessionId)) => {
 		if (!sessionId) return undefined;
+		if (indexedFile && idFromFileName(indexedFile) !== sessionId && mainSessionFileMatches(indexedFile, sessionId)) return indexedFile;
 		let file = mainFiles.get(sessionId);
 		if (file && statSafe(file)?.isFile()) return file;
 		if (file) mainFiles.delete(sessionId);

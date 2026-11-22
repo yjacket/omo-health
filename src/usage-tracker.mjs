@@ -1,4 +1,4 @@
-import { idFromFileName } from "./collect/sessions.mjs";
+import { mainSessionFileMatches } from "./collect/session-files.mjs";
 import { pathKey } from "./paths.mjs";
 import { ENDED_LOCATION, locateEndedRows, readEndedCwd } from "./session-ledger.mjs";
 import { USAGE_TICK_BYTES, compactUsage, fresh as isFresh, treeTotals } from "./usage-index.mjs";
@@ -8,9 +8,9 @@ import { USAGE_TICK_BYTES, compactUsage, fresh as isFresh, treeTotals } from "./
  * live appends, first reads of live sessions and the ended-session backlog, all
  * spent through the single writer of the index (`src/usage-index.mjs`).
  *
- * Live sessions are indexed only from a file that passes the backlog's exact-file
- * rule: a main file name must carry its session id, and a child file must be the
- * one the locator returns for its task and session id. The live collector can
+ * Live sessions are indexed only from their own file: a main file name or
+ * session header must carry its session id, and a child file must be the one
+ * the locator returns for its task and session id. The live collector can
  * attach a task directory's newest file to the wrong child
  * (`findChildSessionFile`), and that file's usage must never be billed there.
  */
@@ -75,11 +75,11 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 		rootSessionId: source?.rootSessionId ?? null,
 	});
 
-	/** The live session's own file, only when it is the exact file the locator would choose. */
+	/** Verify that the live collector's file belongs to this session before billing it. */
 	const verifiedFile = (session, liveSessions, cwdOf) => {
 		const file = session?.file;
 		if (!isNonEmptyString(file)) return undefined;
-		if (session.kind === "main") return idFromFileName(file) === session.id ? file : undefined;
+		if (session.kind === "main") return mainSessionFileMatches(file, session.id) ? file : undefined;
 		if (session.kind !== "child" || !isNonEmptyString(session.taskId)) return undefined;
 		const found = locator?.childFile?.({ taskId: session.taskId, sessionId: session.id, cwds: cwdCandidates(session, liveSessions, cwdOf) });
 		return found && pathKey(found) === pathKey(file) ? file : undefined;
@@ -89,7 +89,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 		if (row.kind === "child") {
 			return locator?.childFile?.({ taskId: row.taskId ?? row.sessionId, sessionId: row.sessionId, cwds: cwdCandidates(row, liveSessions, cwdOf) });
 		}
-		return locator?.mainFile?.(row.sessionId);
+		return locator?.mainFile?.(row.sessionId, index.get(row.sessionId)?.file ?? null);
 	};
 
 	const counts = () => {
