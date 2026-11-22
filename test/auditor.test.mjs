@@ -597,7 +597,7 @@ test("IS-10 deadline: the second audit starts and charges once only after the ti
 	h.tick(a);
 	assert.equal(h.record("m1").status, "running");
 	assert.equal(h.record("m2").status, "queued");
-	assert.equal(recording.calls.length, 2);
+	assert.equal(recording.calls.length, 3, "one launch and two termination attempts");
 	assert.equal(h.budget().count, 1);
 	childAlive = false;
 	h.tick(a);
@@ -608,7 +608,7 @@ test("IS-10 deadline: the second audit starts and charges once only after the ti
 	assert.equal(second.status, "running");
 	h.tick(a);
 	assert.equal(recording.calls.filter(({ command }) => command !== "taskkill").length, 2);
-	assert.deepEqual(kills(), [["/F", "/T", "/PID", "71000"]]);
+	assert.deepEqual(kills(), [["/F", "/T", "/PID", "71000"], ["/F", "/T", "/PID", "71000"]]);
 	assert.equal(h.budget().count, 2);
 	assert.deepEqual(h.budget().jobs, [firstJob, second.jobId]);
 });
@@ -1738,6 +1738,75 @@ test("a failed first kill is retried by the real runner and the one-per-PC slot 
 	h.tick(a, 30_000);
 	assert.equal(h.record("m1").holdUntilExit, undefined);
 	assert.equal(a.busy(), false);
+});
+
+test("IS-10 retry: a restarted auditor retries the adopted child and charges the next audit only after confirmed exit", async () => {
+	const h = harness({ sessions: ["m1", "m2"] });
+	h.config.audit.timeoutMs = 60_000;
+	const launcher = { ctimeMs: BASE, cmdSha1: "launcher" };
+	const child = { pid: 71000, ctimeMs: 0, cmdSha1: "model-child" };
+	let launcherAlive = true;
+	let childAlive = true;
+	let taskkill;
+	const recording = createRecordingSpawn();
+	const newRunner = () => createRunner({
+		paths: h.paths, clock: h.clock, env: {},
+		spawnImpl(command, args, options) {
+			const proc = recording.spawnImpl(command, args, options);
+			if (command === "taskkill") taskkill = proc;
+			return proc;
+		},
+		isAlive: (pid) => pid === 70000 ? launcherAlive : pid !== child.pid || childAlive,
+		identify: (pid) => pid === child.pid ? (childAlive ? child : null) : pid === 70000 && !launcherAlive ? null : launcher,
+		findJobProcess: () => childAlive ? child : null,
+	});
+	const runner = newRunner();
+	const a = h.auditor({ runner });
+	const starts = () => recording.calls.filter(({ command }) => command !== "taskkill").length;
+	const kills = () => recording.calls.filter(({ command }) => command === "taskkill").map(({ args }) => args);
+	const ownTree = ["/F", "/T", "/PID", String(child.pid)];
+	h.request("m1");
+	await h.prepare(a);
+	const { jobId, startedMs } = h.record("m1");
+	child.ctimeMs = startedMs + 1;
+	const meta = () => readJsonSafe(path.join(runner.jobDir(jobId), "meta.json"));
+	launcherAlive = false;
+	fs.writeFileSync(path.join(runner.jobDir(jobId), "exit.json"), '{"code":0}');
+	h.request("m2");
+	h.tick(a, h.config.audit.timeoutMs + 1);
+	assert.deepEqual(kills(), [ownTree]);
+	taskkill.emit("exit", 1, null);
+	assert.equal(meta().adopted, true);
+	assert.equal(h.record("m1").status, "running");
+	assert.equal(h.record("m2").status, "queued");
+	assert.deepEqual(h.budget().jobs, [jobId]);
+	assert.equal(h.budget().count, 1);
+	await a.close();
+
+	const restarted = h.auditor({ runner: newRunner() });
+	h.tick(restarted);
+	assert.deepEqual(kills(), [ownTree, ownTree], "the first post-restart poll must retry the failed kill");
+	assert.equal(meta().adoptedTerminationAttempts, 2, "the attempt count survives restart");
+	assert.equal(h.record("m1").status, "running");
+	assert.equal(h.record("m2").status, "queued");
+	assert.equal(starts(), 1);
+	assert.equal(h.budget().count, 1);
+
+	taskkill.emit("exit", 0, null);
+	childAlive = false;
+	h.tick(restarted);
+	assert.deepEqual(kills(), [ownTree, ownTree]);
+	assert.equal(meta().final.exitConfirmed, true);
+	assert.deepEqual([h.record("m1").status, h.record("m1").reason, h.record("m1").holdUntilExit],
+		["failed", "timeout", undefined]);
+	assert.equal(h.record("m2").status, "queued");
+	assert.equal(starts(), 1);
+	await h.prepare(restarted);
+	const second = h.record("m2");
+	assert.equal(second.status, "running");
+	assert.equal(starts(), 2);
+	assert.deepEqual(h.budget().jobs, [jobId, second.jobId]);
+	assert.equal(h.budget().count, 2, "the queued audit added exactly one charge");
 });
 
 for (const timedOut of [true, false]) {

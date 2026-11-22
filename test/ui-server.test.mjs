@@ -18,7 +18,7 @@ import { buildEnded, daemonStatus, loadDaemonInputs, uiState } from "../src/ui/m
 import { createUiServer } from "../src/ui/server.mjs";
 import { createUsageIndex, USAGE_INDEX_VERSION } from "../src/usage-index.mjs";
 import { expectedSelector } from "./helpers/ended-selector.mjs";
-import { writeJsonl, writeTask } from "./helpers/fixtures.mjs";
+import { appendJsonl, writeJsonl, writeTask } from "./helpers/fixtures.mjs";
 
 const TOKEN = "test-token-abc_123";
 const STATE = { generatedMs: 1, overview: { level: "ok" } };
@@ -686,6 +686,65 @@ describe("ui server", { timeout: 20_000 }, () => {
 			function requestFileOf(world) {
 				return path.join(world.paths.health.auditRequestsDir, `${AUDIT_ID}.json`);
 			}
+
+			it("IS-7 refreshes cached parent detail after a child-only transcript change", async (t) => {
+				const world = makeWorld();
+				const { paths, env, now, nowMs } = world;
+				const worker = createDetailWorker({ paths, env });
+				const jobs = [];
+				const detail = createSessionDetail({
+					paths, env, now,
+					worker: { run: (job) => { jobs.push(job.kind); return worker.run(job); }, close: worker.close },
+				});
+				const ui = createUiServer({ paths, token: TOKEN, getState: () => STATE, sessionDetail: detail, now });
+				t.after(async () => {
+					await ui.close();
+					await world.detail.close();
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				});
+				const childId = "s_cachechild";
+				const taskId = "st_cachechild";
+				const cwd = world.dir;
+				appendEnded(paths, {
+					sessionId: childId, taskId, kind: "child", parentSessionId: AUDIT_ID, cwd,
+					startedMs: nowMs - 500, endedMs: nowMs, outcome: "answered",
+				}, { nowMs });
+				const childFile = writeTask(cwd, { task_id: taskId, child_session_id: childId, status: "completed" }, [
+					{ type: "session", id: childId, cwd },
+				]);
+				const { port } = await ui.listen();
+				const open = async () => {
+					const { status, body } = await getAt(port, `/api/session?id=${AUDIT_ID}`);
+					assert.equal(status, 200);
+					assert.equal(body.session.sessionId, AUDIT_ID);
+					assert.equal(body.children[0]?.sessionId, childId);
+					assert.equal(JSON.stringify(body).includes(JSON.stringify(childFile).slice(1, -1)), false, "no transcript path in the response");
+					return body.health.messages.map(({ recipient, text }) => [recipient, text]);
+				};
+				assert.deepEqual(await open(), []);
+				assert.deepEqual(await open(), []);
+				assert.deepEqual(jobs, ["detail", "preview"], "an unchanged reopen does not load the record");
+
+				const message = { type: "custom_message", customType: "omo-health", timestamp: new Date(nowMs).toISOString(), content: "delivered to child" };
+				appendJsonl(childFile, [message]);
+				const mtime = nowMs / 1000;
+				fs.utimesSync(childFile, mtime, mtime);
+				assert.deepEqual(await open(), [[childId, message.content]], "child-only append must refresh the parent's messages");
+				assert.deepEqual(await open(), [[childId, message.content]]);
+				assert.deepEqual(jobs, ["detail", "preview", "detail", "preview"]);
+
+				const original = fs.statSync(childFile);
+				const replacement = `${childFile}.tmp`;
+				const text = "replaced child msg";
+				fs.writeFileSync(replacement, fs.readFileSync(childFile, "utf8").replace(message.content, text));
+				fs.utimesSync(replacement, mtime, mtime);
+				fs.renameSync(replacement, childFile);
+				const replaced = fs.statSync(childFile);
+				assert.deepEqual([replaced.size, replaced.mtimeMs], [original.size, original.mtimeMs]);
+				assert.notDeepEqual([replaced.ino, replaced.birthtimeMs], [original.ino, original.birthtimeMs]);
+				assert.deepEqual(await open(), [[childId, text]], "same-size, same-mtime child replacement must also refresh");
+				assert.deepEqual(jobs, ["detail", "preview", "detail", "preview", "detail"]);
+			});
 
 			it("isolates ended children with task id st_x in two project stores", async () => {
 				const world = makeWorld();

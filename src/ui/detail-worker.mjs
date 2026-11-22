@@ -1,16 +1,20 @@
 import { parentPort, workerData } from "node:worker_threads";
-import { auditModelFacts, auditsToday, readAuditState, readAuditTimeline, requestAudit, withdrawAuditRequest } from "../auditor.mjs";
+import { auditFileVersion, auditModelFacts, auditsToday, readAuditState, readAuditTimeline, requestAudit, withdrawAuditRequest } from "../auditor.mjs";
 import { createSessionFileLocator } from "../collect/session-files.mjs";
 import { loadConfig } from "../config.mjs";
 import { resolveAuditModel } from "../judge/audit.mjs";
 import { loadSessionRecord, recoverPendingAnalystModels, usageEntryOf } from "../session-record.mjs";
 import { fresh, readUsageIndex } from "../usage-index.mjs";
 import { auditReasonLabel, auditStatusLabel } from "./labels.mjs";
-import { daemonStatus, loadDaemonInputs } from "./model.mjs";
+import { daemonStatus, loadDaemonInputs, recordsStamp } from "./model.mjs";
 
 const ACTIVE_AUDIT_STATUSES = new Set(["requested", "queued", "launching", "running"]);
 const isAuditActive = (state) => Boolean(state && (ACTIVE_AUDIT_STATUSES.has(state.status) || state.holdUntilExit === true));
 const canonicalIdOf = (session, id) => typeof session?.sessionId === "string" && session.sessionId ? session.sessionId : id;
+
+export function detailSignature(paths, files) {
+	return JSON.stringify([files.map(auditFileVersion), recordsStamp(paths)]);
+}
 
 function auditFactsFor(paths, session, tokens) {
 	const usage = readUsageIndex(paths.health.usageIndexFile);
@@ -102,14 +106,18 @@ export function createDetailOperations({
 		const { kind, id, now } = job;
 		at = now;
 		if (kind === "preview") return previewOf(job.record, id);
-		const record = loadRecord(job);
-		if (kind === "audit") return startAudit(record, id);
-		if (record?.found !== true) return { record, file: undefined, audit: null };
+		const loaded = loadRecord(job);
+		if (kind === "audit") return startAudit(loaded, id);
+		if (loaded?.found !== true) return { record: loaded, files: [], signature: detailSignature(paths, []), audit: null };
+		// Keep dependency paths out of the record sent through the client view.
+		const { transcriptFiles, ...record } = loaded;
 		const session = record.session;
-		const file = session?.taskId
+		// Injected loaders may not report dependencies; retain the selected-file lookup for them.
+		const file = transcriptFiles === undefined && (session?.taskId
 			? locator.childFile({ taskId: session.taskId, sessionId: session.sessionId, cwds: session.cwd ? [session.cwd] : [] })
-			: locator.mainFile(session?.sessionId);
-		return { record, file, audit: previewOf(record, id) };
+			: locator.mainFile(session?.sessionId));
+		const files = transcriptFiles ?? (file ? [file] : []);
+		return { record, files, signature: detailSignature(paths, files), audit: previewOf(record, id) };
 	};
 }
 

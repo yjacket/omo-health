@@ -692,7 +692,7 @@ test("IS-10: only audit liveness looks for a surviving model child after launche
 	assert.equal(runner.alive("j1"), false, "neither a different bundle nor a different lane holds the slot");
 });
 
-test("IS-10 deadline: a verified surviving audit child is killed once and times out only after disappearance", () => {
+test("IS-10 deadline: a verified surviving audit child is targeted each poll until disappearance", () => {
 	const child = { pid: 71000, ctimeMs: T + 1, cmdSha1: "model-child" };
 	let launcherAlive = true;
 	let childAlive = true;
@@ -724,7 +724,60 @@ test("IS-10 deadline: a verified surviving audit child is killed once and times 
 	assert.equal(runner.poll("j1").status, "running");
 	childAlive = false;
 	assert.equal(runner.poll("j1").status, "timeout");
-	assert.deepEqual(kills(), [["/F", "/T", "/PID", "71000"]]);
+	assert.deepEqual(kills(), [["/F", "/T", "/PID", "71000"], ["/F", "/T", "/PID", "71000"]]);
+});
+
+test("IS-10 retry: every attempt re-verifies the adopted identity and records the attempt", (t) => {
+	const child = { pid: 71000, ctimeMs: T + 1, cmdSha1: "model-child" };
+	let found = child;
+	let seen = child;
+	let ambiguous = false;
+	let snapshot = 0;
+	let verifiedAt = 0;
+	const { runner, calls, clock, home } = setup({
+		isAlive: DEAD_PID,
+		identify(pid) {
+			if (pid === 70000) return SAME_PROCESS();
+			verifiedAt = snapshot;
+			return seen?.pid === pid ? seen : null;
+		},
+		findProcess(_jobId, _args, options) {
+			assert.equal(options.requireSingle, true);
+			snapshot++;
+			if (ambiguous) throw new Error("ambiguous job process lookup");
+			return found;
+		},
+	});
+	t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+	runner.start({ ...baseJob, kind: "audit", args: laneArgsFor("j1", "lane-1") });
+	clock.advance(baseJob.timeoutMs + 1);
+	const kills = () => calls.filter(({ command }) => command === "taskkill").map(({ args }) => args);
+	const ownTree = ["/F", "/T", "/PID", "71000"];
+	for (let attempt = 1; attempt <= 2; attempt++) {
+		assert.equal(runner.poll("j1").status, "running");
+		assert.deepEqual(kills(), Array(attempt).fill(ownTree), `verified attempt ${attempt}`);
+		assert.equal(verifiedAt, snapshot, "the attempt used a fresh PID identity snapshot");
+	}
+
+	ambiguous = true;
+	assert.equal(runner.poll("j1").status, "running");
+	ambiguous = false;
+	for (const mismatch of [{ ctimeMs: T + 2 }, { cmdSha1: "different-command" }, { pid: 71001 }]) {
+		seen = { ...child, ...mismatch };
+		assert.equal(runner.poll("j1").status, "running");
+		found = seen;
+		assert.equal(runner.poll("j1").status, "running", "a different matching process must not replace the adopted child");
+		found = child;
+	}
+	assert.deepEqual(kills(), [ownTree, ownTree], "ambiguity and mismatches do not send taskkill");
+	assert.equal(readMeta(runner).adoptedTerminationAttempts, 2);
+
+	found = seen = child;
+	assert.equal(runner.poll("j1").status, "running");
+	assert.deepEqual(kills(), [ownTree, ownTree, ownTree]);
+	found = seen = null;
+	assert.deepEqual(runner.poll("j1"), { status: "timeout", result: null, exitCode: null, exitConfirmed: true });
+	assert.equal(readMeta(runner).adoptedTerminationAttempts, 3);
 });
 
 test("IS-10 deadline: multiple matches or failed verification hold the audit without killing", () => {

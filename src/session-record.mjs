@@ -1082,6 +1082,7 @@ function recordLedger(rows, id, selector, usage, descendantScanMax) {
  * per-file limit or the remaining total message scan budget is skipped and
  * listed in `truncated.messagesSkipped`. `auditRetention` keeps only the
  * daemon's audit samples; the dashboard defaults to no retention limit.
+ * Non-audit records report the transcript paths scanned for detail caching.
  */
 export function loadSessionRecord({ paths, id, row: selector, now = Date.now(), messageScanMaxBytes = Infinity, messageScanTotalBytes = Infinity, descendantScanMax = Infinity, scanMessages, auditRetention = false, locator, index } = {}) {
 	if (!nonEmpty(id)) return { found: false, id };
@@ -1104,6 +1105,7 @@ export function loadSessionRecord({ paths, id, row: selector, now = Date.now(), 
 
 	const messages = [];
 	const skipped = [];
+	const transcriptFiles = auditRetention ? null : new Set();
 	let scannedBytes = 0;
 	for (const { sessionId, file } of files) {
 		const stat = statSafe(file);
@@ -1113,6 +1115,7 @@ export function loadSessionRecord({ paths, id, row: selector, now = Date.now(), 
 			continue;
 		}
 		scannedBytes += stat.size;
+		transcriptFiles?.add(file);
 		for (const message of (scanMessages ? scanMessages(file) : streamOmoHealthMessages(file, auditRetention)) ?? []) {
 			if (!retained) messages.push({ ...message, recipient: sessionId });
 			else if (isRecord(message)) retained.messages.add({ ms: Number.isFinite(message.ms) ? message.ms : null, kind: auditMessageKind(message.kind) });
@@ -1121,5 +1124,5 @@ export function loadSessionRecord({ paths, id, row: selector, now = Date.now(), 
 
 	const auditHealth = retained && auditRecordHealth(retained, decisionHistory.infoFindings);
 	const record = buildSessionRecord({ id, row, descendants, ambiguous, usage, decisionJoin, decisionHistory, auditHealth, messages, truncated: { messagesSkipped: skipped } });
-	return auditRetention ? { ...record, auditSubjectIds: decisionJoin.auditSubjectIds } : record;
+	return auditRetention ? { ...record, auditSubjectIds: decisionJoin.auditSubjectIds } : { ...record, transcriptFiles: [...transcriptFiles] };
 }

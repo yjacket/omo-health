@@ -6,8 +6,8 @@ import { Worker } from "node:worker_threads";
 import { loadConfig } from "../config.mjs";
 import { listSubjectsNow, runDiagnose } from "../diagnose.mjs";
 import { createLogger } from "../log.mjs";
-import { createDetailOperations } from "./detail-worker.mjs";
-import { fileStamp, recordsStamp, uiState } from "./model.mjs";
+import { createDetailOperations, detailSignature } from "./detail-worker.mjs";
+import { uiState } from "./model.mjs";
 import { createUiServer } from "./server.mjs";
 import { buildSessionView } from "./session-view.mjs";
 
@@ -105,12 +105,10 @@ export function createSessionDetail({ paths, env = process.env, now = Date.now, 
 	const detailWorker = worker ?? (local ? null : createDetailWorker({ paths, env }));
 	const cache = new Map();
 
-	const signatureOf = (file) => JSON.stringify([fileStamp(file), recordsStamp(paths)]);
-
 	function sessionDetail(id, row) {
 		const key = row === undefined ? id : `${id}:${row}`;
 		const cached = cache.get(key);
-		if (cached && signatureOf(cached.file) === cached.signature) {
+		if (cached && detailSignature(paths, cached.files) === cached.signature) {
 			cache.delete(key);
 			cache.set(key, cached);
 			const { record } = cached;
@@ -121,9 +119,9 @@ export function createSessionDetail({ paths, env = process.env, now = Date.now, 
 		}
 		if (cached) cache.delete(key);
 		const job = { kind: "detail", id, row, now: now() };
-		const remember = ({ record, file, audit }) => {
+		const remember = ({ record, files = [], signature = detailSignature(paths, files), audit }) => {
 			cache.delete(key);
-			cache.set(key, { record, file, signature: signatureOf(file) });
+			cache.set(key, { record, files, signature });
 			while (cache.size > maxEntries) cache.delete(cache.keys().next().value);
 			return buildSessionView(record, { audit });
 		};

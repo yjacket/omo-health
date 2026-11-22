@@ -20,6 +20,8 @@ import { redact, sha1, truncate } from "./util/text.mjs";
 const IDENTITY_FAILURE_LIMIT = 5;
 /** How far before `startedMs` an adopted process's creation time may be (the shim starts a moment after the spawn). */
 const ADOPT_SKEW_MS = 5_000;
+// Older daemons recorded the first attempt as a boolean.
+const adoptedTerminationAttempts = (meta) => meta.adoptedTerminationAttempts ?? (meta.adoptedTerminationSent ? 1 : 0);
 /** Job kinds whose argv must pass the analyst guard flags (no session file, no extensions/skills/context, no tools). */
 const GUARDED_KINDS = new Set(["analyst", "audit"]);
 // Print mode writes this prefix only for an applied switch, not exhaustion or reversion.
@@ -256,19 +258,21 @@ export function createRunner({ paths, spawnImpl = spawn, clock, env = process.en
 		}
 		if (!Number.isSafeInteger(found.pid) || found.pid <= 0 || !Number.isFinite(found.ctimeMs) ||
 			found.ctimeMs < meta.startedMs - ADOPT_SKEW_MS || !found.cmdSha1) throw new Error("invalid audit survivor identity");
-		if (meta.adopted && found.pid === meta.pid && found.ctimeMs === meta.ctimeMs && found.cmdSha1 === meta.cmdSha1) return meta;
-		if ((meta.adopted && stillOurs(meta)) || !stillOurs(found)) throw new Error("audit survivor identity changed during lookup");
-		const adopted = { ...meta, pid: found.pid, ctimeMs: found.ctimeMs, cmdSha1: found.cmdSha1, adopted: true, adoptedTerminationSent: false };
+		if (meta.adopted) {
+			if (found.pid !== meta.pid || found.ctimeMs !== meta.ctimeMs || found.cmdSha1 !== meta.cmdSha1) throw new Error("audit survivor identity changed during lookup");
+			return meta;
+		}
+		if (!stillOurs(found)) throw new Error("audit survivor identity changed during lookup");
+		const adopted = { ...meta, pid: found.pid, ctimeMs: found.ctimeMs, cmdSha1: found.cmdSha1, adopted: true, adoptedTerminationAttempts: 0 };
 		writeJson(f.meta, adopted);
 		return adopted;
 	}
 
 	function terminateAuditSurvivor(f, meta) {
-		if (!meta.adoptedTerminationSent) {
-			if (!stillOurs(meta)) throw new Error("audit survivor identity changed before termination");
-			killOwnTree(f, meta);
-			writeJson(f.meta, { ...meta, adoptedTerminationSent: true });
-		}
+		if (!stillOurs(meta)) throw new Error("audit survivor identity changed before termination");
+		// Record the attempt before spawning taskkill; neither the attempt nor taskkill's exit proves the child is gone.
+		writeJson(f.meta, { ...meta, adoptedTerminationAttempts: adoptedTerminationAttempts(meta) + 1 });
+		killOwnTree(f, meta);
 		return "sent";
 	}
 
@@ -280,7 +284,7 @@ export function createRunner({ paths, spawnImpl = spawn, clock, env = process.en
 				if (clock.now() - tracked.startedMs > tracked.timeoutMs) terminateAuditSurvivor(f, tracked);
 				return running();
 			}
-			if (meta.adoptedTerminationSent) return finish(f, meta, { status: "timeout", result: null, exitCode: null, exitConfirmed: true });
+			if (adoptedTerminationAttempts(meta) > 0) return finish(f, meta, { status: "timeout", result: null, exitCode: null, exitConfirmed: true });
 			return null;
 		} catch (error) {
 			return { ...running(), detail: truncate(error.message, 300) };
