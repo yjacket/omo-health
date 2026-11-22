@@ -665,7 +665,7 @@ test("a 40 MiB model id streams under a 96 MB heap and marks the model list inco
 	assert.deepEqual(JSON.parse(child.stdout), { total: 10, modelsIncomplete: true, models: ["openai/(model id too long)"] });
 });
 
-test("a 40 MiB usage object streams under a 96 MB heap and counts as a bad line, not as usage", (t) => {
+test("a 40 MiB note string is truncated while its usage still counts under a 96 MB heap", (t) => {
 	const { file } = setup(t);
 	const head = `{"type":"message","pad":"${"a".repeat(MiB)}","message":{"role":"assistant","provider":"openai","model":"m","usage":{"input":13,"note":"`;
 	const tail = `"}}}\n`;
@@ -688,7 +688,80 @@ test("a 40 MiB usage object streams under a 96 MB heap and counts as a bad line,
 		encoding: "utf8",
 	});
 	assert.equal(child.status, 0, child.stderr);
-	assert.deepEqual(JSON.parse(child.stdout), { total: 0, badLines: 1 });
+	assert.deepEqual(JSON.parse(child.stdout), { total: 13, badLines: 0 });
+});
+
+test("(gate r4) legal whitespace is dropped without changing the usage or the winning duplicate", (t) => {
+	const { file } = setup(t);
+	const inner = " ".repeat(70 * 1024);
+	const gap = " ".repeat(17 * MiB);
+	const usage = `{"input":13,${inner}"output":0,"cacheRead":0,"cacheWrite":0,"cost":{"total":0.125}}`;
+	const cases = [
+		`{"type":"usage","provider":"openai","model":"gpt-5",${gap}"usage":${usage}}`,
+		`{"type":"usage","provider":"openai","model":"gpt-5","usage":{"input":999,"output":0,"cacheRead":0,"cacheWrite":0,"cost":{"total":9}},${gap}"usage":${usage}}`,
+	];
+	for (const [index, line] of cases.entries()) {
+		const parsed = JSON.parse(line);
+		fs.writeFileSync(file(`case-${index}.jsonl`), `${line}\n`);
+		const got = readUsage(file(`case-${index}.jsonl`)).effective;
+		assert.equal(got.total, 13);
+		assert.equal(got.total, sumFour(parsed.usage));
+		assert.equal(got.cost, 0.125);
+		assert.equal(got.diagnostics.badLines, 0);
+		assert.equal(got.total, oracleTotals(file(`case-${index}.jsonl`)).total);
+	}
+});
+
+test("(gate r4) a dropped usage never removes the assistant provider and model from usedModels", (t) => {
+	const { file } = setup(t);
+	const note = "u".repeat(70 * 1024);
+	const line = `{"type":"message","pad":"${"a".repeat(17 * MiB)}","message":{"role":"assistant","provider":"openai","model":"gpt-5","usage":{"input":999,"note":"${note}"},"usage":"${note}"}}`;
+	const parsed = JSON.parse(line);
+	assert.equal(typeof parsed.message.usage, "string");
+	fs.writeFileSync(file(), `${line}\n`);
+	const got = readUsage(file()).effective;
+	assert.equal(got.total, 0);
+	assert.equal(got.diagnostics.badLines, 0);
+	assert.deepEqual(got.usedModels, { "openai/gpt-5": true });
+});
+
+test("(gate r4) a truncated request model defers to a known responseModel, while data.model outside prewarm stays complete", (t) => {
+	const { file } = setup(t);
+	const model = "m".repeat(70 * 1024);
+	const usage = use({ input: 13, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0.125 });
+	const assistantLine = `{"type":"message","pad":"${"a".repeat(17 * MiB)}","message":{"role":"assistant","provider":"openai","model":"${model}","responseModel":"claude-sonnet-4-5","usage":${JSON.stringify(usage)}}}`;
+	fs.writeFileSync(file("assistant.jsonl"), `${assistantLine}\n`);
+	const got = readUsage(file("assistant.jsonl")).effective;
+	assert.equal(got.total, 13);
+	assert.equal(got.models["openai/claude-sonnet-4-5"].tokens, 13);
+	assert.equal(got.models["openai/(model id too long)"], undefined);
+	assert.equal(got.modelsIncomplete, true);
+
+	const otherLine = `{"type":"custom","customType":"other","pad":"${"a".repeat(17 * MiB)}","data":{"model":"${model}"}}`;
+	fs.writeFileSync(file("other.jsonl"), `${otherLine}\n`);
+	const otherGot = readUsage(file("other.jsonl")).effective;
+	assert.equal(otherGot.total, 0);
+	assert.equal(otherGot.modelsIncomplete, false);
+	assert.deepEqual(otherGot.usedModels, {});
+});
+
+test("a 40 MiB string streams under a 96 MB heap with the JSON.parse-equal total", (t) => {
+	const { file } = setup(t);
+	const usage = use({ input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.125 });
+	const record = assistant({ content: [{ type: "text", text: "q".repeat(40 * MiB) }], usage });
+	fs.writeFileSync(file(), `${JSON.stringify(record)}\n`);
+	const expected = sumFour(JSON.parse(fs.readFileSync(file(), "utf8")).message.usage);
+	const source = new URL("../src/collect/usage.mjs", import.meta.url).href;
+	const script = [
+		"const { readUsage } = await import(process.argv[1]);",
+		"const result = readUsage(process.argv[2]);",
+		"process.stdout.write(JSON.stringify({ total: result.effective.total, badLines: result.usage.diagnostics.badLines, models: Object.keys(result.effective.models) }));",
+	].join("\n");
+	const child = spawnSync(process.execPath, ["--max-old-space-size=96", "--input-type=module", "-e", script, source, file()], {
+		encoding: "utf8",
+	});
+	assert.equal(child.status, 0, child.stderr);
+	assert.deepEqual(JSON.parse(child.stdout), { total: expected, badLines: 0, models: ["anthropic-subscription/claude-opus-5-5"] });
 });
 
 test("the scanner validates skipped literals and containers the way JSON.parse does", () => {

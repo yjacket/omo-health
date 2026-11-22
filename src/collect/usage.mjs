@@ -24,34 +24,29 @@ const BOM_0 = 0xef;
 const BOM_1 = 0xbb;
 const BOM_2 = 0xbf;
 const NEWLINE = 0x0a;
-const CARRIAGE = 0x0d;
+const SPACE = 0x20;
 const QUOTE = 0x22;
 const BACKSLASH = 0x5c;
-const BRACE_OPEN = 0x7b;
-const BRACE_CLOSE = 0x7d;
-const BRACKET_OPEN = 0x5b;
-const BRACKET_CLOSE = 0x5d;
-const COMMA = 0x2c;
-const COLON = 0x3a;
-const LOWER_U = 0x75;
 const LOWER_B = 0x62;
 const LOWER_F = 0x66;
 const LOWER_N = 0x6e;
 const LOWER_R = 0x72;
 const LOWER_T = 0x74;
+const LOWER_U = 0x75;
 const SLASH = 0x2f;
 const ZERO = 0x30;
 const NINE = 0x39;
-const MINUS = 0x2d;
-const PLUS = 0x2b;
-const DOT = 0x2e;
-const LOWER_E = 0x65;
-const UPPER_E = 0x45;
-const STRING_CAPTURE_LIMIT = 64 * 1024;
-const STRING_CHUNK_SIZE = 4096;
+const STRING_KEEP_LIMIT = 64 * 1024;
+const REDUCED_CHUNK = 64 * 1024;
 const MODEL_ID_TOO_LONG = "(model id too long)";
-const TOO_LONG = Symbol("scannerStringTooLong");
+const TRUNCATION_MARKER = "\u0000omoh-truncated";
+const TRUNCATION_CONTENT = Buffer.from("\\u0000omoh-truncated");
 const MODELS_INCOMPLETE = Symbol("scannerModelsIncomplete");
+
+const isSimpleEscape = (byte) =>
+	byte === QUOTE || byte === BACKSLASH || byte === SLASH || byte === LOWER_B || byte === LOWER_F || byte === LOWER_N || byte === LOWER_R || byte === LOWER_T || byte === LOWER_U;
+
+const isHexDigit = (byte) => (byte >= ZERO && byte <= NINE) || (byte >= 0x41 && byte <= 0x46) || (byte >= 0x61 && byte <= 0x66);
 
 const isObject = (value) => typeof value === "object" && value !== null;
 const nonNegative = (value) => (Number.isFinite(value) && value >= 0 ? value : 0);
@@ -265,424 +260,183 @@ function sha1(buffer) {
 	return crypto.createHash("sha1").update(buffer).digest("hex");
 }
 
+const isTruncatedString = (value) => value === TRUNCATION_MARKER;
+
 /**
- * Streaming JSON capture for records larger than `RECORD_PARSE_LIMIT`. It tracks
- * object/array depth, strings and escapes across chunk and call boundaries and
- * buffers only the values it captures; every other value is skipped.
+ * A reduced record still carries every byte outside long strings, so only an
+ * identity field can hold the truncation marker. Mark it unknown, and set
+ * `MODELS_INCOMPLETE` only when `modelsOfEntry` would have used that field for
+ * the record's carrier.
+ */
+function normalizeTruncatedIdentities(entry) {
+	if (!isObject(entry)) return;
+	const unknown = (bucket, keys) => {
+		let found = false;
+		for (const key of keys) {
+			if (!isTruncatedString(bucket[key])) continue;
+			bucket[key] = MODEL_ID_TOO_LONG;
+			found = true;
+		}
+		return found;
+	};
+	let incomplete = false;
+	if (entry.type === "message" && isObject(entry.message)) {
+		const message = entry.message;
+		const used = unknown(message, ["provider", "model", "responseModel"]);
+		if (used && (message.role === "assistant" || message.role === "toolResult")) incomplete = true;
+	} else if (entry.type === "usage") {
+		if (unknown(entry, ["provider", "model"])) incomplete = true;
+	} else if (entry.type === "custom" && entry.customType === "prompt-cache-prewarm") {
+		if (isObject(entry.data) && unknown(entry.data, ["provider", "model"])) incomplete = true;
+	}
+	if (incomplete) entry[MODELS_INCOMPLETE] = true;
+}
+
+/**
+ * Streaming reducer for records larger than `RECORD_PARSE_LIMIT`. Whitespace
+ * runs outside strings collapse to one separator, and a string longer than
+ * 64 KiB becomes the fixed marker `"\u0000omoh-truncated"` (every skipped byte
+ * is still validated the way JSON.parse validates a string). `finish()` parses
+ * the reduced text with JSON.parse, so structure, literals and duplicate keys
+ * keep their JSON meaning.
  *
- * `push(chunk)` accepts a Buffer/Uint8Array/string. `finish()` returns a
- * synthetic entry (`{type, customType, provider, model, usage, message, data}`)
- * and sets `.malformed` when the record was not valid JSON.
+ * `push(chunk)` accepts a Buffer/Uint8Array/string. `finish()` returns the
+ * parsed entry; `.malformed` and `.oversized` report why it is undefined.
  */
 export function createRecordScanner() {
-	const root = {};
-	const message = {};
-	const data = {};
-	const stack = [];
-	let expect = "start";
+	let parts = [];
+	let part;
+	let partFill = 0;
+	let total = 0;
+	let oversized = false;
+	let malformed = false;
+	let finished = false;
+	let result;
 	let inString = false;
 	let escaped = false;
 	let unicodeLeft = 0;
-	let stringChunks = [];
-	let stringChunk;
-	let stringChunkFill = 0;
-	let stringLength = 0;
-	let stringTarget;
-	let stringIsKey = false;
-	let stringIsIdentity = false;
-	let stringOverflow = false;
-	let identityLost = false;
-	let literal;
-	let capture;
-	let malformed = false;
-	let done = false;
-	let result;
+	let stringFill = 0;
+	let stringTruncated = false;
+	let stringScratch;
+	let pendingWhitespace = false;
 
-	const currentContainer = () => (stack.length ? stack[stack.length - 1] : undefined);
-
-	const usageHolder = (container) => {
-		if (!container) return undefined;
-		const key = container.key;
-		if (stack.length === 1) return key === "usage" ? root : undefined;
-		if (stack.length === 2) {
-			const parent = stack[0].key;
-			if (parent === "message" && key === "usage") return message;
-			if (parent === "data" && key === "usage") return data;
-		}
-		return undefined;
-	};
-
-	const stringValueTarget = (container) => {
-		if (!container) return undefined;
-		const key = container.key;
-		if (stack.length === 1) {
-			if (key === "type" || key === "customType" || key === "provider" || key === "model") return root;
-			return undefined;
-		}
-		if (stack.length === 2) {
-			const parent = stack[0].key;
-			if (parent === "message" && (key === "role" || key === "provider" || key === "model" || key === "responseModel")) return message;
-			if (parent === "data" && (key === "phase" || key === "provider" || key === "model")) return data;
-		}
-		return undefined;
-	};
-
-	// Identity strings must never be dropped: a lost provider/model would turn a
-	// model id into "undefined" instead of flagging the list incomplete.
-	const isIdentityValue = (target, container) => {
-		if (!target || !container) return false;
-		const key = container.key;
-		if (target === message) return key === "provider" || key === "model" || key === "responseModel";
-		if (target === root || target === data) return key === "provider" || key === "model";
-		return false;
-	};
-
-	const decodeString = () => {
-		if (stringOverflow) return undefined;
-		try {
-			return JSON.parse(`"${Buffer.concat(stringChunks, stringLength).toString("utf8")}"`);
-		} catch {
-			malformed = true;
-			if (stringIsIdentity) identityLost = true;
-			return undefined;
-		}
-	};
-
-	// Captured strings are capped at 64 KiB and stored in Buffer chunks: an
-	// identity over the cap is dropped (never retained byte by byte), and the
-	// record is materialized with the "(model id too long)" key and a models
-	// list flagged incomplete.
-	const retainStringByte = (byte) => {
-		if (!(stringIsKey || stringTarget) || stringOverflow) return;
-		if (stringLength >= STRING_CAPTURE_LIMIT) {
-			stringOverflow = true;
+	const emit = (byte) => {
+		if (oversized) return;
+		if (total >= RECORD_PARSE_LIMIT) {
+			oversized = true;
+			parts = [];
+			part = undefined;
+			partFill = 0;
 			return;
 		}
-		if (!stringChunk || stringChunkFill === stringChunk.length) {
-			stringChunk = Buffer.allocUnsafe(Math.min(STRING_CHUNK_SIZE, STRING_CAPTURE_LIMIT - stringLength));
-			stringChunkFill = 0;
-			stringChunks.push(stringChunk);
+		if (!part || partFill === part.length) {
+			if (part) parts.push(part);
+			part = Buffer.allocUnsafe(REDUCED_CHUNK);
+			partFill = 0;
 		}
-		stringChunk[stringChunkFill] = byte;
-		stringChunkFill += 1;
-		stringLength += 1;
-	};
-
-	// A selected key that recurs gets its last value. Clear the previous capture
-	// before a new value starts; a null literal replaces it with null. A recurring
-	// depth-1 parent (message, data) discards everything captured under the
-	// earlier value, because JSON.parse keeps only the last member.
-	const clearBucket = (bucket) => {
-		for (const key of Object.keys(bucket)) delete bucket[key];
-	};
-	const clearSelectedValue = (byte) => {
-		const container = currentContainer();
-		if (!container) return;
-		if (stack.length === 1) {
-			if (container.key === "message") clearBucket(message);
-			else if (container.key === "data") clearBucket(data);
-		}
-		const target = stringValueTarget(container);
-		if (target) {
-			const key = container.key;
-			if (byte === LOWER_N) target[key] = null;
-			else delete target[key];
-		}
-		const holder = usageHolder(container);
-		if (holder) {
-			if (byte === LOWER_N) holder.usage = null;
-			else delete holder.usage;
-		}
-	};
-
-	const isHexDigit = (byte) => (byte >= ZERO && byte <= NINE) || (byte >= 0x41 && byte <= 0x46) || (byte >= 0x61 && byte <= 0x66);
-	const isSimpleEscape = (byte) =>
-		byte === QUOTE || byte === BACKSLASH || byte === SLASH || byte === LOWER_B || byte === LOWER_F || byte === LOWER_N || byte === LOWER_R || byte === LOWER_T || byte === LOWER_U;
-
-	const isDigit = (byte) => byte >= ZERO && byte <= NINE;
-	const isNonZeroDigit = (byte) => byte > ZERO && byte <= NINE;
-	const isExponent = (byte) => byte === LOWER_E || byte === UPPER_E;
-
-	const beginLiteral = (byte) => {
-		if (byte === 0x74) literal = { token: "true", index: 1 };
-		else if (byte === 0x66) literal = { token: "false", index: 1 };
-		else if (byte === 0x6e) literal = { token: "null", index: 1 };
-		else if (byte === MINUS) literal = { state: "minus" };
-		else if (byte === ZERO) literal = { state: "zero" };
-		else if (isNonZeroDigit(byte)) literal = { state: "int" };
-		else {
-			literal = undefined;
-			malformed = true;
-		}
-	};
-
-	const feedLiteral = (byte) => {
-		if (!literal) return;
-		if (literal.token) {
-			if (literal.token.charCodeAt(literal.index) !== byte) malformed = true;
-			literal.index += 1;
-			return;
-		}
-		switch (literal.state) {
-			case "minus":
-				if (byte === ZERO) literal.state = "zero";
-				else if (isNonZeroDigit(byte)) literal.state = "int";
-				else malformed = true;
-				break;
-			case "zero":
-				if (byte === DOT) literal.state = "fracStart";
-				else if (isExponent(byte)) literal.state = "expStart";
-				else malformed = true;
-				break;
-			case "int":
-				if (isDigit(byte)) break;
-				if (byte === DOT) literal.state = "fracStart";
-				else if (isExponent(byte)) literal.state = "expStart";
-				else malformed = true;
-				break;
-			case "fracStart":
-				if (isDigit(byte)) literal.state = "frac";
-				else malformed = true;
-				break;
-			case "frac":
-				if (isExponent(byte)) literal.state = "expStart";
-				else if (!isDigit(byte)) malformed = true;
-				break;
-			case "expStart":
-				if (byte === PLUS || byte === MINUS) literal.state = "expSign";
-				else if (isDigit(byte)) literal.state = "exp";
-				else malformed = true;
-				break;
-			case "expSign":
-				if (isDigit(byte)) literal.state = "exp";
-				else malformed = true;
-				break;
-			case "exp":
-				if (!isDigit(byte)) malformed = true;
-				break;
-		}
-	};
-
-	const endLiteral = () => {
-		if (!literal) return false;
-		const complete = literal.token
-			? literal.index === literal.token.length
-			: literal.state === "zero" || literal.state === "int" || literal.state === "frac" || literal.state === "exp";
-		literal = undefined;
-		return complete;
+		part[partFill] = byte;
+		partFill += 1;
+		total += 1;
 	};
 
 	const beginString = () => {
 		inString = true;
 		escaped = false;
 		unicodeLeft = 0;
-		stringChunks = [];
-		stringChunk = undefined;
-		stringChunkFill = 0;
-		stringLength = 0;
-		stringOverflow = false;
-		stringIsKey = expect === "key";
-		stringIsIdentity = false;
-		if (stringIsKey) {
-			stringTarget = undefined;
+		stringFill = 0;
+		stringTruncated = false;
+		pendingWhitespace = false;
+		emit(QUOTE);
+	};
+
+	const keepStringByte = (byte) => {
+		if (stringTruncated) return;
+		if (stringFill >= STRING_KEEP_LIMIT) {
+			stringTruncated = true;
 			return;
 		}
-		if (expect !== "value") malformed = true;
-		stringTarget = expect === "value" ? stringValueTarget(currentContainer()) : undefined;
-		stringIsIdentity = isIdentityValue(stringTarget, currentContainer());
-		if (expect === "value") clearSelectedValue(QUOTE);
+		if (!stringScratch) stringScratch = Buffer.allocUnsafe(STRING_KEEP_LIMIT);
+		stringScratch[stringFill] = byte;
+		stringFill += 1;
 	};
 
 	const endString = () => {
 		inString = false;
-		const container = currentContainer();
-		if (stringIsKey) {
-			const key = decodeString();
-			if (container) container.key = key;
-			expect = "colon";
-			return;
-		}
-		if (stringTarget) {
-			const value = decodeString();
-			if (value !== undefined && container && container.key !== undefined) stringTarget[container.key] = value;
-			else if (stringOverflow && stringIsIdentity && container && container.key !== undefined) {
-				stringTarget[container.key] = TOO_LONG;
-			}
-		}
-		if (container) container.count += 1;
-		expect = "after";
-	};
-
-	const openContainer = (byte) => {
-		if (expect !== "value" && expect !== "start") malformed = true;
-		const type = byte === BRACE_OPEN ? "object" : "array";
-		let target;
-		if (expect !== "start") {
-			clearSelectedValue(byte);
-			if (byte === BRACE_OPEN && !capture) target = usageHolder(currentContainer());
-		}
-		stack.push({ type, key: undefined, count: 0 });
-		if (target) capture = { holder: target, key: "usage", depth: stack.length, bytes: [byte] };
-		expect = type === "object" ? "key" : "value";
-	};
-
-	const closeContainer = (byte) => {
-		const type = byte === BRACE_CLOSE ? "object" : "array";
-		const container = currentContainer();
-		if (!container || container.type !== type) {
-			malformed = true;
-			return;
-		}
-		const empty = container.count === 0;
-		const closesCleanly =
-			type === "object" ? expect === "after" || (empty && expect === "key") : expect === "after" || (empty && expect === "value");
-		if (!closesCleanly) malformed = true;
-		stack.pop();
-		if (capture && stack.length === capture.depth - 1) {
-			let value;
-			try {
-				value = JSON.parse(Buffer.from(capture.bytes).toString("utf8"));
-			} catch {
-				malformed = true;
-			}
-			if (value !== undefined) capture.holder[capture.key] = value;
-			capture = undefined;
-		}
-		expect = "after";
-		if (!stack.length) {
-			done = true;
+		if (stringTruncated) {
+			for (let index = 0; index < TRUNCATION_CONTENT.length; index += 1) emit(TRUNCATION_CONTENT[index]);
 		} else {
-			currentContainer().count += 1;
+			for (let index = 0; index < stringFill; index += 1) emit(stringScratch[index]);
 		}
+		emit(QUOTE);
+		stringFill = 0;
+		pendingWhitespace = false;
 	};
 
 	const push = (chunk) => {
+		if (finished || oversized) return;
 		const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
 		for (let index = 0; index < buffer.length; index += 1) {
+			if (oversized) return;
 			const byte = buffer[index];
-			if (done) {
-				if (!isWhitespace(byte)) malformed = true;
-				continue;
-			}
-			// A senpi usage object is a few numbers; one over the string cap is not one, and buffering it would break the heap bound.
-		if (capture) {
-			if (capture.bytes.length >= STRING_CAPTURE_LIMIT) {
-				capture = undefined;
-				malformed = true;
-			} else capture.bytes.push(byte);
-		}
 			if (inString) {
 				if (unicodeLeft > 0) {
-					retainStringByte(byte);
 					if (!isHexDigit(byte)) malformed = true;
 					unicodeLeft -= 1;
+					keepStringByte(byte);
 					continue;
 				}
 				if (escaped) {
-					retainStringByte(byte);
 					escaped = false;
 					if (byte === LOWER_U) unicodeLeft = 4;
 					else if (!isSimpleEscape(byte)) malformed = true;
+					keepStringByte(byte);
 					continue;
 				}
 				if (byte === BACKSLASH) {
-					retainStringByte(byte);
 					escaped = true;
+					keepStringByte(byte);
 					continue;
 				}
 				if (byte === QUOTE) {
 					endString();
 					continue;
 				}
-				if (byte < 0x20) malformed = true;
-				retainStringByte(byte);
+				if (byte < SPACE) malformed = true;
+				keepStringByte(byte);
 				continue;
 			}
-			if (expect === "literal") {
-				if (isWhitespace(byte)) {
-					if (!endLiteral()) malformed = true;
-					expect = "after";
-					if (currentContainer()) currentContainer().count += 1;
-					continue;
+			if (isWhitespace(byte)) {
+				if (!pendingWhitespace) {
+					pendingWhitespace = true;
+					emit(SPACE);
 				}
-				if (byte !== COMMA && byte !== BRACE_CLOSE && byte !== BRACKET_CLOSE) {
-					feedLiteral(byte);
-					continue;
-				}
-				if (!endLiteral()) malformed = true;
-				expect = "after";
-				if (currentContainer()) currentContainer().count += 1;
-			} else if (isWhitespace(byte)) {
 				continue;
 			}
-			switch (byte) {
-				case QUOTE:
-					beginString();
-					break;
-				case BRACE_OPEN:
-				case BRACKET_OPEN:
-					openContainer(byte);
-					break;
-				case BRACE_CLOSE:
-				case BRACKET_CLOSE:
-					closeContainer(byte);
-					break;
-				case COMMA:
-					if (!stack.length || expect !== "after") {
-						malformed = true;
-					} else {
-						expect = currentContainer().type === "object" ? "key" : "value";
-					}
-					break;
-				case COLON:
-					if (expect !== "colon") malformed = true;
-					expect = "value";
-					break;
-				default:
-					if (expect === "value") {
-						clearSelectedValue(byte);
-						beginLiteral(byte);
-						expect = "literal";
-					} else {
-						malformed = true;
-					}
-					break;
-			}
+			pendingWhitespace = false;
+			if (byte === QUOTE) beginString();
+			else emit(byte);
 		}
 	};
 
 	const finish = () => {
-		if (result) return result;
-		if (inString || escaped || unicodeLeft > 0 || literal || stack.length > 0 || !done) malformed = true;
-		let entry;
-		if (!malformed) {
-			let incomplete = identityLost;
-			const materialize = (bucket) => {
-				let lost = false;
-				for (const key of Object.keys(bucket)) {
-					if (bucket[key] !== TOO_LONG) continue;
-					delete bucket[key];
-					lost = true;
-				}
-				if (!lost) return;
-				incomplete = true;
-				if (typeof bucket.provider !== "string") bucket.provider = "";
-				bucket.model = MODEL_ID_TOO_LONG;
-				delete bucket.responseModel;
-			};
-			materialize(root);
-			materialize(message);
-			materialize(data);
-			entry = {};
-			if (root.type !== undefined) entry.type = root.type;
-			if (root.customType !== undefined) entry.customType = root.customType;
-			if (root.provider !== undefined) entry.provider = root.provider;
-			if (root.model !== undefined) entry.model = root.model;
-			if (root.usage !== undefined) entry.usage = root.usage;
-			if (Object.keys(message).length) entry.message = { ...message };
-			if (Object.keys(data).length) entry.data = { ...data };
-			if (incomplete) entry[MODELS_INCOMPLETE] = true;
+		if (finished) return result;
+		finished = true;
+		if (inString || escaped || unicodeLeft > 0) malformed = true;
+		if (malformed || oversized) return undefined;
+		if (part) {
+			parts.push(partFill === part.length ? part : part.subarray(0, partFill));
+			part = undefined;
 		}
+		const text = Buffer.concat(parts, total).toString("utf8");
+		parts = [];
+		let entry;
+		try {
+			entry = JSON.parse(text);
+		} catch {
+			malformed = true;
+			return undefined;
+		}
+		normalizeTruncatedIdentities(entry);
 		result = entry;
 		return entry;
 	};
@@ -693,9 +447,11 @@ export function createRecordScanner() {
 		get malformed() {
 			return malformed;
 		},
+		get oversized() {
+			return oversized;
+		},
 	};
 }
-
 function newAccumulator(start) {
 	return { start, kind: "buffer", parts: [], len: 0 };
 }
@@ -737,6 +493,11 @@ function finishRecord(totals, acc) {
 			totals.diagnostics.badLines += 1;
 			return;
 		}
+		if (acc.scanner.oversized) {
+			totals.diagnostics.skippedLines += 1;
+			totals.modelsIncomplete = true;
+			return;
+		}
 		consumeEntry(totals, entry);
 		return;
 	}
@@ -762,7 +523,8 @@ function finishRecord(totals, acc) {
 function finalFragment(acc) {
 	if (acc.kind === "scanner") {
 		const entry = acc.scanner.finish();
-		return acc.scanner.malformed ? undefined : entry;
+		if (acc.scanner.malformed) return undefined;
+		return acc.scanner.oversized ? { [MODELS_INCOMPLETE]: true } : entry;
 	}
 	const text = accumulatorText(acc);
 	if (!text.trim() || !wantsUsage(text)) return undefined;
@@ -1026,6 +788,11 @@ function consumeTimelineRecord(totals, stats, acc, options) {
 			totals.diagnostics.badLines += 1;
 			return;
 		}
+		if (acc.scanner.oversized) {
+			totals.diagnostics.skippedLines += 1;
+			totals.modelsIncomplete = true;
+			return;
+		}
 		consumeEntry(totals, entry);
 		return;
 	}
@@ -1055,6 +822,10 @@ function consumeTimelineFragment(totals, stats, acc, options) {
 	if (acc.kind === "scanner") {
 		const entry = acc.scanner.finish();
 		if (acc.scanner.malformed) return;
+		if (acc.scanner.oversized) {
+			totals.modelsIncomplete = true;
+			return;
+		}
 		consumeEntry(totals, entry);
 		return;
 	}
