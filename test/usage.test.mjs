@@ -1,6 +1,7 @@
 import "./helpers/tmp-root.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { tmpDir } from "./helpers/fixtures.mjs";
@@ -617,19 +618,24 @@ test("does not restart when a large record is appended to a 2 KiB file", (t) => 
 	assert.equal(second.effective.total, oracleTotals(file()).total + 1);
 });
 
-test("a large escaped ignored value is not retained by the scanner", () => {
+test("a 20 MiB escaped ignored value streams under a 96 MB heap", (t) => {
+	const { file } = setup(t);
 	const usage = use({ input: 7, output: 0, cacheRead: 0, cacheWrite: 0 });
-	const escaped = "\\n".repeat((3 * MiB) / 2);
-	const record = Buffer.from(`{"type":"message","message":{"role":"assistant","content":"${escaped}"},"usage":${JSON.stringify(usage)}}`);
-	const scanner = createRecordScanner();
-	let peak = 0;
-	for (let index = 0; index < record.length; index += 4093) {
-		scanner.push(record.subarray(index, index + 4093));
-		peak = Math.max(peak, scanner.bufferedBytes);
-	}
-	assert.equal(scanner.malformed, false);
-	assert.ok(peak <= 8192, `scanner retained ${peak} bytes`);
-	assert.deepEqual(scanner.finish().usage, usage);
+	const escaped = "\\n".repeat(10 * MiB);
+	const record = `{"type":"usage","provider":"openai","model":"gpt-5","pad":"${escaped}","usage":${JSON.stringify(usage)}}`;
+	assert.ok(Buffer.byteLength(record) > 16 * MiB);
+	fs.writeFileSync(file(), `${record}\n`);
+	const source = new URL("../src/collect/usage.mjs", import.meta.url).href;
+	const script = [
+		"const { readUsage } = await import(process.argv[1]);",
+		"const result = readUsage(process.argv[2]);",
+		"process.stdout.write(JSON.stringify({ total: result.effective.total, badLines: result.usage.diagnostics.badLines }));",
+	].join("\n");
+	const child = spawnSync(process.execPath, ["--max-old-space-size=96", "--input-type=module", "-e", script, source, file()], {
+		encoding: "utf8",
+	});
+	assert.equal(child.status, 0, child.stderr);
+	assert.deepEqual(JSON.parse(child.stdout), { total: 7, badLines: 0 });
 });
 
 test("the scanner validates skipped literals and containers the way JSON.parse does", () => {
@@ -653,10 +659,74 @@ test("the scanner validates skipped literals and containers the way JSON.parse d
 	}
 });
 
+test("a large record with an invalid string is rejected the way JSON.parse rejects it", (t) => {
+	const cases = {
+		"unknown escape": "\\q",
+		"non-hex unicode escape": "\\u12zz",
+		"raw control byte": "\t",
+	};
+	for (const [label, bad] of Object.entries(cases)) {
+		const { file } = setup(t);
+		const line = `{"type":"usage","provider":"openai","model":"gpt-5","pad":"${"a".repeat(17 * MiB)}${bad}","usage":{"input":13,"output":0,"cacheRead":0,"cacheWrite":0,"cost":{"total":0}}}`;
+		assert.throws(() => JSON.parse(line), undefined, label);
+		fs.writeFileSync(file(), `${line}\n`);
+		const got = readUsage(file());
+		assert.equal(got.usage.diagnostics.badLines, 1, label);
+		assert.equal(got.effective.total, 0, label);
+	}
+});
+
+test("a large record keeps a captured model id longer than the key limit", (t) => {
+	const { file } = setup(t);
+	const model = "m".repeat(4097);
+	const usage = use({ input: 1, output: 2, cacheRead: 3, cacheWrite: 4 });
+	const line = `{"type":"message","pad":"${"a".repeat(17 * MiB)}","message":{"role":"assistant","provider":"openai","model":"${model}","usage":${JSON.stringify(usage)}}}`;
+	assert.equal(JSON.parse(line).message.model.length, 4097);
+	fs.writeFileSync(file(), `${line}\n`);
+	const got = readUsage(file()).effective;
+	assert.equal(got.total, oracleTotals(file()).total);
+	assert.equal(got.total, 10);
+	assert.equal(got.models[`openai/${model}`]?.tokens, 10);
+	assert.deepEqual(got.usedModels, { [`openai/${model}`]: true });
+	assert.equal(got.modelsIncomplete, false);
+});
+
+test("a large record gives a repeated selected key its last value like JSON.parse", (t) => {
+	const pad = "a".repeat(17 * MiB);
+	const cases = [
+		{
+			label: "usage cleared by null",
+			line: `{"type":"usage","pad":"${pad}","provider":"openai","model":"gpt-5","usage":{"input":13,"output":0,"cacheRead":0,"cacheWrite":0,"cost":{"total":0}},"usage":null}`,
+			check(got) {
+				assert.equal(got.total, 0);
+				assert.deepEqual(got.models, {});
+			},
+		},
+		{
+			label: "provider cleared by null",
+			line: `{"type":"usage","pad":"${pad}","provider":"openai","provider":null,"model":"gpt-5","usage":{"input":13,"output":0,"cacheRead":0,"cacheWrite":0,"cost":{"total":0}}}`,
+			check(got, parsed) {
+				assert.equal(got.total, 13);
+				assert.deepEqual(Object.keys(got.models), [`${parsed.provider}/${parsed.model}`]);
+			},
+		},
+	];
+	for (const item of cases) {
+		const { file } = setup(t);
+		const parsed = JSON.parse(item.line);
+		fs.writeFileSync(file(), `${item.line}\n`);
+		const got = readUsage(file()).effective;
+		assert.equal(got.diagnostics.badLines, 0, item.label);
+		assert.equal(got.total, oracleTotals(file()).total, item.label);
+		item.check(got, parsed);
+	}
+});
+
 test("a large record with an invalid literal counts as bad and adds no usage", (t) => {
 	const { file } = setup(t);
 	const padding = "a".repeat(17 * MiB);
-	const line = `{"type":"message","message":{"role":"assistant","content":"${padding}"},"bad":broken,"usage":{"input":13,"output":0,"cacheRead":0,"cacheWrite":0,"cost":{"total":0}}}`;
+	const line = `{"type":"usage","pad":"${padding}","bad":broken,"usage":{"input":13,"output":0,"cacheRead":0,"cacheWrite":0,"cost":{"total":0}}}`;
+	assert.throws(() => JSON.parse(line));
 	fs.writeFileSync(file(), `${line}\n`);
 	const got = readUsage(file());
 	assert.equal(got.usage.diagnostics.badLines, 1);
@@ -665,7 +735,8 @@ test("a large record with an invalid literal counts as bad and adds no usage", (
 
 test("counts a malformed large record in badLines", (t) => {
 	const { file } = setup(t);
-	const malformed = `{"type":"message","usage":{"input":1},"x":"${"a".repeat(17 * MiB)}"`;
+	const malformed = `{"type":"usage","usage":{"input":1},"x":"${"a".repeat(17 * MiB)}"`;
+	assert.throws(() => JSON.parse(malformed));
 	fs.writeFileSync(file(), `${malformed}\n`);
 	const got = readUsage(file());
 	assert.equal(got.usage.diagnostics.badLines, 1);

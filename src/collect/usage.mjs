@@ -34,6 +34,12 @@ const BRACKET_CLOSE = 0x5d;
 const COMMA = 0x2c;
 const COLON = 0x3a;
 const LOWER_U = 0x75;
+const LOWER_B = 0x62;
+const LOWER_F = 0x66;
+const LOWER_N = 0x6e;
+const LOWER_R = 0x72;
+const LOWER_T = 0x74;
+const SLASH = 0x2f;
 const ZERO = 0x30;
 const NINE = 0x39;
 const MINUS = 0x2d;
@@ -42,6 +48,7 @@ const DOT = 0x2e;
 const LOWER_E = 0x65;
 const UPPER_E = 0x45;
 const STRING_RETAIN_LIMIT = 4096;
+const MODELS_INCOMPLETE = Symbol("scannerModelsIncomplete");
 
 const isObject = (value) => typeof value === "object" && value !== null;
 const nonNegative = (value) => (Number.isFinite(value) && value >= 0 ? value : 0);
@@ -224,6 +231,7 @@ export function modelsOfEntry(entry) {
 }
 
 function consumeEntry(totals, entry) {
+	if (entry?.[MODELS_INCOMPLETE] === true) totals.modelsIncomplete = true;
 	const hit = usageOfEntry(entry);
 	if (hit) addUsage(totals, hit);
 	const models = modelsOfEntry(entry);
@@ -273,7 +281,9 @@ export function createRecordScanner() {
 	let stringBytes = [];
 	let stringTarget;
 	let stringIsKey = false;
+	let stringIsIdentity = false;
 	let stringOverflow = false;
+	let identityLost = false;
 	let literal;
 	let capture;
 	let malformed = false;
@@ -282,30 +292,41 @@ export function createRecordScanner() {
 
 	const currentContainer = () => (stack.length ? stack[stack.length - 1] : undefined);
 
-	const usageObjectTarget = () => {
-		if (stack.length === 1) return stack[0].key === "usage" ? root : undefined;
+	const usageHolder = (container) => {
+		if (!container) return undefined;
+		const key = container.key;
+		if (stack.length === 1) return key === "usage" ? root : undefined;
 		if (stack.length === 2) {
 			const parent = stack[0].key;
-			const key = stack[1].key;
 			if (parent === "message" && key === "usage") return message;
 			if (parent === "data" && key === "usage") return data;
 		}
 		return undefined;
 	};
 
-	const stringValueTarget = () => {
+	const stringValueTarget = (container) => {
+		if (!container) return undefined;
+		const key = container.key;
 		if (stack.length === 1) {
-			const key = stack[0].key;
 			if (key === "type" || key === "customType" || key === "provider" || key === "model") return root;
 			return undefined;
 		}
 		if (stack.length === 2) {
 			const parent = stack[0].key;
-			const key = stack[1].key;
 			if (parent === "message" && (key === "role" || key === "provider" || key === "model" || key === "responseModel")) return message;
 			if (parent === "data" && (key === "phase" || key === "provider" || key === "model")) return data;
 		}
 		return undefined;
+	};
+
+	// Identity strings must never be dropped: a lost provider/model would turn a
+	// model id into "undefined" instead of flagging the list incomplete.
+	const isIdentityValue = (target, container) => {
+		if (!target || !container) return false;
+		const key = container.key;
+		if (target === message) return key === "provider" || key === "model" || key === "responseModel";
+		if (target === root || target === data) return key === "provider" || key === "model";
+		return false;
 	};
 
 	const decodeString = () => {
@@ -314,18 +335,43 @@ export function createRecordScanner() {
 			return JSON.parse(`"${Buffer.from(stringBytes).toString("utf8")}"`);
 		} catch {
 			malformed = true;
+			if (stringIsIdentity) identityLost = true;
 			return undefined;
 		}
 	};
 
 	const retainStringByte = (byte) => {
 		if (!(stringIsKey || stringTarget) || stringOverflow) return;
-		if (stringBytes.length >= STRING_RETAIN_LIMIT) {
+		const limit = stringIsIdentity && !stringIsKey ? Infinity : STRING_RETAIN_LIMIT;
+		if (stringBytes.length >= limit) {
 			stringOverflow = true;
+			if (stringIsIdentity) identityLost = true;
 			return;
 		}
 		stringBytes.push(byte);
 	};
+
+	// A selected key that recurs gets its last value. Clear the previous capture
+	// before a new value starts; a null literal replaces it with null.
+	const clearSelectedValue = (byte) => {
+		const container = currentContainer();
+		if (!container) return;
+		const target = stringValueTarget(container);
+		if (target) {
+			const key = container.key;
+			if (byte === LOWER_N) target[key] = null;
+			else delete target[key];
+		}
+		const holder = usageHolder(container);
+		if (holder) {
+			if (byte === LOWER_N) holder.usage = null;
+			else delete holder.usage;
+		}
+	};
+
+	const isHexDigit = (byte) => (byte >= ZERO && byte <= NINE) || (byte >= 0x41 && byte <= 0x46) || (byte >= 0x61 && byte <= 0x66);
+	const isSimpleEscape = (byte) =>
+		byte === QUOTE || byte === BACKSLASH || byte === SLASH || byte === LOWER_B || byte === LOWER_F || byte === LOWER_N || byte === LOWER_R || byte === LOWER_T || byte === LOWER_U;
 
 	const isDigit = (byte) => byte >= ZERO && byte <= NINE;
 	const isNonZeroDigit = (byte) => byte > ZERO && byte <= NINE;
@@ -406,14 +452,16 @@ export function createRecordScanner() {
 		unicodeLeft = 0;
 		stringBytes = [];
 		stringOverflow = false;
-		if (expect === "key") {
-			stringIsKey = true;
+		stringIsKey = expect === "key";
+		stringIsIdentity = false;
+		if (stringIsKey) {
 			stringTarget = undefined;
 			return;
 		}
-		stringIsKey = false;
-		stringTarget = expect === "value" ? stringValueTarget() : undefined;
 		if (expect !== "value") malformed = true;
+		stringTarget = expect === "value" ? stringValueTarget(currentContainer()) : undefined;
+		stringIsIdentity = isIdentityValue(stringTarget, currentContainer());
+		if (expect === "value") clearSelectedValue(QUOTE);
 	};
 
 	const endString = () => {
@@ -436,13 +484,13 @@ export function createRecordScanner() {
 	const openContainer = (byte) => {
 		if (expect !== "value" && expect !== "start") malformed = true;
 		const type = byte === BRACE_OPEN ? "object" : "array";
-		if (byte === BRACE_OPEN) {
-			const target = !capture && expect !== "start" ? usageObjectTarget() : undefined;
-			stack.push({ type, key: undefined, count: 0 });
-			if (target) capture = { holder: target, key: "usage", depth: stack.length, bytes: [byte] };
-		} else {
-			stack.push({ type, key: undefined, count: 0 });
+		let target;
+		if (expect !== "start") {
+			clearSelectedValue(byte);
+			if (byte === BRACE_OPEN && !capture) target = usageHolder(currentContainer());
 		}
+		stack.push({ type, key: undefined, count: 0 });
+		if (target) capture = { holder: target, key: "usage", depth: stack.length, bytes: [byte] };
 		expect = type === "object" ? "key" : "value";
 	};
 
@@ -488,6 +536,7 @@ export function createRecordScanner() {
 			if (inString) {
 				if (unicodeLeft > 0) {
 					retainStringByte(byte);
+					if (!isHexDigit(byte)) malformed = true;
 					unicodeLeft -= 1;
 					continue;
 				}
@@ -495,6 +544,7 @@ export function createRecordScanner() {
 					retainStringByte(byte);
 					escaped = false;
 					if (byte === LOWER_U) unicodeLeft = 4;
+					else if (!isSimpleEscape(byte)) malformed = true;
 					continue;
 				}
 				if (byte === BACKSLASH) {
@@ -506,6 +556,7 @@ export function createRecordScanner() {
 					endString();
 					continue;
 				}
+				if (byte < 0x20) malformed = true;
 				retainStringByte(byte);
 				continue;
 			}
@@ -551,6 +602,7 @@ export function createRecordScanner() {
 					break;
 				default:
 					if (expect === "value") {
+						clearSelectedValue(byte);
 						beginLiteral(byte);
 						expect = "literal";
 					} else {
@@ -574,6 +626,7 @@ export function createRecordScanner() {
 			if (root.usage !== undefined) entry.usage = root.usage;
 			if (Object.keys(message).length) entry.message = { ...message };
 			if (Object.keys(data).length) entry.data = { ...data };
+			if (identityLost) entry[MODELS_INCOMPLETE] = true;
 		}
 		result = entry;
 		return entry;
@@ -584,9 +637,6 @@ export function createRecordScanner() {
 		finish,
 		get malformed() {
 			return malformed;
-		},
-		get bufferedBytes() {
-			return stringBytes.length + (capture ? capture.bytes.length : 0);
 		},
 	};
 }
