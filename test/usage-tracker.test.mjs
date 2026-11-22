@@ -291,9 +291,12 @@ for (const spent of [0, 256]) test(`(IS-1, IS-12) an in-place longer replacement
 	fs.appendFileSync(file, replacement);
 	const stat = fs.statSync(file);
 	assert.deepEqual([fs.statSync(file, { bigint: true }).ino.toString(), stat.birthtimeMs], [ino, birthtimeMs]);
+	const checkBytes = 2 * torn.length; // The short fragment fills both windows.
 
 	if (spent) {
-		assert.equal(s.tracker.tick(world, { maxBytes: spent }).bytesRead, spent);
+		assert.equal(s.tracker.tick(world, { maxBytes: spent }).bytesRead, 0, "defer when the checks do not fit");
+		assert.equal(s.index.get(key(s, id)).scanOffset, scanOffset, "keep the old cursor until it can be checked");
+		assert.equal(s.tracker.tick(world, { maxBytes: checkBytes + spent }).bytesRead, checkBytes + spent);
 		const entry = s.index.get(key(s, id));
 		assert.equal(entry.offset, offset);
 		assert.equal(entry.scanOffset, offset + spent);
@@ -307,7 +310,7 @@ for (const spent of [0, 256]) test(`(IS-1, IS-12) an in-place longer replacement
 	assert.deepEqual(Object.keys(clean.models).sort(), ["p/m", "p/replacement"]);
 	assert.equal(s.tracker.tokensOf(sub(s, id)).tokens.total, clean.total);
 	assert.deepEqual(s.index.get(key(s, id)).published, clean);
-	assert.equal(tick.bytesRead, replacement.length - spent, "the replacement is scanned once from the committed offset");
+	assert.equal(tick.bytesRead, replacement.length - spent + (spent ? 0 : checkBytes), "after the checks, the replacement is scanned once from the committed offset");
 });
 
 test("(IS-1) a same-size rewrite with a torn fragment recounts records between the fingerprints", (t) => {
@@ -372,7 +375,7 @@ test("(IS-1, IS-12) a same-size fragment replacement can overlap the head finger
 	assert.equal(s.tracker.tokensOf(sub(s, id)).tokens.total, 38);
 });
 
-test("(IS-2, IS-12) four medium live fragments publish after budgeted rescans", (t) => {
+test("(IS-2, IS-12) four medium live fragments publish together after an eight-byte append", (t) => {
 	const s = setup();
 	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
 	const bytes = 10 * 1024 * 1024;
@@ -399,17 +402,14 @@ test("(IS-2, IS-12) four medium live fragments publish after budgeted rescans", 
 		actual += n;
 		return n;
 	});
-	const first = s.tracker.tick(world, { maxBytes: 2 * (bytes + 2) });
-	assert.ok(actual <= USAGE_TICK_BYTES, `actual reads: ${actual}`);
-	actual = 0;
-	const second = s.tracker.tick(world);
+	const tick = s.tracker.tick(world);
 	spy.mock.restore();
-	t.diagnostic(`last closing tick: ${actual} actual, ${second.bytesRead} scan bytes`);
+	t.diagnostic(`closing tick: ${actual} actual, ${tick.bytesRead} charged bytes`);
 	const expected = sessions.map(({ file }) => singleRecordModelOracle(file));
 	assert.deepEqual(sessions.map(({ id }) => s.tracker.tokensOf(sub(s, id))?.tokens?.total), expected.map((models) => models["p/m"].tokens));
 	assert.deepEqual(sessions.map(({ id }) => s.index.get(key(s, id)).published.models), expected);
 	assert.deepEqual(sessions.map(({ file }) => usageTimeline(file).totals.models), expected);
-	assert.equal(first.bytesRead + second.bytesRead, 4 * (bytes + 2), "each changed record is scanned from its start");
+	assert.equal(tick.bytesRead, 4 * (2 * 4096 + 2), "charge the two windows and two closing bytes per file");
 	assert.ok(actual <= USAGE_TICK_BYTES, `actual reads: ${actual}`);
 });
 
@@ -430,20 +430,16 @@ test("(IS-2, IS-12) an over-capture identity waits until the exact reread fits",
 	s.tracker.tick(world);
 	assert.equal(s.index.get(key(s, id)).scanOffset, bytes);
 
-	// Split the rescan across ticks so the reader must use its bounded scanner,
-	// then leave no room for the exact reread when it reaches the delimiter.
+	// Leave 1 MiB for the fragment checks and delimiter, but not the exact reread.
 	const busyLine = bigRecord(1023, usage(1)) + "\n";
-	const rescanBytes = 3 * bytes / 4;
-	const busyBytes = USAGE_TICK_BYTES - rescanBytes;
+	const busyBytes = USAGE_TICK_BYTES - bytes / 2;
 	fs.writeFileSync(busy, busyLine.repeat(busyBytes / busyLine.length));
 	fs.appendFileSync(file, "}\n");
-	assert.equal(s.tracker.tick(world).bytesRead, USAGE_TICK_BYTES, "the initial rescan uses the remaining budget");
-	const suffixBytes = bytes - rescanBytes + 2;
-	const tick = s.tracker.tick(world, { maxBytes: suffixBytes });
+	const tick = s.tracker.tick(world);
 	assert.equal(s.tracker.tokensOf(sub(s, id))?.pending, true);
 	assert.equal(s.tracker.tokensOf(sub(s, id))?.tokens, undefined);
 	assert.equal(s.index.get(key(s, id)).offset, 0, "inexact usage is not committed");
-	assert.equal(tick.bytesRead, suffixBytes, "the exact reread is not partially attempted");
+	assert.equal(tick.bytesRead, busyBytes + 2 * 4096 + 2, "the exact reread is not partially attempted");
 
 	assert.equal(s.tracker.tick(world).bytesRead, bytes + 1, "reread starts at the record and excludes the already scanned delimiter");
 	const expected = singleRecordModelOracle(file);
@@ -481,15 +477,12 @@ test("(IS-1, IS-2) four oversized non-numeric counters publish without exact rer
 		actual += n;
 		return n;
 	});
-	const first = s.tracker.tick(world, { maxBytes: 2 * (bytes + 2) });
-	assert.ok(actual <= USAGE_TICK_BYTES, `actual reads: ${actual}`);
-	actual = 0;
-	const second = s.tracker.tick(world);
+	const tick = s.tracker.tick(world);
 	spy.mock.restore();
-	t.diagnostic(`last closing tick: ${actual} actual, ${second.bytesRead} scan bytes (budget ${USAGE_TICK_BYTES})`);
+	t.diagnostic(`closing tick: ${actual} actual, ${tick.bytesRead} charged bytes (budget ${USAGE_TICK_BYTES})`);
 	assert.ok(actual <= USAGE_TICK_BYTES, `actual reads: ${actual}`);
 	assert.deepEqual(sessions.map(({ id }) => s.tracker.tokensOf(sub(s, id))?.tokens?.total), [42, 42, 42, 42]);
-	assert.equal(first.bytesRead + second.bytesRead, 4 * (bytes + 2), "no exact reread follows the rescan of each changed record");
+	assert.equal(tick.bytesRead, 4 * (2 * 4096 + 2), "charge only the windows and closing bytes, with no exact rereads");
 
 	const counter = (value) => typeof value === "number" ? value : 0;
 	for (const { id, file } of sessions) {
@@ -537,13 +530,10 @@ test("(IS-2) a deferred exact reread keeps the last published tokens on the boar
 	assert.equal(s.index.get(key(s, id)).scanOffset, start + bytes);
 
 	const busyLine = bigRecord(1023, usage(1)) + "\n";
-	const rescanBytes = 3 * bytes / 4;
-	const busyBytes = USAGE_TICK_BYTES - rescanBytes;
+	const busyBytes = USAGE_TICK_BYTES - bytes / 2;
 	fs.writeFileSync(busy, busyLine.repeat(busyBytes / busyLine.length));
 	fs.appendFileSync(file, "}\n");
-	assert.equal(s.tracker.tick(world).bytesRead, USAGE_TICK_BYTES, "the initial rescan uses the remaining budget");
-	const suffixBytes = bytes - rescanBytes + 2;
-	assert.equal(s.tracker.tick(world, { maxBytes: suffixBytes }).bytesRead, suffixBytes, "the exact reread does not fit after the rescan");
+	assert.equal(s.tracker.tick(world).bytesRead, busyBytes + 2 * 4096 + 2, "the exact reread does not fit this tick");
 	const deferred = s.index.get(key(s, id));
 	assert.equal(deferred.offset, start, "inexact usage is not committed");
 	assert.equal(deferred.usage.total, 10);
@@ -1057,7 +1047,7 @@ test("(IS-4, IS-12) live header probes share the tick budget and deferred sessio
 	assert.deepEqual(totals(), expected);
 });
 
-test("a tick never reads more than the byte budget: a 40 MiB live record waits while a backlog waits", (t) => {
+test("(IS-1, IS-2, IS-12) a 40 MiB live record resumes when another line arrives before tick two", (t) => {
 	const s = setup();
 	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
 	const live = mainFile(s.paths, "m1");
@@ -1068,7 +1058,8 @@ test("a tick never reads more than the byte budget: a 40 MiB live record waits w
 	s.tracker.tick(world);
 	assert.equal(compactUsage(s.index.get(key(s, "m1"))).total, 10);
 
-	fs.appendFileSync(live, `${bigRecord(40 * 1024 * 1024, usage(1000))}\n`);
+	const record = `${bigRecord(40 * 1024 * 1024, usage(42))}\n`;
+	fs.appendFileSync(live, record);
 	s.tracker.queueLedger([{ sessionId: "b1", kind: "main", cwd: s.cwd, endedMs: T0 }]);
 	const first = s.tracker.tick(world);
 	assert.equal(first.bytesRead, USAGE_TICK_BYTES, "the whole budget went to the live append");
@@ -1076,14 +1067,20 @@ test("a tick never reads more than the byte budget: a 40 MiB live record waits w
 	assert.equal(compactUsage(s.index.get(key(s, "m1"))).total, 10, "the previous total stays while the record is partial");
 	assert.equal(s.index.has(key(s, "b1")), false, "the backlog got nothing this tick");
 
+	const append = `${bigRecord(0, usage(1))}\n`;
+	fs.appendFileSync(live, append);
+	const update = t.mock.method(s.index, "update");
 	const second = s.tracker.tick(world);
 	assert.ok(second.bytesRead <= USAGE_TICK_BYTES);
-	assert.equal(compactUsage(s.index.get(key(s, "m1"))).total, 1010, "the full record counts once it completes");
+	assert.equal(compactUsage(s.index.get(key(s, "m1"))).total, 53, "the full record and the new line count once");
 	assert.equal(compactUsage(s.index.get(key(s, "b1"))).total, 5);
+	const liveRead = update.mock.calls.find(({ arguments: [, file] }) => file === live);
+	assert.equal(liveRead?.result, record.length - USAGE_TICK_BYTES + append.length + 2 * 4096);
+	t.diagnostic(`tick one: ${first.bytesRead} charged; tick two: ${second.bytesRead} charged (${liveRead.result} for live usage)`);
 });
 
 for (const [label, bytes] of [["40 MiB", 40 * 1024 * 1024], ["small", 512 * 1024]]) {
-	test(`(IS-2, IS-12) a small append triggers a budgeted rescan of a ${label} EOF record`, (t) => {
+	test(`(IS-2, IS-12) a small append resumes a ${label} EOF record in memory`, (t) => {
 		const s = setup();
 		t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
 		const id = "resume";
@@ -1115,19 +1112,14 @@ for (const [label, bytes] of [["40 MiB", 40 * 1024 * 1024], ["small", 512 * 1024
 		const appendedBytes = Buffer.byteLength(append);
 		fs.appendFileSync(file, append);
 
-		const coldBytes = bytes + appendedBytes;
-		assert.equal(s.tracker.tick(world).bytesRead, Math.min(coldBytes, USAGE_TICK_BYTES), "the live rescan spends the shared tick budget");
-		if (coldBytes > USAGE_TICK_BYTES) {
-			assert.equal(s.tracker.tokensOf(sub(s, id)).pending, true);
-			assert.equal(s.tracker.tokensOf(sub(s, id)).tokens.total, 7);
-			assert.equal(s.tracker.tick(world).bytesRead, coldBytes - USAGE_TICK_BYTES);
-		}
+		assert.equal(s.tracker.tick(world).bytesRead, appendedBytes + 2 * 4096, "only the window checks and append spend the live tick budget");
 		const live = s.tracker.tokensOf(sub(s, id)).tokens;
 		assert.deepEqual([live.total, live.turns], [18, 2]);
 		assert.equal(s.index.get(key(s, id)).overlay.total, 0);
 		assert.equal(s.tracker.tick(world).bytesRead, 0);
 		assert.deepEqual(s.tracker.tokensOf(sub(s, id)).tokens, live);
 
+		const coldBytes = bytes + appendedBytes;
 		assert.equal(restarted.tick(world).bytesRead, Math.min(coldBytes, USAGE_TICK_BYTES), "restart reads from the persisted offset");
 		if (coldBytes > USAGE_TICK_BYTES) assert.equal(restarted.tick(world).bytesRead, coldBytes - USAGE_TICK_BYTES);
 		assert.deepEqual(restarted.tokensOf(sub(s, id)).tokens, live);

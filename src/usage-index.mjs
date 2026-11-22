@@ -31,8 +31,8 @@ export const INDEX_BYTE_BUDGET = 16 * 1024 * 1024;
 const INDEX_LINE_BYTE_BUDGET = 8 * 1024 * 1024;
 /** Per-tick byte budget for live appends, first reads and the backlog. */
 export const USAGE_TICK_BYTES = 32 * 1024 * 1024;
-// readUsage can check the old head and tail, compute a new head, then hash the new tail.
-export const USAGE_FINGERPRINT_BYTES_MAX = 4 * 4096;
+// Uncharged reads: old head/tail, new head/tail and two saved fragment windows.
+export const USAGE_FINGERPRINT_BYTES_MAX = 6 * 4096;
 /** Total named model slots, including repeats between rows or counter maps. */
 export const USAGE_INDEX_MODEL_BUDGET = 4096;
 const PRUNE_KEEP_MS = 45 * 24 * 3600_000;
@@ -446,7 +446,8 @@ function entryBytes(entry, line) {
 	// counters). It is a floor, not a measure of the resident strings' encoding.
 	let serialized = line.length;
 	for (let i = 0; i < line.length; i++) if (line.charCodeAt(i) > 127) serialized++;
-	return INDEX_ENTRY_OVERHEAD + modelBytes + Math.max(strings, serialized);
+	const fragmentBytes = entry.partial ? 2 * 64 : 0; // Two in-memory SHA-1 strings, including headers.
+	return INDEX_ENTRY_OVERHEAD + fragmentBytes + modelBytes + Math.max(strings, serialized);
 }
 
 function fitsIndexLine(text) {

@@ -926,7 +926,8 @@ export function sameFileStamp(a, b) {
  * last complete record, `scanOffset`/`partial` an in-memory record in progress,
  * and `effective` = committed `usage` + the valid EOF `overlay`.
  * `onScanBytes` reports each successful budgeted read, even if a later read
- * throws. Bounded fingerprint reads are not part of the scan budget.
+ * throws. Fragment rechecks are budgeted; committed-prefix checks and saving
+ * bounded fingerprints for the next read are not.
  */
 export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {}) {
 	let fd;
@@ -939,6 +940,15 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 	try {
 		const { size, mtimeMs, ino, birthtimeMs } = usageFileStamp(fs.fstatSync(fd, { bigint: true }));
 		const hashRange = (position, length) => sha1(readRange(fd, position, length));
+		const fragmentHash = (position, length, onRead) => {
+			const bytes = readRange(fd, position, length, onRead);
+			return bytes.length === length ? sha1(bytes) : undefined;
+		};
+		let bytesRead = 0;
+		const charge = (n) => {
+			bytesRead += n;
+			onScanBytes?.(n);
+		};
 
 		let restart =
 			!isObject(from) ||
@@ -948,14 +958,13 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 			!Number.isSafeInteger(from.headLen) || from.headLen < 0 || from.headLen > Math.min(from.size, HEAD_LIMIT) ||
 			typeof from.head !== "string" ||
 			typeof from.tail !== "string";
-		// A writer can truncate a torn record in place and regrow past the old
-		// size before we see it. Reuse only the validated committed prefix,
-		// and only on growth; same-size rewrites and shrinks must recount.
-		const rewind = !restart && size > from.size &&
-			Number.isSafeInteger(from.scanOffset) && from.scanOffset > from.offset;
-		// If the head overlaps the discarded fragment, the tail covers the
+		const hasFragment = !restart && from.partial?.[RECORD_ACCUMULATOR] === true &&
+			Number.isSafeInteger(from.scanOffset) && from.scanOffset > from.offset &&
+			from.scanOffset <= from.size && from.partial.start === from.offset;
+		const checkFragment = hasFragment && size > from.size;
+		// If the head overlaps the fragment, the tail covers the
 		// entire committed prefix instead.
-		const refreshHead = rewind && from.headLen > from.offset;
+		const refreshHead = checkFragment && from.headLen > from.offset;
 		if (!restart) {
 			if (size < from.size || (size === from.size && from.mtimeMs !== mtimeMs)) {
 				restart = true;
@@ -968,6 +977,29 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 			}
 		}
 
+		let rewound = false;
+		if (!restart && checkFragment) {
+			// Growth can hide a truncate-and-replace. Check the record's start
+			// (including its ID) and the bytes just before the saved scan cursor.
+			const length = Math.min(from.scanOffset - from.offset, HEAD_LIMIT);
+			const { firstHash, lastHash } = from.partial;
+			if (firstHash === undefined || lastHash === undefined) {
+				rewound = true;
+			} else {
+				if (2 * length > maxBytes) {
+					// Keep the old stamp so the next tick still checks the fragment.
+					const usage = cloneUsage(from.usage);
+					const overlay = cloneUsage(from.overlay);
+					const effective = cloneUsage(usage);
+					mergeUsage(effective, overlay);
+					return { ...from, usage, overlay, effective, done: false, pending: true, bytesRead };
+				}
+				const first = fragmentHash(from.offset, length, charge);
+				const last = fragmentHash(from.scanOffset - length, length, charge);
+				rewound = first !== firstHash || last !== lastHash;
+			}
+		}
+
 		let usage;
 		let offset;
 		let scanOffset;
@@ -976,7 +1008,6 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 		let head;
 		let cachedOverlay;
 		const savedUsage = restart ? undefined : cloneUsage(from.usage);
-		const rewound = Boolean(savedUsage && rewind);
 		if (!savedUsage) {
 			usage = emptyUsage();
 			offset = 0;
@@ -987,7 +1018,7 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 		} else {
 			usage = savedUsage;
 			offset = from.offset;
-			const resumable = !rewound && from.partial?.[RECORD_ACCUMULATOR] === true && Number.isInteger(from.scanOffset) && from.partial.start === offset;
+			const resumable = !rewound && hasFragment;
 			if (resumable && size === from.size && from.evaluatedTo === size) {
 				cachedOverlay = cloneUsage(from.overlay);
 			}
@@ -1003,12 +1034,7 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 
 		const startOffset = offset;
 		let position = scanOffset;
-		let bytesRead = 0;
 		let acc = partial;
-		const charge = (n) => {
-			bytesRead += n;
-			onScanBytes?.(n);
-		};
 		const reread = (start, len) => {
 			if (len > maxBytes - bytesRead) return undefined;
 			const bytes = readRange(fd, start, len, charge);
@@ -1097,6 +1123,11 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 		const effective = cloneUsage(usage);
 		mergeUsage(effective, overlay);
 		const tailLength = Math.min(offset, HEAD_LIMIT);
+		if (acc && position > offset) {
+			const length = Math.min(position - offset, HEAD_LIMIT);
+			acc.firstHash = fragmentHash(offset, length);
+			acc.lastHash = fragmentHash(position - length, length);
+		}
 		return {
 			offset,
 			scanOffset: position,
