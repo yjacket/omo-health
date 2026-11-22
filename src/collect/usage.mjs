@@ -349,8 +349,11 @@ function addModelId(out, provider, model) {
 			out.ids.push(MODEL_ID_TOO_LONG);
 			out.incomplete = true;
 		} else out.ids.push(`${provider}/${model}`);
+		return true;
 	}
-	else if ((known(provider) || truncated(provider)) && (known(model) || truncated(model))) out.incomplete = true;
+	// Both fields were there but at least one lost its tail: the identity is unusable.
+	if ((known(provider) || truncated(provider)) && (known(model) || truncated(model))) out.incomplete = true;
+	return false;
 }
 
 /**
@@ -367,23 +370,22 @@ export function modelsOfEntry(entry) {
 	const message = entry.message;
 	if (type === "message" && isObject(message)) {
 		if (message.role === "assistant") {
-			addModelId(out, message.provider, message.model);
-			addModelId(out, message.provider, message.responseModel);
+			const byModel = addModelId(out, message.provider, message.model);
+			const byResponse = addModelId(out, message.provider, message.responseModel);
+			if (!byModel && !byResponse) out.incomplete = true;
 		}
 		if (message.role === "toolResult" && isObject(message.usage)) {
-			addModelId(out, message.provider, message.model);
-			if (!message.provider && !message.model) out.incomplete = true;
+			if (!addModelId(out, message.provider, message.model)) out.incomplete = true;
 		}
 	}
 	if (type === "usage") {
-		addModelId(out, entry.provider, entry.model);
+		if (!addModelId(out, entry.provider, entry.model)) out.incomplete = true;
 	}
 	if (type === "custom" && entry.customType === "prompt-cache-prewarm" && isObject(entry.data)) {
-		addModelId(out, entry.data.provider, entry.data.model);
+		if (!addModelId(out, entry.data.provider, entry.data.model)) out.incomplete = true;
 	}
 	if ((type === "compaction" || type === "branch_summary") && isObject(entry.usage)) {
-		addModelId(out, entry.provider, entry.model);
-		if (!entry.provider && !entry.model) out.incomplete = true;
+		if (!addModelId(out, entry.provider, entry.model)) out.incomplete = true;
 	}
 	return out;
 }

@@ -388,6 +388,39 @@ test("usedModels lists every processing model and flags an incomplete model list
 	assert.equal(got.modelsIncomplete, true);
 });
 
+test("every usage carrier with no complete identity adds no id and marks the model list incomplete", (t) => {
+	const { file } = setup(t);
+	const usage = () => use({ input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.1 });
+	const carriers = {
+		assistant: (identity) => ({ type: "message", message: { role: "assistant", ...identity, usage: usage() } }),
+		usage: (identity) => ({ type: "usage", ...identity, usage: usage() }),
+		prewarm: (identity) => ({ type: "custom", customType: "prompt-cache-prewarm", data: { phase: "warmed", ...identity, usage: usage() } }),
+		toolResult: (identity) => ({ type: "message", message: { role: "toolResult", ...identity, usage: usage() } }),
+		compaction: (identity) => ({ type: "compaction", ...identity, usage: usage() }),
+		branch_summary: (identity) => ({ type: "branch_summary", ...identity, usage: usage() }),
+	};
+	for (const [kind, make] of Object.entries(carriers)) {
+		for (const [label, identity] of [["provider-only", { provider: "p" }], ["model-only", { model: "m" }]]) {
+			fs.writeFileSync(file(), `${JSON.stringify(make(identity))}\n`);
+			const got = readUsage(file()).effective;
+			assert.deepEqual(got.usedModels, {}, `${kind} ${label}`);
+			assert.equal(got.modelsIncomplete, true, `${kind} ${label}`);
+		}
+		fs.writeFileSync(file(), `${JSON.stringify(make({ provider: "p", model: "m" }))}\n`);
+		const complete = readUsage(file()).effective;
+		assert.deepEqual(complete.usedModels, { "p/m": true }, kind);
+		assert.equal(complete.modelsIncomplete, false, kind);
+	}
+});
+
+test("an assistant reply with only a responseModel identity marks the model list incomplete", (t) => {
+	const { file } = setup(t);
+	writeRecords(file(), [{ type: "message", message: { role: "assistant", responseModel: "claude-sonnet-4-5", usage: use() } }]);
+	const got = readUsage(file()).effective;
+	assert.deepEqual(got.usedModels, {});
+	assert.equal(got.modelsIncomplete, true);
+});
+
 test("an identity-bearing toolResult, compaction and branch_summary record their model while billing under Tools/summaries", (t) => {
 	const { file } = setup(t);
 	const usage = () => use({ input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.1 });
@@ -1006,7 +1039,8 @@ test("(gate 13) small records cap composite billing and model ids at 256 charact
 	const billed = readUsage(billingOnly).effective;
 	assert.deepEqual(billed.models, { "(model id too long)": { tokens: 12, cost: 4 } });
 	assert.deepEqual(billed.usedModels, {});
-	assert.equal(billed.modelsIncomplete, false);
+	// The provider is not a usable id, so no model identity was recorded.
+	assert.equal(billed.modelsIncomplete, true);
 });
 
 test("(gate 13) a full cursor and an EOF overlay merge without losing spill billing", (t) => {
@@ -1285,15 +1319,15 @@ test("(gate 6 row 8) an overlong last role replaces assistant", (t) => {
 	assert.equal(assertLargeRecordParity(t, line).total, 0);
 });
 
-test("(gate 6 row 9) a tool result's long provider satisfies its presence check", (t) => {
+test("(gate 6 row 9) a tool result's long provider alone adds no id and marks the model list incomplete", (t) => {
 	const message = { role: "toolResult", provider: gate6Long, usage: gate6Message.usage };
 	const line = `{${gate6Gap}"type":"message","message":${JSON.stringify(message)}}`;
-	assert.equal(assertLargeRecordParity(t, line).modelsIncomplete, false);
+	assert.equal(assertLargeRecordParity(t, line).modelsIncomplete, true);
 });
 
-test("(gate 6 row 10) a compaction's long model satisfies its presence check", (t) => {
+test("(gate 6 row 10) a compaction's long model alone adds no id and marks the model list incomplete", (t) => {
 	const line = `{${gate6Gap}"type":"compaction","model":"${gate6Long}","usage":${JSON.stringify(gate6Message.usage)}}`;
-	assert.equal(assertLargeRecordParity(t, line).modelsIncomplete, false);
+	assert.equal(assertLargeRecordParity(t, line).modelsIncomplete, true);
 });
 
 test("(gate 6) a selected array identity preserves billing coercion", (t) => {
@@ -1326,14 +1360,14 @@ test("(gate 6) an escaped duplicate role is compared after unescaping", (t) => {
 	assert.equal(assertLargeRecordParity(t, line).total, 0);
 });
 
-test("(gate 6) oversized non-string identities bill as too long without implying a lost model id", (t) => {
+test("(gate 6) oversized non-string identities bill as too long and mark the model list incomplete", (t) => {
 	const { file } = setup(t);
 	const message = { ...gate6Message, provider: [gate6Long] };
 	fs.writeFileSync(file(), `{${gate6Gap}"type":"message","message":${JSON.stringify(message)}}\n`);
 	const got = readUsage(file()).effective;
 	assert.deepEqual(got.models, { "(model id too long)/alpha": { tokens: 13, cost: 0.125 } });
 	assert.deepEqual(got.usedModels, {});
-	assert.equal(got.modelsIncomplete, false);
+	assert.equal(got.modelsIncomplete, true);
 });
 
 test("(gate 6) only a winning oversized non-number usage leaf skips usage", (t) => {
