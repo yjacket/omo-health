@@ -17,6 +17,8 @@ import { classifyProviderError } from "../detect/provider.mjs";
  */
 
 export const USAGE_TOOLS_KEY = "Tools/summaries";
+export const MODEL_KEY_LIMIT = 1000;
+export const MODEL_KEY_LENGTH = 256;
 
 const RECORD_PARSE_LIMIT = 16 * 1024 * 1024;
 const READ_CHUNK = 4 * 1024 * 1024;
@@ -40,6 +42,8 @@ const VALUE_RAW_LIMIT = 64 * 1024;
 const KEY_RAW_LIMIT = 128;
 const MODEL_ID_TOO_LONG = "(model id too long)";
 const MODEL_ID_UNREADABLE = "(model id unreadable)";
+const OTHER_MODELS = "(other models)";
+const modelMapSizes = new WeakMap();
 const TRUNCATED_STRING_ID = Symbol("truncatedStringIdentity");
 const TRUNCATED_USAGE = Symbol("truncatedUsage");
 const TRUNCATED_VALUE = Object.freeze({});
@@ -120,6 +124,55 @@ export function emptyUsage() {
 	};
 }
 
+function modelMapSize(map) {
+	let state = modelMapSizes.get(map);
+	if (!state) {
+		state = { count: 0, last: undefined };
+		for (const key in map) {
+			if (!Object.hasOwn(map, key)) continue;
+			state.count += 1;
+			if (key !== OTHER_MODELS) state.last = key;
+		}
+		modelMapSizes.set(map, state);
+	}
+	return state;
+}
+
+function addModelBilling(totals, key, tokens, cost) {
+	const models = totals.models;
+	if (key.length > MODEL_KEY_LENGTH) key = MODEL_ID_TOO_LONG;
+	if (!Object.hasOwn(models, key)) {
+		const state = modelMapSize(models);
+		if (state.count === MODEL_KEY_LIMIT) {
+			totals.modelsIncomplete = true;
+			key = OTHER_MODELS;
+			if (!Object.hasOwn(models, key)) {
+				// Make room for the spill bucket without losing the last key's billing.
+				models[key] = models[state.last];
+				delete models[state.last];
+			}
+		} else {
+			state.count += 1;
+			if (key !== OTHER_MODELS) state.last = key;
+			models[key] = { tokens: 0, cost: 0 };
+		}
+	}
+	models[key].tokens += tokens;
+	models[key].cost += cost;
+}
+
+function addUsedModel(totals, id) {
+	const usedModels = totals.usedModels;
+	if (Object.hasOwn(usedModels, id)) return;
+	const state = modelMapSize(usedModels);
+	if (state.count === MODEL_KEY_LIMIT) {
+		totals.modelsIncomplete = true;
+		return;
+	}
+	state.count += 1;
+	usedModels[id] = true;
+}
+
 function cloneUsage(usage) {
 	const src = isObject(usage) ? usage : emptyUsage();
 	const out = {
@@ -146,12 +199,13 @@ function cloneUsage(usage) {
 	for (const [key, value] of Object.entries(src.models ?? {})) {
 		const tokens = value?.tokens ?? 0;
 		const cost = value?.cost ?? 0;
-		if (!key.includes("/") || typeof tokens !== "number" || typeof cost !== "number") return undefined;
-		out.models[key] = { tokens, cost };
+		if ((!key.includes("/") && key !== MODEL_ID_TOO_LONG && key !== OTHER_MODELS) || typeof tokens !== "number" || typeof cost !== "number") return undefined;
+		addModelBilling(out, key, tokens, cost);
 	}
 	for (const key of Object.keys(src.usedModels ?? {})) {
-		if (!key.includes("/")) return undefined;
-		out.usedModels[key] = true;
+		if (!key.includes("/") && key !== MODEL_ID_TOO_LONG) return undefined;
+		if (key.length > MODEL_KEY_LENGTH) out.modelsIncomplete = true;
+		addUsedModel(out, key.length > MODEL_KEY_LENGTH ? MODEL_ID_TOO_LONG : key);
 	}
 	return out;
 }
@@ -169,12 +223,9 @@ function mergeUsage(into, extra) {
 	into.diagnostics.skippedLines += extra.diagnostics.skippedLines;
 	into.diagnostics.badLines += extra.diagnostics.badLines;
 	for (const [key, value] of Object.entries(extra.models)) {
-		into.models[key] ??= { tokens: 0, cost: 0 };
-		const model = into.models[key];
-		model.tokens += value.tokens;
-		model.cost += value.cost;
+		addModelBilling(into, key, value.tokens, value.cost);
 	}
-	for (const key of Object.keys(extra.usedModels)) into.usedModels[key] = true;
+	for (const key of Object.keys(extra.usedModels)) addUsedModel(into, key);
 }
 
 function billingPart(value) {
@@ -188,7 +239,9 @@ function billingPart(value) {
 
 /** Billing key text for values a JSON line can put where a model id belongs. */
 function billingKey(provider, model) {
-	return `${billingPart(provider)}/${billingPart(model)}`;
+	const left = billingPart(provider);
+	const right = billingPart(model);
+	return left.length + 1 + right.length > MODEL_KEY_LENGTH ? MODEL_ID_TOO_LONG : `${left}/${right}`;
 }
 
 /** The usage object a record's type/role/customType selects, or undefined. */
@@ -260,17 +313,18 @@ export function addUsage(totals, hit) {
 	totals.cost += cost;
 	if (usage.costUnknown === true) totals.costUnknown = true;
 	if (hit.turn) totals.turns += 1;
-	const key = hit.key ?? USAGE_TOOLS_KEY;
-	totals.models[key] ??= { tokens: 0, cost: 0 };
-	const model = totals.models[key];
-	model.tokens += tokens;
-	model.cost += cost;
+	addModelBilling(totals, hit.key ?? USAGE_TOOLS_KEY, tokens, cost);
 }
 
 function addModelId(out, provider, model) {
 	const known = (value) => typeof value === "string" && value.length > 0;
 	const truncated = (value) => value?.[TRUNCATED_STRING_ID] !== undefined;
-	if (known(provider) && known(model)) out.ids.push(`${provider}/${model}`);
+	if (known(provider) && known(model)) {
+		if (provider.length + 1 + model.length > MODEL_KEY_LENGTH) {
+			out.ids.push(MODEL_ID_TOO_LONG);
+			out.incomplete = true;
+		} else out.ids.push(`${provider}/${model}`);
+	}
 	else if ((known(provider) || truncated(provider)) && (known(model) || truncated(model))) out.incomplete = true;
 }
 
@@ -311,7 +365,7 @@ function consumeEntry(totals, entry, skipUsage = false) {
 		if (hit) addUsage(totals, hit);
 	}
 	const models = modelsOfEntry(entry);
-	for (const id of models.ids) totals.usedModels[id] = true;
+	for (const id of models.ids) addUsedModel(totals, id);
 	if (models.incomplete) totals.modelsIncomplete = true;
 }
 

@@ -803,7 +803,7 @@ test("a large record with an invalid string is rejected the way JSON.parse rejec
 	}
 });
 
-test("a large record keeps a captured model id longer than the key limit", (t) => {
+test("a large record replaces a captured model id longer than the key limit", (t) => {
 	const { file } = setup(t);
 	const model = "m".repeat(4097);
 	const usage = use({ input: 1, output: 2, cacheRead: 3, cacheWrite: 4 });
@@ -813,9 +813,64 @@ test("a large record keeps a captured model id longer than the key limit", (t) =
 	const got = readUsage(file()).effective;
 	assert.equal(got.total, oracleTotals(file()).total);
 	assert.equal(got.total, 10);
-	assert.equal(got.models[`openai/${model}`]?.tokens, 10);
-	assert.deepEqual(got.usedModels, { [`openai/${model}`]: true });
-	assert.equal(got.modelsIncomplete, false);
+	assert.equal(got.models["(model id too long)"]?.tokens, 10);
+	assert.deepEqual(got.usedModels, { "(model id too long)": true });
+	assert.equal(got.modelsIncomplete, true);
+});
+
+test("(gate 13) small records cap composite billing and model ids at 256 characters", (t) => {
+	const { file } = setup(t);
+	const records = [
+		{ provider: "p", model: "a".repeat(254), usage: use({ input: 1, cost: 1 }) },
+		{ provider: "p", model: "b".repeat(255), usage: use({ input: 2, cost: 2 }) },
+		{ provider: ["p".repeat(256)], model: "m", usage: use({ input: 3, cost: 4 }) },
+	];
+	fs.writeFileSync(file(), `${records.map((entry) => JSON.stringify({ type: "usage", ...entry })).join("\n")}\n`);
+	const got = readUsage(file()).effective;
+	const atLimit = `p/${records[0].model}`;
+	assert.deepEqual(got.models, { [atLimit]: { tokens: 10, cost: 1 }, "(model id too long)": { tokens: 23, cost: 6 } });
+	assert.deepEqual(got.usedModels, { [atLimit]: true, "(model id too long)": true });
+	assert.equal(got.modelsIncomplete, true);
+	assert.equal(got.total, 33);
+	assert.equal(got.cost, 7);
+	const billingOnly = file("billing-only.jsonl");
+	fs.writeFileSync(billingOnly, `${JSON.stringify({ type: "usage", ...records[2] })}\n`);
+	const billed = readUsage(billingOnly).effective;
+	assert.deepEqual(billed.models, { "(model id too long)": { tokens: 12, cost: 4 } });
+	assert.deepEqual(billed.usedModels, {});
+	assert.equal(billed.modelsIncomplete, false);
+});
+
+test("(gate 13) a full cursor and an EOF overlay merge without losing spill billing", (t) => {
+	const { file } = setup(t);
+	const record = (i) => JSON.stringify({ type: "usage", provider: "p", model: `m${i}`, usage: { input: 2, cost: { total: 0.25 } } });
+	const committed = Array.from({ length: 1000 }, (_, i) => record(i)).join("\n") + "\n";
+	fs.writeFileSync(file(), committed + record(1000));
+	const first = readUsage(file());
+	assert.equal(Object.keys(first.usage.models).length, 1000);
+	assert.equal(first.usage.modelsIncomplete, false);
+	assert.deepEqual(first.overlay.models, { "p/m1000": { tokens: 2, cost: 0.25 } });
+	assert.equal(Object.keys(first.effective.models).length, 1000);
+	assert.equal(Object.keys(first.effective.usedModels).length, 1000);
+	assert.deepEqual(first.effective.models["(other models)"], { tokens: 4, cost: 0.5 });
+	assert.equal(first.effective.modelsIncomplete, true);
+	fs.appendFileSync(file(), `\n${record(999)}\n${record(0)}\n`);
+	const resumed = readUsage(file(), first).effective;
+	assert.deepEqual(resumed, readUsage(file()).effective);
+	assert.deepEqual(resumed.models["(other models)"], { tokens: 6, cost: 0.75 });
+	assert.equal(resumed.total, 2006);
+	assert.equal(resumed.cost, 250.75);
+});
+
+test("(gate 13) usedModels caps model identities even without billing", (t) => {
+	const { file } = setup(t);
+	const rows = Array.from({ length: 1001 }, (_, i) => JSON.stringify({ type: "message", message: { role: "assistant", provider: "p", model: `m${i}` } }));
+	fs.writeFileSync(file(), `${rows.join("\n")}\n`);
+	const got = readUsage(file()).effective;
+	assert.equal(Object.keys(got.usedModels).length, 1000);
+	assert.deepEqual(got.models, {});
+	assert.equal(got.modelsIncomplete, true);
+	assert.equal(got.total, 0);
 });
 
 test("a large record gives a repeated selected key its last value like JSON.parse", (t) => {

@@ -1,5 +1,5 @@
 import { basename } from "node:path";
-import { readUsage } from "./collect/usage.mjs";
+import { MODEL_KEY_LENGTH, MODEL_KEY_LIMIT, readUsage } from "./collect/usage.mjs";
 import { atomicWriteFile, readTextSafe, statSafe } from "./util/fsx.mjs";
 
 /**
@@ -223,7 +223,7 @@ function taggedNumber(value) {
  * the tagged shape. Null, strings, plain objects and malformed tags are invalid.
  */
 function normalizeNumber(node, key, version) {
-	if (!Object.hasOwn(node, key)) return true;
+	if (!Object.hasOwn(node, key)) return false;
 	const value = node[key];
 	if (typeof value === "number") return true;
 	if (version !== 1) {
@@ -252,26 +252,29 @@ function validCounterTree(tree, version) {
 		if (models === null || models === undefined) continue;
 		if (!isObject(models) || Array.isArray(models)) return false;
 	}
-	// for-in over the 105k-model maps: Object.values would allocate an array per tree
-	// in a process the daemon caps at 96 MiB.
+	// Reject legacy oversized maps in place; don't build an array or copy of the models.
 	const models = tree.models;
 	if (models) {
+		let count = 0;
 		for (const key in models) {
 			if (!Object.hasOwn(models, key)) continue;
+			if (++count > MODEL_KEY_LIMIT || key.length > MODEL_KEY_LENGTH) return false;
 			const model = models[key];
 			if (!isObject(model) || Array.isArray(model)) return false;
 			if (!normalizeNumber(model, "tokens", version) || !normalizeNumber(model, "cost", version)) return false;
-			if (typeof model.tokens !== "number" || typeof model.cost !== "number") return false;
 		}
 	}
 	const usedModels = tree.usedModels;
 	if (usedModels) {
-		for (const key in usedModels) if (Object.hasOwn(usedModels, key) && usedModels[key] !== true) return false;
+		let count = 0;
+		for (const key in usedModels) {
+			if (!Object.hasOwn(usedModels, key)) continue;
+			if (++count > MODEL_KEY_LIMIT || key.length > MODEL_KEY_LENGTH || usedModels[key] !== true) return false;
+		}
 	}
 	const diagnostics = tree.diagnostics;
 	if (diagnostics) {
 		if (!normalizeNumber(diagnostics, "badLines", version) || !normalizeNumber(diagnostics, "skippedLines", version)) return false;
-		if (typeof diagnostics.badLines !== "number" || typeof diagnostics.skippedLines !== "number") return false;
 	}
 	return true;
 }
@@ -280,7 +283,18 @@ const ENTRY_NUMBERS = [...CURSOR_NUMBERS, "checkedMs"];
 
 /** Every persisted numeric slot and counter leaf must fit the file's version. */
 function validEntry(entry, version) {
-	for (const key of ENTRY_NUMBERS) if (!normalizeNumber(entry, key, version)) return false;
+	const neverRead = entry.state === "missing" && entry.complete === false && entry.gone === false &&
+		CURSOR_NUMBERS.every((key) => entry[key] === null) &&
+		USAGE_KEYS.every((key) => entry[key] === null) &&
+		entry.head === null && entry.tail === null;
+	if (neverRead) return Number.isFinite(entry.checkedMs);
+	for (const key of ENTRY_NUMBERS) {
+		if (Object.hasOwn(entry, key) && (!normalizeNumber(entry, key, version) || !Number.isFinite(entry[key]))) return false;
+	}
+	for (const key of ["size", "offset", "evaluatedTo", "headLen"]) {
+		if (Object.hasOwn(entry, key) && (!Number.isSafeInteger(entry[key]) || entry[key] < 0)) return false;
+	}
+	if (entry.offset > entry.evaluatedTo || entry.evaluatedTo > entry.size || entry.headLen > Math.min(entry.size, 4096)) return false;
 	return USAGE_KEYS.every((key) => validCounterTree(entry[key], version));
 }
 

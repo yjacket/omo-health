@@ -403,6 +403,38 @@ test("(gate 12) malformed numeric fields keep a row pending until the tracker re
 	}
 });
 
+for (const version of [1, 2]) {
+	for (const treeName of ["usage", "published"]) {
+		test(`(gate 13) v${version} missing ${treeName}.total stays pending and recounts through an append`, (t) => {
+			const s = setup();
+			t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+			const id = "omitted";
+			const file = mainFile(s.paths, id);
+			const indexFile = s.paths.health.usageIndexFile;
+			writeJsonl(file, [E.assistant({ ms: T0, usage: usage(42) })]);
+			s.index.update(id, file);
+			s.index.save();
+			const data = JSON.parse(fs.readFileSync(indexFile, "utf8"));
+			data.v = version;
+			delete data.entries[id][treeName].total;
+			fs.writeFileSync(indexFile, JSON.stringify(data));
+
+			const index = createUsageIndex({ file: indexFile, clock: s.clock, log: s.log });
+			const tracker = createUsageTracker({ paths: s.paths, index, locator: s.locator, clock: s.clock, log: s.log });
+			const row = { sessionId: id, kind: "main", cwd: s.cwd, endedMs: T0 };
+			assert.equal(compactUsage(readUsageIndex(indexFile).get(id)), null);
+			assert.deepEqual(tracker.tokensOf(id), { pending: true });
+			assert.equal(tracker.queueLedger([row]), 1);
+			assert.equal(endedRow(row, 0, readUsageIndex(indexFile)).tokensState, "pending");
+
+			fs.appendFileSync(file, `${JSON.stringify(E.assistant({ ms: T0 + 1000, usage: usage(3) }))}\n`);
+			assert.equal(tracker.tick(emptyWorld(s.clock)).bytesRead, fs.statSync(file).size);
+			assert.equal(tracker.tokensOf(id).tokens.total, 45);
+			assert.equal(endedRow(row, 0, readUsageIndex(indexFile)).tokens.total, readUsage(file).effective.total);
+		});
+	}
+}
+
 test("a child of a child is located through its grandparent's cwd", () => {
 	const s = setup();
 	writeJsonl(childFile(s.cwd, "st_mid", "mid1"), [E.assistant({ ms: T0, usage: usage(3) })]);
