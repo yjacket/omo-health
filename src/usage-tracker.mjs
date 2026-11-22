@@ -5,8 +5,8 @@ import { USAGE_TICK_BYTES, compactUsage, fresh as isFresh, treeTotals } from "./
 
 /**
  * The daemon's token tracker (plan todo 5): one per-tick byte budget shared by
- * live appends, first reads of live sessions and the ended-session backlog, all
- * spent through the single writer of the index (`src/usage-index.mjs`).
+ * live appends, first reads of live sessions and the ended-session backlog,
+ * including discovery of the backlog's main-session files.
  *
  * Live sessions are indexed only from their own file: a main file name or
  * session header must carry its session id, and a child file must be the one
@@ -85,11 +85,12 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 		return found && pathKey(found) === pathKey(file) ? file : undefined;
 	};
 
-	const locate = (row, liveSessions, cwdOf) => {
+	const locate = (row, liveSessions, cwdOf, maxBytes) => {
 		if (row.kind === "child") {
-			return locator?.childFile?.({ taskId: row.taskId ?? row.sessionId, sessionId: row.sessionId, cwds: cwdCandidates(row, liveSessions, cwdOf) });
+			const file = locator?.childFile?.({ taskId: row.taskId ?? row.sessionId, sessionId: row.sessionId, cwds: cwdCandidates(row, liveSessions, cwdOf) });
+			return { file, bytesRead: 0 };
 		}
-		return locator?.mainFile?.(row.sessionId, index.get(row.sessionId)?.file ?? null);
+		return locator?.findMainFile?.(row.sessionId, index.get(row.sessionId)?.file ?? null, { maxBytes }) ?? { bytesRead: 0 };
 	};
 
 	const counts = () => {
@@ -199,12 +200,15 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			// (c) the ended-session backlog, newest first
 			for (const [id, row] of queue) {
 				if (budget <= 0) break;
-				const rowFile = locate(row, liveSessions, cwdOf);
+				const { file: rowFile, pending, bytesRead } = locate(row, liveSessions, cwdOf, budget);
+				budget -= bytesRead;
+				if (pending) break;
 				if (!rowFile) {
 					index.markMissing(id, metaOf(row));
 					queue.delete(id);
 					continue;
 				}
+				if (budget <= 0) break;
 				budget = Math.max(0, budget - index.update(id, rowFile, metaOf(row), { maxBytes: budget }));
 				const entry = index.get(id);
 				// Missing/gone files are retried by queueLedger, not every tick.

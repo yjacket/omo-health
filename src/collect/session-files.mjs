@@ -1,8 +1,11 @@
+import fs from "node:fs";
 import path from "node:path";
 import { listDirSafe, statSafe } from "../util/fsx.mjs";
 import { readUsageIndex } from "../usage-index.mjs";
 import { idFromFileName, readSessionHeader } from "./sessions.mjs";
 import { senpiTaskStoreDir } from "./tasks.mjs";
+
+const HEADER_BYTES = 64 * 1024;
 
 export function mainSessionFileMatches(file, sessionId) {
 	return idFromFileName(file) === sessionId || readSessionHeader(file)?.id === sessionId;
@@ -27,6 +30,7 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 	const nowMs = typeof clock?.now === "function" ? () => clock.now() : () => Date.now();
 	let mainFiles = new Map();
 	let mainScannedMs = -Infinity;
+	let mainScan;
 	let usageStamp;
 	let customMainFiles = new Map();
 
@@ -53,40 +57,81 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 
 	const indexedMainFile = typeof indexedFile === "function" ? residentMainFile : readMainFile;
 
-	const scanMain = () => {
-		const found = new Map();
+	function* mainCandidates() {
 		for (const slug of listDirSafe(paths.sessionsDir)) {
 			const dir = path.join(paths.sessionsDir, slug);
 			for (const name of listDirSafe(dir)) {
-				if (!name.endsWith(".jsonl")) continue;
-				const file = path.join(dir, name);
-				if (!statSafe(file)?.isFile()) continue;
-				const nameId = idFromFileName(file);
-				const headerId = readSessionHeader(file)?.id;
-				if (typeof headerId === "string" && headerId && headerId !== nameId) {
-					// A differing header identifies this file, but don't displace a matching filename for that id.
-					if (!found.has(headerId)) found.set(headerId, file);
-				} else if (nameId) {
-					found.set(nameId, file);
-				}
+				if (name.endsWith(".jsonl")) yield path.join(dir, name);
 			}
 		}
-		mainFiles = found;
+	}
+
+	/** A header probe is atomic; leave the candidate at the cursor if its prefix won't fit. */
+	const findMainFile = (sessionId, indexedFile = indexedMainFile(sessionId), { maxBytes = Infinity } = {}) => {
+		let bytesRead = 0;
+		const result = (file, pending = false) => ({ file, pending, bytesRead });
+		const header = (file, size) => {
+			const length = Math.min(size, HEADER_BYTES);
+			if (length > maxBytes - bytesRead) return { pending: true };
+			if (length === 0) return {};
+			let fd;
+			try {
+				fd = fs.openSync(file, "r");
+				const buf = Buffer.alloc(length);
+				const n = fs.readSync(fd, buf, 0, length, 0);
+				bytesRead += n;
+				const text = buf.toString("utf8", 0, n);
+				const end = text.indexOf("\n");
+				const entry = JSON.parse(end >= 0 ? text.slice(0, end) : text);
+				return { id: entry?.type === "session" ? entry.id : undefined };
+			} catch {
+				return {};
+			} finally {
+				if (fd !== undefined) fs.closeSync(fd);
+			}
+		};
+		if (!sessionId) return result();
+		if (indexedFile && idFromFileName(indexedFile) !== sessionId) {
+			const stat = statSafe(indexedFile);
+			if (stat?.isFile()) {
+				const probe = header(indexedFile, stat.size);
+				if (probe.pending) return result(undefined, true);
+				if (probe.id === sessionId) return result(indexedFile);
+			}
+		}
+		let file = mainFiles.get(sessionId);
+		if (file && statSafe(file)?.isFile()) return result(file);
+		if (file) mainFiles.delete(sessionId);
+		if (!mainScan) {
+			if (nowMs() - mainScannedMs < rescanMs) return result();
+			const candidates = mainCandidates();
+			mainScan = { candidates, next: candidates.next(), found: new Map() };
+		}
+		const scan = mainScan;
+		for (; !scan.next.done; scan.next = scan.candidates.next()) {
+			const candidate = scan.next.value;
+			const stat = statSafe(candidate);
+			if (!stat?.isFile()) continue;
+			const probe = header(candidate, stat.size);
+			if (probe.pending) return result(undefined, true);
+			const nameId = idFromFileName(candidate);
+			const headerId = probe.id;
+			if (typeof headerId === "string" && headerId && headerId !== nameId) {
+				// A differing header identifies this file, but don't displace a matching filename for that id.
+				if (!scan.found.has(headerId)) scan.found.set(headerId, candidate);
+			} else if (nameId) {
+				scan.found.set(nameId, candidate);
+			}
+		}
+		// Publish only the finished map: unseen files can still change which path wins.
+		mainFiles = scan.found;
+		mainScan = undefined;
 		mainScannedMs = nowMs();
+		file = mainFiles.get(sessionId);
+		return result(file && statSafe(file)?.isFile() ? file : undefined);
 	};
 
-	/** Prefer the indexed custom path; otherwise use the scan's header/filename map. */
-	const mainFile = (sessionId, indexedFile = indexedMainFile(sessionId)) => {
-		if (!sessionId) return undefined;
-		if (indexedFile && idFromFileName(indexedFile) !== sessionId && mainSessionFileMatches(indexedFile, sessionId)) return indexedFile;
-		let file = mainFiles.get(sessionId);
-		if (file && statSafe(file)?.isFile()) return file;
-		if (file) mainFiles.delete(sessionId);
-		if (mainScannedMs !== -Infinity && nowMs() - mainScannedMs < rescanMs) return undefined;
-		scanMain();
-		file = mainFiles.get(sessionId);
-		return file && statSafe(file)?.isFile() ? file : undefined;
-	};
+	const mainFile = (sessionId, indexedFile) => findMainFile(sessionId, indexedFile).file;
 
 	const childFiles = new Map();
 	const childMisses = new Map();
@@ -138,5 +183,5 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 		return undefined;
 	};
 
-	return { mainFile, childFile };
+	return { mainFile, findMainFile, childFile };
 }

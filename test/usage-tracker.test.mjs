@@ -18,6 +18,7 @@ import { buildSessionSnapshot, detectEnded } from "../src/session-board.mjs";
 
 const T0 = Date.UTC(2026, 8, 28, 12, 0, 0);
 const DAY = 86_400_000;
+const HEADER_BYTES = 64 * 1024;
 
 const usage = (input, output = 0, cacheRead = 0, cacheWrite = 0, cost = 0) => ({ input, output, cacheRead, cacheWrite, cost: { total: cost } });
 const indexRow = (text) => JSON.parse(text.split("\n")[1]);
@@ -291,6 +292,46 @@ test("a live child attached to another session's file gets no tokens, and its ro
 	assert.equal(s.tracker.tokensOf("c1"), null);
 });
 
+test("(IS-4, IS-12) cold discovery shares the tick budget and keeps history pending", (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const sessionId = "review-session";
+	const file = path.join(path.dirname(mainFile(s.paths, sessionId)), "review.jsonl");
+	writeJsonl(file, [E.header(sessionId, s.cwd, T0 - 1000), E.assistant({ ms: T0, usage: usage(42) })]);
+	const reviewBytes = fs.statSync(file).size;
+	const header = `${JSON.stringify({ type: "session", id: "unmatched" }).padEnd(HEADER_BYTES - 1)}\n`;
+	for (let i = 0; i < 600; i += 1) fs.writeFileSync(mainFile(s.paths, `decoy-${i}`), header);
+	const row = { sessionId, kind: "main", endedMs: T0 };
+	assert.equal(s.tracker.queueLedger([row]), 1);
+
+	let actual = 0;
+	const readSync = fs.readSync;
+	t.mock.method(fs, "readSync", (...args) => {
+		const n = readSync(...args);
+		actual += n;
+		return n;
+	});
+	const tick = () => {
+		actual = 0;
+		const state = s.tracker.tick(emptyWorld(s.clock));
+		assert.ok(actual <= USAGE_TICK_BYTES, `tick read ${actual} actual bytes (budget ${USAGE_TICK_BYTES})`);
+		assert.ok(state.bytesRead <= USAGE_TICK_BYTES);
+		assert.equal(state.missing, 0);
+		return state.bytesRead;
+	};
+	const history = () => endedRow(row, 0, new Map(s.index.entries().map((entry) => [entry.id, entry])));
+	const first = tick();
+	assert.equal(first, actual, "all first-tick reads were charged for discovery");
+	assert.equal(history().tokensState, "pending");
+	assert.equal(s.events.some(({ event }) => event === "usage_backlog"), false);
+
+	const second = tick();
+	assert.equal(first + second, 600 * Buffer.byteLength(header) + 2 * reviewBytes, "charge each header once and count the review file");
+	assert.equal(s.index.get(sessionId).file, file);
+	assert.equal(history().tokensState, "ok");
+	assert.equal(history().tokens.total, 42);
+});
+
 test("a tick never reads more than the byte budget: a 40 MiB live record waits while a backlog waits", () => {
 	const s = setup();
 	const live = mainFile(s.paths, "m1");
@@ -454,7 +495,7 @@ test("(gate 10) a previously published ended file stays queued through three rea
 		assert.deepEqual(s.tracker.tokensOf(row.sessionId).tokens, previous);
 		assert.equal(s.events.some(({ event }) => event === "usage_backlog"), false, `tick ${i} has not drained the queue`);
 	}
-	assert.equal(s.tracker.tick(world).bytesRead, size - Buffer.byteLength(record) - 1 - 2 * USAGE_TICK_BYTES);
+	assert.equal(s.tracker.tick(world).bytesRead, HEADER_BYTES + size - Buffer.byteLength(record) - 1 - 2 * USAGE_TICK_BYTES);
 	assert.equal(s.index.fresh(s.index.get(row.sessionId)), true);
 	assert.equal(s.tracker.tokensOf(row.sessionId).tokens.total, 1_000_001);
 	assert.equal(s.tracker.tokensOf(row.sessionId).tokens.total, readUsage(file).effective.total);
@@ -583,7 +624,8 @@ test("a restart resumes an interrupted file from the saved offset instead of rec
 	const tracker = createUsageTracker({ paths: s.paths, index, locator, clock: s.clock, log: s.log });
 	tracker.queueLedger([row]);
 	const tick = tracker.tick(emptyWorld(s.clock));
-	assert.equal(tick.bytesRead, fs.statSync(file).size - savedOffset, "only the bytes after the persisted offset are read");
+	assert.equal(tick.bytesRead, HEADER_BYTES + fs.statSync(file).size - savedOffset,
+		"after header discovery, counting reads only the bytes after the persisted offset");
 	assert.equal(index.get("r1").complete, true);
 	assert.equal(compactUsage(index.get("r1")).total, 600);
 });
@@ -687,7 +729,7 @@ for (const treeName of ["usage", "published"]) {
 			assert.equal(endedRow(row, 0, readUsageIndex(indexFile)).tokensState, "pending");
 
 			fs.appendFileSync(file, `${JSON.stringify(E.assistant({ ms: T0 + 1000, usage: usage(3) }))}\n`);
-			assert.equal(tracker.tick(emptyWorld(s.clock)).bytesRead, fs.statSync(file).size);
+			assert.equal(tracker.tick(emptyWorld(s.clock)).bytesRead, 2 * fs.statSync(file).size, "discover and recount the file");
 			assert.equal(tracker.tokensOf(id).tokens.total, 45);
 			assert.equal(endedRow(row, 0, readUsageIndex(indexFile)).tokens.total, readUsage(file).effective.total);
 		});
@@ -722,12 +764,13 @@ test("(gate 14) deletion of each written field unpublishes the row until a one-s
 			writeIndexRow(indexFile, saved, data);
 			const loaded = readUsageIndex(indexFile);
 			const index = createUsageIndex({ file: indexFile, clock: s.clock, log: s.log });
-			const tracker = createUsageTracker({ paths: s.paths, index, locator: s.locator, clock: s.clock, log: s.log });
+			const locator = createSessionFileLocator({ paths: s.paths, clock: s.clock });
+			const tracker = createUsageTracker({ paths: s.paths, index, locator, clock: s.clock, log: s.log });
 			assert.equal(endedRow(row, 0, loaded).tokensState, "pending");
 			// A v3 line without its id cannot be attributed to a session, so it is dropped: the session is unindexed, not pending.
 			assert.deepEqual(tracker.tokensOf(id), field.join(".") === "id" ? null : { pending: true });
 			assert.equal(tracker.queueLedger([row]), 1);
-			assert.equal(tracker.tick(emptyWorld(s.clock)).bytesRead, fs.statSync(file).size);
+			assert.equal(tracker.tick(emptyWorld(s.clock)).bytesRead, 2 * fs.statSync(file).size, "discover and recount the file");
 			assert.deepEqual(readUsageIndex(indexFile).get(id).published, expected);
 		});
 	}
@@ -751,7 +794,7 @@ for (const v of [1, 2]) {
 		assert.equal(readUsageIndex(indexFile).size, 0);
 		assert.deepEqual(index.entries(), []);
 		assert.equal(tracker.queueLedger([{ sessionId: id, kind: "main", endedMs: T0 }]), 1);
-		assert.equal(tracker.tick(emptyWorld(s.clock)).bytesRead, fs.statSync(file).size);
+		assert.equal(tracker.tick(emptyWorld(s.clock)).bytesRead, 2 * fs.statSync(file).size, "discover and recount the file");
 		assert.equal(compactUsage(readUsageIndex(indexFile).get(id)).total, readUsage(file).effective.total);
 	});
 }
@@ -768,7 +811,7 @@ test("(gate 15) fractional writer output is accepted and published after recount
 	const tracker = createUsageTracker({ paths: s.paths, index, locator: s.locator, clock: s.clock, log: s.log });
 	const row = { sessionId: id, kind: "main", endedMs: T0 };
 	assert.equal(tracker.queueLedger([row]), 1);
-	assert.equal(tracker.tick(emptyWorld(s.clock)).bytesRead, fs.statSync(file).size);
+	assert.equal(tracker.tick(emptyWorld(s.clock)).bytesRead, 2 * fs.statSync(file).size, "discover and recount the file");
 	const loaded = readUsageIndex(indexFile);
 	assert.deepEqual(loaded.get(id).published, readUsage(file).effective);
 	assert.equal(endedRow(row, 0, loaded).tokensState, "ok");

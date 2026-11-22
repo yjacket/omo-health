@@ -13,13 +13,13 @@ export function prepareAudit({ sessionId, now, bounds, indexEntries, indexFull }
 	const record = loadRecord({ paths, id: sessionId, now, ...scanBounds, auditRetention: true, locator, index });
 	if (!record?.found) return { loaded: record };
 	// Launch-only join keys travel separately from the record used to build the reviewer's bundle.
-	const { selectedFps, ...loaded } = record;
+	const { selectedFps, auditSubjectIds, ...loaded } = record;
 	const session = loaded.session ?? {};
 	const entry = usageEntryOf(index, session);
 	const file = entry?.file ?? (session.taskId ? null : locator.mainFile(session.sessionId));
 	let warning;
 	const report = readVersionedAuditTimeline(file, tokens, { maxFileBytes: bounds.messageScanMaxBytes, timeline, log: { warn: (_event, detail) => { warning = detail; } } });
-	return { loaded, selectedFps, ...report, warning };
+	return { loaded, selectedFps, auditSubjectIds, ...report, warning };
 }
 
 if (parentPort && workerData?.auditPrepareWorker) {

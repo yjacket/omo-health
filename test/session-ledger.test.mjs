@@ -99,6 +99,16 @@ test("duplicate sessionId within 30 days is skipped", () => {
 	assert.equal(readEnded(p, {}).length, 1);
 });
 
+test("ended append dedupe scopes shared task IDs by parent or parentless cwd", (t) => {
+	const child = (parentSessionId, cwd) => rec("st_x", batchNow, { kind: "child", taskId: "st_x", parentSessionId, cwd });
+	const a = child("main-a", "project-a");
+	const b = child("main-b", "project-b");
+	const c = child(null, "project-a");
+	const d = child(null, "project-b");
+	compareAppends(t, {}, [a, b, c, d, a, b, c, d], batchNow,
+		[true, true, true, true, false, false, false, false]);
+});
+
 test("corrupt line is skipped and hasEnded works", () => {
 	const p = setup();
 	const now = Date.now();
@@ -161,7 +171,7 @@ test("bounded live batch preserves sequential duplicate decisions, ledger bytes,
 	const rows = [
 		rec("cutoff", now),
 		rec("expired", now, { cwd: "C:/작업", reason: "가".repeat(400) }),
-		rec("expired", now),
+		rec("expired", now, { cwd: "C:/작업" }),
 		rec("future-cutoff", now + day),
 		rec("future-cutoff", now),
 		rec("outside", now - 31 * day),

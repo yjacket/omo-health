@@ -496,7 +496,11 @@ function joinSessionDecisions(row, descendants, investigations, decisions, bound
 			if (rows === null) investigation.verdictHistoryTooLarge = true;
 			else investigation.verdictHistory = rows.sort(byVerdictTime);
 		}
-		return { analystModels: [...analystModels], selectedFps: [...fpSet] };
+		const taskIds = new Set(nodes.map((node) => node.taskId).filter(nonEmpty));
+		return {
+			analystModels: [...analystModels], selectedFps: [...fpSet],
+			auditSubjectIds: { sessionIds: sessionAllowed, taskIds, childTasksByParent },
+		};
 	}
 	return { selectedInvestigations, fpSet, about, selected: [...new Set([...about, ...delivered])] };
 }
@@ -931,5 +935,6 @@ export function loadSessionRecord({ paths, id, endedMs, now = Date.now(), messag
 	}
 
 	const auditHealth = retained && auditRecordHealth(retained, decisionHistory.infoFindings);
-	return buildSessionRecord({ id, row, descendants, ambiguous, usage, decisionJoin, decisionHistory, auditHealth, messages, truncated: { messagesSkipped: skipped } });
+	const record = buildSessionRecord({ id, row, descendants, ambiguous, usage, decisionJoin, decisionHistory, auditHealth, messages, truncated: { messagesSkipped: skipped } });
+	return auditRetention ? { ...record, auditSubjectIds: decisionJoin.auditSubjectIds } : record;
 }

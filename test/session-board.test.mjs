@@ -196,6 +196,25 @@ test("detectEnded decides nothing without a previous snapshot or a fresh process
 	assert.deepEqual(detectEnded(prev, snap(NOW, []), makeWorld({ now: NOW, procsFresh: false }), NOW), []);
 });
 
+test("live end detection keeps shared task IDs isolated by parent", () => {
+	const parents = ["a", "b"];
+	const prev = snap(NOW - 60_000, parents.map((parent) =>
+		mainRow(parent, { children: [childRow("st_x", { sessionId: null, name: `child ${parent}` })] })));
+	const tasks = parents.map((parent, i) => taskRecord({
+		taskId: "st_x", parentSessionId: parent, spawnCwd: `C:/project-${parent}`,
+		status: "completed", hasFinalResponse: true, terminalAtMs: NOW - i,
+	}));
+	const world = makeWorld({ now: NOW, paths: tmpPaths(), tasks, procsFresh: true });
+	const facts = (current) => detectEnded(prev, current, world, NOW)
+		.map((r) => [r.sessionId, r.parentSessionId, r.title, r.cwd, r.endedMs]);
+	const ended = parents.map((parent, i) => ["st_x", parent, `child ${parent}`, `C:/project-${parent}`, NOW - i]);
+	assert.deepEqual(facts(snap(NOW, parents.map((parent) => mainRow(parent)))), ended);
+	const stillRunning = snap(NOW, [
+		mainRow("a"), mainRow("b", { children: [childRow("st_x", { sessionId: "child-b-now-known" })] }),
+	]);
+	assert.deepEqual(facts(stillRunning), [ended[0]]);
+});
+
 test("buildSessionSnapshot puts the injected token totals on every main and child row", () => {
 	const seen = new Map([
 		["m1", { tokens: { total: 1200, input: 900, output: 300 }, treeTokens: 20_000 }],

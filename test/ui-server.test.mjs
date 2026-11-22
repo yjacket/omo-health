@@ -11,12 +11,13 @@ import { loadConfig } from "../src/config.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 import { emptyUsage } from "../src/collect/usage.mjs";
 import { appendDecision } from "../src/decisions.mjs";
-import { appendEnded } from "../src/session-ledger.mjs";
+import { BACKFILL_MARKER, backfillOnce } from "../src/session-backfill.mjs";
+import { appendEnded, readEnded } from "../src/session-ledger.mjs";
 import { createDetailWorker, createSessionDetail, createStartAudit } from "../src/ui/cli.mjs";
-import { daemonStatus, loadDaemonInputs, uiState } from "../src/ui/model.mjs";
+import { buildEnded, daemonStatus, loadDaemonInputs, uiState } from "../src/ui/model.mjs";
 import { createUiServer } from "../src/ui/server.mjs";
 import { createUsageIndex, USAGE_INDEX_VERSION } from "../src/usage-index.mjs";
-import { writeTask } from "./helpers/fixtures.mjs";
+import { writeJsonl, writeTask } from "./helpers/fixtures.mjs";
 
 const TOKEN = "test-token-abc_123";
 const STATE = { generatedMs: 1, overview: { level: "ok" } };
@@ -757,8 +758,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 					title: `task ${id}`, cwd: path.join(world.dir, id), outcome: "answered",
 					startedMs: world.nowMs - 2000, endedMs: world.nowMs + i, reason: "", source: "live",
 				}));
-				// The append-time ID dedupe would skip the second row. Exercise a ledger
-				// where both writer-shaped records are already present.
+				// Seed both rows directly to isolate read-side collision behavior.
 				const ledger = path.join(world.paths.health.sessionsDir, "ended-2026-11-22.jsonl");
 				fs.appendFileSync(ledger, children.map((row) => `${JSON.stringify(row)}\n`).join(""));
 				const file = writeTask(children[0].cwd, { task_id: taskId, status: "completed" }, [
@@ -810,6 +810,51 @@ describe("ui server", { timeout: 20_000 }, () => {
 					assert.deepEqual(await get("&ended=0"), { status: 404, body: { error: "not-found" } });
 					for (const query of ["&ended=", "&ended=-1", "&ended=1.5", "&ended=1e3", "&ended=9007199254740993", "&Ended=1", "&ended=0&ended=-1"]) {
 						assert.deepEqual(await get(query), { status: 422, body: { error: "invalid" } }, query);
+					}
+				} finally {
+					await ui.close();
+					await world.detail.close();
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				}
+			});
+
+			it("(plan 45) backfill writes both task-only children for history and HTTP ended selection", async () => {
+				const world = makeWorld();
+				const { paths, now, nowMs } = world;
+				const ui = createUiServer({ paths, token: TOKEN, getState: () => STATE, sessionDetail: world.detail, now });
+				try {
+					const taskId = "st_x";
+					const children = ["a", "b"].map((id, i) => ({
+						parentSessionId: `main-${id}`, title: `task ${id}`, cwd: path.join(world.dir, id),
+						endedMs: nowMs - 3_600_000 - i,
+					}));
+					for (const { parentSessionId, title, cwd, endedMs } of children) {
+						const timestamp = new Date(endedMs).toISOString();
+						const file = path.join(paths.sessionsDir, parentSessionId, `${timestamp.replace(/[:.]/g, "-")}_${parentSessionId}.jsonl`);
+						writeJsonl(file, [{ type: "session", version: 3, id: parentSessionId, cwd, timestamp }]);
+						fs.utimesSync(file, endedMs / 1000, endedMs / 1000);
+						writeTask(cwd, {
+							task_id: taskId, parent_session_id: parentSessionId, name: title,
+							terminal_at: timestamp, status: "completed", final_response: "done",
+						});
+					}
+					assert.deepEqual(backfillOnce(paths, nowMs).errors, []);
+					const ledger = () => readEnded(paths);
+					const facts = ({ sessionId, parentSessionId, title, endedMs }) => [sessionId, parentSessionId, title, endedMs];
+					const expected = children.map((row) => facts({ ...row, sessionId: taskId }));
+					assert.deepEqual(ledger().filter((row) => row.sessionId === taskId).map(facts), expected);
+					fs.unlinkSync(path.join(paths.health.sessionsDir, BACKFILL_MARKER));
+					const repeated = backfillOnce(paths, nowMs);
+					assert.deepEqual(repeated.errors, []);
+					assert.equal(repeated.counts.written, 0);
+					assert.deepEqual(ledger().filter((row) => row.sessionId === taskId).map(facts), expected);
+					const history = buildEnded({ ended: ledger(), now: nowMs }).rows.filter((row) => row.sessionId === taskId);
+					assert.deepEqual(history.map((row) => [row.sessionId, row.parentSessionId, row.title, row.detailEndedMs]), expected);
+					const { port } = await ui.listen();
+					for (const row of history) {
+						const { status, body } = await getAt(port, `/api/session?id=${row.sessionId}&ended=${row.detailEndedMs}`);
+						assert.equal(status, 200);
+						assert.deepEqual(facts(body.session), facts(row));
 					}
 				} finally {
 					await ui.close();

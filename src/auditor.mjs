@@ -169,31 +169,46 @@ function sameAuditVersion(a, b) {
 	return b && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ino === b.ino && a.birthtimeMs === b.birthtimeMs;
 }
 
-function decisionVersions(paths) {
+function auditFileVersions(dir, suffix) {
 	const files = new Map();
-	for (const name of listDirSafe(paths.health.decisionsDir)) {
-		if (!name.endsWith(".jsonl")) continue;
-		const file = path.join(paths.health.decisionsDir, name);
+	for (const name of listDirSafe(dir)) {
+		if (!name.endsWith(suffix)) continue;
+		const file = path.join(dir, name);
 		const version = auditFileVersion(file);
 		if (version) files.set(file, version);
 	}
 	return files;
 }
 
-function launchAnalystModels(paths, investigations, loaded, selectedFps, before) {
+function launchAnalystModels(paths, investigations, loaded, selectedFps, auditSubjectIds, analystStart) {
 	const models = new Set(loaded.analystModels);
 	const fps = new Set(selectedFps);
-	if (!fps.size) return models;
 	const add = (model) => { if (typeof model === "string" && model) models.add(model); };
+	const matches = (subject) => {
+		if (!subject || !auditSubjectIds) return false;
+		const { sessionId, taskId, parentSessionId } = subject;
+		// A parent pointing at an unrelated task is not itself a subject match.
+		return auditSubjectIds.sessionIds.has(sessionId) || (parentSessionId
+			? auditSubjectIds.childTasksByParent.get(parentSessionId)?.has(taskId)
+			: auditSubjectIds.taskIds.has(taskId));
+	};
 	for (const fp of fps) {
 		const current = investigations.get(fp);
 		if (current?.id === fp) add(current.model);
 	}
+	// A new investigation can supply the subject for decision rows that carry only its fp.
+	for (const [file, version] of auditFileVersions(paths.health.investigationsDir, ".json")) {
+		if (sameAuditVersion(version, analystStart.investigations.get(file))) continue;
+		const current = readJsonSafe(file);
+		if (typeof current?.id !== "string" || !current.id || !matches(current.subject)) continue;
+		fps.add(current.id);
+		add(current.model);
+	}
 	// The daemon appends complete decision lines. Track file boundaries rather than
 	// comparing event timestamps: even a backdated append or a new day is covered.
-	for (const [file, version] of decisionVersions(paths)) {
-		const start = before.get(file);
-		if (start && sameAuditVersion(start, version)) continue;
+	for (const [file, version] of auditFileVersions(paths.health.decisionsDir, ".jsonl")) {
+		const start = analystStart.decisions.get(file);
+		if (sameAuditVersion(version, start)) continue;
 		const tail = new JsonlTail(file, { maxReadBytes: 64 * 1024 });
 		if (start && start.ino === version.ino && start.birthtimeMs === version.birthtimeMs && start.size < version.size) {
 			tail.offset = start.size;
@@ -202,7 +217,7 @@ function launchAnalystModels(paths, investigations, loaded, selectedFps, before)
 		do {
 			batch = tail.readNew();
 			for (const row of batch.entries) {
-				if (row?.event === "investigation" && row.status === "analyzing" && fps.has(row.fp)) add(row.model);
+				if (row?.event === "investigation" && row.status === "analyzing" && (fps.has(row.fp) || matches(row.subject))) add(row.model);
 			}
 		} while (batch.more);
 	}
@@ -337,7 +352,7 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		}
 	}
 
-	function launchPrepared(record, now, { loaded, selectedFps, full, warning, timelineSource }, changedVersions, decisionStart) {
+	function launchPrepared(record, now, { loaded, selectedFps, auditSubjectIds, full, warning, timelineSource }, changedVersions, analystStart) {
 		if (config.audit?.enabled !== true) return fail(record, "disabled", null, now);
 		if (!loaded?.found) return fail(record, "not-found", null, now);
 		if (readBudget(paths, now).count >= config.audit.perDay) return fail(record, "cap", null, now);
@@ -349,7 +364,7 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		}
 		// The resident index may have learned identities since the worker prepared the evidence.
 		const facts = auditModelFacts(index ? usageEntryOf(index, loaded.session ?? {}) : null, full);
-		const analystModels = launchAnalystModels(paths, investigations, loaded, selectedFps, decisionStart);
+		const analystModels = launchAnalystModels(paths, investigations, loaded, selectedFps, auditSubjectIds, analystStart);
 		const choice = resolveAuditModel(paths, config, { ...facts, analystModels });
 		if (choice?.blocked === "models-unknown") return fail(record, "models-unknown", null, now);
 		if (!choice) return fail(record, "no-model", null, now);
@@ -422,7 +437,10 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 				owner.on("exit", (code) => lostWorker(owner, `preparation worker exited (${code})`));
 			}
 			worker.ref();
-			pending.decisionStart = decisionVersions(paths);
+			pending.analystStart = {
+				decisions: auditFileVersions(paths.health.decisionsDir, ".jsonl"),
+				investigations: auditFileVersions(paths.health.investigationsDir, ".json"),
+			};
 			// The daemon passes its resident index; an auditor built without one reads the file here, never in the worker.
 			const source = index ?? readUsageIndex(paths.health.usageIndexFile);
 			worker.postMessage({ sessionId: record.sessionId, now, indexEntries: relatedUsageEntries(source, record.sessionId), indexFull: source?.full === true, bounds: {
@@ -441,11 +459,11 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		for (const record of recovering) resolveLaunching(record);
 		if (recovering.length || slotHeld()) return;
 		if (pending) {
-			const { record, result, error, changedVersions, decisionStart } = pending;
+			const { record, result, error, changedVersions, analystStart } = pending;
 			if (!result && error === undefined) return;
 			pending = undefined;
 			if (error !== undefined) return fail(record, "prepare-error", error, now);
-			return launchPrepared(record, now, result, changedVersions, decisionStart);
+			return launchPrepared(record, now, result, changedVersions, analystStart);
 		}
 		const next = [...records.values()].filter((record) => record.status === "queued").sort((a, b) => a.requestedMs - b.requestedMs)[0];
 		if (next) startPreparation(next, now);

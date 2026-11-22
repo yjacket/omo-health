@@ -139,14 +139,24 @@ export function locateEndedRows(paths, rows, { fs: fsImpl = fs } = {}) {
 	}
 }
 
-/** True when the sessionId appears in the ledger files of the last 30 days. */
-export function hasEnded(paths, sessionId, { nowMs = Date.now() } = {}) {
+/** Ended identity: a parent scopes the ID; without one, the recorded cwd scopes it. */
+export function endedKey(row) {
+	if (typeof row?.sessionId !== "string") return undefined;
+	const parent = row.parentSessionId || null;
+	return JSON.stringify([row.sessionId, parent, parent ? null : row.cwd || null]);
+}
+
+/** Look up a record's identity, or any occurrence of a bare session ID, in the last 30 days. */
+export function hasEnded(paths, record, { nowMs = Date.now() } = {}) {
+	const byId = typeof record === "string";
+	const key = byId ? record : endedKey(record);
+	if (key === undefined) return false;
 	// The cutoff selects files, not rows: the entire cutoff day's file
 	// participates in duplicate detection.
 	const cutoff = nowMs - DEDUPE_DAYS * DAY_MS;
 	const sinceDay = Number.isFinite(cutoff) ? dayOf(cutoff) : "";
 	for (const file of ledgerFiles(paths, sinceDay)) {
-		for (const row of streamFile(file)) if (row.sessionId === sessionId) return true;
+		for (const row of streamFile(file)) if ((byId ? row.sessionId : endedKey(row)) === key) return true;
 	}
 	return false;
 }
@@ -162,13 +172,13 @@ export function appendEnded(paths, record, options = {}) {
  * `appendEnded`; `location` is null when nothing was written.
  */
 export function appendEndedLocated(paths, record, { nowMs = Date.now() } = {}) {
-	if (hasEnded(paths, record.sessionId, { nowMs: Math.max(nowMs, Number(record.endedMs) || 0) })) return { appended: false, location: null };
+	if (hasEnded(paths, record, { nowMs: Math.max(nowMs, Number(record.endedMs) || 0) })) return { appended: false, location: null };
 	return writeEnded(paths, record);
 }
 
 /**
  * Append ends in input order with a shared disk scan. Backfill can also supply
- * its own window's recorded IDs; successful writes are added to that set.
+ * its own window's recorded keys; successful writes are added to that set.
  */
 export function appendEndedBatch(paths, records, { nowMs = Date.now(), recorded } = {}) {
 	const skipped = { appended: false, location: null };
@@ -177,12 +187,12 @@ export function appendEndedBatch(paths, records, { nowMs = Date.now(), recorded 
 	const pending = records.map((record) => {
 		let id;
 		try {
-			id = record.sessionId;
+			id = endedKey(record);
 			if (recorded?.has(id)) return { id, result: skipped };
 			const ms = Math.max(nowMs, Number(record.endedMs) || 0) - DEDUPE_DAYS * DAY_MS;
 			const cutoff = Number.isFinite(ms) ? dayOf(ms) : "";
 			if (earliest === undefined || cutoff < earliest) earliest = cutoff;
-			if (typeof id === "string") candidates.add(id);
+			if (id !== undefined) candidates.add(id);
 			return { record, id, cutoff };
 		} catch (error) {
 			return { id, result: { ...skipped, error } };
@@ -194,7 +204,7 @@ export function appendEndedBatch(paths, records, { nowMs = Date.now(), recorded 
 	for (const file of candidates.size ? ledgerFiles(paths, earliest) : []) {
 		const [, day] = FILE_RE.exec(path.basename(file));
 		for (const { line, offset, unterminated } of ledgerLines(file)) {
-			const id = parseRow(line)?.sessionId;
+			const id = endedKey(parseRow(line));
 			if (unterminated) {
 				tails.set(file, { offset, id });
 				if (candidates.has(id)) {
@@ -213,7 +223,7 @@ export function appendEndedBatch(paths, records, { nowMs = Date.now(), recorded 
 		for (const day of tailDays.get(id) ?? []) if (day >= cutoff) return skipped;
 		try {
 			let writtenId;
-			const written = writeEnded(paths, record, (line) => { writtenId = parseRow(line)?.sessionId; });
+			const written = writeEnded(paths, record, (line) => { writtenId = endedKey(parseRow(line)); });
 			recorded?.add(id);
 			const { file, offset, length } = written.location;
 			const day = FILE_RE.exec(path.basename(file))?.[1];
@@ -223,7 +233,7 @@ export function appendEndedBatch(paths, records, { nowMs = Date.now(), recorded 
 				// that merged line (not the old tail or the new row alone) is visible.
 				tails.delete(file);
 				tailDays.get(tail.id)?.delete(day);
-				writtenId = readLocatedRow({ file, offset: tail.offset, length: offset - tail.offset + length })?.sessionId;
+				writtenId = endedKey(readLocatedRow({ file, offset: tail.offset, length: offset - tail.offset + length }));
 			}
 			if (day && candidates.has(writtenId) && day > (newest.get(writtenId) ?? "")) newest.set(writtenId, day);
 			return written;

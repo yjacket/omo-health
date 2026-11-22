@@ -64,6 +64,27 @@ test("(IS-3) mainFile maps cold files by their headers, not a conflicting name",
 	assert.equal(locator.mainFile("unnamed-id"), undefined);
 });
 
+test("(IS-4) a main header scan resumes from its cursor without rereading candidates", (t) => {
+	const { paths, clock, locator } = setup(t);
+	const cap = 64 * 1024;
+	const first = writeMain(paths, "first");
+	fs.writeFileSync(first, `${'{"type":"session","id":"other"}'.padEnd(cap - 1)}\n`);
+	const review = path.join(path.dirname(first), "review.jsonl");
+	fs.writeFileSync(review, `${'{"type":"session","id":"review"}'.padEnd(cap - 1)}\n`);
+
+	assert.deepEqual(locator.findMainFile("review", null, { maxBytes: cap - 1 }),
+		{ file: undefined, pending: true, bytesRead: 0 });
+	assert.deepEqual(locator.findMainFile("review", null, { maxBytes: cap }),
+		{ file: undefined, pending: true, bytesRead: cap });
+	clock.advance(RESCAN + 1);
+	assert.deepEqual(locator.findMainFile("review", null, { maxBytes: cap }),
+		{ file: review, pending: false, bytesRead: cap });
+	assert.deepEqual(locator.findMainFile("other", null, { maxBytes: 0 }),
+		{ file: first, pending: false, bytesRead: 0 }, "results from the earlier call were retained");
+	assert.deepEqual(locator.findMainFile("first", null, { maxBytes: 0 }),
+		{ file: undefined, pending: false, bytesRead: 0 }, "a finished scan can conclusively rule out an id");
+});
+
 test("(plan 41) mainFile uses a saved custom path only while its first line matches", (t) => {
 	const { paths, root, clock, locator } = setup(t);
 	const id = "sess-review";

@@ -860,6 +860,50 @@ test("(IS-9 launch refresh) a changed investigation file joins prepared models a
 	assert.equal(h.budget(), undefined);
 });
 
+test("(IS-9 launch refresh) new descendant investigations exclude their analyst but unrelated ones do not", async () => {
+	const first = LANES.ultrabrain[0];
+	const next = LANES.architect[0];
+	const models = {};
+	for (const [kind, subject, source] of [
+		["unrelated", { sessionId: "other", taskId: "st_other", parentSessionId: "m1", toolCallId: "st_child" }, "both"],
+		["descendant session", { sessionId: "child" }, "both"],
+		["descendant task", { taskId: "st_child" }, "file"],
+		["descendant parent and task", { parentSessionId: "m1", taskId: "st_child" }, "both"],
+		["audited session decision", { sessionId: "m1" }, "decision"],
+	]) {
+		const h = harness();
+		h.config.analyst.lane = "deep-high";
+		appendEnded(h.paths, {
+			sessionId: "child", taskId: "st_child", parentSessionId: "m1", kind: "child",
+			startedMs: BASE - 180_000, endedMs: BASE - 90_000, outcome: "completed",
+		});
+		await prepareWithFrozenRecord(h, () => {
+			const fp = "late-investigation";
+			if (source !== "decision") {
+				createInvestigations(h).open({ id: fp, subject, ...(source === "file" ? { model: first } : {}) });
+			}
+			if (source !== "file") {
+				// The engine's analyzing row can name only the fp, not the subject.
+				appendDecision(h.paths, {
+					ts: new Date(BASE).toISOString(), event: "investigation", status: "analyzing", fp, model: first,
+					...(source === "decision" ? { subject } : {}),
+				});
+			}
+		});
+		assert.equal(h.record("m1").status, "running", kind);
+		assert.equal(h.runner.starts.length, 1, kind);
+		assert.equal(h.budget().count, 1, kind);
+		models[kind] = modelOf(h.runner.starts[0]);
+	}
+	assert.deepEqual(models, {
+		unrelated: first,
+		"descendant session": next,
+		"descendant task": next,
+		"descendant parent and task": next,
+		"audited session decision": next,
+	});
+});
+
 test("(IS-9) an unindexed append after preparation retries before selecting a reviewer", async (t) => {
 	const h = harness();
 	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));

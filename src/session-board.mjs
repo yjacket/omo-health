@@ -1,4 +1,5 @@
 import path from "node:path";
+import { endedKey } from "./session-ledger.mjs";
 import { listDirSafe, readTextSafe, statSafe } from "./util/fsx.mjs";
 import { redact, truncate } from "./util/text.mjs";
 import { toMs } from "./util/time.mjs";
@@ -269,14 +270,6 @@ function crashFor(world, host, sinceMs, nowMs) {
 	return undefined;
 }
 
-function flatten(rows, parentSessionId, out = new Map()) {
-	for (const row of rows ?? []) {
-		out.set(row.taskId, { row, parentSessionId });
-		flatten(row.children, row.sessionId, out);
-	}
-	return out;
-}
-
 function mainsOf(snapshot) {
 	const out = new Map();
 	for (const group of snapshot?.groups ?? []) for (const row of group.sessions ?? []) out.set(row.sessionId, { row, omoVersion: group.omoVersion ?? null });
@@ -292,8 +285,22 @@ export function detectEnded(prevSnapshot, snapshot, world, nowMs = world.now) {
 	const out = [];
 	const prevMains = mainsOf(prevSnapshot);
 	const curMains = mainsOf(snapshot);
-	const curChildren = new Map();
-	for (const { row } of curMains.values()) flatten(row.children, row.sessionId, curChildren);
+	const currentByTask = new Map();
+	const flatten = (mains, byTask) => {
+		const children = new Map();
+		const visit = (rows, parentSessionId, root) => {
+			for (const row of rows ?? []) {
+				const sessionId = row.sessionId || row.taskId;
+				const key = endedKey({ sessionId, parentSessionId, cwd: root.cwd });
+				children.set(key, { row, sessionId, parentSessionId, root });
+				if (byTask && row.sessionId) byTask.set(endedKey({ sessionId: row.taskId, parentSessionId, cwd: root.cwd }), row);
+				visit(row.children, row.sessionId, root);
+			}
+		};
+		for (const { row } of mains.values()) visit(row.children, row.sessionId, row);
+		return children;
+	};
+	const curChildren = flatten(curMains, currentByTask);
 	let releases;
 	const releaseOf = (...ids) => {
 		releases ??= recentReleases(world.paths);
@@ -343,20 +350,13 @@ export function detectEnded(prevSnapshot, snapshot, world, nowMs = world.now) {
 		});
 	}
 
-	const prevChildren = new Map();
-	const rootOf = new Map();
-	for (const [sessionId, { row }] of prevMains) {
-		const flat = flatten(row.children, sessionId);
-		for (const [taskId, item] of flat) {
-			prevChildren.set(taskId, item);
-			rootOf.set(taskId, sessionId);
-		}
-	}
-	for (const [taskId, { row, parentSessionId }] of prevChildren) {
+	for (const [key, { row, sessionId, parentSessionId, root }] of flatten(prevMains)) {
 		if (TERMINAL_STATUSES.has(row.status)) continue;
-		const current = curChildren.get(taskId)?.row;
+		// A running task-only child may acquire its session ID between snapshots.
+		const current = curChildren.get(key)?.row ?? (!row.sessionId ? currentByTask.get(key) : undefined);
 		if (current && !TERMINAL_STATUSES.has(current.status)) continue;
-		const task = (world.tasks ?? []).find((t) => t.taskId === taskId && t.parentSessionId === parentSessionId) ?? (world.tasks ?? []).find((t) => t.taskId === taskId);
+		const taskId = row.taskId;
+		const task = (world.tasks ?? []).find((t) => t.taskId === taskId && t.parentSessionId === parentSessionId);
 		const status = task?.status ?? current?.status;
 		let outcome;
 		let reason;
@@ -373,10 +373,10 @@ export function detectEnded(prevSnapshot, snapshot, world, nowMs = world.now) {
 		} else if (FAILED_STATUSES.has(status)) {
 			outcome = "failed";
 			reason = `작업이 오류로 끝났습니다${task?.errorMessage ? `: ${clean(task.errorMessage, 160)}` : "."}`;
-		} else if (mainOutcome.get(rootOf.get(taskId)) === "crash") {
+		} else if (mainOutcome.get(root.sessionId) === "crash") {
 			outcome = "crash";
 			reason = "부모 세션의 omo 호스트가 비정상 종료되었습니다.";
-		} else if (mainOutcome.has(rootOf.get(taskId)) && !TERMINAL_STATUSES.has(status)) {
+		} else if (mainOutcome.has(root.sessionId) && !TERMINAL_STATUSES.has(status)) {
 			outcome = "closed";
 			reason = "부모 세션이 끝나면서 작업도 함께 끝났습니다.";
 		} else {
@@ -385,12 +385,12 @@ export function detectEnded(prevSnapshot, snapshot, world, nowMs = world.now) {
 		}
 		out.push({
 			v: 1,
-			sessionId: row.sessionId ?? taskId,
+			sessionId,
 			kind: "child",
 			parentSessionId: parentSessionId ?? null,
 			taskId,
 			title: row.name,
-			cwd: task?.spawnCwd ?? null,
+			cwd: task?.spawnCwd ?? root.cwd ?? null,
 			terminal: null,
 			omoVersion: null,
 			startedMs: row.startedMs ?? null,
