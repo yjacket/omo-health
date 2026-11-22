@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { tmpDir } from "./helpers/fixtures.mjs";
-import { createRecordScanner, readUsage, usageTimeline } from "../src/collect/usage.mjs";
+import { addUsage, createRecordScanner, emptyUsage, modelsOfEntry, readUsage, usageOfEntry, usageTimeline } from "../src/collect/usage.mjs";
 
 const MiB = 1024 * 1024;
 const MIN = 60_000;
@@ -990,6 +990,140 @@ test("(gate 5) a 17 MiB duplicate message replacement is the JSON.parse total un
 	const child = childUsageTotal(file());
 	assert.equal(child.badLines, 0);
 	assert.equal(child.total, oracleTotals(file()).total);
+});
+
+const gate6Gap = " ".repeat(17 * MiB);
+const gate6Long = "r".repeat(65537);
+const gate6Message = { role: "assistant", provider: "p", model: "alpha", usage: gate5Usage() };
+
+function gate6Oracle(line) {
+	const entry = JSON.parse(line);
+	const expected = emptyUsage();
+	const hit = usageOfEntry(entry);
+	if (hit) addUsage(expected, hit);
+	const models = modelsOfEntry(entry);
+	for (const id of models.ids) expected.usedModels[id] = true;
+	expected.modelsIncomplete = models.incomplete;
+	return expected;
+}
+
+function assertLargeRecordParity(t, line, { capped = false } = {}) {
+	const { file } = setup(t);
+	const expected = gate6Oracle(line);
+	fs.writeFileSync(file(), `${line}\n`);
+	assert.ok(fs.statSync(file()).size > 16 * MiB);
+	if (!capped) {
+		assert.deepEqual(readUsage(file()).effective, expected, "readUsage");
+		assert.deepEqual(usageTimeline(file()).totals, expected, "usageTimeline");
+		return expected;
+	}
+	const source = new URL("../src/collect/usage.mjs", import.meta.url).href;
+	const script = `
+		const { readUsage, usageTimeline } = await import(process.argv[1]);
+		const file = process.argv[2];
+		if (process.argv[3] === "usageTimeline") {
+			console.log(JSON.stringify(usageTimeline(file).totals));
+		} else {
+			let state;
+			do { state = readUsage(file, state, { maxBytes: 5 * 1024 * 1024 }); } while (!state.done);
+			console.log(JSON.stringify(state.effective));
+		}
+	`;
+	for (const reader of ["readUsage", "usageTimeline"]) {
+		const child = spawnSync(process.execPath, [
+			"--max-old-space-size=96", "--max-semi-space-size=1", "--input-type=module", "-e", script, source, file(), reader,
+		], { encoding: "utf8" });
+		assert.equal(child.status, 0, `${reader}: ${child.stderr || child.error || child.signal}`);
+		assert.deepEqual(JSON.parse(child.stdout), expected, reader);
+	}
+	return expected;
+}
+
+test("(gate 6 row 5) ignored usage.details objects fit under a 96 MiB heap", (t) => {
+	const message = JSON.stringify(gate6Message);
+	const line = `{${gate6Gap}"type":"message","message":${message.slice(0, -2)},"details":[${'{},'.repeat(1600000)}{}]}}}`;
+	assertLargeRecordParity(t, line, { capped: true });
+});
+
+test("(gate 6 row 6) ignored usage.details text blocks do not discard usage", (t) => {
+	const details = Array(1088).fill({ text: "z".repeat(32768) });
+	const line = JSON.stringify({ type: "message", message: { ...gate6Message, usage: { ...gate6Message.usage, details } } });
+	assertLargeRecordParity(t, line, { capped: true });
+});
+
+test("(gate 6 row 7) ignored nesting at the old depth limit does not discard usage", (t) => {
+	const line = `{${gate6Gap}"type":"message","message":${JSON.stringify(gate6Message)},"ignored":${"[".repeat(1024)}0${"]".repeat(1024)}}`;
+	assertLargeRecordParity(t, line);
+});
+
+test("(gate 6 row 8) an overlong last role replaces assistant", (t) => {
+	const line = `{${gate6Gap}"type":"message","message":${JSON.stringify(gate6Message).slice(0, -1)},"role":"${gate6Long}"}}`;
+	assert.equal(assertLargeRecordParity(t, line).total, 0);
+});
+
+test("(gate 6 row 9) a tool result's long provider satisfies its presence check", (t) => {
+	const message = { role: "toolResult", provider: gate6Long, usage: gate6Message.usage };
+	const line = `{${gate6Gap}"type":"message","message":${JSON.stringify(message)}}`;
+	assert.equal(assertLargeRecordParity(t, line).modelsIncomplete, false);
+});
+
+test("(gate 6 row 10) a compaction's long model satisfies its presence check", (t) => {
+	const line = `{${gate6Gap}"type":"compaction","model":"${gate6Long}","usage":${JSON.stringify(gate6Message.usage)}}`;
+	assert.equal(assertLargeRecordParity(t, line).modelsIncomplete, false);
+});
+
+test("(gate 6) a selected array identity preserves billing coercion", (t) => {
+	const line = `{${gate6Gap}"type":"message","message":${JSON.stringify({ ...gate6Message, provider: ["p"] })}}`;
+	assert.deepEqual(assertLargeRecordParity(t, line).models, { "p/alpha": { tokens: 13, cost: 0.125 } });
+});
+
+test("(gate 6) two million ignored levels validate under a 96 MiB heap", (t) => {
+	const levels = 1000000;
+	const line = `{${gate6Gap}"type":"message","message":${JSON.stringify(gate6Message)},"ignored":${'[{"x":'.repeat(levels)}0${"}]".repeat(levels)}}`;
+	assertLargeRecordParity(t, line, { capped: true });
+
+	const { file } = setup(t);
+	fs.writeFileSync(file(), `${line.slice(0, -1)}!}\n`);
+	for (const totals of [readUsage(file()).effective, usageTimeline(file()).totals]) {
+		assert.equal(totals.total, 0);
+		assert.deepEqual(totals.diagnostics, { badLines: 1, skippedLines: 0 });
+	}
+});
+
+test("(gate 6) a 2 MiB counter rounds like JSON.parse even when a distant digit breaks a tie", (t) => {
+	const midpoint = "1.00000000000000011102230246251565404236316680908203125";
+	const literal = `${midpoint}${"0".repeat(2 * MiB - midpoint.length - 1)}1`;
+	const line = `{${gate6Gap}"type":"usage","provider":"p","model":"alpha","usage":{"input":${literal}}}`;
+	assert.equal(assertLargeRecordParity(t, line).input, 1 + Number.EPSILON);
+});
+
+test("(gate 6) an escaped duplicate role is compared after unescaping", (t) => {
+	const line = `{${gate6Gap}"type":"message","message":${JSON.stringify(gate6Message).slice(0, -1)},"\\u0072ole":"user"}}`;
+	assert.equal(assertLargeRecordParity(t, line).total, 0);
+});
+
+test("(gate 6) oversized non-string identities bill as too long without implying a lost model id", (t) => {
+	const { file } = setup(t);
+	const message = { ...gate6Message, provider: [gate6Long] };
+	fs.writeFileSync(file(), `{${gate6Gap}"type":"message","message":${JSON.stringify(message)}}\n`);
+	const got = readUsage(file()).effective;
+	assert.deepEqual(got.models, { "(model id too long)/alpha": { tokens: 13, cost: 0.125 } });
+	assert.deepEqual(got.usedModels, {});
+	assert.equal(got.modelsIncomplete, false);
+});
+
+test("(gate 6) only a winning oversized non-number usage leaf skips usage", (t) => {
+	const { file } = setup(t);
+	const prefix = `{${gate6Gap}"type":"usage","provider":"p","model":"alpha","usage":{"output":2,"input":"${gate6Long}"`;
+	for (const [suffix, skipped, total] of [["}}\n", 1, 0], [',"input":7}}\n', 0, 9], ["}}", 1, 0]]) {
+		fs.writeFileSync(file(), prefix + suffix);
+		for (const got of [readUsage(file()).effective, usageTimeline(file()).totals]) {
+			assert.equal(got.total, total);
+			assert.deepEqual(got.diagnostics, { badLines: 0, skippedLines: skipped });
+			assert.deepEqual(got.usedModels, { "p/alpha": true });
+			assert.equal(got.modelsIncomplete, false);
+		}
+	}
 });
 
 test("returns null for a missing file", (t) => {
