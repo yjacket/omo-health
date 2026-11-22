@@ -299,6 +299,7 @@ for (const [complete, restart] of [[false, false], [false, true], [true, true]])
 		}));
 		const h = harness({ entries });
 		t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+		appendDecision(h.paths, { ts: new Date(BASE - 3_600_000).toISOString(), event: "config", result: "startup", thresholdsHash: detectorThresholdsHash(h.config) });
 		const auditor = h.auditor();
 		h.request("m1");
 		await h.prepare(auditor);

@@ -9,6 +9,8 @@ import path from "node:path";
 import { after, before, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { createAuditor, readAuditState, requestAudit } from "../src/auditor.mjs";
+import { createSessionFileLocator } from "../src/collect/session-files.mjs";
+import { senpiTaskStoreDir } from "../src/collect/tasks.mjs";
 import { loadConfig } from "../src/config.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 import { emptyUsage } from "../src/collect/usage.mjs";
@@ -19,6 +21,7 @@ import { createDetailWorker, createSessionDetail, createStartAudit } from "../sr
 import { buildEnded, daemonStatus, loadDaemonInputs, uiState } from "../src/ui/model.mjs";
 import { createUiServer } from "../src/ui/server.mjs";
 import { createUsageIndex, USAGE_INDEX_VERSION } from "../src/usage-index.mjs";
+import { createUsageTracker } from "../src/usage-tracker.mjs";
 import { expectedSelector } from "./helpers/ended-selector.mjs";
 import { appendJsonl, writeJsonl, writeTask } from "./helpers/fixtures.mjs";
 
@@ -219,14 +222,13 @@ describe("ui server", { timeout: 20_000 }, () => {
 			assert.deepEqual(res.body, STATE);
 		});
 
-		it("IS-4 serves live and ended state without opening session transcripts", async (t) => {
+		it("IS-4 serves live and ended state without touching session stores", async (t) => {
 			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omoh-ui-state-index-"));
 			const env = { USERPROFILE: dir, OMO_HEALTH_HOME: path.join(dir, "health") };
 			const paths = resolvePaths(env);
 			const nowMs = Date.parse("2026-11-22T12:00:00.000Z");
 			const now = () => nowMs;
 			const index = createUsageIndex({ file: paths.health.usageIndexFile, clock: { now } });
-			const transcriptPaths = new Set();
 			const ended = new Map();
 			const liveId = "s_state_live";
 			const canonicalPath = (file) => {
@@ -241,12 +243,26 @@ describe("ui server", { timeout: 20_000 }, () => {
 					{ type: "session", id, cwd: dir },
 					{ type: "message", message: { role: "assistant", provider: "anthropic", model: "claude-used", usage: { input: total }, stopReason: "stop" } },
 				]);
-				transcriptPaths.add(canonicalPath(file));
 				index.update(id, file, { kind: "main" });
 				if (id === liveId) continue;
 				appendEnded(paths, { sessionId: id, kind: "main", cwd: dir, startedMs: nowMs - 1_000, endedMs: nowMs, outcome: "answered" }, { nowMs });
 				ended.set(id, total);
 			}
+			const taskId = "st_state_child";
+			const store = senpiTaskStoreDir(dir, paths.agentDir);
+			const childDir = path.join(store, "children", taskId, "sessions", taskId);
+			const first = path.join(childDir, "2026-11-22T11-59-59-000Z_child-one.jsonl");
+			const second = path.join(childDir, "2026-11-22T12-00-00-000Z_child-two.jsonl");
+			writeJsonl(first, [
+				{ type: "session", id: "child-one", cwd: dir },
+				{ type: "message", message: { role: "assistant", provider: "anthropic", model: "claude-used", usage: { input: 55 }, stopReason: "stop" } },
+			]);
+			const row = { sessionId: taskId, taskId, kind: "child", cwd: dir, startedMs: nowMs - 1_000, endedMs: nowMs, outcome: "answered" };
+			appendEnded(paths, row, { nowMs });
+			ended.set(taskId, 55);
+			const tracker = createUsageTracker({ paths, index, locator: createSessionFileLocator({ paths, clock: { now } }), clock: { now } });
+			tracker.queueLedger([row]);
+			tracker.tick();
 			index.save();
 			fs.mkdirSync(path.dirname(paths.health.sessionsSnapshotFile), { recursive: true });
 			fs.writeFileSync(paths.health.sessionsSnapshotFile, JSON.stringify({
@@ -257,27 +273,44 @@ describe("ui server", { timeout: 20_000 }, () => {
 			try {
 				const { port } = await ui.listen();
 				const transcriptOpens = [];
+				const storeAccesses = [];
+				const roots = [paths.sessionsDir, path.join(store, "children")].map(canonicalPath);
+				let servingState = false;
 				for (const [target, methods] of [
-					[fs, ["openSync", "readFileSync", "createReadStream", "open", "readFile"]],
-					[fs.promises, ["open", "readFile"]],
+					[fs, ["openSync", "readFileSync", "createReadStream", "open", "readFile", "opendirSync", "readdirSync", "opendir", "readdir", "statSync"]],
+					[fs.promises, ["open", "readFile", "opendir", "readdir", "stat"]],
 				]) {
 					for (const method of methods) {
 						const original = target[method];
 						t.mock.method(target, method, function (file, ...args) {
 							const filename = file instanceof URL ? fileURLToPath(file) : Buffer.isBuffer(file) ? file.toString() : file;
-							if (typeof filename === "string" && transcriptPaths.has(canonicalPath(filename))) {
-								transcriptOpens.push({ method, file: filename });
+							if (servingState && typeof filename === "string") {
+								const resolved = canonicalPath(filename);
+								if (roots.some((item) => resolved === item || resolved.startsWith(item + path.sep))) {
+									const accesses = /^(open|readFile|createReadStream)(Sync)?$/.test(method) ? transcriptOpens : storeAccesses;
+									accesses.push({ method, file: filename });
+								}
 							}
 							return original.call(this, file, ...args);
 						});
 					}
 				}
 				syncBuiltinESMExports();
-				const { status, body } = await getAt(port, "/api/state");
-				assert.deepEqual(transcriptOpens, [], "/api/state opened a session transcript on the server thread");
-				assert.equal(status, 200);
-				assert.deepEqual(body.sessions.groups[0].sessions.map((row) => [row.sessionId, row.tokens?.total]), [[liveId, 11]]);
-				assert.deepEqual(new Map(body.ended.rows.map((row) => [row.sessionId, row.tokens?.total])), ended);
+				const checkState = async () => {
+					servingState = true;
+					const { status, body } = await getAt(port, "/api/state");
+					servingState = false;
+					assert.equal(status, 200);
+					assert.deepEqual(body.sessions.groups[0].sessions.map((row) => [row.sessionId, row.tokens?.total]), [[liveId, 11]]);
+					assert.deepEqual(new Map(body.ended.rows.map((row) => [row.sessionId, row.tokens?.total])), ended);
+					assert.deepEqual(transcriptOpens, [], "/api/state opened a session transcript on the server thread");
+					assert.deepEqual(storeAccesses, [], "/api/state accessed a session directory or transcript on the server thread");
+				};
+				await checkState();
+				writeJsonl(second, [{ type: "session", id: "child-two", cwd: dir }]);
+				tracker.tick();
+				ended.set(taskId, undefined);
+				await checkState();
 			} finally {
 				t.mock.reset();
 				syncBuiltinESMExports();

@@ -1254,7 +1254,11 @@ test("(IS-3) deleted task-only usage survives zero candidates, not a competing f
 	assert.deepEqual([saved.state, saved.complete, saved.gone, compactUsage(saved)?.total, fresh(saved)], ["ok", true, true, 10, false]);
 
 	writeText(fileOf("replacement.jsonl"), `${line()}\n`);
-	assert.equal(compactUsage(saved), null, "a different candidate cannot inherit the deleted file's total");
+	// Publish the daemon's revocation before a replacement can be counted.
+	index.markMissing(id, {}, { withdraw: true });
+	index.save();
+	assert.equal(compactUsage(readUsageIndex(path.join(dir, "usage.json")).get(id)), null,
+		"a different candidate cannot inherit the deleted file's total");
 });
 
 test("markMissing keeps a complete entry's published total and marks it gone, while a never-found row stays missing", (t) => {

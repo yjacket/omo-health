@@ -252,7 +252,9 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 					}
 				}
 				if (!matches || budget <= 0) continue;
-				budget = Math.max(0, budget - index.update(session.id, session.file, metaOf(session), { maxBytes: budget }));
+				budget = Math.max(0, budget - index.update(session.id, session.file, metaOf(session), {
+					maxBytes: budget, ownershipUnique: session.id === session.taskId ? true : null,
+				}));
 			}
 			// Ownership checks cost no transcript bytes and must run even when live
 			// reads exhaust the budget. A different path or a veto invalidates the old claim.
@@ -261,13 +263,14 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 				const { file } = locate(row, liveSessions, cwdOf, 0);
 				const entry = index.get(id);
 				const withdraw = file === null || (file !== undefined && pathKey(file) !== pathKey(entry?.file));
-				if (entry?.state === "ok" && (withdraw || (file === undefined && !entry.gone))) {
+				if (entry?.state === "ok" && (withdraw || (file === undefined && (!entry.gone || entry.ownershipUnique !== true)))) {
 					index.markMissing(id, metaOf(row), { withdraw });
 					ownershipChanged = true;
 				}
 				if (file) {
 					checkedFiles.set(id, file);
 					if (!isFresh(index.get(id))) queue.set(id, row);
+					else if (index.recordOwnership(id, true)) ownershipChanged = true;
 				} else {
 					queue.delete(id);
 				}
@@ -285,15 +288,28 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 					queue.delete(id);
 					continue;
 				}
-				if (row.kind === "child" && !ledgerUsageSessionId(row)) taskOnlyChecks.set(id, row);
+				const taskOnly = row.kind === "child" && !ledgerUsageSessionId(row);
+				if (taskOnly) taskOnlyChecks.set(id, row);
 				if (budget <= 0) break;
-				budget = Math.max(0, budget - index.update(id, rowFile, metaOf(row), { maxBytes: budget }));
+				budget = Math.max(0, budget - index.update(id, rowFile, metaOf(row), {
+					maxBytes: budget, ownershipUnique: taskOnly ? true : null,
+				}));
 				const entry = index.get(id);
 				// Missing/gone files are retried by queueLedger, not every tick.
 				if (entry.readError === true) continue;
 				if (entry.state === "missing" || entry.state === "full" || entry.gone === true ||
 					(entry.state === "ok" && entry.complete === true && entry.evaluatedTo === entry.size)) {
 					queue.delete(id);
+				}
+			}
+			// An exact-session child can also be the alias of a task-only history row.
+			// Refresh only aliases history can use; exact-ID rows need no directory check.
+			if (fallbackRows.size > 0) {
+				const taskIds = new Set([...fallbackRows.values()].map((row) => row.taskId));
+				for (const entry of index.values()) {
+					if (entry.kind === "child" && entry.state === "ok" && !isTaskOnlyEntry(entry) && taskIds.has(entry.taskId)) {
+						if (index.checkAliasOwnership(entry.id)) ownershipChanged = true;
+					}
 				}
 			}
 			const board = boardTaskLinks(world, nowMs());

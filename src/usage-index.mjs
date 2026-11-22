@@ -176,7 +176,7 @@ function canShowTaskOnlyUsage(entry) {
 export function compactUsage(entry) {
 	if (!isObject(entry) || entry.state !== "ok" || entry.complete !== true || entry.readError === true) return null;
 	if (!isObject(entry.published)) return null;
-	if (isTaskOnlyEntry(entry) && !canShowTaskOnlyUsage(entry)) return null;
+	if (isTaskOnlyEntry(entry) && entry.ownershipUnique !== true) return null;
 	return ownerTotals(entry.published);
 }
 
@@ -285,6 +285,7 @@ export function treeTotals(entries, knownRows = []) {
 function persisted(entry) {
 	const out = {};
 	for (const key of PERSISTED_KEYS) out[key] = entry[key];
+	if (typeof entry.ownershipUnique === "boolean") out.ownershipUnique = entry.ownershipUnique;
 	// Non-finite leaves are tagged by the serializer, not by copying the trees here:
 	// a 105k-model entry copied into a second tree of the same size aborts at 96 MiB.
 	return out;
@@ -377,7 +378,10 @@ const TREE_KEYS = [...COUNTER_KEYS, "costUnknown", "modelsIncomplete", "models",
 /** Validate and decode a whole row atomically; -1 means recount, never publish. */
 function validateEntry(entry, remaining) {
 	if (entry.state === "ok") for (const key of MEMORY_ONLY_KEYS) delete entry[key];
-	if (!hasShape(entry, PERSISTED_KEYS)) return -1;
+	const hasOwnership = Object.hasOwn(entry, "ownershipUnique");
+	if (hasOwnership && typeof entry.ownershipUnique !== "boolean") return -1;
+	if (Object.keys(entry).length !== PERSISTED_KEYS.length + Number(hasOwnership) ||
+		!PERSISTED_KEYS.every((key) => Object.hasOwn(entry, key))) return -1;
 	if (typeof entry.id !== "string" || !META_KEYS.every((key) => nullableString(entry[key]))) return -1;
 	if (!Number.isFinite(entry.checkedMs) || typeof entry.complete !== "boolean" || typeof entry.gone !== "boolean") return -1;
 	if (entry.state === "missing") {
@@ -453,6 +457,11 @@ function* indexChunks(entries, weights, full) {
 
 const isId = (value) => typeof value === "string" && value.length > 0;
 
+/** The dashboard can look up aliases using only the daemon's published ownership. */
+export function publishedUsageView(usage) {
+	return { get: (id) => usage.get(id), values: () => usage.values(), full: usage.full, publishedOwnership: true };
+}
+
 /** Session ids are authoritative; a task id is only a lookup for a sessionless row. */
 export function usageEntryFor(usage, sessionId, taskId) {
 	if (isId(sessionId)) return usage?.get(sessionId);
@@ -465,7 +474,8 @@ export function usageEntryFor(usage, sessionId, taskId) {
 	}
 	// An exact ID can still identify its file where a task-only alias cannot.
 	if (match?.kind === "child" && match.state === "ok" && match.file) {
-		const owned = isTaskOnlyEntry(match) ? canShowTaskOnlyUsage(match) : isSoleChildSessionFile(match.file);
+		const owned = usage.publishedOwnership ? match.ownershipUnique === true
+			: isTaskOnlyEntry(match) ? canShowTaskOnlyUsage(match) : isSoleChildSessionFile(match.file);
 		if (!owned) return undefined;
 	}
 	return match;
@@ -529,6 +539,7 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 
 	const dropCursor = (entry) => {
 		Object.assign(entry, newEntry(entry.id), persistedMeta(entry), { checkedMs: entry.checkedMs });
+		delete entry.ownershipUnique;
 		entry.partial = undefined;
 		entry.scanOffset = undefined;
 		delete entry.pending;
@@ -546,12 +557,25 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			return usageEntryFor(entries, sessionId, taskId) !== undefined;
 		},
 		values: () => entries.values(),
+		recordOwnership(id, unique) {
+			const entry = entries.get(id);
+			if (!entry || entry.ownershipUnique === unique) return false;
+			const { slots } = weights.get(id);
+			unweigh(id);
+			entry.ownershipUnique = unique;
+			admit(entry, slots);
+			return true;
+		},
+		checkAliasOwnership(id) {
+			const entry = entries.get(id);
+			return this.recordOwnership(id, isSoleChildSessionFile(entry?.file));
+		},
 		/**
 		 * Read up to `maxBytes` more bytes of `file`. Returns bytesRead; a missing
 		 * file marks the entry missing (or, after a complete read, gone) and a read
 		 * error keeps the saved totals while `readError` hides them from the board.
 		 */
-		update(id, path, meta = {}, { maxBytes = Infinity } = {}) {
+		update(id, path, meta = {}, { maxBytes = Infinity, ownershipUnique } = {}) {
 			const stored = entries.get(id);
 			const entry = stored && Object.hasOwn(stored, "file") ? stored : newEntry(id);
 			if (stored && entry !== stored) {
@@ -563,6 +587,9 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			const sameFile = entry.file && pathKey(entry.file) === pathKey(path);
 			entry.file = path;
 			applyMeta(entry, meta);
+			if (entry.kind === "child" && entry.taskId && ownershipUnique !== null) {
+				entry.ownershipUnique = ownershipUnique ?? isSoleChildSessionFile(path);
+			} else if (!sameFile || entry.kind !== "child" || !entry.taskId) delete entry.ownershipUnique;
 			entry.checkedMs = clock.now();
 			// Keep any last published total for a missing file, but never resume or compare a malformed cursor.
 			const canResume = !isTaskOnlyEntry(entry) || (sameFile && !entry.gone);
@@ -634,11 +661,15 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			const deleted = !taskOnly || (!withdraw && entry.file && soleChildSessionFile(dirname(entry.file)) === undefined);
 			if (entry.state === "ok" && entry.complete === true && deleted) {
 				entry.gone = true;
+				// Zero candidates leaves a previously counted file's ownership unchallenged.
+				if (taskOnly) entry.ownershipUnique = true;
+				else delete entry.ownershipUnique;
 			} else {
 				dropCursor(entry);
 				if (taskOnly) {
 					entry.file = null;
 					entry.readError = false;
+					entry.ownershipUnique = false;
 				}
 			}
 			entry.checkedMs = clock.now();

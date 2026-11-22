@@ -98,6 +98,8 @@ function emptyRecord(over = {}) {
 	};
 }
 
+const defaultConfigDecision = { ms: T0, thresholdsHash: detectorThresholdsHash(DEFAULT_CONFIG) };
+
 function oversizedTurnBundle(t, timestamp, trailingNewline) {
 	const dir = tmpDir("omoh-audit-large-turn-");
 	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -289,7 +291,7 @@ test("(IS-8) the audit bundle and prompt distinguish incomplete statistics from 
 		}),
 		largeRecords: 1,
 	};
-	const bundle = auditBundle(emptyRecord(), timeline, { config: DEFAULT_CONFIG, now: T0 });
+	const bundle = auditBundle(emptyRecord(), timeline, { config: DEFAULT_CONFIG, now: T0, configDecisions: [defaultConfigDecision] });
 	const { tokens } = JSON.parse(JSON.stringify(bundle));
 	assert.equal(tokens.largeRecords, 1);
 	assert.equal(tokens.images.incomplete, true);
@@ -576,7 +578,7 @@ test("verdict and action reasons reach the document only as recognized codes; fr
 
 /* ---------------------------------------------------------------- coverage */
 
-test("plan64: fast turns with a cache storm suggest D4, not D5", () => {
+function fastStormFile() {
 	const file = path.join(tmpDir("omoh-audit-fast-storm-"), "session.jsonl");
 	const { cacheStormWrite } = DEFAULT_CONFIG.tokens;
 	writeJsonl(file, [3 * cacheStormWrite, 0, 0].map((cacheRead, i) => {
@@ -590,19 +592,47 @@ test("plan64: fast turns with a cache storm suggest D4, not D5", () => {
 			},
 		};
 	}));
-	const bundle = auditBundle(emptyRecord(), usageTimeline(file, DEFAULT_CONFIG.tokens), { config: DEFAULT_CONFIG, now: T0 + HOUR });
+	return file;
+}
+
+test("plan64: fast turns with a cache storm suggest D4, not D5", () => {
+	const file = fastStormFile();
+	const bundle = auditBundle(emptyRecord(), usageTimeline(file, DEFAULT_CONFIG.tokens), {
+		config: DEFAULT_CONFIG, now: T0 + HOUR, configDecisions: [defaultConfigDecision],
+	});
 	assert.equal(bundle.tokens.cache.stormTurns, 2);
 	assert.ok(bundle.tokens.cache.hitRate >= 0.25, "low hit rate must not independently suggest D4");
 	assert.equal(bundle.tokens.errors.count, 0);
 	const suggestion = auditDocument(bundle).split("\n").find((line) => line.startsWith("Also write one check"));
 	assert.match(suggestion, /\(D4(?:,|\))/);
 	assert.doesNotMatch(suggestion, /\bD5\b/);
+	assert.deepEqual(bundle.requiredDetectors, ["D4"]);
+});
+
+test("IS-8: lowering the cache-storm cutoff after a session does not imply a miss", () => {
+	const file = fastStormFile();
+	const original = structuredClone(DEFAULT_CONFIG);
+	original.tokens.cacheStormWrite *= 2;
+	assert.equal(usageTimeline(file, original.tokens).cache.stormTurns, 0);
+	const now = T0 + 2 * HOUR;
+	const bundle = auditBundle(emptyRecord(), usageTimeline(file, DEFAULT_CONFIG.tokens), {
+		config: DEFAULT_CONFIG, now, configDecisions: [
+			{ ms: T0 - 1, thresholdsHash: detectorThresholdsHash(original) },
+			{ ...defaultConfigDecision, ms: T0 + HOUR + 1 },
+		],
+	});
+	assert.equal(bundle.tokens.cache.stormTurns, 2);
+	assert.deepEqual(bundle.requiredDetectors, []);
+	assert.equal(bundle.inferenceThresholdsKnown.D4, false);
+	const document = auditDocument(bundle);
+	assert.doesNotMatch(document, /^Also write one check.*\bD4\b/m);
+	assert.match(document, /When inferenceThresholdsKnown marks a detector false, the thresholds in effect during the session are unknown; do not infer a miss for that detector\./);
 });
 
 test("plan65: the bundle requires both fired and aggregate-suggested detectors", () => {
 	const record = emptyRecord({ health: { findings: [finding(1, 1, { detector: "D6" })] } });
 	const timeline = timelineShell({ cache: { hitRate: 0.75, stormTurns: 2 } });
-	const bundle = auditBundle(record, timeline, { config: DEFAULT_CONFIG, now: T0 + HOUR });
+	const bundle = auditBundle(record, timeline, { config: DEFAULT_CONFIG, now: T0 + HOUR, configDecisions: [defaultConfigDecision] });
 	assert.deepEqual(audit.firedDetectors(bundle), ["D6"]);
 	assert.match(auditDocument(bundle), /^Also write one check for each detector whose conditions the aggregates suggest should have fired \(D4\),/m);
 	assert.deepEqual(bundle.requiredDetectors, ["D6", "D4"]);

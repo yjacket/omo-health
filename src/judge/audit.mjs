@@ -205,6 +205,12 @@ const FINDING_CUTOFFS = Object.freeze({
 	"D25:omo-login-aging": ["omoLogin.warnBeforeMs", "omoLogin.warnAfterMs"],
 });
 
+// Each aggregate suggestion cites a detector rule and the cutoffs it relies on.
+const INFERENCE_CUTOFFS = {
+	D4: { kind: "cache-storm", keys: ["tokens.cacheStormWrite", "tokens.cacheStormReadFrac"] },
+	D10: { kind: "error-storm", keys: ["loops.errorStormCount", "loops.errorStormWindowMs"] },
+};
+
 const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 const textOf = (value) => (typeof value === "string" ? redact(value) : null);
 const numOf = (value) => (typeof value === "number" && Number.isFinite(value) ? value : null);
@@ -520,7 +526,18 @@ export function auditBundle(record, timeline, { config, now, configDecisions = [
 		messages: messagesSkipped > 0 || descendantsSkipped > 0,
 		investigations: false,
 	};
-	const continuousSinceMs = thresholdsContinuousSince([...(record?.configDecisions ?? []), ...configDecisions], detectorThresholdsHash(config));
+	const decisions = [...(record?.configDecisions ?? []), ...configDecisions];
+	const continuousSinceMs = thresholdsContinuousSince(
+		Number.isFinite(now) ? decisions.filter((row) => row?.ms <= now) : decisions,
+		detectorThresholdsHash(config),
+	);
+	const continuousFromStart = Number.isFinite(now) && Number.isFinite(session.startedMs) &&
+		session.startedMs <= now && session.startedMs >= continuousSinceMs;
+	const inferenceThresholdsKnown = Object.fromEntries(Object.entries(INFERENCE_CUTOFFS).map(([detector, { kind, keys }]) => {
+		const cutoffs = FINDING_CUTOFFS[`${detector}:${kind}`];
+		return [detector, continuousFromStart && keys.every((key) => cutoffs?.includes(key)) &&
+			findingThresholds(config, detector, kind) !== undefined];
+	}));
 	const allFindings = findingsOf(health.findings, continuousSinceMs, config);
 	// Coverage is judged on every finding, before any cut: an answer cannot be
 	// required to cover more detectors than it has checks.
@@ -570,6 +587,7 @@ export function auditBundle(record, timeline, { config, now, configDecisions = [
 		},
 		checks_omo_health_runs: DETECTOR_CHECKS,
 		thresholds: { analyst: { actConfidence: numOf(config?.analyst?.actConfidence) } },
+		inferenceThresholdsKnown,
 		coverage: { infoFindings: record?.coverage?.infoFindings === true },
 		truncated,
 		question: AUDIT_QUESTION,
@@ -588,8 +606,6 @@ export function auditBundle(record, timeline, { config, now, configDecisions = [
 		if (sizeOf(bundle) > BUNDLE_MAX_CHARS) throw new Error("evidence-too-large");
 	}
 	assertBundleText(bundle);
-	// `now` is accepted so callers and tests use the same clock seam as the rest of the record path.
-	void now;
 	return bundle;
 }
 
@@ -615,10 +631,11 @@ export function hasDetectorCoverage(checks, required, findingRefs) {
 
 function suggestedDetectors(bundle) {
 	const tokens = bundle.tokens ?? {};
+	const known = bundle.inferenceThresholdsKnown;
 	const out = [];
-	if ((tokens.cache?.stormTurns ?? 0) > 0 || (tokens.cache?.hitRate !== null && tokens.cache?.hitRate < 0.25) || (tokens.errors?.count ?? 0) > 0) out.push("D4");
-	if ((tokens.tools?.rows ?? []).some((tool) => (tool.errors ?? 0) > 0)) out.push("D10");
-	return [...new Set(out)];
+	if (known?.D4 === true && ((tokens.cache?.stormTurns ?? 0) > 0 || (tokens.cache?.hitRate !== null && tokens.cache?.hitRate < 0.25) || (tokens.errors?.count ?? 0) > 0)) out.push("D4");
+	if (known?.D10 === true && (tokens.tools?.rows ?? []).some((tool) => (tool.errors ?? 0) > 0)) out.push("D10");
+	return out;
 }
 
 /** The English instruction document around the bundle, with the bundle JSON appended as data. */
@@ -633,6 +650,7 @@ export function auditDocument(bundle) {
 		"Write your free text in Korean, for the machine owner.",
 		"Judge every record against its structured facts and any applicable thresholds: severity, metrics, the actions taken and the analyst's verdict with its confidence. A missing finding alone is not a miss, and a high count alone is not waste; answer `unclear` when the data cannot decide.",
 		"When a finding has thresholdsKnown: false, do not judge it as exaggerated by threshold. Do not apply current thresholds or thresholds from another finding to it.",
+		"When inferenceThresholdsKnown marks a detector false, the thresholds in effect during the session are unknown; do not infer a miss for that detector.",
 		"When coverage.infoFindings is false, info findings were not being recorded before the session started, so their absence is not a miss.",
 		"Treat incomplete statistics as unknown, not zero.",
 		`Fired detectors: ${fired.length ? fired.join(", ") : "none"}. Write at least one check per fired detector. Set item to its detector ID or one of its finding refs.`,

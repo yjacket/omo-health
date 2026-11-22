@@ -54,15 +54,18 @@ function fixture(t) {
 			},
 		});
 	}
-	function finding() {
+	function bundle(timeline = null) {
 		appendEnded(paths, { sessionId, kind: "main", startedMs: T0, endedMs: now }, { nowMs: now });
 		const record = loadSessionRecord({ paths, id: sessionId, now, auditRetention: true });
-		const bundle = auditBundle(record, null, { config: config(), now });
-		assert.equal(bundle.omo_health_record.findings.length, 1);
-		return bundle.omo_health_record.findings[0];
+		return auditBundle(record, timeline, { config: config(), now });
+	}
+	function finding() {
+		const { findings } = bundle().omo_health_record;
+		assert.equal(findings.length, 1);
+		return findings[0];
 	}
 	const hashes = () => readDecisions(paths).filter((row) => row.event === "config" && row.result !== "rejected").map((row) => row.thresholdsHash);
-	return { writeConfig, recordFinding, run, finding, hashes };
+	return { writeConfig, recordFinding, run, finding, hashes, bundle };
 }
 
 test("offline threshold edit makes the previous finding's thresholds unknown after restart", async (t) => {
@@ -106,4 +109,17 @@ test("changing and restoring thresholds breaks continuity even when the current 
 	for (const hash of hashes) assert.match(hash, /^[a-f0-9]{64}$/);
 	assert.notEqual(hashes[0], hashes[1]);
 	assert.equal(hashes[0], hashes[2]);
+});
+
+test("IS-8: a changed and restored cutoff does not prove inference continuity", async (t) => {
+	const f = fixture(t);
+	await f.run(() => f.writeConfig(changedWrite), () => f.writeConfig(originalWrite), () => {});
+	const [initial, changed, restored] = f.hashes();
+	assert.notEqual(initial, changed);
+	assert.equal(initial, restored);
+	const bundle = f.bundle({ cache: { hitRate: 0.75, stormTurns: 2 } });
+	assert.deepEqual(bundle.omo_health_record.findings, []);
+	assert.equal(bundle.tokens.cache.stormTurns, 2);
+	assert.deepEqual(bundle.requiredDetectors, []);
+	assert.equal(bundle.inferenceThresholdsKnown.D4, false);
 });
