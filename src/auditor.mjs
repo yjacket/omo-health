@@ -7,7 +7,7 @@ import { createInvestigations } from "./investigations.mjs";
 import { auditBundle, auditDocument, detectorFindingRefs, firedDetectors, hasDetectorCoverage, resolveAuditModel, validateAudit } from "./judge/audit.mjs";
 import { ANALYST_POLL_MS, parseAnalystOutput, unavailableReason } from "./judge/analyst.mjs";
 import { laneArgs } from "./judge/lane.mjs";
-import { collectAnalystDecisionModels, usageEntryOf } from "./session-record.mjs";
+import { collectAnalystDecisionModels, recoverPendingAnalystModels, usageEntryOf } from "./session-record.mjs";
 import { auditReasonLabel } from "./ui/labels.mjs";
 import { fresh, isSpillModelKey, readUsageIndex, relatedUsageEntries } from "./usage-index.mjs";
 import { atomicWriteFile, atomicWriteJson, ensureDir, listDirSafe, readJsonSafe, readTextSafe, removeSafe, statSafe } from "./util/fsx.mjs";
@@ -181,7 +181,8 @@ function auditFileVersions(dir, suffix) {
 }
 
 function launchAnalystModels(paths, investigations, loaded, selectedFps, auditSubjectIds, analystStart) {
-	if (loaded.session?.analystModelsUnknown) return null;
+	const pending = new Set(loaded.session?.pendingAnalystJobs);
+	if (loaded.session?.analystModelsUnknown && !pending.size) return null;
 	const models = new Set(loaded.analystModels);
 	const fps = new Set(selectedFps);
 	const add = (model) => { if (typeof model === "string" && model) models.add(model); };
@@ -207,7 +208,9 @@ function launchAnalystModels(paths, investigations, loaded, selectedFps, auditSu
 	}
 	// The daemon appends complete decision lines. Track file boundaries rather than
 	// comparing event timestamps: even a backdated append or a new day is covered.
-	for (const [file, version] of auditFileVersions(paths.health.decisionsDir, ".jsonl")) {
+	const decisions = auditFileVersions(paths.health.decisionsDir, ".jsonl");
+	for (const file of [...decisions.keys()].sort()) {
+		const version = decisions.get(file);
 		const start = analystStart.decisions.get(file);
 		if (sameAuditVersion(version, start)) continue;
 		const tail = new JsonlTail(file, { maxReadBytes: 64 * 1024 });
@@ -221,11 +224,11 @@ function launchAnalystModels(paths, investigations, loaded, selectedFps, auditSu
 				if (!row || (!fps.has(row.fp) && !matches(row.subject))) continue;
 				if (typeof row.fp === "string" && row.fp) fps.add(row.fp);
 				if (row.status !== "analyzing" && !row.analyst?.verdict && !row.jobId && row.usedModels === undefined) continue;
-				if (!collectAnalystDecisionModels(models, row, paths.health.jobsDir)) return null;
+				if (!collectAnalystDecisionModels(models, row, paths.health.jobsDir, pending)) return null;
 			}
 		} while (batch.more);
 	}
-	return models;
+	return recoverPendingAnalystModels(models, pending, paths.health.jobsDir) ? models : null;
 }
 
 export function readVersionedAuditTimeline(file, tokens, { maxFileBytes = TIMELINE_MAX_BYTES, timeline = usageTimeline, log } = {}) {

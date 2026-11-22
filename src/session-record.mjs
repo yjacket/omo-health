@@ -10,7 +10,7 @@ import { compactUsage, readUsageIndex, usageEntryFor } from "./usage-index.mjs";
 import { reasonCode } from "./audit-codes.mjs";
 import { AUDIT_CHECK_MAX, AUDIT_DETECTOR_ID, AUDIT_LIST_CAPS, BUNDLE_MAX_CHARS, auditEvidence, auditHistoryRow, auditMessageKind } from "./judge/audit.mjs";
 import { readFallbackTargets } from "./runner.mjs";
-import { statSafe } from "./util/fsx.mjs";
+import { readJsonSafe, statSafe } from "./util/fsx.mjs";
 import { redact, truncate } from "./util/text.mjs";
 
 /**
@@ -408,19 +408,59 @@ function verdictFacts(entry) {
 	};
 }
 
-/** Add models from a related analyst decision; false means a terminal row lacks provenance. */
-export function collectAnalystDecisionModels(models, entry, jobsDir) {
+function analystJobDir(jobsDir, jobId) {
+	return jobsDir && typeof jobId === "string" && /^[A-Za-z0-9][\w-]{0,127}$/.test(jobId) ? path.join(jobsDir, jobId) : null;
+}
+
+/** Read related decisions in producer order; false means a terminal row lacks provenance. */
+export function collectAnalystDecisionModels(models, entry, jobsDir, pending) {
 	if (entry.event !== "investigation") return true;
 	if (nonEmpty(entry.model)) models.add(entry.model);
-	// A late answer to a closed investigation keeps its earlier status on the decision row.
+	// The engine writes jobId/step/model on start and jobId/step/analyst on answer.
+	// Either row can retain the investigation's earlier status after resolution.
+	if (nonEmpty(entry.jobId) && !nonEmpty(entry.analyst?.verdict) && entry.usedModels === undefined &&
+		(entry.status === "analyzing" || (entry.step != null && nonEmpty(entry.model)))) {
+		pending.add(entry.jobId);
+		return true;
+	}
 	if (!nonEmpty(entry.analyst?.verdict) && entry.usedModels === undefined &&
 		!(entry.jobId && (entry.status === "verdict" || entry.status === "failed"))) return true;
+	pending.delete(entry.jobId);
+	const dir = analystJobDir(jobsDir, entry.jobId);
 	const used = Array.isArray(entry.usedModels) && entry.usedModels.every(nonEmpty) ? entry.usedModels :
-		jobsDir && typeof entry.jobId === "string" && /^[A-Za-z0-9][\w-]{0,127}$/.test(entry.jobId)
-			? readFallbackTargets(path.join(jobsDir, entry.jobId, "err.log")) : null;
+		dir ? readFallbackTargets(path.join(dir, "err.log")) : null;
 	if (!used) return false;
 	for (const model of used) models.add(model);
 	return true;
+}
+
+function analystJobEnded(dir) {
+	const exit = readJsonSafe(path.join(dir, "exit.json"));
+	if (Number.isInteger(exit?.code) || nonEmpty(exit?.signal)) return true;
+	const meta = readJsonSafe(path.join(dir, "meta.json"));
+	if (["done", "failed", "unavailable"].includes(meta?.final?.status) && !meta.final.holdUntilExit) return true;
+	// A restarted daemon may have missed the exit event. Probe for absence only;
+	// a live or inaccessible PID cannot certify the log (even if the PID was reused).
+	const pid = meta?.pid;
+	if (!Number.isInteger(pid) || pid <= 0 || pid > 0x7fffffff) return false;
+	try {
+		process.kill(pid, 0);
+		return false;
+	} catch (error) {
+		return error.code === "ESRCH";
+	}
+}
+
+/** Recover only runs whose retained stderr can no longer be extended by the analyst. */
+export function recoverPendingAnalystModels(models, pending, jobsDir) {
+	for (const jobId of pending) {
+		const dir = analystJobDir(jobsDir, jobId);
+		const used = dir && analystJobEnded(dir) ? readFallbackTargets(path.join(dir, "err.log")) : null;
+		if (!used) continue;
+		for (const model of used) models.add(model);
+		pending.delete(jobId);
+	}
+	return pending.size === 0;
 }
 
 const byVerdictTime = (a, b) => (msOf(a.ts) || 0) - (msOf(b.ts) || 0);
@@ -540,6 +580,7 @@ function joinSessionDecisions(row, descendants, investigations, decisions, bound
 	const selectedInvestigations = [];
 	const fpSet = new Set();
 	const analystModels = new Set();
+	const pendingAnalystJobs = new Set();
 	let analystModelsKnown = true;
 	for (const record of investigations()) {
 		if (!isRecord(record) || !subjectMatches(record.subject)) continue;
@@ -575,7 +616,7 @@ function joinSessionDecisions(row, descendants, investigations, decisions, bound
 		if (pending && !acted) addAction(pending.entry, pending.deliveredOnly);
 		pending = undefined;
 		if (!selected) continue;
-		if (related && !collectAnalystDecisionModels(analystModels, entry, jobsDir)) analystModelsKnown = false;
+		if (related && !collectAnalystDecisionModels(analystModels, entry, jobsDir, pendingAnalystJobs)) analystModelsKnown = false;
 		if (entry.event === "investigation" && nonEmpty(entry.fp) && nonEmpty(entry.acted?.key) && nonEmpty(entry.acted?.kind)) {
 			pending = { entry, deliveredOnly: !related };
 		} else addAction(entry, !related, acted);
@@ -597,6 +638,13 @@ function joinSessionDecisions(row, descendants, investigations, decisions, bound
 		}
 	}
 	if (pending) addAction(pending.entry, pending.deliveredOnly);
+	recoverPendingAnalystModels(analystModels, pendingAnalystJobs, jobsDir);
+	const modelHistory = {
+		analystModels: [...analystModels],
+		analystModelsKnown: analystModelsKnown && pendingAnalystJobs.size === 0,
+		// If terminal provenance was missing, resolving the pending jobs alone cannot establish coverage.
+		pendingAnalystJobs: analystModelsKnown ? [...pendingAnalystJobs] : [],
+	};
 	if (bounded) {
 		for (const investigation of bounded.investigations.rows) {
 			const { rows } = histories.get(investigation.historyId);
@@ -606,17 +654,17 @@ function joinSessionDecisions(row, descendants, investigations, decisions, bound
 		}
 		const taskIds = new Set(nodes.map((node) => node.taskId).filter(nonEmpty));
 		return {
-			analystModels: [...analystModels], analystModelsKnown, selectedFps: [...fpSet],
+			...modelHistory, selectedFps: [...fpSet],
 			auditSubjectIds: { sessionIds: sessionAllowed, taskIds, childTasksByParent },
 		};
 	}
-	return { selectedInvestigations, fpSet, about, selected: [...new Set([...about, ...delivered])], actionEntries, analystModels: [...analystModels], analystModelsKnown };
+	return { selectedInvestigations, fpSet, about, selected: [...new Set([...about, ...delivered])], actionEntries, ...modelHistory };
 }
 
 function recordHealth(inputs, row, descendants) {
 	if (inputs.auditHealth) return { ...inputs.auditHealth, ...inputs.decisionJoin };
 	const { decisions, investigations, messages: messagesIn } = inputs;
-	const { selectedInvestigations, fpSet, about, selected, actionEntries, analystModels, analystModelsKnown } = inputs.decisionJoin ?? joinSessionDecisions(row, descendants, () => investigations, () => decisions);
+	const { selectedInvestigations, fpSet, about, selected, actionEntries, analystModels, analystModelsKnown, pendingAnalystJobs } = inputs.decisionJoin ?? joinSessionDecisions(row, descendants, () => investigations, () => decisions);
 	const findings = selected.filter((entry) => FINDING_EVENTS.has(entry.event)).map((entry) => findingRow(entry));
 	const { machine, infoFindings } = inputs.decisionHistory ?? scanDecisionHistory(
 		decisions.filter((entry) => Number.isFinite(timeOf(entry))).sort((a, b) => timeOf(a) - timeOf(b)), row, activeWindows(row, descendants, inputs.now),
@@ -638,6 +686,7 @@ function recordHealth(inputs, row, descendants) {
 		infoFindings,
 		analystModels,
 		analystModelsKnown,
+		pendingAnalystJobs,
 		selectedFps: [...fpSet],
 		health: {
 			findings: allFindings, actions, investigations: investigationRows, messages,
@@ -693,7 +742,7 @@ export function buildSessionRecord(inputs = {}) {
 	const endedMs = msOf(row.endedMs);
 	const descendants = inputs.descendants ?? collectDescendants(row, ledger, usage.values());
 	const ambiguous = inputs.ambiguous ?? ambiguousLedgerTaskIds(ledger);
-	const { health, infoFindings, analystModels, analystModelsKnown, selectedFps } = recordHealth({ ...inputs, decisions, investigations, messages: messagesIn }, row, descendants);
+	const { health, infoFindings, analystModels, analystModelsKnown, pendingAnalystJobs, selectedFps } = recordHealth({ ...inputs, decisions, investigations, messages: messagesIn }, row, descendants);
 
 	const entry = usageEntryOf(usage, row, ambiguous);
 	const compact = compactUsage(entry);
@@ -750,6 +799,7 @@ export function buildSessionRecord(inputs = {}) {
 	if (!ledgerUsageSessionId(row) && ambiguous.has(row.taskId)) session.usageTaskIdAmbiguous = true;
 	// Cached previews only receive session metadata and the model list.
 	if (!analystModelsKnown) session.analystModelsUnknown = true;
+	if (pendingAnalystJobs?.length) session.pendingAnalystJobs = pendingAnalystJobs;
 	session.durationMs = Number.isFinite(startedMs) && Number.isFinite(endedMs) && endedMs >= startedMs ? endedMs - startedMs : null;
 
 	return {

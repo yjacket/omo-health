@@ -3,7 +3,7 @@ import { auditModelFacts, auditsToday, readAuditState, readAuditTimeline, reques
 import { createSessionFileLocator } from "../collect/session-files.mjs";
 import { loadConfig } from "../config.mjs";
 import { resolveAuditModel } from "../judge/audit.mjs";
-import { loadSessionRecord, usageEntryOf } from "../session-record.mjs";
+import { loadSessionRecord, recoverPendingAnalystModels, usageEntryOf } from "../session-record.mjs";
 import { fresh, readUsageIndex } from "../usage-index.mjs";
 import { auditReasonLabel, auditStatusLabel } from "./labels.mjs";
 import { daemonStatus, loadDaemonInputs } from "./model.mjs";
@@ -42,6 +42,14 @@ export function createDetailOperations({
 		facts.sessionModelsKnown ? resolveModel(paths, config, { ...facts, analystModels: Array.isArray(analystModels) ? analystModels : [] }) : null;
 
 	function preview(id, { session, analystModels }) {
+		// A cached record may predate an exit that didn't generate a decision.
+		if (session?.pendingAnalystJobs?.length) {
+			const models = new Set(analystModels);
+			if (recoverPendingAnalystModels(models, new Set(session.pendingAnalystJobs), paths.health.jobsDir)) {
+				session = { ...session, analystModelsUnknown: false };
+				analystModels = [...models];
+			}
+		}
 		const { config } = loadConfig({ env, paths });
 		const daemon = daemonStatus(daemonInputs({ paths, env, now: at }));
 		// A task id and its canonical session id share the same audit files.

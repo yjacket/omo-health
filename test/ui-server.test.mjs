@@ -1006,6 +1006,35 @@ describe("ui server", { timeout: 20_000 }, () => {
 				}
 			});
 
+			it("IS-9 unfinished analyst run: preview and POST refuse until the fallback history is recorded", async () => {
+				const world = makeWorld({ providers: ["p"], lanes: { ultrabrain: ["p/b"], architect: ["p/c"] } });
+				try {
+					const ts = new Date(world.nowMs - 120_000).toISOString();
+					const run = { event: "investigation", ts, fp: "current-fp", jobId: "analyst-current" };
+					const dir = path.join(world.paths.health.jobsDir, run.jobId);
+					fs.mkdirSync(dir, { recursive: true });
+					fs.writeFileSync(path.join(dir, "err.log"), "Model fallback: p/a -> p/b\n");
+					appendDecision(world.paths, { ...run, status: "analyzing", subject: { sessionId: AUDIT_ID }, model: "p/a" });
+					for (const pass of ["initial", "cached"]) {
+						const { blocked, planned } = (await world.detail(AUDIT_ID)).audit;
+						assert.deepEqual([blocked, planned], ["models-unknown", null], pass);
+					}
+					assert.deepEqual(await world.startAudit(AUDIT_ID), [409, {
+						error: "models-unknown", reasonKo: "세션이 쓴 모델을 다 확인하지 못해 조사할 수 없습니다",
+					}]);
+					assert.equal(fs.existsSync(requestFileOf(world)), false);
+					assert.equal(fs.existsSync(world.paths.health.auditBudgetFile), false);
+					appendDecision(world.paths, { ...run, status: "verdict", analyst: { verdict: "act" }, usedModels: ["p/a", "p/b"] });
+					const { blocked, planned } = (await world.detail(AUDIT_ID)).audit;
+					assert.deepEqual([blocked, planned?.model], [null, "p/c"]);
+					const [status, body] = await world.startAudit(AUDIT_ID);
+					assert.deepEqual([status, body.audit.planned.model], [202, "p/c"]);
+				} finally {
+					await world.detail.close();
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				}
+			});
+
 			it("excludes a decision-only fp's analyzing model from the detail and the POST", async () => {
 				const world = makeWorld({ lanes: { ultrabrain: ["openai/alpha-review"], architect: ["openai/beta-review"] } });
 				try {

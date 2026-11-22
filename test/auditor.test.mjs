@@ -1573,6 +1573,38 @@ for (const source of ["recorded", "retained", "missing", "late", "late-missing"]
 	}
 });
 
+test("IS-9 unfinished analyst run: daemon refuses without charge, then excludes the recorded fallback", async (t) => {
+	for (const duringPreparation of [false, true]) {
+		const h = harness({ providers: ["p"] });
+		t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+		fs.writeFileSync(h.paths.omoJsonc, JSON.stringify({ "[native]": { categories: {
+			ultrabrain: { models: ["p/b"] }, architect: { models: ["p/c"] },
+		} } }));
+		const run = { ts: new Date(BASE).toISOString(), event: "investigation", fp: "current-fp", jobId: "analyst-current" };
+		const start = () => {
+			const dir = path.join(h.paths.health.jobsDir, run.jobId);
+			fs.mkdirSync(dir, { recursive: true });
+			fs.writeFileSync(path.join(dir, "err.log"), "Model fallback: p/a -> p/b\n");
+			appendDecision(h.paths, { ...run, status: "analyzing", subject: { sessionId: "m1" }, model: "p/a" });
+		};
+		if (duringPreparation) await prepareWithFrozenRecord(h, start);
+		else {
+			start();
+			const a = h.auditor();
+			h.request("m1");
+			await h.prepare(a);
+		}
+		assert.deepEqual([h.record("m1").status, h.record("m1").reason, h.runner.starts.length, h.budget()],
+			["failed", "models-unknown", 0, undefined], `analyzing row arrived during preparation: ${duringPreparation}`);
+		appendDecision(h.paths, { ...run, status: "verdict", analyst: { verdict: "act" }, usedModels: ["p/a", "p/b"] });
+		const a = h.auditor();
+		h.request("m1");
+		await h.prepare(a);
+		assert.deepEqual(h.runner.starts.map(modelOf), ["p/c"]);
+		assert.equal(h.budget().count, 1);
+	}
+});
+
 test("a decision-only fp's analyzing model is excluded from the daemon's model choice", async () => {
 	const h = harness();
 	assert.equal([...LANES.ultrabrain][0], "openai/gpt-5-5", "the analyst model is the first lane candidate");

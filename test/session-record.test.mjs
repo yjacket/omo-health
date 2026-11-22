@@ -7,6 +7,7 @@ import { test } from "node:test";
 import { DEFAULT_CONFIG } from "../src/config.mjs";
 import { AUDIT_LIST_CAPS, auditBundle } from "../src/judge/audit.mjs";
 import { resolvePaths } from "../src/paths.mjs";
+import { appendEnded } from "../src/session-ledger.mjs";
 import { buildSessionRecord, loadSessionRecord, scanOmoHealthMessages } from "../src/session-record.mjs";
 import * as sessionRecord from "../src/session-record.mjs";
 import { buildSessionView } from "../src/ui/session-view.mjs";
@@ -1026,6 +1027,34 @@ test("IS-9 provenance: analystModels includes all related terminal decisions but
 });
 
 const MIB = 1024 * 1024;
+
+test("IS-9 unfinished analyst run: only its later terminal decision or retained exit evidence establishes models", (t) => {
+	const dir = tmpDir("omoh-analyst-models-");
+	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+	const paths = resolvePaths({ USERPROFILE: dir, OMO_HEALTH_HOME: path.join(dir, "health") });
+	const ts = iso(T0);
+	const run = { event: "investigation", ts, fp: "same", jobId: "analyst-current" };
+	const file = path.join(paths.health.decisionsDir, `${ts.slice(0, 10)}.jsonl`);
+	const jobs = path.join(paths.health.jobsDir, run.jobId);
+	fs.mkdirSync(jobs, { recursive: true });
+	fs.writeFileSync(path.join(jobs, "err.log"), "Model fallback: p/a -> p/b\n");
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	appendEnded(paths, { sessionId: "s-run", kind: "main", startedMs: T0 - 1_000, endedMs: T0, outcome: "answered" });
+	const terminal = { ...run, status: "verdict", analyst: { verdict: "act" }, usedModels: ["p/a", "p/b"] };
+	const start = { ...run, status: "analyzing", subject: { sessionId: "s-run" }, model: "p/a" };
+	const load = () => loadSessionRecord({ paths, id: "s-run", now: T0 });
+	fs.writeFileSync(file, jsonl([terminal, start, { ...terminal, jobId: "analyst-other", usedModels: ["p/c"] }]));
+	assert.equal(load().session.analystModelsUnknown, true, "an earlier result or another job cannot finalize the current run");
+	fs.writeFileSync(file, jsonl([start]));
+	assert.equal(load().session.analystModelsUnknown, true);
+	fs.writeFileSync(path.join(jobs, "exit.json"), JSON.stringify({ code: 0, signal: null }));
+	assert.deepEqual([load().session.analystModelsUnknown, load().analystModels], [undefined, ["p/a", "p/b"]]);
+	fs.rmSync(path.join(jobs, "err.log"));
+	assert.equal(load().session.analystModelsUnknown, true, "an exit without stderr cannot certify fallback history");
+	fs.appendFileSync(file, jsonl([{ ...terminal, status: "closed" }]));
+	assert.deepEqual([load().session.analystModelsUnknown, load().analystModels], [undefined, ["p/a", "p/b"]]);
+});
+
 const FILLER_LINE = '{"type":"message","id":"f"}\n';
 const FILLER_BLOCK = Buffer.from(FILLER_LINE.repeat(Math.floor(MIB / FILLER_LINE.length)));
 const scanFile = (dir, name = "session.jsonl") => path.join(dir, name);
