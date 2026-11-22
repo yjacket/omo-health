@@ -143,7 +143,7 @@ export function createUiServer({ paths, token, getState, diagnose, sessionDetail
 			throw error;
 		}
 		if (!isPlainObject(body)) throw new HttpFailure(400, { error: "bad-json" });
-		const [status, payload] = runAction(paths, route, body, now(), startAudit);
+		const [status, payload] = await runAction(paths, route, body, now(), startAudit);
 		send(res, status, payload);
 	}
 
@@ -274,12 +274,14 @@ export function createUiServer({ paths, token, getState, diagnose, sessionDetail
 				});
 			});
 		},
-		close() {
-			if (!server.listening) return Promise.resolve();
-			return new Promise((resolve, reject) => {
+		async close() {
+			const httpClosed = new Promise((resolve, reject) => {
+				if (!server.listening) return resolve();
 				server.close((error) => (error ? reject(error) : resolve()));
 				server.closeAllConnections();
 			});
+			const closeHandlers = new Set([sessionDetail?.close, startAudit?.close]);
+			await Promise.all([httpClosed, ...Array.from(closeHandlers, (close) => close?.())]);
 		},
 		checkIdle(nowMs = now()) {
 			return nowMs - lastRequestMs >= idleMs;
