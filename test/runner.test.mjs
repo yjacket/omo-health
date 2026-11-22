@@ -655,6 +655,43 @@ test("a timed-out job stays ours while its verified process lives, and a failed 
 	assert.equal(runner.terminate("j1"), "gone");
 });
 
+test("IS-10: only audit liveness looks for a surviving model child after launcher exit", () => {
+	let identify = SAME_PROCESS;
+	let rows = "";
+	let queryError;
+	let queries = 0;
+	const { runner, paths } = setup({
+		identify: () => identify(),
+		findProcess: (jobId, args) => findJobProcess({ jobsDir: paths.health.jobsDir, jobId, args, exec: () => {
+			queries++;
+			if (queryError) throw queryError;
+			return rows;
+		} }),
+	});
+	const argsFor = (jobId) => laneArgs({ model: "p/reviewer", bundleFile: path.join(runner.jobDir(jobId), "bundle.md"), sessionId: `lane-${jobId}` });
+	const auditArgs = argsFor("j1");
+	runner.start({ ...baseJob, kind: "audit", args: auditArgs });
+	runner.start({ ...baseJob, jobId: "analyst", kind: "analyst", args: argsFor("analyst") });
+	identify = () => null;
+	const matching = cimLine(71000, 70000, T, `omo.exe ${auditArgs.join(" ")}`);
+	const wrongSession = cimLine(71001, 70000, T, `omo.exe ${auditArgs.join(" ").replace("lane-j1", "lane-other")}`);
+	const wrongBundle = cimLine(71002, 70000, T, `omo.exe ${auditArgs.join(" ").replace("bundle.md", "other.md")}`);
+	rows = [matching, wrongSession, wrongBundle].join("\n");
+	queryError = new Error("CIM unavailable");
+	writeExit(runner, { code: 1 }, "analyst");
+	assert.equal(runner.alive("analyst"), false);
+	assert.equal(runner.poll("analyst").reason, "exit-1");
+	assert.equal(queries, 0, "the analyst does not query argv on launcher exit");
+
+	queryError = undefined;
+	assert.equal(runner.alive("j1"), true, "the matching child keeps the audit alive");
+	queryError = new Error("CIM unavailable");
+	assert.throws(() => runner.alive("j1"), /CIM unavailable/);
+	queryError = undefined;
+	rows = [wrongSession, wrongBundle].join("\n");
+	assert.equal(runner.alive("j1"), false, "neither a different bundle nor a different lane holds the slot");
+});
+
 test("a process that only mentions the bundle path is not adopted and nothing is killed", () => {
 	let box;
 	const finder = (jobId, args) => findJobProcess({ jobsDir: box.paths.health.jobsDir, jobId, args, exec: () => cimLine(9, 1, T, "notepad.exe " + path.join(box.paths.health.jobsDir, jobId, "bundle.md")) });

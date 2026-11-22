@@ -519,7 +519,7 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		}
 	}
 
-	/** A timed-out job's tree stays the one-per-PC slot until it is confirmed gone; a failed kill is retried each poll. */
+	/** Only a negative liveness check releases the slot; terminate may return "gone" while a model child survives. */
 	function releaseHold(record) {
 		try {
 			if (runner.alive(record.jobId)) {

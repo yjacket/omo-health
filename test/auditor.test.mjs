@@ -1692,3 +1692,62 @@ test("a failed first kill is retried by the real runner and the one-per-PC slot 
 	assert.equal(h.record("m1").holdUntilExit, undefined);
 	assert.equal(a.busy(), false);
 });
+
+for (const timedOut of [true, false]) {
+	test(`IS-10: a surviving model child blocks the next audit ${timedOut ? "after timeout" : "after launcher exit"}`, async (t) => {
+		const h = harness({ sessions: ["m1", "m2"] });
+		t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+		h.config.audit.timeoutMs = 60_000;
+		const identity = { ctimeMs: BASE, cmdSha1: "launcher" };
+		const modelChild = { pid: 71000, ctimeMs: BASE + 1, cmdSha1: "model-child" };
+		let rootAlive = true;
+		let childAlive = true;
+		let failedLookup = false;
+		const recording = createRecordingSpawn();
+		const runner = createRunner({
+			paths: h.paths, spawnImpl: recording.spawnImpl, clock: h.clock, env: {},
+			isAlive: (pid) => pid !== 70000 || rootAlive,
+			identify: (pid) => pid === 70000 && !rootAlive ? null : identity,
+			findJobProcess: (jobId, args) => {
+				assert.equal(jobId, h.record("m1").jobId);
+				assert.deepEqual(args, recording.calls[0].args);
+				if (failedLookup) throw new Error("CIM unavailable");
+				return childAlive ? modelChild : null;
+			},
+		});
+		const a = h.auditor({ runner });
+		const starts = () => recording.calls.filter((call) => call.command !== "taskkill").length;
+		h.request("m1");
+		await h.prepare(a);
+		const { jobId: firstJob } = h.record("m1");
+		h.request("m2");
+		if (timedOut) {
+			h.tick(a, 61_000);
+			assert.deepEqual([h.record("m1").reason, h.record("m1").holdUntilExit], ["timeout", true]);
+		}
+		rootAlive = false;
+		fs.writeFileSync(path.join(runner.jobDir(firstJob), "exit.json"), '{"code":0}');
+		h.tick(a);
+		await h.prepare(a);
+		assert.equal(starts(), 1, "the second audit must not launch alongside the model child");
+		assert.equal(h.record("m2").status, "queued");
+		assert.deepEqual(h.budget().jobs, [firstJob]);
+
+		childAlive = false;
+		failedLookup = true;
+		h.tick(a);
+		await h.prepare(a);
+		assert.equal(h.record("m2").status, "queued", "a failed process lookup is not proof the child exited");
+		assert.equal(starts(), 1);
+		assert.equal(h.budget().count, 1);
+
+		failedLookup = false;
+		h.tick(a);
+		await h.prepare(a);
+		assert.equal(starts(), 2);
+		const second = h.record("m2");
+		assert.equal(second.status, "running");
+		assert.deepEqual(h.budget().jobs, [firstJob, second.jobId]);
+		assert.equal(h.budget().count, 2, "the newly launched audit adds exactly one charge");
+	});
+}

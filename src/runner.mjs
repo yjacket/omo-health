@@ -115,7 +115,7 @@ export function findJobProcess({ jobsDir, jobId, args, exec = execFileSync }) {
 	const literal = bundleFile.replace(/'/g, "''");
 	const script = [
 		`$bs = '${literal}'`,
-		"$p = Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($bs) }",
+		"$p = Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($bs) }",
 		'foreach ($x in $p) { "$($x.ProcessId)`t$($x.ParentProcessId)`t$(([DateTimeOffset]$x.CreationDate).ToUnixTimeMilliseconds())`t$($x.CommandLine)" }',
 	].join("; ");
 	let out;
@@ -176,6 +176,9 @@ export function createRunner({ paths, spawnImpl = spawn, clock, env = process.en
 			exit: path.join(dir, "exit.json"),
 		};
 	};
+	// The launcher can exit while the model process still carries the job's argv.
+	const auditProcessRemains = (jobId, meta) => meta?.kind === "audit" && Boolean(findProcess(jobId, meta.args ?? []));
+	const running = () => ({ status: "running", result: null, exitCode: null });
 
 	function finish(f, meta, outcome, stderr) {
 		// An unverified timeout releases the slot without establishing that stderr is final.
@@ -194,18 +197,20 @@ export function createRunner({ paths, spawnImpl = spawn, clock, env = process.en
 
 	/** The outcome of a job whose process ended: its answer, an unavailable provider, or a failure. */
 	function ended(f, meta, exit) {
-		const handler = handlers.get(path.basename(f.dir)) ?? contracts[meta.kind] ?? {};
-		const stdout = readTextSafe(f.out, "");
+		const jobId = path.basename(f.dir);
 		const exitCode = exit?.code ?? null;
+		// A child error alone is not proof: Node can also emit it after assigning a pid.
+		const errored = Boolean(exit?.error) && exitCode === null;
+		const notSpawned = errored && (meta.pid === undefined || meta.pid === null);
+		if (!notSpawned && auditProcessRemains(jobId, meta)) return running();
+		const handler = handlers.get(jobId) ?? contracts[meta.kind] ?? {};
+		const stdout = readTextSafe(f.out, "");
 		const fallback = fallbackFailure(f, meta, exitCode);
 		if (fallback) return fallback;
 		if (exitCode === 0 || (!exit && handler.parse?.(stdout) != null)) return finish(f, meta, { status: "done", result: handler.parse ? handler.parse(stdout) : stdout, exitCode });
 		const stderr = meta.kind === "analyst" ? readFallbackLog(f.err) : undefined;
 		const text = `${stderr ?? readTextSafe(f.err, "")}\n${stdout}`;
 		const detail = truncate(redact(text.trim()), 300);
-		// A child error alone is not proof: Node can also emit it after assigning a pid.
-		const errored = Boolean(exit?.error) && exitCode === null;
-		const notSpawned = errored && (meta.pid === undefined || meta.pid === null);
 		const reason = notSpawned ? null : handler.unavailableReason?.(text) ?? null;
 		if (reason) return finish(f, meta, { status: "unavailable", reason, detail, result: null, exitCode }, stderr);
 		if (errored) return finish(f, meta, { status: "failed", reason: `spawn-error:${exit.error}`, ...(notSpawned ? { spawned: false } : {}), detail, result: null, exitCode }, stderr);
@@ -307,6 +312,8 @@ export function createRunner({ paths, spawnImpl = spawn, clock, env = process.en
 			if (!meta) return { status: "failed", reason: "no-job", result: null, exitCode: null };
 			if (meta.final) {
 				if (meta.kind === "analyst" && meta.final.reason !== "unverified" && !("fallbackTargets" in meta.final)) return finish(f, meta, meta.final);
+				// A pre-fix final outcome may only reflect launcher exit. Timeout holds are checked by the auditor.
+				if (meta.final.status !== "timeout" && !meta.final.holdUntilExit && meta.final.spawned !== false && auditProcessRemains(jobId, meta)) return running();
 				// A runner from before the fallback guard may have finalized before the auditor saved the outcome.
 				return meta.final.reason === "model-fallback" ? meta.final :
 					fallbackFailure(f, meta, meta.final.exitCode, meta.final.status === "timeout") ?? meta.final;
@@ -355,8 +362,11 @@ export function createRunner({ paths, spawnImpl = spawn, clock, env = process.en
 				return { status: "running", result: null, exitCode: null, detail: truncate(error.message, 300) };
 			}
 			if (seen) {
-				if (seen.ctimeMs !== meta.ctimeMs || seen.cmdSha1 !== meta.cmdSha1) return fallbackFailure(f, meta, null) ?? finish(f, meta, { status: "failed", reason: "pid-reused", result: null, exitCode: null });
-				if (!timedOut) return { status: "running", result: null, exitCode: null };
+				if (seen.ctimeMs !== meta.ctimeMs || seen.cmdSha1 !== meta.cmdSha1) {
+					if (auditProcessRemains(jobId, meta)) return running();
+					return fallbackFailure(f, meta, null) ?? finish(f, meta, { status: "failed", reason: "pid-reused", result: null, exitCode: null });
+				}
+				if (!timedOut) return running();
 				// The one documented exception to the no-/T rule (AGENTS.md): the verified job's OWN tree (omo.exe ->
 				// omo.exe -p -> git.exe) would be orphaned by a single-PID kill.
 				return timeoutKill(f, meta);
@@ -382,9 +392,10 @@ export function createRunner({ paths, spawnImpl = spawn, clock, env = process.en
 			return "running";
 		},
 
-		/** True while the verified pid of the job is still the same process; a failed lookup throws. */
+		/** True for the verified job pid or a surviving audit process carrying its argv; lookup failures throw. */
 		alive(jobId) {
-			return stillOurs(readJsonSafe(files(jobId).meta));
+			const meta = readJsonSafe(files(jobId).meta);
+			return stillOurs(meta) || auditProcessRemains(jobId, meta);
 		},
 
 		/** Re-verify and send `taskkill /F /T` to the job's own tree: `sent`, `gone`, or a lookup error. */

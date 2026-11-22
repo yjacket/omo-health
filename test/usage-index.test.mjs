@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
 import { tmpDir } from "./helpers/fixtures.mjs";
-import { readUsage } from "../src/collect/usage.mjs";
+import { readUsage, usageTimeline } from "../src/collect/usage.mjs";
 import { createFakeClock, iso } from "../src/util/time.mjs";
 import {
 	USAGE_INDEX_VERSION,
@@ -80,6 +80,48 @@ function parseIndex(text) {
 function indexText({ v, entries }) {
 	return [JSON.stringify({ v }), ...Object.values(entries).map((entry) => JSON.stringify(entry))].join("\n") + "\n";
 }
+
+test("(IS-1) a 2 MiB EOF record keeps its JSON.parse billing row across newline and index reload", (t) => {
+	const { fileOf, indexOf } = setup(t);
+	const file = fileOf();
+	const id = "medium-eof";
+	const model = { label: "m".repeat(128 * 1024) };
+	const record = assistant({ model });
+	record.message.content[0].text = "x".repeat(2 * MiB - Buffer.byteLength(JSON.stringify(record)));
+	writeText(file, JSON.stringify(record));
+	assert.equal(fs.statSync(file).size, 2 * MiB);
+
+	const oracle = () => {
+		const { message } = JSON.parse(fs.readFileSync(file, "utf8"));
+		const { input, output, cacheRead, cacheWrite, cost } = message.usage;
+		return [[`${message.provider}/${String(message.model)}`, {
+			input, output, cacheRead, cacheWrite, tokens: input + output + cacheRead + cacheWrite, cost: cost.total,
+		}]];
+	};
+	const models = ({ models }) => Object.entries(models);
+	const budget = { maxBytes: USAGE_TICK_BYTES };
+	const live = indexOf();
+	const observations = {};
+	const expected = {};
+	const observe = (label, usage) => {
+		observations[label] = models(usage);
+		expected[label] = oracle();
+	};
+	live.update(id, file, {}, budget);
+	observe("live EOF", live.get(id).published);
+	observe("timeline EOF", usageTimeline(file).totals);
+	assert.equal(live.save(), true);
+	const reloaded = indexOf();
+	observe("reloaded EOF", reloaded.get(id).published);
+
+	fs.appendFileSync(file, "\n");
+	live.update(id, file, {}, budget);
+	reloaded.update(id, file, {}, budget);
+	observe("live newline", live.get(id).published);
+	observe("reloaded newline", reloaded.get(id).published);
+	observe("timeline newline", usageTimeline(file).totals);
+	assert.deepEqual(observations, expected);
+});
 
 test("(gate 17) saturated index save, daemon reload, and audit preparation fit in 66 MiB", (t) => {
 	const { dir } = setup(t);

@@ -727,11 +727,11 @@ function newAccumulator(start) {
 	return { [RECORD_ACCUMULATOR]: true, start, kind: "buffer", parts: [], len: 0 };
 }
 
-function appendBytes(accumulator, bytes, bufferLimit = RECORD_PARSE_LIMIT) {
+function appendBytes(accumulator, bytes) {
 	if (!bytes.length) return accumulator;
 	let acc = accumulator;
 	if (acc.kind === "buffer") {
-		if (acc.len + bytes.length > bufferLimit) {
+		if (acc.len + bytes.length > RECORD_PARSE_LIMIT) {
 			const scanner = createRecordScanner();
 			const parts = [...acc.parts, bytes];
 			let skip = 0;
@@ -872,6 +872,7 @@ export function readUsage(file, from, { maxBytes = Infinity } = {}) {
 		let partial;
 		let headLen;
 		let head;
+		let cachedOverlay;
 		const savedUsage = restart ? undefined : cloneUsage(from.usage);
 		if (!savedUsage) {
 			usage = emptyUsage();
@@ -884,8 +885,12 @@ export function readUsage(file, from, { maxBytes = Infinity } = {}) {
 			usage = savedUsage;
 			offset = from.offset;
 			const resumable = from.partial?.[RECORD_ACCUMULATOR] === true && Number.isInteger(from.scanOffset) && from.partial.start === offset;
-			scanOffset = resumable ? from.scanOffset : offset;
-			partial = resumable ? from.partial : undefined;
+			if (resumable && from.partial.kind === "reread" && size === from.size) {
+				cachedOverlay = cloneUsage(from.overlay);
+			}
+			const reusePartial = resumable && (from.partial.kind !== "reread" || cachedOverlay);
+			scanOffset = reusePartial ? from.scanOffset : offset;
+			partial = reusePartial ? from.partial : undefined;
 			headLen = from.headLen;
 			head = from.head;
 			if (headLen < HEAD_LIMIT && size > headLen) {
@@ -910,10 +915,10 @@ export function readUsage(file, from, { maxBytes = Infinity } = {}) {
 			for (;;) {
 				const newline = chunk.indexOf(NEWLINE, index);
 				if (newline === -1) {
-					acc = appendBytes(acc, chunk.subarray(index), USAGE_BUFFER_LIMIT);
+					acc = appendBytes(acc, chunk.subarray(index));
 					break;
 				}
-				acc = appendBytes(acc, chunk.subarray(index, newline), USAGE_BUFFER_LIMIT);
+				acc = appendBytes(acc, chunk.subarray(index, newline));
 				finishRecord(usage, acc);
 				offset = chunkStart + newline + 1;
 				acc = newline + 1 >= chunk.length ? undefined : newAccumulator(chunkStart + newline + 1);
@@ -922,12 +927,17 @@ export function readUsage(file, from, { maxBytes = Infinity } = {}) {
 			}
 		}
 
-		const overlay = emptyUsage();
-		if (acc && position === size) {
+		const overlay = cachedOverlay ?? emptyUsage();
+		if (!cachedOverlay && acc && position === size) {
 			if (acc.kind === "scanner") consumeScannerRecord(overlay, acc.scanner, true);
 			else {
 				const entry = finalFragment(acc);
 				if (entry !== undefined) consumeEntry(overlay, entry);
+				// Keep the preview, not the medium record's bytes. Growth restarts
+				// at offset so the eventual commit uses whole-record parsing too.
+				if (acc.len > USAGE_BUFFER_LIMIT) {
+					acc = { [RECORD_ACCUMULATOR]: true, start: acc.start, kind: "reread" };
+				}
 			}
 		}
 		const evaluatedTo = position;
