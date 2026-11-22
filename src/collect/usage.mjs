@@ -43,6 +43,7 @@ const KEY_RAW_LIMIT = 128;
 const MODEL_ID_TOO_LONG = "(model id too long)";
 const MODEL_ID_UNREADABLE = "(model id unreadable)";
 const OTHER_MODELS = "(other models)";
+const MODEL_COUNTERS = Symbol("modelCounters");
 const modelMapSizes = new WeakMap();
 const TRUNCATED_STRING_ID = Symbol("truncatedStringIdentity");
 const TRUNCATED_USAGE = Symbol("truncatedUsage");
@@ -86,13 +87,10 @@ const isSimpleEscape = (byte) =>
 const isHexDigit = (byte) => (byte >= ZERO && byte <= NINE) || (byte >= 0x41 && byte <= 0x46) || (byte >= 0x61 && byte <= 0x66);
 
 const isObject = (value) => typeof value === "object" && value !== null;
-const nonNegative = (value) => (Number.isFinite(value) && value >= 0 ? value : 0);
+/** A parsed JS number counts exactly as supplied (negatives and +/-Infinity too); anything else counts 0. */
+const counter = (value) => (typeof value === "number" ? value : 0);
 const isWhitespace = (byte) => byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d;
 const isDigit = (byte) => byte >= ZERO && byte <= NINE;
-
-function isFiniteCounter(value) {
-	return Number.isFinite(value) && value >= 0;
-}
 
 function isPrewarmUsage(usage) {
 	return (
@@ -138,7 +136,21 @@ function modelMapSize(map) {
 	return state;
 }
 
-function addModelBilling(totals, key, tokens, cost) {
+/** Hidden four-counter split behind a key's persisted `tokens` total. */
+function modelCounters(model) {
+	let counters = model[MODEL_COUNTERS];
+	if (!counters) {
+		// A reloaded tree only carries the computed total; resume it as one input counter.
+		counters = { input: model.tokens, output: 0, cacheRead: 0, cacheWrite: 0 };
+		Object.defineProperty(model, MODEL_COUNTERS, { value: counters, configurable: true });
+	} else {
+		const sum = counters.input + counters.output + counters.cacheRead + counters.cacheWrite;
+		if (!Object.is(sum, model.tokens)) counters.input += model.tokens - sum;
+	}
+	return counters;
+}
+
+function addModelBilling(totals, key, tokens, cost, input, output, cacheRead, cacheWrite) {
 	const models = totals.models;
 	if (key.length > MODEL_KEY_LENGTH) key = MODEL_ID_TOO_LONG;
 	if (!Object.hasOwn(models, key)) {
@@ -157,8 +169,18 @@ function addModelBilling(totals, key, tokens, cost) {
 			models[key] = { tokens: 0, cost: 0 };
 		}
 	}
-	models[key].tokens += tokens;
-	models[key].cost += cost;
+	const billing = models[key];
+	const counters = modelCounters(billing);
+	if (input === undefined) counters.input += tokens;
+	else {
+		counters.input += input;
+		counters.output += output;
+		counters.cacheRead += cacheRead;
+		counters.cacheWrite += cacheWrite;
+	}
+	// A key's tokens are the four counters as they stand, like getUsageCostBreakdown.
+	billing.tokens = counters.input + counters.output + counters.cacheRead + counters.cacheWrite;
+	billing.cost += cost;
 }
 
 function addUsedModel(totals, id) {
@@ -196,11 +218,13 @@ function cloneUsage(usage) {
 		if (typeof out[key] !== "number") return undefined;
 	}
 	if (typeof out.diagnostics.badLines !== "number" || typeof out.diagnostics.skippedLines !== "number") return undefined;
+	out.total = out.input + out.output + out.cacheRead + out.cacheWrite;
 	for (const [key, value] of Object.entries(src.models ?? {})) {
 		const tokens = value?.tokens ?? 0;
 		const cost = value?.cost ?? 0;
 		if ((!key.includes("/") && key !== MODEL_ID_TOO_LONG && key !== OTHER_MODELS) || typeof tokens !== "number" || typeof cost !== "number") return undefined;
-		addModelBilling(out, key, tokens, cost);
+		const counters = value?.[MODEL_COUNTERS];
+		addModelBilling(out, key, tokens, cost, counters?.input, counters?.output, counters?.cacheRead, counters?.cacheWrite);
 	}
 	for (const key of Object.keys(src.usedModels ?? {})) {
 		if (!key.includes("/") && key !== MODEL_ID_TOO_LONG) return undefined;
@@ -215,7 +239,7 @@ function mergeUsage(into, extra) {
 	into.output += extra.output;
 	into.cacheRead += extra.cacheRead;
 	into.cacheWrite += extra.cacheWrite;
-	into.total += extra.total;
+	into.total = into.input + into.output + into.cacheRead + into.cacheWrite;
 	into.cost += extra.cost;
 	if (extra.costUnknown) into.costUnknown = true;
 	into.turns += extra.turns;
@@ -223,7 +247,8 @@ function mergeUsage(into, extra) {
 	into.diagnostics.skippedLines += extra.diagnostics.skippedLines;
 	into.diagnostics.badLines += extra.diagnostics.badLines;
 	for (const [key, value] of Object.entries(extra.models)) {
-		addModelBilling(into, key, value.tokens, value.cost);
+		const counters = value[MODEL_COUNTERS];
+		addModelBilling(into, key, value.tokens, value.cost, counters?.input, counters?.output, counters?.cacheRead, counters?.cacheWrite);
 	}
 	for (const key of Object.keys(extra.usedModels)) addUsedModel(into, key);
 }
@@ -299,21 +324,21 @@ export function usageOfEntry(entry) {
 /** Fold one `usageOfEntry` hit into a totals accumulator. */
 export function addUsage(totals, hit) {
 	const usage = hit.usage;
-	const input = nonNegative(usage.input);
-	const output = nonNegative(usage.output);
-	const cacheRead = nonNegative(usage.cacheRead);
-	const cacheWrite = nonNegative(usage.cacheWrite);
+	const input = counter(usage.input);
+	const output = counter(usage.output);
+	const cacheRead = counter(usage.cacheRead);
+	const cacheWrite = counter(usage.cacheWrite);
 	const tokens = input + output + cacheRead + cacheWrite;
-	const cost = Number.isFinite(usage.cost?.total) ? usage.cost.total : 0;
+	const cost = counter(usage.cost?.total);
 	totals.input += input;
 	totals.output += output;
 	totals.cacheRead += cacheRead;
 	totals.cacheWrite += cacheWrite;
-	totals.total += tokens;
+	totals.total = totals.input + totals.output + totals.cacheRead + totals.cacheWrite;
 	totals.cost += cost;
 	if (usage.costUnknown === true) totals.costUnknown = true;
 	if (hit.turn) totals.turns += 1;
-	addModelBilling(totals, hit.key ?? USAGE_TOOLS_KEY, tokens, cost);
+	addModelBilling(totals, hit.key ?? USAGE_TOOLS_KEY, tokens, cost, input, output, cacheRead, cacheWrite);
 }
 
 function addModelId(out, provider, model) {
@@ -995,10 +1020,10 @@ function consumeTimelineStats(stats, entry, options) {
 	const message = entry.message;
 	if (message.role === "assistant") {
 		const usage = isObject(message.usage) ? message.usage : undefined;
-		const input = usage ? nonNegative(usage.input) : 0;
-		const output = usage ? nonNegative(usage.output) : 0;
-		const cacheRead = usage ? nonNegative(usage.cacheRead) : 0;
-		const cacheWrite = usage ? nonNegative(usage.cacheWrite) : 0;
+		const input = usage ? counter(usage.input) : 0;
+		const output = usage ? counter(usage.output) : 0;
+		const cacheRead = usage ? counter(usage.cacheRead) : 0;
+		const cacheWrite = usage ? counter(usage.cacheWrite) : 0;
 		const total = input + output + cacheRead + cacheWrite;
 		const ms = timestampOf(entry, message);
 		if (usage && Number.isFinite(ms)) {

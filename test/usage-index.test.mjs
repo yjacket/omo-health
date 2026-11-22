@@ -705,7 +705,9 @@ test("(gate 10) finite records that overflow survive a reload and a resumable ap
 	assert.equal(compactUsage(reloaded.get("s1")).total, Infinity);
 });
 
-for (const [expected, appendUsage] of [[-Infinity, use()], [NaN, use({ input: 1e308, output: 1e308 })]]) {
+const tagNumber = (value) => (Number.isFinite(value) ? value : { $n: Number.isNaN(value) ? "NaN" : value > 0 ? "Infinity" : "-Infinity" });
+
+for (const [expected, taggedCounters, appendUsage] of [[-Infinity, { input: -Infinity }, use()], [NaN, { input: -Infinity, output: Infinity }, use({ input: 1e308, output: 1e308 })]]) {
 	test(`(gate 10) ${expected} from a tagged index survives save, reload and append`, (t) => {
 		const { fileOf, indexOf } = setup(t);
 		const file = fileOf();
@@ -715,11 +717,14 @@ for (const [expected, appendUsage] of [[-Infinity, use()], [NaN, use({ input: 1e
 		index.update("s1", file);
 		index.save();
 		const tagged = parseIndex(fs.readFileSync(savedFile, "utf8"));
-		tagged.entries.s1.usage.total = { $n: "-Infinity" };
-		tagged.entries.s1.published.total = { $n: "-Infinity" };
+		// A total is now recomputed from the four counters, so tag the counters that produce it.
+		for (const name of ["usage", "published"]) {
+			for (const [key, value] of Object.entries(taggedCounters)) tagged.entries.s1[name][key] = tagNumber(value);
+			tagged.entries.s1[name].total = tagNumber(expected);
+		}
 		writeText(savedFile, indexText(tagged));
 		const migrated = indexOf();
-		assert.equal(migrated.get("s1").usage.total, -Infinity);
+		assert.equal(migrated.get("s1").usage.total, expected);
 		const appended = `${JSON.stringify(assistant({ usage: appendUsage }))}\n`;
 		fs.appendFileSync(file, appended);
 		assert.equal(migrated.update("s1", file), Buffer.byteLength(appended), "resume the tagged cursor");
@@ -1201,6 +1206,42 @@ test("treeTotals sums descendants, survives a cycle, and skips an incomplete chi
 	const index = createUsageIndex({ file: "unused.json", clock: createFakeClock(T0) });
 	const map = treeTotals(new Map([["main", { id: "main", state: "ok", complete: true, published: { total: 3 } }]]));
 	assert.equal(map.get("main"), 3);
+});
+
+test("(IS-1) a negative total and cost save and reload through the index", (t) => {
+	const { fileOf, indexOf } = setup(t);
+	const file = fileOf();
+	const negative = JSON.stringify({
+		type: "message",
+		id: nextId(),
+		timestamp: iso(T0),
+		message: {
+			role: "assistant",
+			content: [],
+			provider: "p",
+			model: "m",
+			usage: { input: -5, output: 3, cacheRead: 0, cacheWrite: 0, cost: { total: -0.5 } },
+			stopReason: "stop",
+			timestamp: T0,
+		},
+	});
+	writeText(file, `${negative}\n`);
+	const index = indexOf();
+	index.update("s1", file);
+	assert.equal(compactUsage(index.get("s1")).total, -2);
+	assert.equal(compactUsage(index.get("s1")).cost, -0.5);
+	assert.deepEqual(index.get("s1").published.models["p/m"], { tokens: -2, cost: -0.5 });
+	assert.equal(index.save(), true);
+	const saved = fileOf("usage.json");
+	assert.equal(compactUsage(readUsageIndex(saved).get("s1")).total, -2);
+	const reloaded = indexOf();
+	assert.equal(compactUsage(reloaded.get("s1")).total, -2);
+	assert.equal(compactUsage(reloaded.get("s1")).cost, -0.5);
+	fs.appendFileSync(file, `${line()}\n`);
+	reloaded.update("s1", file);
+	assert.equal(compactUsage(reloaded.get("s1")).total, 8);
+	assert.equal(reloaded.save(), true);
+	assert.equal(compactUsage(indexOf().get("s1")).total, 8);
 });
 
 test("usage_read_failed is logged once for a directory path and the next successful read clears it", (t) => {

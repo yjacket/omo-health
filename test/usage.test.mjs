@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { tmpDir } from "./helpers/fixtures.mjs";
-import { addUsage, createRecordScanner, emptyUsage, modelsOfEntry, readUsage, usageOfEntry, usageTimeline } from "../src/collect/usage.mjs";
+import { addUsage, createRecordScanner, emptyUsage, modelsOfEntry, readUsage, usageOfEntry, usageTimeline, USAGE_TOOLS_KEY } from "../src/collect/usage.mjs";
 import { classifyProviderError } from "../src/detect/provider.mjs";
 
 const MiB = 1024 * 1024;
@@ -136,15 +136,130 @@ function oracleTotals(file) {
 		}
 		if (!usage) continue;
 		for (const key of ["input", "output", "cacheRead", "cacheWrite"]) {
-			totals[key] += Number.isFinite(usage[key]) && usage[key] >= 0 ? usage[key] : 0;
+			totals[key] += typeof usage[key] === "number" ? usage[key] : 0;
 		}
 		totals.total = totals.input + totals.output + totals.cacheRead + totals.cacheWrite;
-		totals.cost += Number.isFinite(usage.cost?.total) ? usage.cost.total : 0;
+		totals.cost += typeof usage.cost?.total === "number" ? usage.cost.total : 0;
 		if (usage.costUnknown === true) totals.costUnknown = true;
 		if (entry.type === "message" && entry.message?.role === "assistant") totals.turns += 1;
 	}
 	return totals;
 }
+
+// Oracle: @code-yeongyu/senpi 2026.11.18-3, dist/core/usage-totals.js:11-19, verbatim.
+function addUsageToTotals(totals, usage) {
+	totals.input += usage.input;
+	totals.output += usage.output;
+	totals.cacheRead += usage.cacheRead;
+	totals.cacheWrite += usage.cacheWrite;
+	totals.cost += usage.cost.total;
+	if (usage.costUnknown)
+		totals.costUnknown = true;
+}
+
+// Oracle: @code-yeongyu/senpi 2026.11.18-3, dist/core/agent-session.js:12005, verbatim.
+const senpiTotal = (usageTotals) => usageTotals.input + usageTotals.output + usageTotals.cacheRead + usageTotals.cacheWrite;
+
+function* senpiEntries(file) {
+	for (const raw of fs.readFileSync(file, "utf8").replace(/^\uFEFF/, "").split("\n")) {
+		if (!raw.trim()) continue;
+		try {
+			yield JSON.parse(raw.replace(/\r$/, ""));
+		} catch {
+			// Unparseable lines contribute nothing, like the readers under test.
+		}
+	}
+}
+
+/** `/session` totals, produced only by the embedded senpi oracle. */
+function senpiUsageTotals(file) {
+	const totals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, costUnknown: false };
+	for (const entry of senpiEntries(file)) {
+		const hit = usageOfEntry(entry);
+		if (hit) addUsageToTotals(totals, hit.usage);
+	}
+	return { ...totals, total: senpiTotal(totals) };
+}
+
+/** Per-key tokens the way senpi getUsageCostBreakdown computes them. */
+function senpiModelTokens(file) {
+	const byKey = new Map();
+	for (const entry of senpiEntries(file)) {
+		const hit = usageOfEntry(entry);
+		if (!hit) continue;
+		const key = hit.key ?? USAGE_TOOLS_KEY;
+		let totals = byKey.get(key);
+		if (!totals) {
+			totals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+			byKey.set(key, totals);
+		}
+		addUsageToTotals(totals, hit.usage);
+	}
+	return Object.fromEntries([...byKey].map(([key, totals]) => [key, senpiTotal(totals)]));
+}
+
+test("(IS-1) negative, mixed-sign and fractional counters match senpi's raw sums", (t) => {
+	const { file } = setup(t);
+	writeRecords(file(), [
+		assistant({ usage: use({ input: -1, output: 3, cacheRead: 0, cacheWrite: 0, cost: -0.5 }) }),
+		usageEntry(use({ input: 4, output: -6, cacheRead: -1, cacheWrite: 2, cost: 0.25 }), { provider: "p", model: "mixed" }),
+		usageEntry(use({ input: 0.1, output: 0.1, cacheRead: 0.1, cacheWrite: 0.1, cost: 0 }), { provider: "p", model: "frac" }),
+		usageEntry(use({ input: 0.1, output: 0.1, cacheRead: 0.1, cacheWrite: 0.2, cost: 0 }), { provider: "p", model: "frac" }),
+	]);
+	const expected = senpiUsageTotals(file());
+	const got = readUsage(file()).effective;
+	for (const key of ["input", "output", "cacheRead", "cacheWrite", "total", "cost"]) assert.equal(got[key], expected[key], key);
+	assert.equal(got.models["anthropic-subscription/claude-opus-5-5"].tokens, 2);
+	assert.equal(got.models["p/mixed"].tokens, -1);
+	// Per-record sums would total 0.9; senpi's per-counter totals give this instead.
+	assert.equal(got.models["p/frac"].tokens, 0.9000000000000001);
+	assert.deepEqual(
+		Object.fromEntries(Object.entries(got.models).map(([key, value]) => [key, value.tokens])),
+		senpiModelTokens(file()),
+	);
+	assert.deepEqual(core(usageTimeline(file()).totals), core(got));
+});
+
+test("(IS-1) a 1e999 counter is Infinity like senpi", (t) => {
+	const { file } = setup(t);
+	const line = `{"type":"usage","provider":"p","model":"inf","usage":{"input":1e999,"output":-2,"cacheRead":3,"cacheWrite":0,"cost":{"total":-1e999}}}`;
+	fs.writeFileSync(file(), `${line}\n`);
+	assert.equal(JSON.parse(line).usage.input, Infinity);
+	const expected = senpiUsageTotals(file());
+	const got = readUsage(file()).effective;
+	for (const key of ["input", "output", "cacheRead", "cacheWrite", "total", "cost"]) assert.equal(got[key], expected[key], key);
+	assert.equal(got.total, Infinity);
+	assert.equal(got.cost, -Infinity);
+	assert.equal(got.models["p/inf"].tokens, Infinity);
+	assert.deepEqual(core(usageTimeline(file()).totals), core(got));
+});
+
+test("(IS-1) a non-number counter counts 0 (senpi's coercion is not reproduced)", (t) => {
+	const { file } = setup(t);
+	fs.writeFileSync(file(), '{"type":"usage","provider":"p","model":"s","usage":{"input":"5","output":-3,"cacheRead":"7","cacheWrite":0,"cost":{"total":"0.5"}}}\n');
+	const got = readUsage(file()).effective;
+	assert.equal(got.input, 0);
+	assert.equal(got.output, -3);
+	assert.equal(got.cacheRead, 0);
+	assert.equal(got.cacheWrite, 0);
+	assert.equal(got.total, -3);
+	assert.equal(got.cost, 0);
+	assert.equal(got.models["p/s"].tokens, -3);
+	assert.deepEqual(core(usageTimeline(file()).totals), core(got));
+});
+
+test("(IS-1) a >16 MiB record applies the same raw counter rule", (t) => {
+	const { file } = setup(t);
+	const record = assistant({ content: [{ type: "text", text: "x".repeat(17 * MiB) }], usage: use({ input: -1, output: 3, cacheRead: 0.1, cacheWrite: 0.2, cost: -0.5 }) });
+	const inf = '{"type":"usage","provider":"p","model":"inf","usage":{"input":1e999,"output":-2,"cacheRead":3,"cacheWrite":0,"cost":{"total":-1e999}}}';
+	fs.writeFileSync(file(), `${JSON.stringify(record)}\n${inf}\n`);
+	assert.ok(fs.statSync(file()).size > 16 * MiB);
+	const expected = senpiUsageTotals(file());
+	const got = readUsage(file()).effective;
+	for (const key of ["input", "output", "cacheRead", "cacheWrite", "total", "cost"]) assert.equal(got[key], expected[key], key);
+	assert.equal(got.total, Infinity);
+	assert.deepEqual(core(usageTimeline(file()).totals), core(got));
+});
 
 const core = (usage) => ({
 	input: usage.input,
