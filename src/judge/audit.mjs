@@ -1,4 +1,5 @@
 import { AUDIT_REASON_CODES, reasonCode } from "../audit-codes.mjs";
+import { MODEL_KEY_LENGTH } from "../collect/usage.mjs";
 import { detectorThresholdsHash } from "../config-reload.mjs";
 import { errorStormFact } from "../detect/loops.mjs";
 import { imageLevel } from "../detect/tokens.mjs";
@@ -24,7 +25,7 @@ export { AUDIT_REASON_CODES, reasonCode };
 export const AUDIT_OVERALL = Object.freeze(["sound", "exaggerated", "overreach", "missed", "mixed"]);
 export const AUDIT_JUDGMENTS = Object.freeze(["sound", "exaggerated", "overreach", "missed", "unverifiable"]);
 export const AUDIT_TOKEN_JUDGMENTS = Object.freeze(["normal", "high", "wasteful", "unclear"]);
-/** Generic string limit; subject IDs and fixed prose have separate rules. */
+/** Generic string limit; subject IDs, model keys and fixed prose have separate rules. */
 const BUNDLE_STRING_MAX = 120;
 export const BUNDLE_MAX_CHARS = 100_000;
 const HANGUL = /[\uAC00-\uD7A3]/;
@@ -514,12 +515,21 @@ const BUNDLE_SUBJECT_ID_PATHS = new Set([
 	"omo_health_record.findings[].subject.taskId",
 ]);
 
+const BUNDLE_MODEL_KEY_PATHS = new Set([
+	"tokens.models[].key",
+	"tokens.topTurns[].key",
+	"omo_health_record.investigations[].model",
+]);
+
 function assertBundleText(value, key, path = "") {
 	if (key === "question" || key === "checks_omo_health_runs") return;
 	if (typeof value === "string") {
-		const valid = BUNDLE_SUBJECT_ID_PATHS.has(path)
-			? safeSubjectId(value) !== null
-			: value.length <= BUNDLE_STRING_MAX && !/\s/.test(value);
+		let valid;
+		if (BUNDLE_SUBJECT_ID_PATHS.has(path)) valid = safeSubjectId(value) !== null;
+		// Accounting's billingKey/addModelId (collect/usage.mjs) cap the
+		// composite length without filtering the characters in either part.
+		else if (BUNDLE_MODEL_KEY_PATHS.has(path)) valid = value.length <= MODEL_KEY_LENGTH;
+		else valid = value.length <= BUNDLE_STRING_MAX && !/\s/.test(value);
 		if (!valid) throw new Error("bundle-text");
 		return;
 	}
@@ -540,8 +550,8 @@ const sizeOf = (bundle) => JSON.stringify(bundle).length;
  * The allowlisted evidence bundle for one session record (plan IS-11). Every
  * copied field is an id, enum, number, timestamp or model name; evidence text
  * survives only as `key:value` numeric metrics, and analyst reasons only as a
- * recognized code. The final walk applies the shared subject ID grammar at
- * designated paths and the generic text guard to other non-prose strings.
+ * recognized code. The final walk applies the subject ID and accounting
+ * model-key rules at designated paths and the generic guard to other non-prose strings.
  */
 export function auditBundle(record, timeline, { config, now, configDecisions = [] } = {}) {
 	const session = isObject(record?.session) ? record.session : {};

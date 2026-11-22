@@ -25,7 +25,7 @@ import { createUiServer } from "../src/ui/server.mjs";
 import { createUsageIndex, USAGE_INDEX_VERSION } from "../src/usage-index.mjs";
 import { createUsageTracker } from "../src/usage-tracker.mjs";
 import { expectedSelector } from "./helpers/ended-selector.mjs";
-import { appendJsonl, writeJsonl, writeTask } from "./helpers/fixtures.mjs";
+import { E, appendJsonl, writeJsonl, writeTask } from "./helpers/fixtures.mjs";
 
 const TOKEN = "test-token-abc_123";
 const STATE = { generatedMs: 1, overview: { level: "ok" } };
@@ -859,6 +859,75 @@ describe("ui server", { timeout: 20_000 }, () => {
 					auditor.tick(nowMs);
 					const done = readAuditState(paths, sessionId);
 					assert.deepEqual([done.status, done.sessionId, done.result?.overall], ["done", sessionId, "sound"]);
+				});
+			}
+
+			for (const length of [121, 256]) {
+				it(`plan82: an accounted ${length}-character model key previews and completes an independent audit`, async (t) => {
+					const provider = "anthropic";
+					const model = "x".repeat(length - provider.length - 1);
+					const key = `${provider}/${model}`;
+					const reviewer = "openai/gpt-review:high";
+					const world = makeWorld({
+						lanes: { ultrabrain: [key], architect: [reviewer] },
+						entries: [E.assistant({ provider, model, ms: Date.parse("2026-11-21T23:59:59.500Z"), usage: { input: 4, output: 1 } })],
+					});
+					const { paths, env, now, sessionFile } = world;
+					const ui = createUiServer({ paths, token: TOKEN, getState: () => STATE, sessionDetail: world.detail, startAudit: world.startAudit, now });
+					const starts = [];
+					let nowMs = now();
+					const runner = {
+						start(options) {
+							starts.push(options);
+							return { jobId: options.jobId, pid: 5000 };
+						},
+						poll() {
+							return { status: "done", exitCode: 0, result: {
+								overall: "sound",
+								summary: "토큰 사용과 점검이 모두 적절했습니다.",
+								tokens: { judgment: "normal", explanation: "정상 범위입니다." },
+								checks: [{ item: "토큰", judgment: "unverifiable", explanation: "자료가 부족합니다.", evidence: [] }],
+								recommendations: [],
+								confidence: 0.8,
+							} };
+						},
+					};
+					const auditor = createAuditor({ paths, config: loadConfig({ paths, env }).config, clock: { now: () => nowMs }, runner, env });
+					t.after(async () => {
+						await Promise.all([ui.close(), world.detail.close(), auditor.close()]);
+						fs.rmSync(world.dir, { recursive: true, force: true });
+					});
+
+					// Replace the fixture's seeded index row with one produced by accounting.
+					fs.unlinkSync(paths.health.usageIndexFile);
+					const index = createUsageIndex({ file: paths.health.usageIndexFile, clock: { now } });
+					index.update(AUDIT_ID, sessionFile, { kind: "main" });
+					const { models, usedModels, modelsIncomplete } = index.get(AUDIT_ID).published;
+					assert.deepEqual([Object.keys(models), Object.keys(usedModels), modelsIncomplete], [[key], [key], false]);
+					index.save();
+
+					const { port } = await ui.listen();
+					const detail = await getAt(port, `/api/session?id=${AUDIT_ID}`);
+					assert.deepEqual([detail.status, detail.body.audit.blocked, detail.body.audit.planned?.model], [200, null, reviewer]);
+					const posted = await postAt(port, "/api/audit", { sessionId: AUDIT_ID });
+					assert.deepEqual([posted.status, posted.body.audit?.planned?.model], [202, reviewer]);
+					auditor.tick(nowMs);
+					await auditor.preparing();
+					auditor.tick(nowMs);
+					const running = readAuditState(paths, AUDIT_ID);
+					assert.equal(running.status, "running", running.detail ?? running.reason);
+					assert.equal(starts.length, 1);
+					assert.equal(starts[0].args[starts[0].args.indexOf("--model") + 1], reviewer);
+					const bundleFile = path.join(starts[0].cwd, "bundle.md");
+					assert.ok(starts[0].args.includes(`@${bundleFile}`));
+					const bundle = JSON.parse(fs.readFileSync(bundleFile, "utf8").split("\n").find((line) => line.startsWith('{"session":')));
+					assert.deepEqual(bundle.tokens.models.map(({ key }) => key), [key]);
+					assert.deepEqual(bundle.tokens.topTurns.map(({ key }) => key), [key]);
+
+					nowMs += ANALYST_POLL_MS;
+					auditor.tick(nowMs);
+					const done = readAuditState(paths, AUDIT_ID);
+					assert.deepEqual([done.status, done.model, done.result?.overall], ["done", reviewer, "sound"]);
 				});
 			}
 

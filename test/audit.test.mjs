@@ -635,6 +635,31 @@ test("plan79: a non-ID string and an investigation ID still throw bundle-text pa
 	}
 });
 
+test("plan82: all designated model-key slots accept the accounting bound and characters", () => {
+	const key = `p/${"x".repeat(249)} part`;
+	assert.equal(key.length, 256);
+	const record = emptyRecord({ health: { investigations: [{ model: key }] } });
+	const timeline = { totals: { modelsIncomplete: false, models: { [key]: { tokens: 5 } } }, topTurns: [{ key, total: 5 }] };
+	const bundle = auditBundle(record, timeline, { config: DEFAULT_CONFIG, now: T0 });
+	assert.deepEqual([
+		bundle.tokens.models[0].key,
+		bundle.tokens.topTurns[0].key,
+		bundle.omo_health_record.investigations[0].model,
+	], [key, key, key]);
+});
+
+test("plan82: each model-key slot rejects 257 characters and non-key text still rejects 121", () => {
+	const key = `p/${"x".repeat(255)}`;
+	for (const [slot, record, timeline] of [
+		["tokens.models[].key", emptyRecord(), { totals: { modelsIncomplete: false, models: { [key]: { tokens: 5 } } } }],
+		["tokens.topTurns[].key", emptyRecord(), { topTurns: [{ key, total: 5 }] }],
+		["omo_health_record.investigations[].model", emptyRecord({ health: { investigations: [{ model: key }] } }), null],
+		["session.source", emptyRecord({ session: { source: key.slice(0, 121) } }), null],
+	]) {
+		assert.throws(() => auditBundle(record, timeline, { config: DEFAULT_CONFIG, now: T0 }), /bundle-text/, slot);
+	}
+});
+
 test("plan79: credential-shaped subject IDs are still redacted from reviewer data", () => {
 	const credentialShapedId = `sk-ant-${"x".repeat(300)}`;
 	const record = emptyRecord({ session: { sessionId: credentialShapedId } });
