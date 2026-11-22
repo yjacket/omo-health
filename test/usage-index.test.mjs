@@ -638,6 +638,45 @@ test("a resumable append reads only the appended bytes", (t) => {
 	assert.equal(index.fresh(index.get("s1")), true);
 });
 
+test("a file replaced with the same size and mtime is not fresh and is recounted", (t) => {
+	const { fileOf, indexOf } = setup(t);
+	const file = fileOf();
+	const text = `${line()}\n`;
+	writeText(file, text);
+	fs.utimesSync(file, 1_700_000_000, 1_700_000_000);
+	const index = indexOf();
+	index.update("s1", file);
+	assert.equal(index.fresh(index.get("s1")), true);
+	const replacement = `${file}.new`;
+	writeText(replacement, text);
+	fs.utimesSync(replacement, 1_700_000_000, 1_700_000_000);
+	fs.renameSync(replacement, file);
+	const stat = fs.statSync(file);
+	assert.equal(stat.size, index.get("s1").size);
+	assert.equal(stat.mtimeMs, index.get("s1").mtimeMs);
+	assert.equal(index.fresh(index.get("s1")), false, "a new file identity is a replacement");
+	assert.equal(index.update("s1", file), Buffer.byteLength(text), "the replacement is read from the start");
+	assert.equal(compactUsage(index.get("s1")).total, 10);
+	assert.equal(index.fresh(index.get("s1")), true);
+});
+
+test("a valid final record without a newline is published and stays published through reload and its newline", (t) => {
+	const { fileOf, indexOf } = setup(t);
+	const file = fileOf();
+	const fragment = JSON.stringify(assistant({ usage: use({ cacheWrite: 1 }) }));
+	writeText(file, `${line()}\n${fragment}`);
+	const index = indexOf();
+	index.update("s1", file);
+	assert.equal(compactUsage(index.get("s1")).total, 17);
+	assert.equal(index.save(), true);
+	assert.equal(compactUsage(readUsageIndex(fileOf("usage.json")).get("s1")).total, 17, "dashboard reload");
+	const restarted = indexOf();
+	assert.equal(compactUsage(restarted.get("s1")).total, 17, "daemon restart");
+	fs.appendFileSync(file, "\n");
+	restarted.update("s1", file, {}, { maxBytes: USAGE_TICK_BYTES });
+	assert.equal(compactUsage(restarted.get("s1")).total, 17, "the fragment is counted once, now as a committed record");
+});
+
 test("(gate 10) finite records that overflow survive a reload and a resumable append", (t) => {
 	const { fileOf, indexOf } = setup(t);
 	const file = fileOf();

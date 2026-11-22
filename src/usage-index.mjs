@@ -142,14 +142,21 @@ export function compactUsage(entry) {
 /**
  * True when the entry is complete and the file on disk still has exactly the
  * size, mtime and end the last read saw. Used for requeueing and reviewer
- * eligibility alike; a same-length rewrite (new mtimeMs) is never fresh.
+ * eligibility alike; a same-length rewrite (new mtimeMs) or a replaced file (new
+ * ino or birthtimeMs, the identity `readUsage` checks) is never fresh.
  */
 export function fresh(entry) {
 	if (!isObject(entry) || entry.state !== "ok" || entry.complete !== true) return false;
 	if (!hasNumericCursor(entry)) return false;
 	if (entry.evaluatedTo !== entry.size) return false;
 	const stat = statSafe(entry.file);
-	return Boolean(stat && stat.size === entry.size && stat.mtimeMs === entry.mtimeMs);
+	return Boolean(
+		stat &&
+			stat.size === entry.size &&
+			stat.mtimeMs === entry.mtimeMs &&
+			stat.ino === entry.ino &&
+			stat.birthtimeMs === entry.birthtimeMs,
+	);
 }
 
 /** `fresh` under the name the requeue path uses. */
