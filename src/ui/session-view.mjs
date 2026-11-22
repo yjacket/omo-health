@@ -39,7 +39,29 @@ function labelledVerdictHistory(history) {
 
 function labelledInvestigation(investigation) {
 	const row = investigationRow(investigation);
-	return { ...row, verdictHistory: labelledVerdictHistory(investigation.verdictHistory) };
+	const verdict = row.verdict;
+	const last = list(investigation.actions).at(-1);
+	// The shared list row makes previews. The detail API sends the local text unchanged.
+	return {
+		...row,
+		evidence: investigation.evidence ?? [],
+		signals: investigation.signals ?? [],
+		verdict: verdict ? {
+			...verdict,
+			diagnosis: investigation.verdict.diagnosis ?? null,
+			mechanism: investigation.verdict.mechanism ?? null,
+			avoid: investigation.verdict.avoid ?? null,
+			advice: investigation.verdict.advice ?? null,
+			reason: investigation.verdict.reason ?? null,
+			evidence: investigation.verdict.evidence ?? [],
+		} : null,
+		action: last && row.action ? {
+			...row.action,
+			detail: last.detail ?? row.action.detail,
+			advice: last.advice ?? null,
+		} : row.action,
+		verdictHistory: labelledVerdictHistory(investigation.verdictHistory),
+	};
 }
 
 function labelledChild(child) {

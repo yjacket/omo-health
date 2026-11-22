@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createSessionFileLocator } from "./collect/session-files.mjs";
-import { actionDetail, readDecisions, streamDecisions } from "./decisions.mjs";
+import { streamDecisions } from "./decisions.mjs";
 import { streamEnded } from "./session-ledger.mjs";
 import { compactUsage, readUsageIndex, treeTotals, usageEntryFor } from "./usage-index.mjs";
 import { reasonCode } from "./audit-codes.mjs";
@@ -24,10 +24,7 @@ import { redact, truncate } from "./util/text.mjs";
 const DAY_MS = 86_400_000;
 const DEPTH_MAX = 8;
 const LINE_MAX = 300;
-const EVIDENCE_LINE_MAX = 200;
-const EVIDENCE_LINES_MAX = 6;
-const RECORD_LINES_MAX = 12;
-const MESSAGE_TEXT_MAX = 300;
+const DETAIL_TEXT_MAX = 20_000;
 const TITLE_MAX = 200;
 const TEXT_MAX = 2000;
 const FINDING_EVENTS = new Set(["opened", "reopened", "resolved"]);
@@ -52,9 +49,42 @@ function cleanValue(value, depth = 0) {
 	return out;
 }
 
-function cleanLines(lines, max = RECORD_LINES_MAX, lineMax = LINE_MAX) {
+const cleanDetail = (value) => clean(value, DETAIL_TEXT_MAX);
+
+function cleanLines(lines) {
 	if (!Array.isArray(lines)) return [];
-	return lines.filter((line) => typeof line === "string" && line).slice(0, max).map((line) => truncate(scrub(line), lineMax));
+	return lines.map(cleanDetail).filter(Boolean);
+}
+
+// Unlike the history samples, owner-local action details retain the complete outcome.
+function actionDetail(outcome, rule, investigation = false) {
+	const ids = (list) => Array.isArray(list) && list.length
+		? list.map((item) => isRecord(item) ? (item.pid ?? (investigation ? "?" : item)) : item).join(investigation ? ", " : ",")
+		: null;
+	const killed = ids(outcome.killed);
+	const noop = investigation && ids(outcome.noop);
+	const survived = ids(outcome.survived);
+	const parts = [
+		killed && `killed ${killed}`,
+		noop && `noop ${noop}`,
+		survived && `survived ${survived}`,
+		outcome.delivered !== undefined && (!investigation || outcome.delivered !== null) && `delivered ${outcome.delivered}`,
+		!investigation && outcome.via && `via ${outcome.via}`,
+		!investigation && outcome.error && `error ${outcome.error}`,
+		rule && `rule ${isRecord(rule) ? rule.id : rule}`,
+	];
+	return cleanDetail(parts.filter(Boolean).join("; "));
+}
+
+function verdictText(verdict) {
+	return {
+		reason: cleanDetail(verdict.reason),
+		diagnosis: cleanDetail(verdict.diagnosis),
+		mechanism: cleanDetail(verdict.mechanism),
+		avoid: cleanDetail(verdict.avoid),
+		advice: cleanDetail(verdict.advice),
+		evidence: cleanLines(verdict.evidence),
+	};
 }
 
 function byNewest(a, b) {
@@ -164,7 +194,7 @@ function machineRow(entry, fp, ts) {
 		titleKo: clean(entry.titleKo, TITLE_MAX),
 		subject: cleanValue(entry.subject ?? {}),
 		scope: "machine",
-		evidence: cleanLines(entry.evidence, EVIDENCE_LINES_MAX, EVIDENCE_LINE_MAX),
+		evidence: cleanLines(entry.evidence),
 	};
 }
 
@@ -183,15 +213,24 @@ function factsOf(entry) {
 }
 
 function actionRow(entry) {
+	let kind = entry.action?.kind;
+	let result = entry.result;
+	if (!isRecord(entry.action)) {
+		if (entry.detector !== "D20" || entry.kind !== "park-resume") return null;
+		kind = "relaunch";
+		if (entry.event === "park-transition" && entry.to === "launched") result = entry.to;
+		else if (entry.event === "park-transition" && entry.why === "launch-failed") result = entry.why;
+		else if (entry.event !== "park-gated") return null;
+	}
 	const recipient = isRecord(entry.outcome) && nonEmpty(entry.outcome.sessionId) ? entry.outcome.sessionId : isRecord(entry.subject) && nonEmpty(entry.subject.sessionId) ? entry.subject.sessionId : null;
 	return {
 		ts: entry.ts ?? null,
 		detector: clean(entry.detector, 20),
 		// An engine action decision carries the finding's kind at top level and the action's kind under `action`.
-		kind: clean(entry.action.kind, 80),
+		kind: clean(kind, 80),
 		findingKind: clean(entry.kind, 80),
-		result: clean(entry.result, 120),
-		detail: actionDetail(entry),
+		result: clean(result, 120),
+		detail: actionDetail(isRecord(entry.outcome) ? entry.outcome : {}, entry.rule) ?? "",
 		recipient,
 		subject: cleanValue(entry.subject ?? {}),
 		facts: factsOf(entry),
@@ -211,8 +250,7 @@ function verdictRows(decisions, fp) {
 			cause: a.cause ?? null,
 			confidence: Number.isFinite(a.confidence) ? a.confidence : null,
 			failed: a.failed === true || entry.result === "analyst-failed",
-			reason: clean(a.reason, LINE_MAX),
-			diagnosis: clean(a.diagnosis, TEXT_MAX),
+			...verdictText(a),
 		});
 	}
 	return rows.sort((a, b) => (msOf(a.ts) || 0) - (msOf(b.ts) || 0));
@@ -220,10 +258,17 @@ function verdictRows(decisions, fp) {
 
 function investigationRow(record, decisions) {
 	const raw = cleanValue(record);
+	const actions = Array.isArray(record.actions) ? record.actions.slice(0, 500) : null;
 	return {
 		...raw,
-		evidence: cleanLines(record.evidence, RECORD_LINES_MAX, LINE_MAX),
-		signals: cleanLines(record.signals, RECORD_LINES_MAX, LINE_MAX),
+		evidence: cleanLines(record.evidence),
+		signals: cleanLines(record.signals),
+		...(isRecord(record.verdict) ? { verdict: { ...raw.verdict, ...verdictText(record.verdict) } } : {}),
+		...(actions ? { actions: actions.map((action, i) => isRecord(action) ? {
+			...raw.actions[i],
+			detail: actionDetail(action, action.rule, true),
+			advice: cleanDetail(action.advice),
+		} : raw.actions[i]) } : {}),
 		verdictHistory: verdictRows(decisions, record.id),
 	};
 }
@@ -262,6 +307,52 @@ export function usageEntryOf(usage, row, ambiguous) {
 
 const FULL_USAGE = Object.freeze({ state: "full" });
 
+function joinSessionDecisions(row, descendants, investigations, decisions) {
+	const nodes = [row, ...descendants];
+	const sessionAllowed = new Set(nodes.map((node) => node.sessionId).filter(nonEmpty));
+	// D8 addresses the parent session but names the affected child by its task id.
+	const childTasksByParent = new Map();
+	for (const { parentSessionId, taskId } of nodes) {
+		if (!nonEmpty(parentSessionId) || !nonEmpty(taskId)) continue;
+		if (!childTasksByParent.has(parentSessionId)) childTasksByParent.set(parentSessionId, new Set());
+		childTasksByParent.get(parentSessionId).add(taskId);
+	}
+	const taskOnly = new Set(nodes.filter((node) => !nonEmpty(node.sessionId)).map((node) => node.taskId).filter(nonEmpty));
+	const taskSubjects = new Map();
+	if (taskOnly.size) {
+		const countSubject = ({ subject } = {}) => {
+			if (!isRecord(subject) || !taskOnly.has(subject.taskId)) return;
+			const identity = nonEmpty(subject.sessionId) ? `session:${subject.sessionId}` : `parent:${subject.parentSessionId ?? subject.rootSessionId ?? ""}`;
+			trackOwner(taskSubjects, subject.taskId, identity);
+		};
+		// A competing owner can veto a task-only match, even if its row would not be retained.
+		for (const entry of decisions()) if (isRecord(entry)) countSubject(entry);
+		for (const record of investigations) if (isRecord(record)) countSubject(record);
+	}
+	const subjectMatches = (subject) => isRecord(subject) && (sessionAllowed.has(subject.sessionId) ||
+		childTasksByParent.get(subject.sessionId)?.has(subject.taskId) ||
+		(typeof taskSubjects.get(subject.taskId) === "string") ||
+		sessionAllowed.has(subject.parentSessionId) || sessionAllowed.has(subject.rootSessionId));
+
+	// 1. investigations about the session or its descendants
+	const selectedInvestigations = investigations.filter((record) => isRecord(record) && subjectMatches(record.subject));
+
+	// 2. the fp set: selected investigations plus lifecycle rows whose subject matches
+	const fpSet = new Set(selectedInvestigations.map((record) => record.id).filter(nonEmpty));
+	for (const entry of decisions()) if (isRecord(entry) && FINDING_EVENTS.has(entry.event) && nonEmpty(entry.fp) && subjectMatches(entry.subject)) fpSet.add(entry.fp);
+
+	// 3. decisions about the session; 4. decisions delivered to it or its descendants.
+	// Scan again so an action written before the lifecycle row can still join by fp.
+	const about = [];
+	const delivered = [];
+	for (const entry of decisions()) {
+		if (!isRecord(entry)) continue;
+		if ((nonEmpty(entry.fp) && fpSet.has(entry.fp)) || subjectMatches(entry.subject) || (nonEmpty(row.sessionId) && entry.sessionId === row.sessionId)) about.push(entry);
+		else if (sessionAllowed.has(entry.outcome?.sessionId)) delivered.push(entry);
+	}
+	return { selectedInvestigations, fpSet, about, selected: [...new Set([...about, ...delivered])] };
+}
+
 /**
  * Join every stored record about `inputs.row` and its descendants. Pure: the
  * loader supplies already-read inputs, so tests can drive a fixture directly.
@@ -280,37 +371,7 @@ export function buildSessionRecord(inputs = {}) {
 	const endedMs = msOf(row.endedMs);
 	const descendants = inputs.descendants ?? collectDescendants(row, ledger, usage.values());
 	const ambiguous = inputs.ambiguous ?? ambiguousLedgerTaskIds(ledger);
-	const nodes = [row, ...descendants];
-	const sessionAllowed = new Set(nodes.map((node) => node.sessionId).filter(nonEmpty));
-	// D8 addresses the parent session but names the affected child by its task id.
-	const childTasksByParent = new Map();
-	for (const { parentSessionId, taskId } of nodes) {
-		if (!nonEmpty(parentSessionId) || !nonEmpty(taskId)) continue;
-		if (!childTasksByParent.has(parentSessionId)) childTasksByParent.set(parentSessionId, new Set());
-		childTasksByParent.get(parentSessionId).add(taskId);
-	}
-	const taskOnly = new Set(nodes.filter((node) => !nonEmpty(node.sessionId)).map((node) => node.taskId).filter(nonEmpty));
-	const taskSubjects = new Map();
-	if (taskOnly.size) {
-		const countSubject = ({ subject } = {}) => {
-			if (!isRecord(subject) || !taskOnly.has(subject.taskId)) return;
-			const identity = nonEmpty(subject.sessionId) ? `session:${subject.sessionId}` : `parent:${subject.parentSessionId ?? subject.rootSessionId ?? ""}`;
-			trackOwner(taskSubjects, subject.taskId, identity);
-		};
-		for (const entry of decisions) if (isRecord(entry)) countSubject(entry);
-		for (const record of investigations) if (isRecord(record)) countSubject(record);
-	}
-	const subjectMatches = (subject) => isRecord(subject) && (sessionAllowed.has(subject.sessionId) ||
-		childTasksByParent.get(subject.sessionId)?.has(subject.taskId) ||
-		(typeof taskSubjects.get(subject.taskId) === "string") ||
-		sessionAllowed.has(subject.parentSessionId) || sessionAllowed.has(subject.rootSessionId));
-
-	// 1. investigations about the session or its descendants
-	const selectedInvestigations = investigations.filter((record) => isRecord(record) && subjectMatches(record.subject));
-
-	// 2. the fp set: selected investigations plus lifecycle rows whose subject matches
-	const fpSet = new Set(selectedInvestigations.map((record) => record.id).filter(nonEmpty));
-	for (const entry of decisions) if (isRecord(entry) && FINDING_EVENTS.has(entry.event) && nonEmpty(entry.fp) && subjectMatches(entry.subject)) fpSet.add(entry.fp);
+	const { selectedInvestigations, fpSet, about, selected } = inputs.decisionJoin ?? joinSessionDecisions(row, descendants, investigations, () => decisions);
 
 	// 2b. every model that may have analyzed a selected fp: each selected investigation file's current model plus
 	// the analyzing decisions recorded for the fp. An fp known only from decisions has no investigation file, so the
@@ -321,15 +382,10 @@ export function buildSessionRecord(inputs = {}) {
 		analystModels.push(model);
 	};
 	for (const record of selectedInvestigations) addAnalystModel(record.model);
-	for (const entry of decisions) {
-		if (!isRecord(entry) || entry.event !== "investigation" || !fpSet.has(entry.fp)) continue;
+	for (const entry of about) {
+		if (entry.event !== "investigation" || !fpSet.has(entry.fp)) continue;
 		addAnalystModel(entry.model);
 	}
-
-	// 3. decisions about the session; 4. decisions delivered to it or its descendants
-	const about = decisions.filter((entry) => isRecord(entry) && ((nonEmpty(entry.fp) && fpSet.has(entry.fp)) || subjectMatches(entry.subject) || (nonEmpty(row.sessionId) && entry.sessionId === row.sessionId)));
-	const delivered = decisions.filter((entry) => isRecord(entry) && sessionAllowed.has(entry.outcome?.sessionId));
-	const selected = [...new Set([...about, ...delivered])];
 
 	const findings = selected
 		.filter((entry) => FINDING_EVENTS.has(entry.event))
@@ -343,21 +399,21 @@ export function buildSessionRecord(inputs = {}) {
 			titleKo: clean(entry.titleKo, TITLE_MAX),
 			subject: cleanValue(entry.subject ?? {}),
 			scope: "session",
-			evidence: cleanLines(entry.evidence, EVIDENCE_LINES_MAX, EVIDENCE_LINE_MAX),
+			evidence: cleanLines(entry.evidence),
 		}));
 	const { machine, infoFindings } = inputs.decisionHistory ?? scanDecisionHistory(decisions.filter((entry) => Number.isFinite(timeOf(entry))).sort((a, b) => timeOf(a) - timeOf(b)), row);
 	const allFindings = [...findings, ...machine].sort(byNewest);
 
 	const actions = selected
-		.filter((entry) => isRecord(entry.action))
 		.map(actionRow)
+		.filter(Boolean)
 		.sort(byNewest);
 
-	const investigationRows = selectedInvestigations.map((record) => investigationRow(record, decisions)).sort((a, b) => (b.openedMs ?? 0) - (a.openedMs ?? 0));
+	const investigationRows = selectedInvestigations.map((record) => investigationRow(record, about)).sort((a, b) => (b.openedMs ?? 0) - (a.openedMs ?? 0));
 
 	const messages = messagesIn
 		.filter(isRecord)
-		.map((message) => ({ ms: Number.isFinite(message.ms) ? message.ms : null, recipient: clean(message.recipient, 200), text: clean(typeof message.text === "string" ? message.text : "", MESSAGE_TEXT_MAX) }))
+		.map((message) => ({ ms: Number.isFinite(message.ms) ? message.ms : null, recipient: clean(message.recipient, 200), text: cleanDetail(message.text) }))
 		.sort((a, b) => (b.ms ?? 0) - (a.ms ?? 0));
 
 	const entry = usageEntryOf(usage, row, ambiguous);
@@ -602,9 +658,10 @@ export function loadSessionRecord({ paths, id, endedMs, now = Date.now(), messag
 	if (!joined) return { found: false, id };
 	const { row, descendants, ancestors, scanned, ambiguous } = joined;
 	const startedMs = msOf(row.startedMs);
-	const decisions = readDecisions(paths, (Number.isFinite(startedMs) ? startedMs : now) - 30 * DAY_MS);
+	const sinceMs = (Number.isFinite(startedMs) ? startedMs : now) - 30 * DAY_MS;
 	const decisionHistory = scanDecisionHistory(streamDecisions(paths), row);
 	const investigations = readAllInvestigations(paths);
+	const decisionJoin = joinSessionDecisions(row, descendants, investigations, () => streamDecisions(paths, sinceMs));
 	const loc = locator ?? createSessionFileLocator({ paths, clock: { now: () => now } });
 
 	const files = [];
@@ -631,5 +688,5 @@ export function loadSessionRecord({ paths, id, endedMs, now = Date.now(), messag
 		for (const message of scanMessages(file) ?? []) messages.push({ ...message, recipient: sessionId });
 	}
 
-	return buildSessionRecord({ id, row, descendants, ambiguous, usage, decisions, decisionHistory, investigations, messages, truncated: { messagesSkipped: skipped } });
+	return buildSessionRecord({ id, row, descendants, ambiguous, usage, decisionJoin, decisionHistory, messages, truncated: { messagesSkipped: skipped } });
 }

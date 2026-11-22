@@ -108,6 +108,14 @@ function probe(operation, shape, mode, cap) {
 	}
 }
 
+test("IS-10: session decision join fits a 96 MiB heap with over 96 MiB of unrelated decisions", (t) => {
+	const dir = fs.mkdtempSync(path.join(root, "decisions-"));
+	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+	const result = invoke(96, "decision-join", dir);
+	assertsExit(result, "session record decision join");
+	t.diagnostic(result.stdout.trim());
+});
+
 test("gate 19 memory invariant: empty at 80 MiB / full at 96 MiB", async (t) => {
 	const shapes = ["orig", "distinct", "family"];
 	if (process.env.OMOH_MEMORY_REAL_SESSIONS) shapes.push("real-4x");

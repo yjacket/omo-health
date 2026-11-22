@@ -893,6 +893,37 @@ a:hover {
 	padding: 0;
 }
 
+.detail-text {
+	min-inline-size: 0;
+}
+
+.detail-text__value {
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+
+.detail-text > summary {
+	display: block;
+	cursor: pointer;
+}
+
+.detail-text > summary::-webkit-details-marker {
+	display: none;
+}
+
+.detail-text__more,
+.detail-text__less {
+	display: inline-block;
+	margin-inline-start: var(--s-1);
+	font-size: var(--t-caption);
+	text-decoration: underline;
+}
+
+.detail-text:not([open]) .detail-text__less,
+.detail-text[open] :is(.detail-text__preview, .detail-text__more) {
+	display: none;
+}
+
 /* ---------- expandable table rows (investigation list, session history): one tbody per item, a summary row and the detail row it expands into ---------- */
 
 .table--inv {

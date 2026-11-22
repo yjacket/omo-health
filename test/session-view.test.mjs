@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { describe, it } from "node:test";
 import { runInNewContext } from "node:vm";
+import { appendDecision } from "../src/decisions.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 import { appendEnded } from "../src/session-ledger.mjs";
 import { loadSessionRecord } from "../src/session-record.mjs";
@@ -155,6 +156,23 @@ describe("session view", () => {
 			[null, "overflow", "토큰 -", title]);
 	});
 
+	it("IS-7: detail labels a D20 relaunch on the parked session only", () => {
+		const root = tmpDir("session-view-relaunch-");
+		const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health") });
+		const sessionId = "s-parked";
+		const row = { sessionId, kind: "main", startedMs: T0 - 1000, endedMs: T0 };
+		appendEnded(paths, row, { nowMs: T0 });
+		appendEnded(paths, { ...row, sessionId: "s-other" }, { nowMs: T0 });
+		const ts = iso(T0 + 1000);
+		// Producer shape: src/act/park-resume.mjs:154-155,284; timestamp added by the decision log.
+		appendDecision(paths, { detector: "D20", kind: "park-resume", event: "park-transition", subject: { sessionId }, parkId: `${sessionId}.${T0}`, sessionId, from: "claimed", to: "launched", why: "launched", ts });
+		const detail = (id) => buildSessionView(loadSessionRecord({ paths, id, now: T0 + 1000 }));
+		assert.deepEqual(detail("s-other").health.actions, []);
+		assert.deepEqual(detail(sessionId).health.actions.map(({ kind, actionKo, resultKo, ts, recipient }) => [kind, actionKo, resultKo, ts, recipient]), [
+			["relaunch", "한도 대기 세션 다시 열기", "다시 열었음", ts, sessionId],
+		]);
+	});
+
 	it("labels the session, findings, actions and children, falling back to the raw key for unknown kinds", () => {
 		const raw = record();
 		const view = buildSessionView(raw);
@@ -173,6 +191,36 @@ describe("session view", () => {
 		assert.equal(unknown.resultKo, "mystery");
 		assert.equal(view.children[0].outcomeKo, OUTCOME_LABELS.answered);
 		assert.equal(view.children[0].sessionId, "s-child");
+	});
+
+	it("(plan 37) sends full detail text instead of the investigation list previews", () => {
+		const text = `${"x".repeat(900)}\nThe redacted final sentence.`;
+		const evidence = [...Array.from({ length: 12 }, (_, i) => `line ${i}`), text];
+		const raw = record();
+		raw.health.findings[0].evidence = evidence;
+		raw.health.actions[0].detail = text;
+		raw.health.messages[0].text = text;
+		const explanations = { diagnosis: text, mechanism: text, avoid: text, advice: text, reason: text, evidence };
+		raw.health.investigations[0] = investigation({
+			evidence,
+			signals: [text],
+			verdict: { verdict: "escalate", ...explanations },
+			verdictHistory: [{ verdict: "escalate", ...explanations }],
+			actions: [{ kind: "release-shell", detail: text, advice: text }],
+		});
+		const health = JSON.parse(JSON.stringify(buildSessionView(raw))).health;
+		assert.deepEqual(health.findings[0].evidence, evidence);
+		assert.equal(health.actions[0].detail, text);
+		assert.equal(health.messages[0].text, text);
+		const [investigationView] = health.investigations;
+		assert.deepEqual(investigationView.evidence, evidence);
+		assert.deepEqual(investigationView.signals, [text]);
+		for (const [field, value] of Object.entries(explanations)) {
+			assert.deepEqual(investigationView.verdict[field], value);
+			assert.deepEqual(investigationView.verdictHistory[0][field], value);
+		}
+		assert.equal(investigationView.action.detail, text);
+		assert.equal(investigationView.action.advice, text);
 	});
 
 	it("maps investigations through investigationRow and keeps labelled verdict history in order", () => {

@@ -115,6 +115,24 @@ function endedDetailFunctions(names, globals) {
 	return runInNewContext(`${functions.join("\n")}\n({ ${names.map((name) => `${name}: typeof ${name} === "function" ? ${name} : undefined`).join(", ")} })`, globals);
 }
 
+it("(plan 37) the app disclosure uses a 300-character preview and keeps the full text", () => {
+	const el = (tag, attrs, ...children) => ({ tag, attrs, children });
+	const { detailText, detailTextParts } = endedDetailFunctions(["detailTextParts", "detailText"], { el, show: String });
+	assert.equal(typeof detailTextParts, "function");
+	const preview = "x".repeat(300);
+	const full = `${preview}\nThe final sentence.`;
+	const parts = detailTextParts(full);
+	assert.equal(parts.preview, preview);
+	assert.equal(parts.full, full);
+	assert.equal(detailText(preview).tag, "span");
+	const disclosure = detailText(full);
+	assert.equal(disclosure.tag, "details");
+	assert.equal(disclosure.attrs.open, undefined);
+	const [summary, expanded] = disclosure.children;
+	assert.deepEqual(Array.from(summary.children, (node) => node.attrs.text), [`${preview}…`, "전체 보기", "접기"]);
+	assert.equal(expanded.attrs.text, full);
+});
+
 const pendingTokens = { tokensState: "pending", tokens: null, treeTokens: null };
 const readyTokens = { tokensState: "ok", tokens: { total: 30 }, treeTokens: 40 };
 

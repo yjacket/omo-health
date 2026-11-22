@@ -30,7 +30,41 @@ const sparseTick = operation === "sparse-tick" || operation === "positioned-tick
 const indexFile = sparseTick ? path.join(dir, `${mode}-${operation}.json`) : paths.health.usageIndexFile;
 const open = () => createUsageIndex({ file: indexFile, clock });
 
-if (operation === "build-sparse") {
+if (operation === "decision-join") {
+	const { loadSessionRecord } = await load("session-record");
+	const { appendDecision } = await load("decisions");
+	const sessionId = "seed";
+	assert.equal(appendEnded(paths, { sessionId, kind: "main", startedMs: now - 30_000, endedMs: now }, { nowMs: now }), true);
+	const ts = new Date(now - 1000).toISOString();
+	const file = path.join(paths.health.decisionsDir, `${ts.slice(0, 10)}.jsonl`);
+	fs.mkdirSync(paths.health.decisionsDir, { recursive: true });
+	const row = JSON.stringify({ ts, event: "opened", fp: "unrelated", subject: { sessionId: "other" }, evidence: ["x".repeat(8192)] }) + "\n";
+	const block = Buffer.from(row.repeat(128));
+	const fd = fs.openSync(file, "w");
+	try {
+		for (let i = 0; i < 112; i++) fs.writeSync(fd, block);
+	} finally {
+		fs.closeSync(fd);
+	}
+	const bytes = fs.statSync(file).size;
+	assert.ok(bytes > 96 * 1024 * 1024);
+	console.log(`DECISIONS unrelated bytes=${bytes}`);
+	const record = () => {
+		const result = loadSessionRecord({ paths, id: sessionId, now });
+		assert.equal(result.found, true);
+		return result.health;
+	};
+	const empty = record();
+	assert.deepEqual([empty.findings, empty.actions], [[], []]);
+	const fp = "related";
+	// The fp-only action precedes the finding that makes the fp eligible.
+	appendDecision(paths, { ts, fp, action: { kind: "nudge" }, result: "would" });
+	appendDecision(paths, { ts, fp, event: "opened", subject: { sessionId } });
+	const joined = record();
+	assert.deepEqual(joined.findings.map(({ fp, scope }) => [fp, scope]), [["related", "session"]]);
+	assert.deepEqual(joined.actions.map(({ kind, result }) => [kind, result]), [["nudge", "would"]]);
+	console.log("DECISIONS bounded join: findings 0 → 1, actions 0 → 1");
+} else if (operation === "build-sparse") {
 	const cwd = path.join(dir, "prj");
 	const target = path.join(cwd, ".omo", "senpi-task", "children", "st_seed", "sessions", "st_seed", "2026-11-22_seed.jsonl");
 	put(target, "");

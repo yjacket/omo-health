@@ -42,20 +42,21 @@ export function readDecisions(paths, sinceMs = 0) {
 	return out;
 }
 
-function parseDecision(line) {
+function parseDecision(line, sinceMs) {
 	try {
 		const entry = JSON.parse(line.toString("utf8"));
-		return Number.isFinite(Date.parse(entry?.ts)) ? entry : null;
+		return Date.parse(entry?.ts) >= sinceMs ? entry : null;
 	} catch {
 		return null;
 	}
 }
 
-/** Stream every retained day, oldest first, in append order within each day. */
-export function* streamDecisions(paths) {
+/** Stream retained decisions oldest day first, in append order within each day. */
+export function* streamDecisions(paths, sinceMs = -Infinity) {
 	const dir = paths.health.decisionsDir;
 	const chunk = Buffer.allocUnsafe(64 * 1024);
 	for (const name of listDirSafe(dir).filter((n) => n.endsWith(".jsonl")).sort()) {
+		if (Date.parse(`${name.slice(0, 10)}T23:59:59Z`) < sinceMs) continue;
 		let fd;
 		try {
 			fd = fs.openSync(path.join(dir, name), "r");
@@ -65,13 +66,13 @@ export function* streamDecisions(paths) {
 				let start = 0;
 				for (let end; (end = bytes.indexOf(10, start)) !== -1; start = end + 1) {
 					const tail = bytes.subarray(start, end);
-					const entry = parseDecision(parts.length ? Buffer.concat([...parts, tail]) : tail);
+					const entry = parseDecision(parts.length ? Buffer.concat([...parts, tail]) : tail, sinceMs);
 					parts = [];
 					if (entry) yield entry;
 				}
 				if (start < n) parts.push(Buffer.from(bytes.subarray(start)));
 			}
-			const last = parts.length ? parseDecision(Buffer.concat(parts)) : null;
+			const last = parts.length ? parseDecision(Buffer.concat(parts), sinceMs) : null;
 			if (last) yield last;
 		} catch {
 			// A retained file may disappear or be unreadable during a scan.

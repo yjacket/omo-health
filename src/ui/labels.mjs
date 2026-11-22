@@ -86,6 +86,7 @@ export const ACTION_LABELS = Object.freeze({
 	"crash-notice": "재개된 세션에 크래시 안내",
 	"crash-answer": "재개한 세션의 목표 재개 창에 Enter",
 	"park-resume": "한도 대기 재개",
+	relaunch: "한도 대기 세션 다시 열기",
 	"refusal-resume": "정책 거부로 멈춘 목표 세션 다시 시작",
 	"park-cleanup": "비정상 한도 대기 기록 정리(기록만)",
 	"boot-notice": "중단 전 작업 안내",
@@ -97,6 +98,8 @@ export const ACTION_LABELS = Object.freeze({
 
 export const RESULT_LABELS = Object.freeze({
 	execute: "실행",
+	launched: "다시 열었음",
+	"launch-failed": "다시 열기 실패",
 	would: "했을 조치(기록만)",
 	"skipped:paused": "일시정지로 건너뜀",
 	"skipped:switch-off": "스위치 꺼짐(설정 또는 완화 조치)",

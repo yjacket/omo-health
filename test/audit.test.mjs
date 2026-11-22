@@ -239,6 +239,34 @@ test("the bundle carries no seeded secret text but keeps the numeric metric coun
 	assert.equal(bundle.omo_health_record.findings[0].droppedEvidence, 2);
 });
 
+test("(plan 37) the audit bundle omits the final sentence retained in the local record", () => {
+	const row = { sessionId: "s1", kind: "main", startedMs: T0, endedMs: T0 + HOUR };
+	const finalSentence = "This final sentence is for the owner only.";
+	const text = `${"x".repeat(900 - finalSentence.length)}${finalSentence}`;
+	const subject = { sessionId: row.sessionId };
+	const verdict = { verdict: "escalate", diagnosis: text, reason: text, evidence: [text] };
+	const record = buildSessionRecord({
+		row,
+		messages: [{ ms: T0, recipient: row.sessionId, text }],
+		decisions: [
+			{ fp: "fp1", event: "opened", detector: "D1", subject, evidence: [text, "count:6"] },
+			{ fp: "fp1", event: "investigation", analyst: verdict },
+			{ fp: "fp1", action: { kind: "deliver-message" }, outcome: { error: text } },
+		],
+		investigations: [{ id: "fp1", subject, signals: [text], verdict }],
+	});
+	assert.ok(record.health.messages[0].text.endsWith(finalSentence), "the local message must actually contain the final sentence");
+	assert.equal(record.health.findings[0].evidence[0], text);
+	assert.ok(record.health.actions[0].detail.endsWith(finalSentence));
+	assert.equal(record.health.investigations[0].signals[0], text);
+	assert.equal(record.health.investigations[0].verdictHistory[0].diagnosis, text);
+	const bundle = auditBundle(record, null, { config: DEFAULT_CONFIG, now: T0 });
+	const serialized = JSON.stringify(bundle);
+	assert.equal(serialized.includes(finalSentence), false);
+	assert.equal(serialized.includes("x".repeat(300)), false);
+	assert.equal(bundle.omo_health_record.findings[0].metrics.count, "6");
+});
+
 test("(IS-11) numeric-looking error text is omitted while the D10 count is kept", () => {
 	const record = emptyRecord({ health: { findings: [{ detector: "D10", evidence: ["error:123456", "count:6"] }] } });
 	const bundle = auditBundle(record, null, { config: DEFAULT_CONFIG, now: T0 });
@@ -272,6 +300,26 @@ test("(IS-11) allowlisted metric keys occur in detector sources and exclude the 
 test("a long sentence slipped into an allowlisted slot throws bundle-text", () => {
 	const record = emptyRecord({ session: { outcome: "a long sentence that slipped into an allowlisted slot and has spaces" } });
 	assert.throws(() => auditBundle(record, null, { config: DEFAULT_CONFIG, now: T0 }), /bundle-text/);
+});
+
+test("IS-7: the audit bundle carries only the audited session's D20 relaunch and gate result", () => {
+	const root = tmpDir("omoh-audit-relaunch-");
+	const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health") });
+	const now = T0 + HOUR;
+	const row = { sessionId: "s-parked", kind: "main", startedMs: T0, endedMs: now };
+	const other = { ...row, sessionId: "s-other" };
+	for (const entry of [row, other]) appendEnded(paths, entry, { nowMs: now });
+	const { sessionId } = row;
+	const common = { detector: "D20", kind: "park-resume", subject: { sessionId }, parkId: `${sessionId}.${T0}` };
+	// Producer shapes: src/act/park-resume.mjs:154-155,259,284.
+	appendDecision(paths, { ...common, event: "park-gated", result: "would", ts: iso(T0 + 1) });
+	appendDecision(paths, { ...common, event: "park-transition", sessionId, from: "claimed", to: "launched", why: "launched", ts: iso(T0 + 2) });
+	const actions = (id) => auditBundle(loadSessionRecord({ paths, id, now }), null, { config: DEFAULT_CONFIG, now }).omo_health_record.actions;
+	assert.deepEqual(actions(other.sessionId), []);
+	assert.deepEqual(actions(sessionId).map(({ ref, ts, detector, kind, result }) => [ref, ts, detector, kind, result]), [
+		["A1", iso(T0 + 2), "D20", "relaunch", "launched"],
+		["A2", iso(T0 + 1), "D20", "relaunch", "would"],
+	]);
 });
 
 test("an action outcome reaches the bundle as counts and booleans, never as its error text", () => {

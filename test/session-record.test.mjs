@@ -193,6 +193,34 @@ test("IS-7: the child record includes D8 findings and wake-parent decisions addr
 	assert.deepEqual(joined(sibling), [[], [], []]);
 });
 
+test("IS-7: D20 relaunch attempts and gate decisions join the session and its parent, not unrelated sessions", () => {
+	const { paths } = setup();
+	const parent = mainRow();
+	const child = childRow("s-parked", "st_parked", parent.sessionId);
+	const other = mainRow({ sessionId: "s-other" });
+	writeLedger(paths, [parent, child, other]);
+	const { sessionId } = child;
+	const subject = { sessionId };
+	const parkId = `${sessionId}.${T0}`;
+	const common = { detector: "D20", kind: "park-resume", subject, parkId };
+	// Producer shapes: src/act/park-resume.mjs:154-155,259,272,284,287.
+	writeDecisions(paths, [
+		{ ...common, event: "park-gated", result: "skipped:paused", ts: iso(T0 + MIN) },
+		{ ...common, event: "park-transition", sessionId, from: "pending", to: "claimed", why: "claim", ts: iso(T0 + 2 * MIN) },
+		{ ...common, event: "park-transition", sessionId, from: "claimed", to: "pending", why: "launch-failed", ts: iso(T0 + 3 * MIN) },
+		{ ...common, event: "park-transition", sessionId, from: "claimed", to: "launched", why: "launched", ts: iso(T0 + 4 * MIN) },
+	]);
+	const actions = (id) => loadSessionRecord({ paths, id, now: parent.endedMs }).health.actions;
+	assert.deepEqual(actions(other.sessionId), []);
+	for (const id of [sessionId, parent.sessionId]) {
+		assert.deepEqual(actions(id).map(({ detector, kind, findingKind, result, ts, recipient, subject }) => [detector, kind, findingKind, result, ts, recipient, subject]), [
+			["D20", "relaunch", "park-resume", "launched", iso(T0 + 4 * MIN), sessionId, subject],
+			["D20", "relaunch", "park-resume", "launch-failed", iso(T0 + 3 * MIN), sessionId, subject],
+			["D20", "relaunch", "park-resume", "skipped:paused", iso(T0 + MIN), sessionId, subject],
+		]);
+	}
+});
+
 test("an engine action decision is listed by its action kind, not the finding kind", () => {
 	const { paths } = setup();
 	writeLedger(paths, [{ sessionId: "s-kind", kind: "main", startedMs: T0, endedMs: T0 + HOUR }]);
@@ -396,6 +424,55 @@ test("transcript omo-health entries are collected; other custom types and a tool
 	assert.equal(record.health.counts.messages, 2);
 	assert.deepEqual(record.health.messages.map((m) => m.text), ["second notice", "first notice"]);
 	assert.ok(record.health.messages.every((m) => m.recipient === "s-main"));
+});
+
+test("(plan 37) keeps a delivered 900-character message and redacts its final sentence", () => {
+	const { paths } = setup();
+	const row = mainRow();
+	const secret = "sk-ant-0123456789ABCDEF";
+	const finalSentence = `The final sentence contains ${secret}.`;
+	const prefix = `${"x".repeat(899 - finalSentence.length)}\n`;
+	writeLedger(paths, [row]);
+	mainSessionFile(paths, row.sessionId, [ohealth(T0 + MIN, prefix + finalSentence)]);
+	const { messages } = loadSessionRecord({ paths, id: row.sessionId, now: row.endedMs }).health;
+	assert.equal(messages[0].text, prefix + finalSentence.replace(secret, "sk-ant-[REDACTED]"));
+});
+
+test("(plan 37) caps a 30,000-character item at 20,000 characters including the ellipsis", () => {
+	const row = mainRow();
+	const { messages } = buildSessionRecord({ row, messages: [{ text: "x".repeat(30_000) }] }).health;
+	assert.equal(messages[0].text.length, 20_000);
+	assert.ok(messages[0].text.endsWith("…"));
+});
+
+test("(plan 37) keeps redacted evidence, signals, verdict explanations and action details", () => {
+	const row = mainRow();
+	const subject = { sessionId: row.sessionId };
+	const text = `${"x".repeat(2200)} Bearer abcdef0123456789 Final sentence.`;
+	const safe = text.replace("abcdef0123456789", "[REDACTED]");
+	const lines = [...Array.from({ length: 12 }, (_, i) => `line ${i}`), text];
+	const verdict = { verdict: "escalate", reason: text, diagnosis: text, mechanism: text, avoid: text, advice: text, evidence: lines };
+	const { findings, investigations, actions } = buildSessionRecord({
+		row,
+		decisions: [
+			{ fp: "session", event: "opened", subject, evidence: lines },
+			{ fp: "machine", ts: iso(T0), event: "opened", evidence: lines },
+			{ fp: "session", event: "investigation", analyst: verdict },
+			{ fp: "session", action: { kind: "deliver-message" }, outcome: { delivered: false, error: text } },
+		],
+		investigations: [{ id: "session", subject, evidence: lines, signals: lines, verdict, actions: [{ kind: "release-shell", killed: [text], advice: text }] }],
+	}).health;
+	assert.equal(findings.length, 2);
+	const [investigation] = investigations;
+	for (const evidence of [...findings.map((f) => f.evidence), investigation.evidence, investigation.signals, investigation.verdict.evidence, investigation.verdictHistory[0].evidence]) {
+		assert.deepEqual(evidence, [...lines.slice(0, -1), safe]);
+	}
+	for (const v of [investigation.verdict, investigation.verdictHistory[0]]) {
+		for (const field of ["reason", "diagnosis", "mechanism", "avoid", "advice"]) assert.equal(v[field], safe);
+	}
+	assert.equal(actions[0].detail, `delivered false; error ${safe}`);
+	assert.equal(investigation.actions[0].detail, `killed ${safe}`);
+	assert.equal(investigation.actions[0].advice, safe);
 });
 
 test("60 messages are all in the record", () => {

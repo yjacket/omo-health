@@ -559,6 +559,24 @@
 		);
 	}
 
+	function detailTextParts(text) {
+		return { preview: text.slice(0, 300), full: text };
+	}
+
+	function detailText(value, cls) {
+		const { preview, full } = detailTextParts(show(value));
+		const textClass = cls ? `detail-text__value ${cls}` : "detail-text__value";
+		if (preview === full) return el("span", { class: textClass, text: full });
+		return el("details", { class: "detail-text" },
+			el("summary", {},
+				el("span", { class: `${textClass} detail-text__preview`, text: `${preview}…` }),
+				el("span", { class: "detail-text__more", text: "전체 보기" }),
+				el("span", { class: "detail-text__less", text: "접기" }),
+			),
+			el("div", { class: textClass, text: full }),
+		);
+	}
+
 	/** One lifecycle row of a finding: detected (with its severity), detected again, or resolved. `(전체)` marks a machine-wide one. */
 	function endedFinding(f) {
 		return el(
@@ -566,12 +584,12 @@
 			{ class: "sample" },
 			el("span", { class: "sample__t", text: when(toMs(f.ts)) }),
 			el(
-				"span",
+				"div",
 				{ class: "sample__d" },
 				f.event === "resolved" ? chip("해결", "ok") : chip(f.severityKo || show(f.severity), SEVERITY_TONE[f.severity]),
 				` ${f.titleKo}${f.scope === "machine" ? " (전체)" : ""} `,
 				el("span", { class: "meta", text: [f.detector, f.event === "reopened" ? "다시 감지" : null].filter(Boolean).join(" · ") }),
-				f.evidence.length ? evidenceList(f.evidence) : null,
+				f.evidence.length ? evidenceList(f.evidence, detailText) : null,
 			),
 		);
 	}
@@ -581,7 +599,7 @@
 			"div",
 			{ class: "sample" },
 			el("span", { class: "sample__t", text: when(toMs(a.ts)) }),
-			el("span", { class: "sample__d" }, `${a.actionKo} `, chip(a.resultKo, resultTone(a.result)), a.detail ? [" ", mono(a.detail)] : null),
+			el("div", { class: "sample__d" }, `${a.actionKo} `, chip(a.resultKo, resultTone(a.result)), a.detail ? [" ", detailText(a.detail, "mono")] : null),
 		);
 	}
 
@@ -592,12 +610,14 @@
 			{ class: "sample" },
 			el("span", { class: "sample__t", text: when(toMs(v.ts)) }),
 			el(
-				"span",
+				"div",
 				{ class: "sample__d" },
 				v.failed ? chip("실패", "crit") : chip(v.verdictKo, analystTone(v)),
 				Number.isFinite(v.confidence) ? [" ", el("span", { class: "meta", text: `확신 ${Math.round(v.confidence * 100)}%` })] : null,
 				" ",
-				v.failed ? mono(v.reason) : show(v.diagnosis),
+				detailText(v.failed ? v.reason : v.diagnosis, v.failed ? "mono" : undefined),
+				!v.failed ? [v.mechanism, v.avoid, v.advice].filter(Boolean).map((text) => el("div", {}, detailText(text))) : null,
+				v.evidence?.length ? evidenceList(v.evidence, detailText) : null,
 			),
 		);
 	}
@@ -608,7 +628,7 @@
 			"div",
 			{ class: "ended__inv" },
 			el("div", { class: "wrap-row" }, mono(when(inv.openedMs)), investigationSubject(inv), plain(inv.triggerKo), verdictChip(inv), investigationState(inv)),
-			investigationDetail(inv),
+			investigationDetail(inv, detailText),
 			block("판정 기록", inv.verdictHistory.length ? el("div", { class: "samples" }, inv.verdictHistory.map(endedVerdict)) : empty("판정 기록이 없습니다")),
 		);
 	}
@@ -619,7 +639,7 @@
 			"div",
 			{ class: "sample" },
 			el("span", { class: "sample__t", text: when(m.ms) }),
-			el("span", { class: "sample__d" }, show(m.text), m.recipient && m.recipient !== sessionId ? [" ", el("span", { class: "mono", text: `받은 세션 ${m.recipient.slice(0, 8)}` })] : null),
+			el("div", { class: "sample__d" }, detailText(m.text), m.recipient && m.recipient !== sessionId ? [" ", el("span", { class: "mono", text: `받은 세션 ${m.recipient.slice(0, 8)}` })] : null),
 		);
 	}
 
@@ -717,8 +737,14 @@
 		const paged = (name, wrap, none) => {
 			const items = detailList(d, name);
 			const group = `more:${id}:${name}`;
+			const body = items.length ? wrap(items) : empty(none);
+			for (const [i, disclosure] of [...body.querySelectorAll(".detail-text")].entries()) {
+				const key = `text:${id}:${name}:${i}`;
+				disclosure.dataset.open = key;
+				disclosure.firstElementChild.dataset.key = key;
+			}
 			return [
-				items.length ? wrap(items) : empty(none),
+				body,
 				items.length < d.counts[name] ? el("div", { class: "wrap-row" }, button(`더 보기 (${items.length}/${d.counts[name]})`, { group, key: group, onclick: () => void loadEndedPage(r, name) })) : null,
 				errorSlot(group),
 			];
@@ -764,8 +790,10 @@
 		const cell = [...document.querySelectorAll("td[data-ended]")].find((n) => n.dataset.ended === id);
 		if (!cell || !openEnded.has(id)) return;
 		const held = cell.contains(document.activeElement) ? document.activeElement.dataset.key : null;
+		const expanded = new Set([...cell.querySelectorAll("details.detail-text[open]")].map((node) => node.dataset.open));
 		const { scrollX, scrollY } = window;
 		cell.replaceChildren(endedDetailView(lastState.ended.rows.find((r) => endedDetailId(r) === id)));
+		for (const node of cell.querySelectorAll("details.detail-text")) if (expanded.has(node.dataset.open)) node.open = true;
 		// A control the redraw removed (다시 읽기, the last 더 보기) hands its focus to the row's own toggle.
 		if (held && !focusByKey(held)) focusByKey(`ended:${id}`);
 		if (window.scrollX !== scrollX || window.scrollY !== scrollY) window.scrollTo({ left: scrollX, top: scrollY, behavior: "instant" });
@@ -1132,21 +1160,25 @@
 		return undefined;
 	}
 
-	const evidenceList = (lines) => el("ul", { class: "evidence" }, lines.map((line) => el("li", { class: "mono", text: line })));
+	const evidenceList = (lines, read) => el("ul", { class: "evidence" }, lines.map((line) => read
+		? el("li", {}, read(line, "mono"))
+		: el("li", { class: "mono", text: line })));
 
-	function investigationDetail(r) {
+	function investigationDetail(r, read) {
 		const v = r.verdict;
+		const text = (value) => read ? read(value) : plain(value);
+		const code = (value) => read ? read(value, "mono") : mono(value);
 		const confidence = v && Number.isFinite(v.confidence) ? el("span", { class: "meta", text: `확신 ${Math.round(v.confidence * 100)}%` }) : null;
 		const summary = facts([
 			r.clsKo ? ["분류", plain(`${r.clsKo}${r.rule ? ` (${r.rule})` : ""}`)] : null,
 			r.subject.taskId && r.subject.sessionShort ? ["세션", mono(r.subject.sessionShort)] : null,
-			v ? (v.failed ? ["실패", mono(v.reason)] : ["진단", plain(v.diagnosis)]) : null,
+			v ? (v.failed ? ["실패", code(v.reason)] : ["진단", text(v.diagnosis)]) : null,
 			// A why look (analyst-why) explains the mechanism and what to do instead; an older or progressing verdict has neither row.
-			v && !v.failed && v.mechanism ? ["원리", plain(v.mechanism)] : null,
-			v && !v.failed && v.avoid ? ["회피", plain(v.avoid)] : null,
+			v && !v.failed && v.mechanism ? ["원리", text(v.mechanism)] : null,
+			v && !v.failed && v.avoid ? ["회피", text(v.avoid)] : null,
 			v && !v.failed ? ["원인", plain(v.causeKo), confidence] : null,
-			v?.advice ? ["조언", plain(v.advice)] : null,
-			r.action ? ["조치", plain(`${r.action.kindKo} · ${when(r.action.atMs)}`), r.action.detail ? mono(r.action.detail) : null] : null,
+			v?.advice ? ["조언", text(v.advice)] : null,
+			r.action ? ["조치", plain(`${r.action.kindKo} · ${when(r.action.atMs)}`), r.action.detail ? code(r.action.detail) : null, read && r.action.advice ? text(r.action.advice) : null] : null,
 			// A reused verdict (same signature within a day) ran no job of its own, so the row shows even without a lane.
 			r.model || r.lane || v?.reused ? [v?.reused ? "분석가 (재사용)" : "분석가", mono(r.model ?? r.lane), r.failures ? plain(`실패 ${r.failures}회`) : null] : null,
 		]);
@@ -1154,8 +1186,9 @@
 			"div",
 			{ class: "inv__body" },
 			summary,
-			block("근거", r.evidence.length ? evidenceList(r.evidence) : empty("근거 없음")),
-			v?.evidence?.length ? block("분석가 근거", evidenceList(v.evidence)) : null,
+			block("근거", r.evidence.length ? evidenceList(r.evidence, read) : empty("근거 없음")),
+			read && r.signals?.length ? block("신호", evidenceList(r.signals, read)) : null,
+			v?.evidence?.length ? block("분석가 근거", evidenceList(v.evidence, read)) : null,
 		);
 	}
 
