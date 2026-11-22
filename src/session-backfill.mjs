@@ -12,6 +12,7 @@ const DAY_MS = 86_400_000;
 const LIVE_MS = 10 * 60_000;
 const CRASH_WINDOW_MS = 2 * 60_000;
 const MAX_SESSION_FILES = 2000;
+const MAX_REPORTED_ERRORS = 100;
 const HEAD_BYTES = 64 * 1024;
 const TAIL_BYTES = 256 * 1024;
 const INDEX_MAX_BYTES = 64 * 1024 * 1024;
@@ -35,7 +36,7 @@ function parseLine(line) {
 }
 
 /** Head and tail of a session file without loading a huge file: last entry time and last session name. */
-function scanSessionFile(file, size, budget) {
+function scanSessionFile(file, size, budget, headerOnly = false) {
 	const fd = fs.openSync(file, "r");
 	try {
 		const read = (offset, length) => {
@@ -44,12 +45,13 @@ function scanSessionFile(file, size, budget) {
 			budget.remaining -= n;
 			return buf.subarray(0, n);
 		};
-		const whole = size <= HEAD_BYTES + TAIL_BYTES;
-		const head = read(0, whole ? size : HEAD_BYTES);
+		const whole = !headerOnly && size <= HEAD_BYTES + TAIL_BYTES;
+		const head = read(0, whole ? size : Math.min(size, HEAD_BYTES));
 		const headerBytes = head.subarray(0, HEAD_BYTES);
 		const newline = headerBytes.indexOf(10);
 		const header = parseLine(headerBytes.subarray(0, newline === -1 ? headerBytes.length : newline).toString("utf8"));
 		if (header?.type !== "session" || typeof header.id !== "string") return {};
+		if (headerOnly) return { header };
 		const chunks = [{ text: head.toString("utf8"), partialStart: false }];
 		if (!whole) chunks.push({ text: read(size - TAIL_BYTES, TAIL_BYTES).toString("utf8"), partialStart: true });
 		let lastMs;
@@ -170,11 +172,11 @@ function childOutcome(task, releases) {
 	return { outcome: "unknown", reason: `작업 상태가 ${clean(task.status ?? "없음", 30)}이고 끝난 이유를 알려 줄 기록이 없습니다.` };
 }
 
-function startScan(paths, nowMs, days) {
+function startScan(paths, nowMs, days, reconcile) {
 	const sinceMs = nowMs - days * DAY_MS;
 	const errors = [];
 
-	// Main session files, newest first, bounded.
+	// Keep only file metadata for the window; parsed transcripts stay in one batch.
 	const files = [];
 	const slugDirs = [];
 	for (const slug of listDirSafe(paths.sessionsDir)) {
@@ -188,12 +190,23 @@ function startScan(paths, nowMs, days) {
 		}
 	}
 	files.sort((a, b) => b.mtimeMs - a.mtimeMs);
-	if (files.length > MAX_SESSION_FILES) errors.push(`session files capped at ${MAX_SESSION_FILES} of ${files.length}`);
+	if (!reconcile && files.length > MAX_SESSION_FILES) errors.push(`session files capped at ${MAX_SESSION_FILES} of ${files.length}`);
 	return {
 		sinceMs, liveCutMs: nowMs - LIVE_MS, days, errors,
 		sessionFiles: files.length, sessionDirs: slugDirs.length,
-		files: files.slice(0, MAX_SESSION_FILES), cursor: 0, indexes: new Map(), mains: [],
+		files: reconcile ? files : files.slice(0, MAX_SESSION_FILES),
+		census: reconcile && files.length > MAX_SESSION_FILES ? 0 : null,
+		cwds: new Map(), cursor: 0, indexes: new Map(), mains: [],
+		counts: emptyCounts(), errorCount: 0, reportedErrors: [],
 	};
+}
+
+function addCwd(cwds, cwd) {
+	if (typeof cwd === "string" && cwd) cwds.set(cwd.toLowerCase(), cwd);
+}
+
+function emptyCounts() {
+	return { main: 0, child: 0, written: 0, duplicate: 0, live: 0, outcomes: {} };
 }
 
 /**
@@ -203,41 +216,88 @@ function startScan(paths, nowMs, days) {
  */
 export function backfillOnce(paths, nowMs, { days = 30, maxBytes = Infinity, progress = {} } = {}) {
 	const markerFile = path.join(paths.health.sessionsDir, BACKFILL_MARKER);
-	if (!progress.scan && Number(readJsonSafe(markerFile)?.v) >= BACKFILL_VERSION) return { skipped: true };
-	const scan = progress.scan ??= startScan(paths, nowMs, days);
+	if (!progress.scan) {
+		const marker = readJsonSafe(markerFile);
+		if (Number(marker?.v) >= BACKFILL_VERSION) return { skipped: true };
+		progress.scan = startScan(paths, nowMs, days, marker != null);
+	}
+	const scan = progress.scan;
 	const { files, indexes, mains, errors } = scan;
 	const budget = { remaining: maxBytes };
-	while (scan.cursor < files.length) {
-		const item = files[scan.cursor];
-		if (Math.min(item.size, HEAD_BYTES + TAIL_BYTES) > budget.remaining) return { pending: true };
-		scan.cursor++;
+	// A child transcript in an early batch can belong to a task store discovered
+	// in a later batch. For multi-batch upgrades, discover all task-store cwd
+	// values from the heads before classifying any transcript. This pass shares
+	// the same byte allowance as the full scan.
+	while (scan.census !== null && scan.census < files.length) {
+		const item = files[scan.census];
+		if (Math.min(item.size, HEAD_BYTES) > budget.remaining) return { pending: true };
+		scan.census++;
 		try {
-			const { header, lastMs: scannedMs, name } = scanSessionFile(item.file, item.size, budget);
-			if (!header) {
-				errors.push(`bad session header: ${item.file}`);
-				continue;
-			}
-			if (!indexes.has(item.dir)) indexes.set(item.dir, readSummaryIndex(item.dir, errors));
-			const summary = indexes.get(item.dir).get(header.id);
-			const lastMs = scannedMs ?? summary?.lastActivityTime ?? toMs(header.timestamp) ?? item.mtimeMs;
-			mains.push({ dir: item.dir, header, lastMs, name, summary });
-		} catch (error) {
-			errors.push(`session ${item.file}: ${error.message}`);
+			addCwd(scan.cwds, scanSessionFile(item.file, item.size, budget, true).header?.cwd);
+		} catch {
+			// Report unreadable transcripts in the full scan.
 		}
 	}
-	const summary = finishScan(paths, nowMs, markerFile, scan);
-	if (!summary.pending) delete progress.scan;
+	while (!scan.complete) {
+		const batchEnd = scan.batchEnd ??= Math.min(scan.cursor + MAX_SESSION_FILES, files.length);
+		while (scan.cursor < batchEnd) {
+			const item = files[scan.cursor];
+			if (Math.min(item.size, HEAD_BYTES + TAIL_BYTES) > budget.remaining) return { pending: true };
+			scan.cursor++;
+			try {
+				const { header, lastMs: scannedMs, name } = scanSessionFile(item.file, item.size, budget);
+				if (!header) {
+					errors.push(`bad session header: ${item.file}`);
+					continue;
+				}
+				if (scan.census === null) addCwd(scan.cwds, header.cwd);
+				if (!indexes.has(item.dir)) indexes.set(item.dir, readSummaryIndex(item.dir, errors));
+				const summary = indexes.get(item.dir).get(header.id);
+				const lastMs = scannedMs ?? summary?.lastActivityTime ?? toMs(header.timestamp) ?? item.mtimeMs;
+				mains.push({ dir: item.dir, header, lastMs, name, summary });
+			} catch (error) {
+				errors.push(`session ${item.file}: ${error.message}`);
+			}
+		}
+		scan.related ??= readRelated(paths, scan);
+		const lastBatch = batchEnd === files.length;
+		const batch = writeBatch(paths, nowMs, scan, lastBatch);
+		if (batch.pending) return { ...scanSummary(scan, [...errors, ...batch.errors]), pending: true };
+		for (const key of ["main", "child", "written", "duplicate", "live"]) scan.counts[key] += batch.counts[key];
+		for (const [outcome, count] of Object.entries(batch.counts.outcomes)) {
+			scan.counts.outcomes[outcome] = (scan.counts.outcomes[outcome] ?? 0) + count;
+		}
+		scan.errorCount += errors.length;
+		for (const error of errors.slice(0, MAX_REPORTED_ERRORS - scan.reportedErrors.length)) {
+			scan.reportedErrors.push(clean(error, 300));
+		}
+		errors.length = 0;
+		mains.length = 0;
+		indexes.clear();
+		delete scan.batchEnd;
+		scan.complete = lastBatch;
+	}
+
+	const summary = scanSummary(scan);
+	try {
+		ensureDir(paths.health.sessionsDir);
+		atomicWriteJson(markerFile, { v: BACKFILL_VERSION, ts: nowMs, days: scan.days, counts: scan.counts, errorCount: scan.errorCount });
+		delete progress.scan;
+	} catch (error) {
+		summary.errors.push(clean(`marker: ${error.message}`, 300));
+		summary.pending = true;
+	}
 	return summary;
 }
 
-function finishScan(paths, nowMs, markerFile, { sinceMs, liveCutMs, days, errors: scanErrors, sessionFiles, sessionDirs, mains }) {
-	const errors = [...scanErrors];
-	const counts = { main: 0, child: 0, written: 0, duplicate: 0, live: 0, outcomes: {} };
-	// Child tasks from every project a session ran in.
-	const cwds = new Map();
-	for (const m of mains) if (typeof m.header.cwd === "string" && m.header.cwd) cwds.set(m.header.cwd.toLowerCase(), m.header.cwd);
+function scanSummary({ sinceMs, sessionFiles, sessionDirs, counts, reportedErrors }, extraErrors = []) {
+	return { skipped: false, sinceMs, sessionFiles, sessionDirs, counts,
+		errors: [...reportedErrors, ...extraErrors.slice(0, MAX_REPORTED_ERRORS - reportedErrors.length).map((e) => clean(e, 300))] };
+}
+
+function readRelated(paths, { cwds, sinceMs, errors }) {
 	const tasks = [];
-	for (const cwd of cwds.values()) tasks.push(...readTasks(cwd, errors, paths.agentDir));
+	for (const cwd of cwds.values()) for (const task of readTasks(cwd, errors, paths.agentDir)) tasks.push(task);
 	const childSubjects = new Set();
 	const childCount = new Map();
 	for (const t of tasks) {
@@ -249,8 +309,13 @@ function finishScan(paths, nowMs, markerFile, { sinceMs, liveCutMs, days, errors
 		}
 	}
 
-	const crashes = readCrashes(paths, sinceMs, errors);
-	const releases = readReleases(paths, sinceMs, errors);
+	return { tasks, childSubjects, childCount, crashes: readCrashes(paths, sinceMs, errors), releases: readReleases(paths, sinceMs, errors) };
+}
+
+function writeBatch(paths, nowMs, { sinceMs, liveCutMs, mains, related }, lastBatch) {
+	const { tasks, childSubjects, childCount, crashes, releases } = related;
+	const errors = [];
+	const counts = emptyCounts();
 	const pending = [];
 	const write = (record) => {
 		counts[record.kind] += 1;
@@ -302,7 +367,7 @@ function finishScan(paths, nowMs, markerFile, { sinceMs, liveCutMs, days, errors
 		});
 	}
 
-	for (const t of tasks) {
+	for (const t of lastBatch ? tasks : []) {
 		if (!t.terminal) continue;
 		const endedMs = t.terminalAtMs ?? t.updatedAtMs;
 		if (!Number.isFinite(endedMs) || endedMs < sinceMs) continue;
@@ -341,11 +406,13 @@ function finishScan(paths, nowMs, markerFile, { sinceMs, liveCutMs, days, errors
 		candidates.push(row);
 		childCandidates.set(key, candidates);
 	}
-	// Stream the retained window once, retaining only keys and identity evidence for candidate children.
+	// Keep only ledger keys and identity evidence relevant to this batch.
+	const wanted = new Set(pending.map(endedKey));
 	const recorded = new Set();
 	const existingChildren = new Map();
 	for (const row of streamEnded(paths, { sinceMs })) {
-		recorded.add(endedKey(row));
+		const keyOfRow = endedKey(row);
+		if (wanted.has(keyOfRow)) recorded.add(keyOfRow);
 		if (row.kind !== "child") continue;
 		const key = childPair(row);
 		if (!childCandidates.has(key)) continue;
@@ -373,14 +440,5 @@ function finishScan(paths, nowMs, markerFile, { sinceMs, liveCutMs, days, errors
 		} else if (appended) counts.written += 1;
 		else counts.duplicate += 1;
 	}
-	const summary = { skipped: false, sinceMs, sessionFiles, sessionDirs, counts, errors: errors.map((e) => clean(e, 300)) };
-	if (appendFailed) return { ...summary, pending: true };
-	try {
-		ensureDir(paths.health.sessionsDir);
-		atomicWriteJson(markerFile, { v: BACKFILL_VERSION, ts: nowMs, days, counts, errorCount: errors.length });
-	} catch (error) {
-		summary.errors.push(clean(`marker: ${error.message}`, 300));
-		summary.pending = true;
-	}
-	return summary;
+	return { counts, errors, pending: appendFailed };
 }

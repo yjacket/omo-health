@@ -423,17 +423,15 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 				log.error("evidence_failed", { error: error.message, stack: String(error.stack).slice(0, 800) });
 			}
 			// The session board: the live snapshot, and the sessions that ended since the last one.
-			// Reserve enough for at least one backfill head/tail even when usage has a full tick of work.
-			const usageAllowance = USAGE_TICK_BYTES - (backfilled ? 0 : 1024 * 1024);
 			let usageBytes = 0;
 			const liveOwners = result?.world ? worldLiveOwners(result.world) : undefined;
 			if (result?.world) {
 				try {
 					const boardNow = clock.now();
 					try {
-						usageBytes = usageTracker.tick(result.world, { maxBytes: usageAllowance }).bytesRead;
+						usageBytes = usageTracker.tick(result.world, { maxBytes: USAGE_TICK_BYTES }).bytesRead;
 					} catch (error) {
-						usageBytes = usageAllowance;
+						usageBytes = USAGE_TICK_BYTES;
 						log.error("usage_tick_failed", { error: error.message, stack: String(error.stack).slice(0, 800) });
 					}
 					const board = buildSessionSnapshot(result.world, result.findings ?? [], boardInvestigations.list({ sinceMs: boardNow - 7 * DAY_MS }), boardNow, {
@@ -461,7 +459,7 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 			} catch (error) {
 				log.error("audit_tick_failed", { error: error.message, stack: String(error.stack).slice(0, 800) });
 			}
-			// Reconcile after the board, using the reserved share plus any unused usage allowance.
+			// Publish first; reconciliation gets only the transcript bytes the tracker didn't use.
 			if (!backfilled) {
 				try {
 					const summary = backfillOnce(paths, clock.now(), { maxBytes: USAGE_TICK_BYTES - usageBytes, progress: backfillProgress });

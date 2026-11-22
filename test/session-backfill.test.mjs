@@ -224,6 +224,51 @@ test("a v2 upgrade leaves the unique cwd-less child untouched without suppressin
 	assert.equal(JSON.parse(fs.readFileSync(marker, "utf8")).v, 3);
 });
 
+test("a v2 upgrade restores a missing project ranked 2,001st before marking v3", (t) => {
+	const { paths, now, startedMs, endedMs, sessionId, a, b } = setupProjectPair(t);
+	assert.ok(appendEnded(paths, { kind: "main", sessionId, cwd: a, endedMs }, { nowMs: now }));
+	const marker = path.join(paths.health.sessionsDir, BACKFILL_MARKER);
+	fs.writeFileSync(marker, JSON.stringify({ v: 2 }));
+	const version = () => JSON.parse(fs.readFileSync(marker, "utf8")).v;
+	const projects = () => readEnded(paths).filter((row) => row.sessionId === sessionId).map((row) => row.cwd);
+	const transcript = (cwd) => path.join(paths.sessionsDir, projectKeyOf(cwd),
+		`${iso(startedMs).replace(/[:.]/g, "-")}_${sessionId}.jsonl`);
+	fs.utimesSync(transcript(a), now / 1000, now / 1000);
+	fs.utimesSync(transcript(b), now / 1000, (now - HOUR) / 1000);
+	let firstBatchBytes = fs.statSync(transcript(a)).size;
+	for (let i = 0; i < 1999; i++) {
+		const file = writeSession(paths, projectKeyOf(a), `filler-${i}`, a, startedMs, i < 2 ? endedMs : now);
+		fs.utimesSync(file, now / 1000, now / 1000);
+		firstBatchBytes += fs.statSync(file).size;
+	}
+	// Only the oldest project's header reveals the store for this cross-project child.
+	writeTask(b, {
+		task_id: "st_cross_batch", parent_session_id: sessionId, child_session_id: "filler-1",
+		spawn_spec: { cwd: a }, status: "completed", final_response: "done",
+		created_at: iso(startedMs), terminal_at: iso(endedMs),
+	});
+
+	let progress = {};
+	backfillOnce(paths, now, { maxBytes: firstBatchBytes, progress });
+	assert.equal(version(), 2, "the first 2,000 transcripts do not cover the whole window");
+	assert.deepEqual(projects(), [a]);
+	progress = {}; // Restart before the final batch.
+	backfillOnce(paths, now, { maxBytes: firstBatchBytes, progress });
+	assert.equal(version(), 2, "replaying the first batch after restart is not completion");
+	backfillOnce(paths, now, { maxBytes: firstBatchBytes + fs.statSync(transcript(b)).size, progress });
+	assert.equal(version(), 2, "even after a batch appends, the marker waits for the oldest transcript");
+	assert.deepEqual(projects(), [a]);
+	assert.ok(readEnded(paths).some((row) => row.sessionId === "filler-0"), "the first batch already reached disk");
+	assert.ok(!readEnded(paths).some((row) => row.sessionId === "filler-1"), "no false main row for a cross-batch child");
+	backfillOnce(paths, now, { progress });
+	assert.deepEqual(projects(), [a, b], "the oldest qualifying project gets its own row");
+	assert.deepEqual(readEnded(paths).filter((row) => row.sessionId === "filler-1")
+		.map((row) => [row.kind, row.cwd, row.parentProjectKey]), [["child", a, projectKeyOf(b)]]);
+	assert.equal(version(), 3, "only the completed reconciliation writes v3");
+	assert.deepEqual(backfillOnce(paths, now), { skipped: true });
+	assert.deepEqual(projects(), [a, b], "a restart leaves both rows and adds no duplicates");
+});
+
 test("a v2 upgrade restores the missing project for an ended ID and never rewrites the original", (t) => {
 	const { paths, now, startedMs, endedMs, sessionId, a, b } = setupProjectPair(t);
 	const original = { sessionId, kind: "main", cwd: a, startedMs, endedMs, outcome: "closed", reason: "original row" };

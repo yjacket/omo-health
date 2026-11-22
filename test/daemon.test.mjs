@@ -18,6 +18,8 @@ import { resolvePaths } from "../src/paths.mjs";
 import { auditFileKey } from "../src/session-subject.mjs";
 import { queueReport } from "../src/reports/intake.mjs";
 import { RUN_KEY } from "../src/install.mjs";
+import { BACKFILL_MARKER } from "../src/session-backfill.mjs";
+import { createUsageIndex } from "../src/usage-index.mjs";
 import { makeWorld, sessionState, taskRecord } from "./helpers/world.mjs";
 import { E, writeJsonl } from "./helpers/fixtures.mjs";
 import { fakeProc, guardProcessListeners } from "./helpers/fake-proc.mjs";
@@ -406,6 +408,67 @@ test("a pinned daemon never uninstalls when its source path is missing", async (
 	});
 	assert.equal(result.reason, "idle-no-omo-hosts");
 	assert.deepEqual(removed, []);
+});
+
+test("a pending v3 reconciliation does not delay the next board for a verified 31.5 MiB live append", async (t) => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "daemon-usage-budget-"));
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health") });
+	const start = Date.now();
+	const cwd = path.join(root, "proj");
+	const dir = path.join(paths.sessionsDir, projectKeyOf(cwd));
+	const file = path.join(dir, "2026-09-28T12-00-00-000Z_m1.jsonl");
+	const assistant = (input) => E.assistant({ ms: start, usage: { input, output: 0, cacheRead: 0, cacheWrite: 0 } });
+	const header = (id, timestamp) => ({ type: "session", version: 3, id, cwd, timestamp: new Date(timestamp).toISOString() });
+	writeJsonl(file, [header("m1", start), assistant(10)]);
+	let ticks = 0;
+	const clock = { now: () => start + ticks * 60_000 };
+	const index = createUsageIndex({ file: paths.health.usageIndexFile, clock });
+	index.update(sub("m1", cwd), file, { kind: "main" });
+	assert.equal(index.get(key("m1", cwd)).published.total, 10);
+	index.save();
+	const marker = path.join(paths.health.sessionsDir, BACKFILL_MARKER);
+	fs.writeFileSync(marker, JSON.stringify({ v: 2 }));
+	for (let i = 0; i < 6; i++) {
+		writeJsonl(path.join(dir, `old-${i}.jsonl`), [header(`old-${i}`, start - 3_600_000), " ".repeat(320 * 1024)]);
+	}
+	const initialSize = fs.statSync(file).size;
+	const finalLine = `${JSON.stringify(assistant(20))}\n`;
+	const appendBytes = 31.5 * 1024 * 1024;
+	const padding = Buffer.alloc(1024 * 1024, 32);
+	padding[padding.length - 1] = 10;
+	for (let i = 0; i < 31; i++) fs.appendFileSync(file, padding);
+	fs.appendFileSync(file, padding.subarray(0, appendBytes - 31 * padding.length - finalLine.length - 1));
+	fs.appendFileSync(file, `\n${finalLine}`);
+	assert.equal(fs.statSync(file).size - initialSize, appendBytes);
+
+	const read = (f) => JSON.parse(fs.readFileSync(f, "utf8"));
+	const boards = [];
+	const versions = [];
+	const result = await runDaemon({
+		proc: fakeProc(), paths, clock, config: DEFAULT_CONFIG,
+		overrides: {
+			procs: { kind: "fake" }, env: {},
+			createEngine: () => ({
+				async tick() {
+					ticks++;
+					return { findings: [], world: makeWorld({ now: clock.now(), procsFresh: true,
+						sessions: [sessionState({ id: "m1", file, kind: "main", cwd, startedMs: start })],
+						sensors: [{ sessionId: "m1", pid: 4321, ts: clock.now(), idle: true }] }) };
+				},
+				table: { all: () => [] }, close() {},
+			}),
+			sleep: async () => {
+				boards.push(read(paths.health.sessionsSnapshotFile).groups.flatMap((g) => g.sessions).find((row) => row.sessionId === "m1"));
+				versions.push(read(marker).v);
+				if (ticks === 2) fs.writeFileSync(paths.health.stoppedFile, "");
+			},
+		},
+	});
+	assert.equal(result.reason, "stopped-file");
+	assert.equal(boards[0].tokens.total, 30, "the next board includes every token in the live append");
+	assert.equal(boards[0].tokensPending, false);
+	assert.deepEqual(versions, [2, 3], "reconciliation stays pending on the busy tick and completes on the idle tick");
 });
 
 test("the daemon indexes a live session's tokens into sessions/usage.json and puts them on the board", async () => {
