@@ -6,7 +6,7 @@ import { usageTimeline } from "./collect/usage.mjs";
 import { auditBundle, auditDocument, detectorFindingRefs, firedDetectors, hasDetectorCoverage, resolveAuditModel, validateAudit } from "./judge/audit.mjs";
 import { ANALYST_POLL_MS, parseAnalystOutput, unavailableReason } from "./judge/analyst.mjs";
 import { laneArgs } from "./judge/lane.mjs";
-import { loadSessionRecord } from "./session-record.mjs";
+import { loadSessionRecord, usageEntryOf } from "./session-record.mjs";
 import { auditReasonLabel } from "./ui/labels.mjs";
 import { fresh, isSpillModelKey, readUsageIndex } from "./usage-index.mjs";
 import { atomicWriteFile, atomicWriteJson, ensureDir, listDirSafe, readJsonSafe, readTextSafe, removeSafe, statSafe } from "./util/fsx.mjs";
@@ -260,8 +260,7 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 	/** The session's own usage entry, its file, and the models the audited session used. */
 	function usageFacts(record, usage) {
 		const session = record.session ?? {};
-		const own = usage.get(session.sessionId);
-		const entry = own && own.state !== "full" ? own : (session.taskId ? usage.get(session.taskId) : null) ?? own ?? null;
+		const entry = usageEntryOf(usage, session);
 		const file = entry?.file ?? (session.taskId ? null : locator.mainFile(session.sessionId)) ?? null;
 		return { entry, file };
 	}

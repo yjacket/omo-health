@@ -238,7 +238,7 @@ function modelRows(published) {
 		.sort((a, b) => sortRank(b.tokens) - sortRank(a.tokens) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
 }
 
-function usageEntryOf(usage, row) {
+export function usageEntryOf(usage, row) {
 	return usageEntryFor(usage, row.sessionId, row.taskId) ?? (usage.full === true ? FULL_USAGE : null);
 }
 

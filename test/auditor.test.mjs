@@ -18,7 +18,7 @@ import { createUsageIndex, fresh } from "../src/usage-index.mjs";
 import { createUsageTracker } from "../src/usage-tracker.mjs";
 import { createRecordingSpawn } from "./fakes/runner.mjs";
 import { readJsonSafe } from "../src/util/fsx.mjs";
-import { E, appendJsonl, writeJsonl } from "./helpers/fixtures.mjs";
+import { E, appendJsonl, writeJsonl, writeTask } from "./helpers/fixtures.mjs";
 
 const BASE = Date.parse("2026-11-20T12:00:00Z");
 const DAY = 24 * 60 * 60_000;
@@ -701,6 +701,28 @@ test("(plan 25) a compaction carrying usage without a model fails the queued aud
 	assert.equal(h.record("m1").reason, "models-unknown");
 	assert.equal(h.runner.starts.length, 0);
 	assert.equal(h.budget(), undefined);
+});
+
+test("a fresh task-keyed entry from another store cannot certify a queued child audit", (t) => {
+	const h = harness({ sessions: [] });
+	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+	const taskId = "st_shared";
+	const index = createUsageIndex({ file: h.paths.health.usageIndexFile, clock: h.clock });
+	for (const sessionId of ["child-a", "child-b"]) {
+		const cwd = path.join(h.root, sessionId);
+		const file = writeTask(cwd, { task_id: taskId, child_session_id: sessionId, status: "completed" }, [
+			E.assistant({ ms: BASE - 120_000, id: `a-${sessionId}`, model: "claude-opus-5-5", provider: "anthropic-subscription" }),
+		]);
+		appendEnded(h.paths, { sessionId, taskId, kind: "child", startedMs: BASE - 180_000, endedMs: BASE - 60_000, outcome: "completed", cwd });
+		if (sessionId === "child-a") index.update(taskId, file, { kind: "child", taskId });
+	}
+	assert.equal(fresh(index.get(taskId)), true);
+	assert.equal(index.has("child-b"), false);
+
+	h.request("child-b");
+	h.tick(h.auditor({ index }));
+	const { status, reason } = h.record("child-b");
+	assert.deepEqual([status, reason, h.runner.starts.length, h.budget()], ["failed", "models-unknown", 0, undefined]);
 });
 
 for (const incomplete of ["timeline", "index"]) {

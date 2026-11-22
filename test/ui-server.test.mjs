@@ -720,6 +720,36 @@ describe("ui server", { timeout: 20_000 }, () => {
 				}
 			});
 
+			it("blocks reviewer preview when a fresh task-keyed entry belongs to a child in another store", async () => {
+				const world = makeWorld();
+				try {
+					const taskId = "st_shared";
+					const children = ["child-a", "child-b"].map((sessionId) => ({
+						sessionId, taskId, kind: "child", cwd: path.join(world.dir, sessionId),
+						startedMs: world.nowMs - 1_000, endedMs: world.nowMs, outcome: "answered",
+					}));
+					const files = children.map((child) => {
+						appendEnded(world.paths, child, { nowMs: world.nowMs });
+						return writeTask(child.cwd, { task_id: taskId, child_session_id: child.sessionId, status: "completed" }, [
+							{ type: "session", id: child.sessionId },
+							{ type: "message", message: { role: "assistant", provider: "anthropic", model: "claude-used", usage: { input: 42 }, stopReason: "stop" } },
+						]);
+					});
+					const index = createUsageIndex({ file: world.paths.health.usageIndexFile, clock: { now: world.now } });
+					index.update(taskId, files[0], { kind: "child", taskId });
+					assert.equal(index.fresh(index.get(taskId)), true);
+					assert.equal(index.has(children[1].sessionId), false);
+					index.save();
+
+					const { audit } = await world.detail(children[1].sessionId);
+					assert.deepEqual([audit.blocked, audit.planned], ["models-unknown", null]);
+					const [status, body] = await world.startAudit(children[1].sessionId);
+					assert.deepEqual([status, body.error], [409, "models-unknown"]);
+				} finally {
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				}
+			});
+
 			it("shows a request as queued, stalls on a stale heartbeat and shows the finished record as done", async () => {
 				const world = makeWorld();
 				try {

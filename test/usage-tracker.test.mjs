@@ -192,6 +192,35 @@ test("a tick never reads more than the byte budget: a 40 MiB live record waits w
 	assert.equal(compactUsage(s.index.get("b1")).total, 5);
 });
 
+test("a verified live session waiting for its first read is pending on the board", (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const first = mainFile(s.paths, "first");
+	const second = mainFile(s.paths, "second");
+	writeJsonl(first, [E.assistant({ ms: T0, usage: usage(10) })]);
+	fs.truncateSync(first, USAGE_TICK_BYTES + 1);
+	writeJsonl(second, [E.assistant({ ms: T0, usage: usage(42) })]);
+	const world = makeWorld({
+		now: T0,
+		sessions: [
+			sessionState({ id: "first", file: first, kind: "main", cwd: s.cwd }),
+			sessionState({ id: "second", file: second, kind: "main", cwd: s.cwd }),
+		],
+		sensors: [{ sessionId: "second", pid: 100, ts: T0 - 1000, idle: true, executingTools: 0 }],
+		procsFresh: true,
+	});
+	const boardRow = () => buildSessionSnapshot(world, [], [], T0, { tokensOf: s.tracker.tokensOf })
+		.groups.flatMap((group) => group.sessions).find((row) => row.sessionId === "second");
+
+	assert.equal(s.tracker.tick(world).bytesRead, USAGE_TICK_BYTES);
+	assert.equal(s.index.has("second"), false);
+	assert.deepEqual([s.tracker.tokensOf("second"), boardRow().tokensPending, boardRow().tokens], [{ pending: true }, true, null]);
+
+	s.tracker.tick(world);
+	assert.equal(s.tracker.tokensOf("second").tokens.total, 42);
+	assert.deepEqual([boardRow().tokensPending, boardRow().tokens.total], [false, 42]);
+});
+
 test("a 32 MiB budget drains three 20 MiB files in two ticks and logs usage_backlog once after saving", () => {
 	const s = setup();
 	const rows = [];

@@ -3,7 +3,7 @@ import { auditModelFacts, auditsToday, readAuditState, readAuditTimeline, reques
 import { createSessionFileLocator } from "../collect/session-files.mjs";
 import { loadConfig } from "../config.mjs";
 import { resolveAuditModel } from "../judge/audit.mjs";
-import { loadSessionRecord } from "../session-record.mjs";
+import { loadSessionRecord, usageEntryOf } from "../session-record.mjs";
 import { fresh, readUsageIndex } from "../usage-index.mjs";
 import { auditReasonLabel, auditStatusLabel } from "./labels.mjs";
 import { daemonStatus, loadDaemonInputs } from "./model.mjs";
@@ -12,9 +12,9 @@ const ACTIVE_AUDIT_STATUSES = new Set(["requested", "queued", "launching", "runn
 const isAuditActive = (state) => Boolean(state && (ACTIVE_AUDIT_STATUSES.has(state.status) || state.holdUntilExit === true));
 const canonicalIdOf = (session, id) => typeof session?.sessionId === "string" && session.sessionId ? session.sessionId : id;
 
-function auditFactsFor(paths, session, id, tokens) {
+function auditFactsFor(paths, session, tokens) {
 	const usage = readUsageIndex(paths.health.usageIndexFile);
-	const entry = usage.get(session?.sessionId) ?? usage.get(session?.taskId) ?? usage.get(id) ?? null;
+	const entry = usageEntryOf(usage, session ?? {});
 	// Do not queue against an index row the daemon still has to finish or refresh.
 	if (!fresh(entry)) return { ...auditModelFacts(entry, null), sessionModelsKnown: false };
 	return auditModelFacts(entry, readAuditTimeline(entry.file, tokens));
@@ -48,7 +48,7 @@ export function createDetailOperations({
 		const state = readState(paths, canonicalIdOf(session, id));
 		const perDay = Number.isFinite(config.audit?.perDay) ? config.audit.perDay : null;
 		const usedToday = today(paths, at);
-		const facts = auditFactsFor(paths, session, id, config.tokens);
+		const facts = auditFactsFor(paths, session, config.tokens);
 		const choice = plan(config, facts, analystModels);
 		const planned = choice && !choice.blocked ? choice : null;
 		const blocked = blockedOf({ config, daemon, usedToday, perDay, modelsKnown: facts.sessionModelsKnown, planned });
@@ -67,7 +67,7 @@ export function createDetailOperations({
 		if (isAuditActive(readState(paths, canonicalId))) return refuse(409, "running");
 		const perDay = config.audit.perDay;
 		if (Number.isFinite(perDay) && today(paths, at) >= perDay) return refuse(429, "cap");
-		const facts = auditFactsFor(paths, record.session, canonicalId, config.tokens);
+		const facts = auditFactsFor(paths, record.session, config.tokens);
 		if (!facts.sessionModelsKnown) return refuse(409, "models-unknown");
 		const choice = plan(config, facts, record.analystModels);
 		if (!choice || choice.blocked) return refuse(409, "no-model");

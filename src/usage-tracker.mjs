@@ -35,6 +35,8 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 	const ledgerRows = new Map();
 	/** Rows waiting for bytes: id -> ledger row, newest first. */
 	let queue = new Map();
+	/** Verified live session ids not yet handed to the index. Rebuilt each tick. */
+	const pendingLive = new Set();
 	let searched = new WeakSet();
 	let trees;
 	let backlogLogged = false;
@@ -177,11 +179,13 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			};
 			const liveAppends = [];
 			const liveFirstReads = [];
+			pendingLive.clear();
 			for (const session of sessions) {
 				if (!isNonEmptyString(session?.id)) continue;
 				const sessionFile = verifiedFile(session, liveSessions, cwdOf);
 				if (!sessionFile) continue;
 				const entry = index.get(session.id);
+				if (!entry) pendingLive.add(session.id);
 				const reads = entry?.state === "ok" && entry.complete === true ? liveAppends : liveFirstReads;
 				reads.push({ id: session.id, file: sessionFile, meta: metaOf(session) });
 			}
@@ -190,6 +194,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			for (const item of [...liveAppends, ...liveFirstReads]) {
 				if (budget <= 0) break;
 				budget = Math.max(0, budget - index.update(item.id, item.file, item.meta, { maxBytes: budget }));
+				pendingLive.delete(item.id);
 			}
 			// (c) the ended-session backlog, newest first
 			for (const [id, row] of queue) {
@@ -226,12 +231,13 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 		/**
 		 * The board's lookup: `{tokens, treeTokens}` for a complete entry
 		 * (`treeTokens` when descendants raise the total or produce a distinct non-finite total),
-		 * `{pending:true}` while an entry's first full read has not finished, and
+		 * `{pending:true}` while a verified first read has not begun or an entry's
+		 * first full read has not finished, and
 		 * null when nothing is known.
 		 */
 		tokensOf(sessionId, taskId) {
 			const entry = index.get(sessionId, taskId);
-			if (!entry) return null;
+			if (!entry) return pendingLive.has(sessionId) ? { pending: true } : null;
 			if (entry.state === "full") return { state: "full" };
 			if (entry.readError === true) return null;
 			const tokens = compactUsage(entry);
