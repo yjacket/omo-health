@@ -344,7 +344,7 @@ export function buildEnded(inputs) {
 	const shownMains = mains.slice(0, ENDED_LIMIT);
 	const shownChildren = children.slice(0, ENDED_LIMIT);
 	const selected = new Set([...shownMains, ...shownChildren]);
-	const usage = inputs.usage instanceof Map ? inputs.usage : new Map();
+	const usage = typeof inputs.usage?.get === "function" && typeof inputs.usage?.values === "function" ? inputs.usage : new Map();
 	const ambiguous = ambiguousLedgerTaskIds(all, { scoped: true });
 	const published = publishedUsageView(usage);
 	// Retained descendants join through published index parent links. Only

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { listDirSafe, statSafe } from "../util/fsx.mjs";
 import { isInside, pathKey } from "../paths.mjs";
-import { subjectKey } from "../session-subject.mjs";
+import { packScopedText, SubjectMap } from "../session-subject.mjs";
 import { fresh, readUsageIndex, soleChildSessionFile } from "../usage-index.mjs";
 import { idFromFileName } from "./sessions.mjs";
 import { senpiTaskStoreDir } from "./tasks.mjs";
@@ -51,7 +51,7 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 	const nowMs = typeof clock?.now === "function" ? () => clock.now() : () => Date.now();
 	const projects = new Map();
 	let usageStamp;
-	let indexedMainEntries = new Map();
+	let indexedMainEntries = new SubjectMap();
 
 	const residentMainFile = (subject) => {
 		const file = indexedFile(subject);
@@ -64,14 +64,14 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 		const stamp = stat?.isFile() ? `${stat.ino}:${stat.birthtimeMs}:${stat.mtimeMs}:${stat.size}` : null;
 		if (stamp !== usageStamp) {
 			usageStamp = stamp;
-			indexedMainEntries = new Map();
+			indexedMainEntries = new SubjectMap();
 			if (stamp !== null) {
-				for (const [id, entry] of readUsageIndex(file)) {
-					if (entry.kind === "main" && entry.file && (!probeHeaders || idFromFileName(entry.file) !== entry.id)) indexedMainEntries.set(id, entry);
+				for (const entry of readUsageIndex(file).values()) {
+					if (entry.kind === "main" && entry.file && (!probeHeaders || idFromFileName(entry.file) !== entry.id)) indexedMainEntries.set(entry, entry);
 				}
 			}
 		}
-		const entry = indexedMainEntries.get(subjectKey(subject));
+		const entry = indexedMainEntries.get(subject);
 		if (!probeHeaders && (entry?.readError === true || !fresh(entry))) return undefined;
 		return entry?.file;
 	};
@@ -113,8 +113,9 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 				if (probe.id === sessionId) return result(indexedFile);
 			}
 		}
-		let project = projects.get(projectKey);
-		if (!project) projects.set(projectKey, project = { files: new Map(), scannedMs: -Infinity });
+		const packed = packScopedText(projectKey);
+		let project = projects.get(packed);
+		if (!project) projects.set(packed, project = { files: new Map(), scannedMs: -Infinity });
 		let file = project.files.get(sessionId);
 		if (file && statSafe(file)?.isFile()) return result(file);
 		if (file) project.files.delete(sessionId);
@@ -152,7 +153,7 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 	const childFiles = new Map();
 	const childMisses = new Map();
 
-	const childKey = (taskId, sessionId, cwds) => JSON.stringify([taskId, sessionId ?? null, cwds ?? []]);
+	const childKey = (taskId, sessionId, cwds) => packScopedText(JSON.stringify([taskId, sessionId ?? null, cwds ?? []]));
 
 	const locateChild = ({ taskId, sessionId, cwds }) => {
 		if (!taskId) return undefined;

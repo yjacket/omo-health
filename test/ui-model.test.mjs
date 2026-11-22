@@ -1,7 +1,7 @@
+import "./helpers/tmp-root.mjs";
 import { subjectOf, subjectKey } from "../src/session-subject.mjs";
 const sub = (sessionId, cwd) => subjectOf({ sessionId, cwd });
 const key = (sessionId, cwd) => subjectKey(sub(sessionId, cwd));
-import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";

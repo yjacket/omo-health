@@ -1,7 +1,7 @@
+import "./helpers/tmp-root.mjs";
 import { auditFileKey, projectKeyOf, subjectOf, subjectKey } from "../src/session-subject.mjs";
 const sub = (sessionId, cwd = sessionId === "Review.1" ? "C:/dev/other" : "C:/dev/proj") => subjectOf({ sessionId, cwd });
 const key = (sessionId, cwd) => subjectKey(sub(sessionId, cwd));
-import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";

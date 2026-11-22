@@ -1,7 +1,7 @@
-import { subjectOf, subjectKey } from "../src/session-subject.mjs";
+import "./helpers/tmp-root.mjs";
+import { SubjectMap, subjectOf, subjectKey } from "../src/session-subject.mjs";
 const sub = (sessionId, cwd) => subjectOf({ sessionId, cwd });
 const key = (sessionId, cwd) => subjectKey(sub(sessionId, cwd));
-import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -454,6 +454,9 @@ const longPathProgram = `
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import * as usage from ${JSON.stringify(new URL("../src/usage-index.mjs", import.meta.url).href)};
+import { subjectKey } from ${JSON.stringify(new URL("../src/session-subject.mjs", import.meta.url).href)};
+const sub = (sessionId) => ({ sessionId, projectKey: null });
+const key = (sessionId) => subjectKey(sub(sessionId));
 const [mode, file] = process.argv.slice(1);
 const N = 16000;
 const id = (i) => "01aaa000-0000-7000-8000-" + String(i).padStart(12, "0");
@@ -649,6 +652,19 @@ test("(gate 14) regrouped model cost need not reconcile in floating point", (t) 
 	assert.equal(fresh(entry), true);
 });
 
+test("scoped maps distinguish long common-prefix projects and preserve insertion order", () => {
+	const projects = ["A", "B"].map((suffix) => `--작업-${"common-".repeat(500)}${suffix}--`);
+	const first = { projectKey: projects[0], sessionId: "review.1" };
+	const second = { projectKey: projects[1], sessionId: "review.1" };
+	const third = { projectKey: projects[0], sessionId: "review.2" };
+	const map = new SubjectMap({ ordered: true, packed: true });
+	map.set(first, "first").set(second, "second").set(third, "third");
+	assert.deepEqual([...map], [[subjectKey(first), "first"], [subjectKey(second), "second"], [subjectKey(third), "third"]]);
+	assert.equal(map.delete(subjectKey(second)), true);
+	assert.equal(map.get(subjectKey(first)), "first");
+	assert.equal(map.has(second), false);
+});
+
 test("save and load round-trip the entries without the in-memory fields", (t) => {
 	const { dir, fileOf, indexOf } = setup(t);
 	const index = indexOf();
@@ -668,7 +684,7 @@ test("save and load round-trip the entries without the in-memory fields", (t) =>
 		assert.equal("readError" in entry, false);
 	}
 	const loaded = readUsageIndex(path.join(dir, "usage.json"));
-	assert.equal(loaded instanceof Map, true);
+	assert.equal(loaded instanceof SubjectMap, true);
 	assert.equal(loaded.size, 2);
 	assert.equal(compactUsage(loaded.get(key("s1"))).total, 10);
 	assert.equal(compactUsage(loaded.get(key("s2"))).total, 20);

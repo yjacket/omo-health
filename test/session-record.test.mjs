@@ -1,7 +1,7 @@
+import "./helpers/tmp-root.mjs";
 import { subjectOf, subjectKey } from "../src/session-subject.mjs";
 const sub = (sessionId, cwd) => subjectOf({ sessionId, cwd });
 const key = (sessionId, cwd) => subjectKey(sub(sessionId, cwd));
-import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";

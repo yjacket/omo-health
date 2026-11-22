@@ -1,5 +1,5 @@
-import { projectKeyOf, subjectKey, subjectOf } from "../src/session-subject.mjs";
 import "./helpers/tmp-root.mjs";
+import { projectKeyOf, subjectKey, subjectOf } from "../src/session-subject.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -10,7 +10,7 @@ import { SessionRegistry } from "../src/collect/sessions.mjs";
 import { readUsage, usageTimeline } from "../src/collect/usage.mjs";
 import { E, iso, tmpDir, writeJsonl } from "./helpers/fixtures.mjs";
 import { makeWorld, sessionState, taskRecord } from "./helpers/world.mjs";
-import { compactUsage, createUsageIndex, readUsageIndex, USAGE_TICK_BYTES } from "../src/usage-index.mjs";
+import { compactUsage, createUsageIndex, parentSubject, readUsageIndex, USAGE_TICK_BYTES } from "../src/usage-index.mjs";
 import * as usageIndex from "../src/usage-index.mjs";
 import { buildEnded, endedRow, loadUiInputs } from "../src/ui/model.mjs";
 import { loadSessionRecord } from "../src/session-record.mjs";
@@ -107,7 +107,9 @@ test("project subject: same-ID ended mains publish separate totals, models and c
 	assert.equal([...saved.values()].filter((entry) => entry.kind === "main").length, 2);
 	assert.equal([...saved.values()].filter((entry) => entry.kind === "child").length, 2);
 	for (const { row, child } of s.projects) {
-		assert.equal(saved.get(subjectKey(subjectOf(child))).parentKey, subjectKey(subjectOf(row)));
+		const entry = saved.get(subjectKey(subjectOf(child)));
+		assert.equal(entry.parentKey, null, "same-project parent key must not be stored");
+		assert.deepEqual(parentSubject(entry), subjectOf(row));
 	}
 	const history = buildEnded({ ended: rows, usage: saved, now: T0 });
 	for (const [i, { cwd, total, model }] of s.projects.entries()) {

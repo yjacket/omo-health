@@ -1,6 +1,6 @@
+import "./helpers/tmp-root.mjs";
 import { projectKeyOf, subjectKey, subjectOf } from "../src/session-subject.mjs";
 const sub = (sessionId, cwd) => subjectOf({ sessionId, cwd });
-import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
