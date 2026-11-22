@@ -61,7 +61,7 @@ const heartbeat = (extra = {}) => ({ pid: 424242, ts: NOW - 10_000, startedMs: N
 const inputsOf = (home, overrides = {}) => ({ ...loadUiInputs({ paths: home.paths, env: home.env, now: NOW }), ...overrides });
 const running = (home, hbExtra, overrides = {}) => inputsOf(home, { heartbeat: heartbeat(hbExtra), pidAlive: true, ...overrides });
 
-it("(plan 35) history adds a detail selector only to shared session IDs", () => {
+it("history gives every row a request selector but only shared IDs a key suffix", () => {
 	const shared = { sessionId: "st_shared", taskId: "st_shared", kind: "child" };
 	const ended = [
 		{ ...shared, endedMs: NOW, parentSessionId: "b" },
@@ -69,6 +69,7 @@ it("(plan 35) history adds a detail selector only to shared session IDs", () => 
 		{ ...shared, endedMs: NOW - 2, parentSessionId: "a" },
 	];
 	const { rows } = buildEnded({ now: NOW, ended });
+	assert.deepEqual(rows.map((r) => r.rowSelector), ended.map(expectedSelector));
 	assert.deepEqual(rows.map((r) => [r.sessionId, r.detailRow]), [
 		["st_shared", expectedSelector(ended[0])], ["unique", undefined], ["st_shared", expectedSelector(ended[2])],
 	]);
@@ -118,10 +119,11 @@ it("(plan 35) browser history toggles and requests each row independently", asyn
 	);
 	const a = "0123456789abcdef";
 	const b = "fedcba9876543210";
+	const c = "0123456789fedcba";
 	const rows = [
-		{ sessionId: "st_shared", endedMs: NOW, detailRow: a },
-		{ sessionId: "st_shared", endedMs: NOW - 1, detailRow: b },
-		{ sessionId: "unique", endedMs: NOW },
+		{ sessionId: "st_shared", endedMs: NOW, detailRow: a, rowSelector: a },
+		{ sessionId: "st_shared", endedMs: NOW - 1, detailRow: b, rowSelector: b },
+		{ sessionId: "unique", endedMs: NOW, rowSelector: c },
 	];
 	const items = rows.map(endedItem);
 	assert.deepEqual(items.map(({ children: [row] }) => row.children[0].children[0]["data-key"]),
@@ -129,11 +131,13 @@ it("(plan 35) browser history toggles and requests each row independently", asyn
 	for (const { children: [row] } of items) row.onclick();
 	await Promise.resolve();
 	await loadEndedPage(rows[1], "messages");
+	await loadEndedPage(rows[2], "messages");
 	assert.deepEqual(urls, [
 		`/api/session?id=st_shared&row=${a}`,
 		`/api/session?id=st_shared&row=${b}`,
-		"/api/session?id=unique",
+		`/api/session?id=unique&row=${c}`,
 		`/api/session?id=st_shared&row=${b}&list=messages&offset=0`,
+		`/api/session?id=unique&row=${c}&list=messages&offset=0`,
 	]);
 	assert.equal(openEnded.size, 3);
 	assert.equal(endedDetails.size, 3);
@@ -154,15 +158,17 @@ it("plan78: 81- and 300-character history IDs survive browser keys, detail URLs 
 			openEnded: new Set(), endedDetails: new Map(), cellClass() {},
 			ENDED_COLUMNS: Array(6).fill("column"), when() {}, endedSessionCell() {}, outcomeMark() {}, endedTokenCell() {}, show() {},
 			append: (body, children) => Object.assign(body, { children }),
-			post: (url, body) => posts.push([url, body.sessionId]),
+			post: (url, body) => posts.push([url, body.sessionId, body.row]),
 		},
 	);
-	const rows = ids.map((sessionId) => endedRow({ sessionId, endedMs: NOW }));
+	const ended = ids.map((sessionId) => ({ sessionId, endedMs: NOW }));
+	const { rows } = buildEnded({ now: NOW, ended });
+	const selectors = ended.map(expectedSelector);
 	const rendered = rows.map(endedItem);
 	rows.forEach(startAudit);
 	assert.deepEqual(rendered.map(({ children: [row] }) => row.children[0].children[0]["data-key"]), ids.map((id) => `ended:${id}`));
-	assert.deepEqual(rows.map(endedDetailUrl), ids.map((id) => `/api/session?id=${id}`));
-	assert.deepEqual(posts, ids.map((id) => ["/api/audit", id]));
+	assert.deepEqual(rows.map(endedDetailUrl), ids.map((id, i) => `/api/session?id=${id}&row=${selectors[i]}`));
+	assert.deepEqual(posts, ids.map((id, i) => ["/api/audit", id, selectors[i]]));
 });
 
 it("IS-10 unconfirmed: the app audit block renders the overdue status when flagged", () => {
@@ -291,8 +297,8 @@ function endedRefreshHarness(recordsStamp) {
 
 it("(plan 36) state refresh re-reads a changed open detail and only drops a changed closed detail", async () => {
 	const h = endedRefreshHarness();
-	const openRow = { sessionId: "shared", detailRow: "0123456789abcdef", ...pendingTokens };
-	const closedRow = { ...openRow, detailRow: "fedcba9876543210" };
+	const openRow = { sessionId: "shared", detailRow: "0123456789abcdef", rowSelector: "0123456789abcdef", ...pendingTokens };
+	const closedRow = { ...openRow, detailRow: "fedcba9876543210", rowSelector: "fedcba9876543210" };
 	const openId = `shared:${openRow.detailRow}`;
 	const closedId = `shared:${closedRow.detailRow}`;
 	const old = { audit: { blocked: "models-unknown" } };
@@ -319,7 +325,7 @@ it("(plan 36) state refresh re-reads a changed open detail and only drops a chan
 
 it("(plan 40) a changed records stamp refreshes an open panel without changed tokens or an active audit", async () => {
 	const h = endedRefreshHarness("before");
-	const row = { sessionId: "open", ...readyTokens };
+	const row = { sessionId: "open", rowSelector: "0123456789abcdef", ...readyTokens };
 	const old = { health: { investigations: [] } };
 	h.openEnded.add(row.sessionId);
 	await h.seed(row, old);
@@ -328,7 +334,7 @@ it("(plan 40) a changed records stamp refreshes an open panel without changed to
 
 	h.setRecordsStamp("after");
 	await h.tick(row);
-	assert.deepEqual(h.requests.map(({ url }) => url), ["/api/session?id=open"]);
+	assert.deepEqual(h.requests.map(({ url }) => url), [`/api/session?id=open&row=${row.rowSelector}`]);
 	assert.equal(h.requests[0].headers["x-omo-health-auto"], "1");
 	assert.equal(h.endedDetails.get(row.sessionId).data, old);
 	assert.deepEqual(h.redraws, [], "keep the panel in place until its replacement is ready");
@@ -345,8 +351,8 @@ it("(plan 40) a changed records stamp refreshes an open panel without changed to
 
 it("(plan 40) a changed records stamp drops closed cache entries, including rows absent from the poll", async () => {
 	const h = endedRefreshHarness("before");
-	const row = { sessionId: "closed", ...readyTokens };
-	const absent = { ...row, sessionId: "absent" };
+	const row = { sessionId: "closed", rowSelector: "0123456789abcdef", ...readyTokens };
+	const absent = { ...row, sessionId: "absent", rowSelector: "fedcba9876543210" };
 	await h.seed(row, {});
 	await h.seed(absent, {});
 	await h.tick(row);
@@ -357,26 +363,26 @@ it("(plan 40) a changed records stamp drops closed cache entries, including rows
 	assert.equal(h.endedDetails.size, 0, "a changed stamp drops closed cache entries");
 	assert.equal(h.requests.length, 0, "closed rows do not refetch in the background");
 	h.endedItem(row).children[0].onclick();
-	assert.deepEqual(h.requests.map(({ url }) => url), ["/api/session?id=closed"]);
+	assert.deepEqual(h.requests.map(({ url }) => url), [`/api/session?id=closed&row=${row.rowSelector}`]);
 });
 
 it("(plan 40) reopening revalidates a cached detail before the next poll", async () => {
 	const h = endedRefreshHarness("before");
-	const row = { sessionId: "reopened", ...readyTokens };
+	const row = { sessionId: "reopened", rowSelector: "0123456789abcdef", ...readyTokens };
 	const old = { health: { investigations: [] } };
 	h.openEnded.add(row.sessionId);
 	await h.seed(row, old);
 	const { children: [toggle] } = h.endedItem(row);
 	toggle.onclick(); // Close.
 	toggle.onclick(); // Reopen while the last polled stamp is still unchanged.
-	assert.deepEqual(h.requests.map(({ url }) => url), ["/api/session?id=reopened"]);
+	assert.deepEqual(h.requests.map(({ url }) => url), [`/api/session?id=reopened&row=${row.rowSelector}`]);
 	assert.equal(h.endedDetails.get(row.sessionId).data, old);
 	assert.equal(h.openEnded.has(row.sessionId), true);
 });
 
 it("(plan 36) a failed token refetch keeps the open panel and retries on the next state refresh", async () => {
 	const h = endedRefreshHarness();
-	const row = { sessionId: "open", ...pendingTokens };
+	const row = { sessionId: "open", rowSelector: "0123456789abcdef", ...pendingTokens };
 	const updatedRow = { ...row, ...readyTokens };
 	const old = { audit: { blocked: "models-unknown" } };
 	h.openEnded.add(row.sessionId);

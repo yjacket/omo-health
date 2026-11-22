@@ -12,6 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import { after, before, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import { runInNewContext } from "node:vm";
 import { MessageChannel, receiveMessageOnPort, Worker } from "node:worker_threads";
 import { createAuditor, readAuditState, requestAudit } from "../src/auditor.mjs";
 import { createSessionFileLocator } from "../src/collect/session-files.mjs";
@@ -1183,6 +1184,60 @@ describe("ui server", { timeout: 20_000 }, () => {
 				} finally {
 					await auditor.close();
 				}
+			});
+
+			it("plan88: a history row with an older same-ID project selects its own detail, page, and audit", async (t) => {
+				const sessionId = "review.1";
+				const world = makeWorld({ sessionId, total: 17 });
+				const { paths, env, now } = world;
+				const ui = createUiServer({ paths, token: TOKEN, getState: () => uiState({ paths, env, now: now() }),
+					sessionDetail: world.detail, startAudit: world.startAudit, now });
+				t.after(async () => {
+					await Promise.all([ui.close(), world.detail.close()]);
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				});
+				const oldCwd = path.join(world.dir, "old-project");
+				const oldEnd = now() - 31 * 86_400_000;
+				assert.equal(appendEnded(paths, { sessionId, cwd: oldCwd, kind: "main",
+					startedMs: oldEnd - 1000, endedMs: oldEnd }, { nowMs: now() }), true);
+				assert.equal(readEnded(paths).filter((row) => row.sessionId === sessionId).length, 2);
+				for (let i = 0; i <= 50; i++) {
+					appendEnded(paths, { sessionId: `child-${i}`, parentSessionId: sessionId, kind: "child", cwd: world.dir,
+						startedMs: now() - 900, endedMs: now() - 100 + i }, { nowMs: now() });
+				}
+				const { port } = await ui.listen();
+				const { status: stateStatus, body: state } = await getAt(port, "/api/state");
+				assert.equal(stateStatus, 200);
+				const history = state.ended.rows.filter((row) => row.sessionId === sessionId);
+				assert.equal(history.length, 1);
+				const [row] = history;
+				assert.equal(Object.hasOwn(row, "detailRow"), false);
+
+				const app = fs.readFileSync(new URL("../src/ui/static/app.js", import.meta.url), "utf8");
+				const urlOf = runInNewContext(`(${app.match(/function endedDetailUrl\([^]*?\n\t\}/)[0]})`);
+				const url = urlOf(row);
+				const bareUrl = `/api/session?id=${sessionId}`;
+				const bare = await getAt(port, bareUrl);
+				// The server also resolves IDs within 30 days; the older twin is not ambiguous.
+				assert.deepEqual([bare.status, bare.body.tokens?.total], [200, 17]);
+				const { status, body } = await getAt(port, url);
+				assert.deepEqual([status, body.tokens?.total, body.counts?.children, body.children?.length], [200, 17, 51, 50]);
+				const selector = expectedSelector({ sessionId, cwd: world.dir, endedMs: now() });
+				assert.equal(url, `${bareUrl}&row=${selector}`, `opening ${url} returned HTTP ${status}; history must send the row selector`);
+				const page = await getAt(port, `${url}&list=children&offset=${body.children.length}`);
+				assert.deepEqual([page.status, page.body.list, page.body.offset, page.body.total, page.body.items?.map((item) => item.sessionId)],
+					[200, "children", 50, 51, ["child-0"]]);
+				const posted = await postAt(port, "/api/audit", { sessionId, row: row.rowSelector });
+				assert.deepEqual([posted.status, posted.body.audit?.status], [202, "queued"]);
+				assert.ok(fs.existsSync(path.join(paths.health.auditRequestsDir, `${auditFileKey(sub(sessionId, world.dir))}.json`)));
+
+				// A twin inside the server's lookup window still makes a bare ID ambiguous.
+				assert.equal(appendEnded(paths, { sessionId, cwd: oldCwd, kind: "main",
+					startedMs: now() - 3000, endedMs: now() - 2000 }, { nowMs: now() }), true);
+				const ambiguous = await getAt(port, bareUrl);
+				assert.deepEqual([ambiguous.status, ambiguous.body.error], [409, "ambiguous-session"]);
+				const bareAudit = await postAt(port, "/api/audit", { sessionId });
+				assert.deepEqual([bareAudit.status, bareAudit.body.error], [409, "ambiguous-session"]);
 			});
 
 			it("plan87: same-ID projects get separate transcript bundles and audit results after restart", async (t) => {

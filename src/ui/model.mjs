@@ -360,7 +360,9 @@ export function buildEnded(inputs) {
 		totals: { main: mains.length, child: children.length },
 		rows: all.filter((r) => selected.has(r)).map((r) => {
 			const row = endedRow(r, childRows.get(subjectKey(subjectOf(r))), usage, trees, usage.full === true, ambiguous);
-			if (idCounts.get(r.sessionId) > 1) row.detailRow = endedSelector(r);
+			row.rowSelector = endedSelector(r);
+			// Only shared IDs need a suffix in the browser's DOM and cache keys.
+			if (idCounts.get(r.sessionId) > 1) row.detailRow = row.rowSelector;
 			return row;
 		}),
 	};

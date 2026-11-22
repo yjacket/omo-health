@@ -726,8 +726,7 @@
 	}
 
 	function endedDetailUrl(r) {
-		const url = `/api/session?id=${encodeURIComponent(r.sessionId)}`;
-		return r.detailRow === undefined ? url : `${url}&row=${r.detailRow}`;
+		return `/api/session?id=${encodeURIComponent(r.sessionId)}&row=${r.rowSelector}`;
 	}
 
 	function endedTokenSignature(r) {
@@ -872,7 +871,7 @@
 
 	/** Asks the daemon for an audit of the session, then re-reads the row's audit block before 조사 can be pressed again. */
 	function startAudit(r) {
-		return post("/api/audit", { sessionId: r.sessionId, row: r.detailRow }, `audit:${endedDetailId(r)}`, () => loadAudit(r));
+		return post("/api/audit", { sessionId: r.sessionId, row: r.rowSelector }, `audit:${endedDetailId(r)}`, () => loadAudit(r));
 	}
 
 	/**
