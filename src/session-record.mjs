@@ -6,7 +6,7 @@ import { DEFAULT_CONFIG } from "./config.mjs";
 import { streamDecisions } from "./decisions.mjs";
 import { streamInvestigations } from "./investigations.mjs";
 import { endedKey, endedSelector, streamEnded } from "./session-ledger.mjs";
-import { compactUsage, readUsageIndex, usageEntryFor } from "./usage-index.mjs";
+import { compactUsage, fresh, readUsageIndex, usageEntryFor } from "./usage-index.mjs";
 import { reasonCode } from "./audit-codes.mjs";
 import { AUDIT_CHECK_MAX, AUDIT_DETECTOR_ID, AUDIT_LIST_CAPS, BUNDLE_MAX_CHARS, auditEvidence, auditHistoryRow, auditMessageKind } from "./judge/audit.mjs";
 import { readFallbackTargets } from "./runner.mjs";
@@ -927,7 +927,7 @@ function* dirNames(directory) {
 	}
 }
 
-function findRecordFiles(paths, nodes, ancestors, locator) {
+function findRecordFiles(paths, nodes, ancestors, locator, usage, ambiguous) {
 	const wanted = new Set(nodes.filter((node) => !nonEmpty(node.taskId)).map((node) => node.sessionId));
 	const main = new Map();
 	if (!locator && wanted.size) {
@@ -956,12 +956,15 @@ function findRecordFiles(paths, nodes, ancestors, locator) {
 			if (found) return path.join(dir, found);
 		}
 	};
-	return nodes.map(({ sessionId, taskId, ...node }) => ({
-		sessionId,
-		file: nonEmpty(taskId)
-			? (locator?.childFile ?? childFile)({ taskId, sessionId, cwds: cwdsOf(node, ancestors) })
-			: locator ? locator.mainFile(sessionId) : main.get(sessionId),
-	})).filter(({ file }) => file);
+	return nodes.map((node) => {
+		const { sessionId, taskId } = node;
+		if (!nonEmpty(taskId)) return { sessionId, file: locator ? locator.mainFile(sessionId) : main.get(sessionId) };
+		// The tracker may have verified the transcript through a live ancestor whose cwd is absent from the ledger.
+		const entry = usageEntryOf(usage, node, ambiguous);
+		const file = entry?.readError !== true && fresh(entry) ? entry.file
+			: (locator?.childFile ?? childFile)({ taskId, sessionId, cwds: cwdsOf(node, ancestors) });
+		return { sessionId, file };
+	}).filter(({ file }) => file);
 }
 
 function cwdsOf(node, ancestors) {
@@ -1117,7 +1120,7 @@ export function loadSessionRecord({ paths, id, row: selector, now = Date.now(), 
 	} : null;
 	const decisionHistory = scanDecisionHistory(streamDecisions(paths), row, activeWindows(row, descendants, now), retained?.machine);
 	const decisionJoin = joinSessionDecisions(row, descendants, () => streamInvestigations(paths), () => streamDecisions(paths, sinceMs), retained, paths.health.jobsDir);
-	const files = findRecordFiles(paths, [row, ...scanned], ancestors, locator);
+	const files = findRecordFiles(paths, [row, ...scanned], ancestors, locator, usage, ambiguous);
 
 	const messages = [];
 	const skipped = [];

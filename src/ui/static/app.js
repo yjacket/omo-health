@@ -715,8 +715,8 @@
 		const status = a.state?.status;
 		let parts;
 		if (AUDIT_ACTIVE.has(status)) parts = auditProgress(a);
-		else if (status === "done") parts = [auditResult(a.state), auditStart(r, a, "다시 조사")];
-		else if (status === "failed") parts = [auditFailure(a.state), auditStart(r, a, "다시 조사")];
+		else if (status === "done") parts = [auditResult(a.state), a.state.holdUntilExit !== true ? auditStart(r, a, "다시 조사") : null];
+		else if (status === "failed") parts = [auditFailure(a.state), a.state.holdUntilExit !== true ? auditStart(r, a, "다시 조사") : null];
 		else parts = auditStart(r, a, "조사", true);
 		return block("상위 모델 조사", el("div", { class: "audit" }, parts, errorSlot(`audit:${id}`), errorSlot(`audit-read:${id}`)));
 	}
@@ -913,7 +913,8 @@
 				if (changed) endedDetails.delete(id);
 			} else if (changed || (!entry.request && entry.state === "loading")) {
 				void loadEndedDetail(r, headers, true);
-			} else if (auto && !entry.request && !(hideChildren && r.kind === "child") && AUDIT_ACTIVE.has(entry.data?.audit?.state?.status)) {
+			} else if (auto && !entry.request && !(hideChildren && r.kind === "child") &&
+				(AUDIT_ACTIVE.has(entry.data?.audit?.state?.status) || entry.data?.audit?.state?.holdUntilExit === true)) {
 				void loadAudit(r, headers);
 			}
 		}

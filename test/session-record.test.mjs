@@ -10,9 +10,12 @@ import { resolvePaths } from "../src/paths.mjs";
 import { appendEnded } from "../src/session-ledger.mjs";
 import { buildSessionRecord, loadSessionRecord, scanOmoHealthMessages } from "../src/session-record.mjs";
 import * as sessionRecord from "../src/session-record.mjs";
+import { createDetailOperations } from "../src/ui/detail-worker.mjs";
 import { buildSessionView } from "../src/ui/session-view.mjs";
+import { fresh } from "../src/usage-index.mjs";
 import { expectedSelector } from "./helpers/ended-selector.mjs";
 import { tmpDir, writeJsonl, writeTask } from "./helpers/fixtures.mjs";
+import { indexLiveParentTranscript } from "./helpers/live-parent-transcript.mjs";
 import { relayDecisions } from "./helpers/relay-decisions.mjs";
 
 const T0 = Date.parse("2026-10-10T00:00:00.000Z");
@@ -137,6 +140,42 @@ let messageSeq = 0;
 const ohealth = (ms, text) => ({ type: "custom_message", customType: "omo-health", id: `oh-${++messageSeq}`, timestamp: iso(ms), content: text, details: { kind: "self-notice" } });
 const mainRow = (extra = {}) => ({ sessionId: "s-main", kind: "main", parentSessionId: null, taskId: null, title: "main", cwd: "C:/work/a", terminal: { kind: "wt" }, omoVersion: "0.8.0", startedMs: T0, endedMs: T0 + 2 * HOUR, childCount: 2, ...extra });
 const childRow = (sessionId, taskId, parentSessionId, extra = {}) => ({ sessionId, kind: "child", parentSessionId, taskId, title: sessionId, cwd: "C:/work/a", terminal: null, omoVersion: null, startedMs: T0 + 10 * MIN, endedMs: T0 + 70 * MIN, ...extra });
+
+test("IS-7 indexed transcript: detail shows messages for a child and descendant located through a live parent", (t) => {
+	const { root, paths } = setup();
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const { index, child, grandchild } = indexLiveParentTranscript(paths, root, T0, { descendant: true });
+	for (const { id, file } of [child, grandchild]) {
+		assert.equal(index.get(id)?.file, file);
+		assert.equal(fresh(index.get(id)), true);
+	}
+	const detail = createDetailOperations({ paths, auditDetail: () => null });
+	const job = { kind: "detail", id: child.id, now: T0 };
+	const result = detail(job);
+	assert.equal(result.record.tokens.total, 51_302);
+	assert.deepEqual(result.record.health.messages, [grandchild, child].map(({ id, ms, kind, text }) => ({ ms, kind, recipient: id, text })));
+	assert.deepEqual(result.files, [child.file, grandchild.file]);
+
+	fs.appendFileSync(child.file, "\n");
+	assert.equal(fresh(index.get(child.id)), false);
+	const afterAppend = detail(job);
+	assert.deepEqual(afterAppend.record.health.messages.map(({ recipient }) => recipient), [grandchild.id]);
+	assert.deepEqual(afterAppend.files, [grandchild.file]);
+});
+
+test("IS-7 indexed transcript: an ambiguous task-only path is not used by detail", (t) => {
+	const { root, paths } = setup();
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const { index, child } = indexLiveParentTranscript(paths, root, T0, { taskOnly: true });
+	assert.equal(fresh(index.get(child.id)), true);
+	writeJsonl(path.join(path.dirname(child.file), "second-session.jsonl"), [ohealth(child.ms, "Another owner")]);
+	const detail = createDetailOperations({ paths, auditDetail: () => null });
+	const result = detail({ kind: "detail", id: child.id, now: T0 });
+	assert.ok(result.record.found);
+	assert.equal(result.record.tokens, null);
+	assert.deepEqual(result.record.health.messages, []);
+	assert.deepEqual(result.files, []);
+});
 
 test("IS-8: records retain only config decision times and hashes, including reloads after session end", (t) => {
 	const { root, paths } = setup();

@@ -216,12 +216,12 @@ function runnerOperations({ jobsDir, spawnImpl, clock, env, isAlive, identify, c
 		};
 	};
 	const running = () => ({ status: "running", result: null, exitCode: null });
+	const deadlineOf = (meta) => meta.startedMs + meta.timeoutMs;
+	const terminationPending = (meta) => ({ ...running(), terminationUnconfirmed: true, deadlineMs: deadlineOf(meta) });
 	const lookupUnconfirmed = (meta, error) => {
-		const deadlineMs = meta.startedMs + meta.timeoutMs;
 		return {
-			...running(),
+			...(meta.kind === "audit" && clock.now() > deadlineOf(meta) ? terminationPending(meta) : running()),
 			detail: truncate(error.message, 300),
-			...(meta.kind === "audit" && clock.now() > deadlineMs ? { terminationUnconfirmed: true, deadlineMs } : {}),
 		};
 	};
 
@@ -232,11 +232,10 @@ function runnerOperations({ jobsDir, spawnImpl, clock, env, isAlive, identify, c
 		return outcome;
 	}
 
-	function fallbackFailure(f, meta, exitCode, holdUntilExit = false) {
+	function fallbackFailure(f, meta, exitCode) {
 		if (meta.kind !== "audit" || !APPLIED_FALLBACK.test(readTextSafe(f.err, ""))) return null;
 		return finish(f, meta, {
 			status: "failed", reason: "model-fallback", result: null, exitCode,
-			...(holdUntilExit ? { holdUntilExit: true } : {}),
 		});
 	}
 
@@ -273,12 +272,12 @@ function runnerOperations({ jobsDir, spawnImpl, clock, env, isAlive, identify, c
 
 	function timeoutKill(f, meta) {
 		killOwnTree(f, meta);
-		return fallbackFailure(f, meta, null, true) ?? finish(f, meta, { status: "timeout", result: null, exitCode: null });
+		return finish(f, meta, { status: "timeout", result: null, exitCode: null });
 	}
 
 	/**
 	 * Can this job's verified pid still be trusted? Throws when the lookup fails (not knowing is never "gone").
-	 * `meta.final` is not consulted: the original launcher timeout path may finalize while the process still lives.
+	 * `meta.final` is not consulted: other job kinds and legacy audits could finalize before exit.
 	 */
 	function* stillOurs(meta) {
 		if (!meta || !meta.pid || !Number.isFinite(meta.ctimeMs)) return false;
@@ -318,10 +317,15 @@ function runnerOperations({ jobsDir, spawnImpl, clock, env, isAlive, identify, c
 		try {
 			const tracked = yield* trackAuditSurvivor(f, meta);
 			if (tracked) {
-				if (clock.now() - tracked.startedMs > tracked.timeoutMs) yield* terminateAuditSurvivor(f, tracked);
+				if (clock.now() > deadlineOf(tracked)) {
+					yield* terminateAuditSurvivor(f, tracked);
+					return terminationPending(tracked);
+				}
 				return running();
 			}
-			if (adoptedTerminationAttempts(meta) > 0) return finish(f, meta, { status: "timeout", result: null, exitCode: null, exitConfirmed: true });
+			if (meta.auditTerminationRequested || adoptedTerminationAttempts(meta) > 0) {
+				return finish(f, meta, { status: "timeout", result: null, exitCode: null, exitConfirmed: true });
+			}
 			return null;
 		} catch (error) {
 			return lookupUnconfirmed(meta, error);
@@ -408,15 +412,16 @@ function runnerOperations({ jobsDir, spawnImpl, clock, env, isAlive, identify, c
 					if (surviving) return surviving;
 				}
 				// A runner from before the fallback guard may have finalized before the auditor saved the outcome.
-				return meta.final.exitConfirmed || meta.final.reason === "model-fallback" ? meta.final :
-					fallbackFailure(f, meta, meta.final.exitCode, meta.final.status === "timeout") ?? meta.final;
+				return meta.final.status === "timeout" || meta.final.reason === "model-fallback" ? meta.final :
+					fallbackFailure(f, meta, meta.final.exitCode) ?? meta.final;
 			}
 			const exit = readJsonSafe(f.exit);
-			if (exit || meta.adopted) return yield* ended(f, meta, exit);
+			// A launcher error after spawn is not an exit notification.
+			if ((exit && !(meta.kind === "audit" && exit.error && meta.pid)) || meta.adopted) return yield* ended(f, meta, exit);
 			// After a reboot or a long gap the pid can name any process: only the one started for this job is killed
 			// (src/act/kill.mjs re-verifies the same way). A process gone meanwhile is ended below.
 			if (!meta.pid || !isAlive(meta.pid)) return yield* ended(f, meta, exit);
-			const timedOut = clock.now() - meta.startedMs > meta.timeoutMs;
+			const timedOut = clock.now() > deadlineOf(meta);
 			if (!Number.isFinite(meta.ctimeMs)) {
 				// Started before the identity could be read (or by an older version): find the job by its own argv.
 				let found;
@@ -460,7 +465,15 @@ function runnerOperations({ jobsDir, spawnImpl, clock, env, isAlive, identify, c
 				if (!timedOut) return running();
 				// The one documented exception to the no-/T rule (AGENTS.md): the verified job's OWN tree (omo.exe ->
 				// omo.exe -p -> git.exe) would be orphaned by a single-PID kill.
-				return timeoutKill(f, meta);
+				if (meta.kind !== "audit") return timeoutKill(f, meta);
+				try {
+					// Persist before requesting termination so a restart cannot read a late verdict as success.
+					if (!meta.auditTerminationRequested) writeJson(f.meta, { ...meta, auditTerminationRequested: true });
+					killOwnTree(f, meta);
+				} catch (error) {
+					return lookupUnconfirmed(meta, error);
+				}
+				return terminationPending(meta);
 			}
 			return yield* ended(f, meta, exit);
 		},

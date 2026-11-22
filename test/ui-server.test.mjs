@@ -2,10 +2,12 @@ import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
+import { syncBuiltinESMExports } from "node:module";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { after, before, beforeEach, describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
 import { createAuditor, readAuditState, requestAudit } from "../src/auditor.mjs";
 import { loadConfig } from "../src/config.mjs";
 import { resolvePaths } from "../src/paths.mjs";
@@ -215,6 +217,72 @@ describe("ui server", { timeout: 20_000 }, () => {
 			assert.equal(res.status, 200);
 			assert.equal(res.headers["content-type"], "application/json; charset=utf-8");
 			assert.deepEqual(res.body, STATE);
+		});
+
+		it("IS-4 serves live and ended state without opening session transcripts", async (t) => {
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omoh-ui-state-index-"));
+			const env = { USERPROFILE: dir, OMO_HEALTH_HOME: path.join(dir, "health") };
+			const paths = resolvePaths(env);
+			const nowMs = Date.parse("2026-11-22T12:00:00.000Z");
+			const now = () => nowMs;
+			const index = createUsageIndex({ file: paths.health.usageIndexFile, clock: { now } });
+			const transcriptPaths = new Set();
+			const ended = new Map();
+			const liveId = "s_state_live";
+			const canonicalPath = (file) => {
+				const resolved = path.resolve(file);
+				return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+			};
+			t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+			for (const [id, total] of [[liveId, 11], ["s_state_done1", 22], ["s_state_done2", 33], ["s_state_done3", 44]]) {
+				const file = path.join(paths.sessionsDir, "slug", `2026-11-22T11-59-59-000Z_${id}.jsonl`);
+				writeJsonl(file, [
+					{ type: "session", id, cwd: dir },
+					{ type: "message", message: { role: "assistant", provider: "anthropic", model: "claude-used", usage: { input: total }, stopReason: "stop" } },
+				]);
+				transcriptPaths.add(canonicalPath(file));
+				index.update(id, file, { kind: "main" });
+				if (id === liveId) continue;
+				appendEnded(paths, { sessionId: id, kind: "main", cwd: dir, startedMs: nowMs - 1_000, endedMs: nowMs, outcome: "answered" }, { nowMs });
+				ended.set(id, total);
+			}
+			index.save();
+			fs.mkdirSync(path.dirname(paths.health.sessionsSnapshotFile), { recursive: true });
+			fs.writeFileSync(paths.health.sessionsSnapshotFile, JSON.stringify({
+				ts: nowMs, groups: [{ omoVersion: "test", sessions: [{ sessionId: liveId, tokens: { total: 11 } }] }],
+			}));
+
+			const ui = createUiServer({ paths, token: TOKEN, getState: () => uiState({ paths, env, now: now() }), now });
+			try {
+				const { port } = await ui.listen();
+				const transcriptOpens = [];
+				for (const [target, methods] of [
+					[fs, ["openSync", "readFileSync", "createReadStream", "open", "readFile"]],
+					[fs.promises, ["open", "readFile"]],
+				]) {
+					for (const method of methods) {
+						const original = target[method];
+						t.mock.method(target, method, function (file, ...args) {
+							const filename = file instanceof URL ? fileURLToPath(file) : Buffer.isBuffer(file) ? file.toString() : file;
+							if (typeof filename === "string" && transcriptPaths.has(canonicalPath(filename))) {
+								transcriptOpens.push({ method, file: filename });
+							}
+							return original.call(this, file, ...args);
+						});
+					}
+				}
+				syncBuiltinESMExports();
+				const { status, body } = await getAt(port, "/api/state");
+				assert.deepEqual(transcriptOpens, [], "/api/state opened a session transcript on the server thread");
+				assert.equal(status, 200);
+				assert.deepEqual(body.sessions.groups[0].sessions.map((row) => [row.sessionId, row.tokens?.total]), [[liveId, 11]]);
+				assert.deepEqual(new Map(body.ended.rows.map((row) => [row.sessionId, row.tokens?.total])), ended);
+			} finally {
+				t.mock.reset();
+				syncBuiltinESMExports();
+				await ui.close();
+			}
 		});
 	});
 

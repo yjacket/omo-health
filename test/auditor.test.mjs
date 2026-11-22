@@ -19,11 +19,14 @@ import { GUARD_FLAGS } from "../src/judge/lane.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 import { appendEnded, readEnded } from "../src/session-ledger.mjs";
 import { createRunner } from "../src/runner.mjs";
+import { createDetailOperations } from "../src/ui/detail-worker.mjs";
+import { createUiServer } from "../src/ui/server.mjs";
 import { createUsageIndex, fresh } from "../src/usage-index.mjs";
 import { createUsageTracker } from "../src/usage-tracker.mjs";
 import { createRecordingSpawn } from "./fakes/runner.mjs";
 import { readJsonSafe } from "../src/util/fsx.mjs";
 import { E, appendJsonl, writeJsonl, writeTask } from "./helpers/fixtures.mjs";
+import { indexLiveParentTranscript } from "./helpers/live-parent-transcript.mjs";
 
 const BASE = Date.parse("2026-11-20T12:00:00Z");
 const DAY = 24 * 60 * 60_000;
@@ -160,6 +163,21 @@ async function crashAfterStart(h, { writeMeta = true } = {}) {
 }
 
 const modelOf = (start) => start.args[start.args.indexOf("--model") + 1];
+
+test("IS-7 indexed transcript: audit includes the message ref for a child located through a live parent", async () => {
+	const h = harness({ sessions: [] });
+	const { index, child } = indexLiveParentTranscript(h.paths, h.root, BASE);
+	assert.equal(index.get(child.id)?.file, child.file);
+	assert.equal(fresh(index.get(child.id)), true);
+	const auditor = h.auditor({ index });
+	h.request(child.id);
+	await h.prepare(auditor);
+	assert.equal(h.record(child.id).status, "running");
+	const document = fs.readFileSync(path.join(h.runner.starts[0].cwd, "bundle.md"), "utf8");
+	const bundle = JSON.parse(document.split("\n").find((line) => line.startsWith('{"session":')));
+	assert.equal(bundle.tokens.total, 51_302);
+	assert.deepEqual(bundle.omo_health_record.messages, [{ ref: "M1", ms: child.ms, kind: child.kind }]);
+});
 
 test("(IS-2 worker) board callbacks keep running while audit preparation is blocked", async () => {
 	const h = harness({ sessions: ["m1", "m2"] });
@@ -566,7 +584,7 @@ test("five failed lookups past the deadline, then timeout: the second audit star
 		assert.equal(h.runner.starts.length, 1);
 	}
 	h.tick(a);
-	assert.equal(h.record("m1").reason, "timeout");
+	assert.deepEqual([h.record("m1").status, h.record("m1").reason, h.record("m1").terminationUnconfirmed], ["running", null, true]);
 	assert.equal(h.record("m1").holdUntilExit, true);
 	for (let i = 0; i < 3; i++) {
 		h.tick(a);
@@ -575,6 +593,7 @@ test("five failed lookups past the deadline, then timeout: the second audit star
 	alive.value = false;
 	h.tick(a);
 	assert.equal(h.record("m1").holdUntilExit, undefined);
+	assert.deepEqual([h.record("m1").status, h.record("m1").reason], ["failed", "timeout"]);
 	assert.equal(h.runner.starts.length, 1, "alive turned false on this tick; the next one starts");
 	await h.prepare(a);
 	assert.equal(h.runner.starts.length, 2);
@@ -589,7 +608,7 @@ test("a timeout holds the slot while alive is true, retries terminate on every p
 	h.request("m2");
 	await h.prepare(a);
 	h.tick(a);
-	assert.equal(h.record("m1").reason, "timeout");
+	assert.deepEqual([h.record("m1").status, h.record("m1").reason, h.record("m1").terminationUnconfirmed], ["running", null, true]);
 	assert.equal(a.busy(), true);
 	alive.throws = true;
 	h.tick(a);
@@ -603,6 +622,7 @@ test("a timeout holds the slot while alive is true, retries terminate on every p
 	}
 	alive.value = false;
 	h.tick(a);
+	assert.deepEqual([h.record("m1").status, h.record("m1").reason], ["failed", "timeout"]);
 	assert.equal(h.runner.starts.length, 1);
 	await h.prepare(a);
 	assert.equal(h.runner.starts.length, 2);
@@ -1499,8 +1519,13 @@ test("a failed first kill is retried by the restarted daemon, and the second aud
 	h.tick(a);
 	h.tick(a);
 	assert.equal(h.runner.terminates.length, 1, "the first taskkill was sent and failed; alive stays true");
+	const recordFile = path.join(h.paths.health.auditsDir, "m1.json");
+	const { terminationUnconfirmed, deadlineMs, ...record } = h.record("m1");
+	fs.writeFileSync(recordFile, JSON.stringify({ ...record, status: "failed", reason: "timeout", finishedMs: h.state.now }));
+	await a.close();
 	const b = h.auditor();
 	assert.equal(h.record("m1").holdUntilExit, true);
+	assert.deepEqual([h.record("m1").status, h.record("m1").terminationUnconfirmed], ["running", true]);
 	h.state.now += 1_000;
 	b.tick(h.state.now);
 	assert.equal(h.runner.terminates.length, 2, "the new auditor terminates again on its first poll");
@@ -1980,15 +2005,76 @@ test("a failed first kill is retried by the real runner and the one-per-PC slot 
 	await h.prepare(a);
 	h.state.now += 61_000;
 	a.tick(h.state.now);
-	assert.deepEqual([h.record("m1").reason, h.record("m1").holdUntilExit], ["timeout", true]);
+	assert.deepEqual([h.record("m1").status, h.record("m1").reason, h.record("m1").terminationUnconfirmed], ["running", null, true]);
 	assert.equal(kills(), 1, "the timeout path sent the first taskkill");
 	h.tick(a, 30_000);
-	assert.equal(h.record("m1").holdUntilExit, true, "a failed first kill keeps the slot while the verified process lives");
+	assert.equal(h.record("m1").terminationUnconfirmed, true, "a failed first kill keeps exit unconfirmed while the verified process lives");
+	assert.equal(a.busy(), true);
 	assert.equal(kills(), 2, "the kill is retried");
 	processState.alive = false;
 	h.tick(a, 30_000);
 	assert.equal(h.record("m1").holdUntilExit, undefined);
+	assert.deepEqual([h.record("m1").status, h.record("m1").reason], ["failed", "timeout"]);
 	assert.equal(a.busy(), false);
+});
+
+test("IS-10 transition: a restarted daemon rejects POST until the overdue audit exits", async (t) => {
+	const id = "main-audit";
+	const h = harness({ sessions: [id] });
+	h.config.audit.timeoutMs = 60_000;
+	let alive = true;
+	let taskkill;
+	const identity = { ctimeMs: BASE, cmdSha1: "launcher" };
+	const recording = createRecordingSpawn();
+	const newRunner = () => createRunner({
+		paths: h.paths, clock: h.clock, env: {},
+		isAlive: () => alive, identify: () => alive ? identity : null, findJobProcess: () => null,
+		spawnImpl(command, args, options) {
+			const child = recording.spawnImpl(command, args, options);
+			if (command === "taskkill") taskkill = child;
+			return child;
+		},
+	});
+	const first = h.auditor({ runner: newRunner() });
+	h.request(id);
+	await h.prepare(first);
+	const { jobId, startedMs } = h.record(id);
+	const deadlineMs = startedMs + h.config.audit.timeoutMs;
+	h.tick(first, h.config.audit.timeoutMs + 1);
+	taskkill.emit("exit", 1, null);
+	const beforeRestart = h.record(id);
+	await first.close();
+	const restarted = h.auditor({ runner: newRunner() });
+	h.tick(restarted);
+	const during = h.record(id);
+	fs.writeFileSync(h.paths.health.daemonJson, JSON.stringify({ ts: h.clock.now(), pid: process.pid }));
+	const prepare = createDetailOperations({
+		paths: h.paths, env: {}, load: () => ({ found: true, session: { sessionId: id } }),
+	});
+	const token = "audit-test-token";
+	const ui = createUiServer({
+		paths: h.paths, token, getState: () => ({}), now: h.clock.now,
+		startAudit: (id) => prepare({ kind: "audit", id, now: h.clock.now() }),
+	});
+	t.after(() => ui.close());
+	const { port } = await ui.listen();
+	const response = await fetch(`http://127.0.0.1:${port}/api/audit`, {
+		method: "POST", headers: { "x-omo-health-token": token, "content-type": "application/json" },
+		body: JSON.stringify({ sessionId: id }),
+	});
+	assert.deepEqual([response.status, (await response.json()).error], [409, "running"]);
+	assert.equal(restarted.busy(), true);
+	for (const record of [beforeRestart, during]) {
+		assert.deepEqual([record.jobId, record.status, record.terminationUnconfirmed, record.deadlineMs, record.finishedMs],
+			[jobId, "running", true, deadlineMs, null]);
+	}
+	assert.equal(recording.calls.filter(({ command }) => command === "taskkill").length, 2);
+	alive = false;
+	h.tick(restarted);
+	const finished = h.record(id);
+	assert.deepEqual([finished.status, finished.reason, finished.terminationUnconfirmed, finished.holdUntilExit],
+		["failed", "timeout", undefined, undefined]);
+	assert.equal(restarted.busy(), false);
 });
 
 test("IS-10 retry: a restarted auditor retries the adopted child and charges the next audit only after confirmed exit", async () => {
@@ -2029,6 +2115,7 @@ test("IS-10 retry: a restarted auditor retries the adopted child and charges the
 	taskkill.emit("exit", 1, null);
 	assert.equal(meta().adopted, true);
 	assert.equal(h.record("m1").status, "running");
+	assert.equal(h.record("m1").terminationUnconfirmed, true);
 	assert.equal(h.record("m2").status, "queued");
 	assert.deepEqual(h.budget().jobs, [jobId]);
 	assert.equal(h.budget().count, 1);
@@ -2039,6 +2126,7 @@ test("IS-10 retry: a restarted auditor retries the adopted child and charges the
 	assert.deepEqual(kills(), [ownTree, ownTree], "the first post-restart poll must retry the failed kill");
 	assert.equal(meta().adoptedTerminationAttempts, 2, "the attempt count survives restart");
 	assert.equal(h.record("m1").status, "running");
+	assert.equal(h.record("m1").terminationUnconfirmed, true);
 	assert.equal(h.record("m2").status, "queued");
 	assert.equal(starts(), 1);
 	assert.equal(h.budget().count, 1);
@@ -2074,7 +2162,7 @@ for (const timedOut of [true, false]) {
 		const runner = createRunner({
 			paths: h.paths, spawnImpl: recording.spawnImpl, clock: h.clock, env: {},
 			isAlive: (pid) => pid !== 70000 || rootAlive,
-			identify: (pid) => pid === 70000 && !rootAlive ? null : identity,
+			identify: (pid) => pid === modelChild.pid ? (childAlive ? modelChild : null) : rootAlive ? identity : null,
 			findJobProcess: (jobId, args) => {
 				assert.equal(jobId, h.record("m1").jobId);
 				assert.deepEqual(args, recording.calls[0].args);
@@ -2090,7 +2178,7 @@ for (const timedOut of [true, false]) {
 		h.request("m2");
 		if (timedOut) {
 			h.tick(a, 61_000);
-			assert.deepEqual([h.record("m1").reason, h.record("m1").holdUntilExit], ["timeout", true]);
+			assert.deepEqual([h.record("m1").status, h.record("m1").reason, h.record("m1").terminationUnconfirmed], ["running", null, true]);
 		}
 		rootAlive = false;
 		fs.writeFileSync(path.join(runner.jobDir(firstJob), "exit.json"), '{"code":0}');
@@ -2110,6 +2198,7 @@ for (const timedOut of [true, false]) {
 
 		failedLookup = false;
 		h.tick(a);
+		if (timedOut) assert.deepEqual([h.record("m1").status, h.record("m1").reason], ["failed", "timeout"]);
 		await h.prepare(a);
 		assert.equal(starts(), 2);
 		const second = h.record("m2");

@@ -578,8 +578,38 @@ test("an audit job past its timeout stays running through failed identity lookup
 	assert.equal(readMeta(runner).final, undefined, "nothing is finalized on a failed lookup");
 	assert.equal(readMeta(runner).identityFailures, 5);
 	lookup = SAME_PROCESS;
-	assert.deepEqual(runner.poll("j1"), { status: "timeout", result: null, exitCode: null });
+	assert.deepEqual(runner.poll("j1"), { status: "running", result: null, exitCode: null, terminationUnconfirmed: true, deadlineMs: T + baseJob.timeoutMs });
 	assert.deepEqual(calls.at(-1).args, ["/F", "/T", "/PID", "70000"]);
+	lookup = () => null;
+	assert.deepEqual(runner.poll("j1"), { status: "timeout", result: null, exitCode: null, exitConfirmed: true });
+});
+
+test("IS-10 transition: a verified audit kill is not an exit and fallback cannot finalize it", () => {
+	let alive = true;
+	const identity = () => alive ? SAME_PROCESS() : null;
+	const findJobProcess = () => null;
+	const isAlive = () => alive;
+	const recording = createRecordingSpawn();
+	let taskkill;
+	const spawnImpl = (command, args, options) => {
+		const child = recording.spawnImpl(command, args, options);
+		if (command === "taskkill") taskkill = child;
+		return child;
+	};
+	const { runner, clock, paths } = setup({ isAlive, identify: identity, findProcess: findJobProcess, spawnImpl });
+	const restart = () => createRunner({ paths, clock, isAlive, identify: identity, findJobProcess, spawnImpl });
+	runner.start({ ...baseJob, kind: "audit", args: laneArgsFor("j1", "lane-1") });
+	writeJob(runner, "err.log", "Model fallback: p/reviewer -> p/audited (provider refused)\n");
+	clock.advance(baseJob.timeoutMs + 1);
+	const pending = runner.poll("j1");
+	taskkill.emit("exit", 1, null);
+	const next = restart();
+	const retried = next.poll("j1");
+	assert.deepEqual([pending.status, pending.terminationUnconfirmed, retried.status, retried.terminationUnconfirmed, readMeta(next).final],
+		["running", true, "running", true, undefined]);
+	assert.equal(recording.calls.filter(({ command }) => command === "taskkill").length, 2);
+	alive = false;
+	assert.deepEqual(next.poll("j1"), { status: "timeout", result: null, exitCode: null, exitConfirmed: true });
 });
 
 test("start errors carry whether a process was spawned", () => {

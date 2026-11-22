@@ -156,6 +156,26 @@ it("IS-10 unconfirmed: the app audit block renders the overdue status when flagg
 	assert.ok(!render({ terminationUnconfirmedKo: label }).includes(label), "an ordinary running audit has no overdue note");
 });
 
+it("IS-10 transition: the rendered audit offers retry only after the slot is released", () => {
+	const { auditBlock } = endedDetailFunctions(["auditBlock", "auditProgress", "auditFailure", "auditStart"], {
+		el: (tag, attrs, ...children) => ({ tag, attrs, children }),
+		block: (title, body) => ({ title, body }), note: (text) => ({ text }),
+		AUDIT_ACTIVE: new Set(["running"]), endedDetailId: (r) => r.sessionId,
+		show: String, when: String, chip: String, errorSlot: () => null,
+		button: (label) => ({ tag: "button", label }),
+	});
+	const label = "제한 시간이 지났지만 종료를 확인하지 못했습니다";
+	const render = (state) => JSON.stringify(auditBlock({ sessionId: "audit" }, { state, terminationUnconfirmedKo: label }));
+	const pending = render({ status: "running", terminationUnconfirmed: true });
+	assert.ok(pending.includes(label));
+	assert.ok(!pending.includes('"tag":"button","label":"다시 조사"'));
+	for (const reason of ["model-fallback", "timeout"]) {
+		const state = { status: "failed", reason };
+		assert.ok(!render({ ...state, holdUntilExit: true }).includes('"tag":"button","label":"다시 조사"'), reason);
+		assert.ok(render(state).includes('"tag":"button","label":"다시 조사"'), reason);
+	}
+});
+
 it("(plan 37) the app disclosure uses a 300-character preview and keeps the full text", () => {
 	const el = (tag, attrs, ...children) => ({ tag, attrs, children });
 	const { detailText, detailTextParts } = endedDetailFunctions(["detailTextParts", "detailText"], { el, show: String });

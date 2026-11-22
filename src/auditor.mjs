@@ -311,7 +311,9 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 	for (const name of listDirSafe(auditsDir)) {
 		if (!name.endsWith(".json") || name.startsWith("_")) continue;
 		const record = readJsonSafe(path.join(auditsDir, name));
-		if (record?.v === 1 && safeAuditId(record.sessionId) && typeof record.status === "string") records.set(record.sessionId, record);
+		if (record?.v !== 1 || !safeAuditId(record.sessionId) || typeof record.status !== "string") continue;
+		if (record.status === "failed" && record.reason === "timeout" && held(record)) resumeLegacyTimeout(record);
+		records.set(record.sessionId, record);
 	}
 
 	const clearUnconfirmedTermination = (record) => {
@@ -332,6 +334,14 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		record.finishedMs = now;
 		save(record);
 	};
+
+	function resumeLegacyTimeout(record) {
+		Object.assign(record, {
+			status: "running", reason: null, finishedMs: null, holdUntilExit: true,
+			terminationUnconfirmed: true, deadlineMs: (record.startedMs ?? record.launchMs) + config.audit.timeoutMs,
+		});
+		save(record);
+	}
 
 	function charge(jobId, now) {
 		const budget = readBudget(paths, now);
@@ -566,8 +576,8 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 				fail(record, "bad-output", truncate(redact(readTextSafe(path.join(jobsDir, record.jobId, "out.txt"), "")), 300), now);
 			}
 		} else if (out.status === "timeout") {
-			if (!out.exitConfirmed) record.holdUntilExit = true;
-			fail(record, "timeout", null, now);
+			if (out.exitConfirmed) fail(record, "timeout", null, now);
+			else resumeLegacyTimeout(record);
 		} else if (out.status === "unavailable") {
 			fail(record, `unavailable:${out.reason}`, out.detail ? truncate(redact(String(out.detail)), 300) : null, now);
 		} else if (out.status === "failed" && out.spawned === false) {
@@ -593,7 +603,7 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 	}
 
 	/** A termination request is not proof of exit; only a negative liveness check releases a legacy hold. */
-	function releaseHold(record) {
+	function releaseHold(record, now) {
 		try {
 			const remains = (alive) => {
 				if (!alive) return false;
@@ -609,7 +619,8 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 			return;
 		}
 		delete record.holdUntilExit;
-		save(record);
+		if (record.status === "running") fail(record, "timeout", null, now);
+		else save(record);
 	}
 
 	function poll(now) {
@@ -622,8 +633,8 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 				if (last !== undefined && now - last < ANALYST_POLL_MS) continue;
 				lastPollMs.set(record.sessionId, now);
 			}
-			if (!running) {
-				releaseHold(record);
+			if (held(record)) {
+				releaseHold(record, now);
 				continue;
 			}
 			if (work?.kind === "running-adopt") {
