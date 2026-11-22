@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import { atomicWriteJson, ensureDir, listDirSafe, readJsonSafe, removeSafe } from "./util/fsx.mjs";
 import { redact, truncate } from "./util/text.mjs";
@@ -24,6 +25,23 @@ const MAX_SIGNALS = 20;
 
 /** Masked like the decision log: an investigation file holds command text and verdict words. */
 const masked = (value) => JSON.parse(redact(JSON.stringify(value)));
+
+/** Unordered, one retained investigation at a time; callers select as they read. */
+export function* streamInvestigations(paths) {
+	let dir;
+	try {
+		dir = fs.opendirSync(paths.health.investigationsDir);
+		for (let entry; (entry = dir.readSync());) {
+			if (!entry.name.endsWith(".json")) continue;
+			const record = readJsonSafe(path.join(dir.path, entry.name));
+			if (typeof record?.id === "string" && record.id) yield record;
+		}
+	} catch {
+		// The directory may be absent or removed during retention.
+	} finally {
+		dir?.closeSync();
+	}
+}
 
 export function createInvestigations({ paths, clock }) {
 	const dir = paths.health.investigationsDir;

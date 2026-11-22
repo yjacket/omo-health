@@ -30,7 +30,69 @@ const sparseTick = operation === "sparse-tick" || operation === "positioned-tick
 const indexFile = sparseTick ? path.join(dir, `${mode}-${operation}.json`) : paths.health.usageIndexFile;
 const open = () => createUsageIndex({ file: indexFile, clock });
 
-if (operation === "decision-join") {
+if (operation === "all-sources") {
+	const { loadSessionRecord } = await load("session-record");
+	const sessionId = "seed";
+	const childId = "child";
+	const ts = new Date(now - 1000).toISOString();
+	const subject = { sessionId };
+	const jsonl = (row) => JSON.stringify(row) + "\n";
+	const padding = "z".repeat(256 * 1024);
+	const repeats = 416;
+	const big = (name, file, noise, { header = "", tail = "" } = {}) => {
+		put(file, header);
+		const fd = fs.openSync(file, "a");
+		try {
+			const block = Buffer.from(noise.repeat(8));
+			for (let i = 0; i < repeats / 8; i++) fs.writeSync(fd, block);
+			fs.writeSync(fd, tail);
+		} finally {
+			fs.closeSync(fd);
+		}
+		const bytes = Buffer.byteLength(noise) * repeats;
+		assert.ok(bytes > 96 * 1024 * 1024, name);
+		console.log(`${name} unrelated bytes=${bytes}`);
+	};
+	const ended = { kind: "main", startedMs: now - 30_000, endedMs: now };
+	big("ledger", path.join(paths.health.sessionsDir, `ended-${ts.slice(0, 10)}.jsonl`),
+		jsonl({ ...ended, sessionId: "other", cwd: padding }),
+		{ tail: jsonl({ ...ended, sessionId }) + jsonl({ ...ended, sessionId: childId, parentSessionId: sessionId }) });
+	big("decisions", path.join(paths.health.decisionsDir, `${ts.slice(0, 10)}.jsonl`),
+		jsonl({ ts, event: "opened", fp: "unrelated", subject: { sessionId: "other" }, evidence: [padding] }),
+		{ tail: jsonl({ ts, event: "opened", fp: "related", subject }) });
+	let invBytes = 0;
+	for (let i = 0; i < repeats; i++) {
+		const id = `other-${i}`;
+		const text = jsonl({ id, subject: { sessionId: "other" }, openedMs: now, evidence: [padding] });
+		put(path.join(paths.health.investigationsDir, `${id}.json`), text);
+		invBytes += Buffer.byteLength(text);
+	}
+	assert.ok(invBytes > 96 * 1024 * 1024);
+	console.log(`investigations unrelated bytes=${invBytes}`);
+	put(path.join(paths.health.investigationsDir, "related.json"), jsonl({ id: "related", subject, openedMs: now }));
+	const ownFile = path.join(paths.sessionsDir, "probe", `2026-11-22_${sessionId}.jsonl`);
+	put(ownFile, usageLine);
+	const index = open();
+	index.markMissing("other", { kind: "main", file: padding });
+	index.update(sessionId, ownFile, { kind: "main" });
+	assert.ok(index.save());
+	const [header, ...rows] = fs.readFileSync(indexFile, "utf8").trimEnd().split("\n");
+	const entry = (id) => rows.find((line) => JSON.parse(line).id === id) + "\n";
+	// The index is writer-capped; repeated valid IDs model stale copies in an
+	// overlarge input without consuming its admission budget before the target.
+	big("usage index", indexFile, entry("other"), { header: header + "\n", tail: entry(sessionId) });
+	big("descendant transcript", path.join(paths.sessionsDir, "probe", `2026-11-22_${childId}.jsonl`),
+		jsonl({ type: "custom_message", customType: "other", content: padding }),
+		{ tail: jsonl({ timestamp: ts, type: "custom_message", customType: "omo-health", content: "related notice" }) });
+	const result = loadSessionRecord({ paths, id: sessionId, now });
+	assert.equal(result.session.sessionId, sessionId);
+	assert.deepEqual(result.children.map(({ sessionId }) => sessionId), [childId]);
+	assert.equal(result.tokens.total, 42);
+	assert.deepEqual(result.health.findings.map(({ fp }) => fp), ["related"]);
+	assert.deepEqual(result.health.investigations.map(({ id }) => id), ["related"]);
+	assert.deepEqual(result.health.messages, [{ ms: Date.parse(ts), recipient: childId, text: "related notice" }]);
+	console.log("all source matches found");
+} else if (operation === "decision-join") {
 	const { loadSessionRecord } = await load("session-record");
 	const { appendDecision } = await load("decisions");
 	const sessionId = "seed";

@@ -4,14 +4,88 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
+import { DEFAULT_CONFIG } from "../src/config.mjs";
+import { auditBundle } from "../src/judge/audit.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 import { buildSessionRecord, loadSessionRecord, scanOmoHealthMessages } from "../src/session-record.mjs";
+import * as sessionRecord from "../src/session-record.mjs";
+import { buildSessionView } from "../src/ui/session-view.mjs";
 import { tmpDir, writeJsonl, writeTask } from "./helpers/fixtures.mjs";
 
 const T0 = Date.parse("2026-10-10T00:00:00.000Z");
 const MIN = 60_000;
 const HOUR = 3_600_000;
 const iso = (ms) => new Date(ms).toISOString();
+
+test("plan38 decision inventory covers all writer event literals", () => {
+	const src = new URL("../src/", import.meta.url);
+	const table = sessionRecord.DECISION_EVENT_SHAPES ?? {};
+	const missing = new Set();
+	const checked = new Set();
+	for (const file of fs.readdirSync(src, { recursive: true }).filter((name) => name.endsWith(".mjs"))) {
+		const text = fs.readFileSync(new URL(file.replaceAll("\\", "/"), src), "utf8");
+		for (const [, body] of text.matchAll(/\b(?:appendDecision(?:Impl)?\([^,]+,|decision\(|ctx\.decide\?\.\()\s*\{([\s\S]*?)\}\s*\);/g)) {
+			const event = /\bevent:\s*["']([\w-]+)["']/.exec(body)?.[1] ?? "(no event)";
+			checked.add(event);
+			if (!Object.hasOwn(table, event)) missing.add(`${file}: ${event}`);
+		}
+	}
+	assert.deepEqual([...missing], []);
+	assert.deepEqual([...checked].sort(), Object.keys(table).sort());
+});
+
+test("plan38 action producer shapes survive record, detail and audit projection", () => {
+	const sessionId = "s-actions";
+	const subject = { sessionId };
+	const ts = iso(T0 + MIN);
+	const row = { sessionId, kind: "main", startedMs: T0, endedMs: T0 + HOUR };
+	const inv = { fp: "fp-action", detector: "D1", kind: "stall", cls: "quiet-hang", event: "investigation", status: "open" };
+	const ordinary = { fp: inv.fp, detector: inv.detector, kind: inv.kind, cls: inv.cls, rule: undefined, action: { key: "r", kind: "release-shell", params: {} }, subject, evidence: [] };
+	const park = { detector: "D20", kind: "park-resume", subject, parkId: "park-1" };
+	const cases = [
+		// src/engine.mjs:1191,1216 (gate and execution).
+		[{ ...ordinary, result: "would" }, "release-shell", "would", "기다리던 셸 해제"],
+		[{ ...ordinary, result: "execute", outcome: { killed: ["proc:5"], survived: [], noop: [], quiet: true } }, "release-shell", "execute", "기다리던 셸 해제", { killed: 1 }],
+		// src/engine.mjs:327.
+		...[["shown", true, false], ["cooldown", false, false], ["failed", false, true]].map(([toast, delivered, error]) =>
+			[{ ...inv, result: "hold-toast", toast }, "hold-toast", toast, "조사 지연 알림", { delivered, error }]),
+		// src/engine.mjs:462.
+		...["expired", "restored"].map((reason) => [{ detector: "D16", kind: "orphan-monitor", event: "notice-withdrawn", result: `withdrawn:${reason}`, subject, messageId: "notice-private", monitors: ["monitor-private"] }, "notice-withdrawn", `withdrawn:${reason}`, "대기 중인 안내 철회"]),
+		// src/engine.mjs:209 wrapping 570,576,632/643/742 and 669/719.
+		[{ ...inv, trigger: "stall", status: "released", result: "released", acted: { key: "r", kind: "release-shell", quiet: true }, killed: ["proc(5)"] }, "release-shell", "released", "기다리던 셸 해제", { killed: 1 }],
+		[{ ...inv, trigger: "stall", result: "no-effect", acted: { key: "r", kind: "release-shell" }, killed: [] }, "release-shell", "no-effect", "기다리던 셸 해제", { killed: 0 }],
+		...[["relay-cancel", "부모 세션에 취소 권고"], ["why-notice", "원인 알림"], ["goal-wake", "goal 세션 깨우기"]].map(([kind, ko]) =>
+			[{ ...inv, trigger: "stall", status: "advised", result: "advised", acted: { key: "r", kind }, delivered: false }, kind, "advised", ko, { delivered: false }]),
+		[{ ...inv, trigger: "stall", status: "noticed", result: "noticed", acted: { key: "r", kind: "main-notice" }, delivered: true }, "main-notice", "noticed", "메인 세션 정지 의심 안내", { delivered: true }],
+		[{ ...inv, detector: "report", kind: "report", trigger: "report", status: "noticed", result: "noticed", acted: { key: "r", kind: "triage-notice" }, delivered: true }, "triage-notice", "noticed", "보고에 대한 판정 알림", { delivered: true }],
+		// src/act/park-resume.mjs:154–155,259,284,287.
+		[{ ...park, event: "park-gated", result: "skipped:paused" }, "relaunch", "skipped:paused", "한도 대기 세션 다시 열기"],
+		[{ ...park, event: "park-transition", sessionId, from: "claimed", to: "launched", why: "launched" }, "relaunch", "launched", "한도 대기 세션 다시 열기"],
+		[{ ...park, event: "park-transition", sessionId, from: "claimed", to: "pending", why: "launch-failed" }, "relaunch", "launch-failed", "한도 대기 세션 다시 열기", { error: true }],
+	];
+	for (const [decision, kind, result, actionKo, facts = {}] of cases) {
+		const decisions = [
+			{ fp: inv.fp, detector: inv.detector, kind: inv.kind, cls: inv.cls, severity: "warn", event: "opened", subject, evidence: [], ts },
+			{ ...park, event: "park-transition", sessionId, from: "pending", to: "claimed", why: "claim", ts },
+			{ ...decision, ts },
+		];
+		const record = buildSessionRecord({ row, decisions });
+		assert.equal(record.health.actions.length, 1, `${result} (${kind})`);
+		const [action] = record.health.actions;
+		assert.deepEqual([action.kind, action.result, action.ts, action.subject], [kind, result, ts, subject]);
+		if (!decision.action) assert.equal(action.detail, "");
+		const [view] = buildSessionView(record).health.actions;
+		assert.deepEqual([view.kind, view.result, view.ts, view.actionKo], [kind, result, ts, actionKo]);
+		const bundle = auditBundle(record, null, { config: DEFAULT_CONFIG, now: T0 + HOUR });
+		assert.equal(bundle.omo_health_record.actions.length, 1);
+		const [audited] = bundle.omo_health_record.actions;
+		assert.deepEqual([audited.kind, audited.result, audited.ts], [kind, result, ts]);
+		for (const [key, value] of Object.entries(facts)) {
+			assert.deepEqual([action.facts[key], view.facts[key], audited[key]], [value, value, value]);
+		}
+		assert.doesNotMatch(JSON.stringify([action, view, audited]), /notice-private|monitor-private/);
+	}
+});
 
 function setup() {
 	const root = tmpDir("omoh-record-");
