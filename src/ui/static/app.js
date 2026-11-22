@@ -734,6 +734,14 @@
 		return JSON.stringify([endedTokenSignature(r), lastState?.recordsStamp]);
 	}
 
+	/** The `.detail-text` disclosures inside a list body, whether its wrapper returned one node or an array of nodes. */
+	function detailTextNodes(body) {
+		return [body]
+			.flat(Infinity)
+			.filter((node) => typeof node?.querySelectorAll === "function")
+			.flatMap((node) => [...(node.matches?.(".detail-text") ? [node] : []), ...node.querySelectorAll(".detail-text")]);
+	}
+
 	/** Everything omo-health recorded about one ended session, as GET /api/session returns it. */
 	function endedRecord(r, d) {
 		const id = endedDetailId(r);
@@ -742,7 +750,7 @@
 			const items = detailList(d, name);
 			const group = `more:${id}:${name}`;
 			const body = items.length ? wrap(items) : empty(none);
-			for (const [i, disclosure] of [...body.querySelectorAll(".detail-text")].entries()) {
+			for (const [i, disclosure] of detailTextNodes(body).entries()) {
 				const key = `text:${id}:${name}:${i}`;
 				disclosure.dataset.open = key;
 				disclosure.firstElementChild.dataset.key = key;

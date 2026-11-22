@@ -151,6 +151,17 @@ for (const [label, previous, next, changed] of [
 	});
 }
 
+it("detail text disclosures are found whether a list wrapper returns one node or an array (investigations return an array)", () => {
+	const { detailTextNodes } = endedDetailFunctions(["detailTextNodes"]);
+	const disclosure = (name) => ({ name, matches: (selector) => selector === ".detail-text", querySelectorAll: () => [] });
+	const holder = (...inside) => ({ matches: () => false, querySelectorAll: (selector) => (selector === ".detail-text" ? inside : []) });
+	// The extracted function runs in another realm, so copy its arrays into this one before comparing.
+	const names = (nodes) => Array.from(nodes, (node) => node.name);
+	assert.deepEqual(names(detailTextNodes(holder(disclosure("a"), disclosure("b")))), ["a", "b"]);
+	assert.deepEqual(names(detailTextNodes([holder(disclosure("a")), [disclosure("b"), holder(disclosure("c"))], "text", null])), ["a", "b", "c"]);
+	assert.deepEqual(names(detailTextNodes("no nodes")), []);
+});
+
 function endedRefreshHarness(recordsStamp) {
 	const openEnded = new Set();
 	const endedDetails = new Map();
