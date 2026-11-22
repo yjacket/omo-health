@@ -2,12 +2,16 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import { performance } from "node:perf_hooks";
 import { StringDecoder } from "node:string_decoder";
+import { DEFAULT_CONFIG } from "../config.mjs";
+import { errorStormFact, errorStormGroups } from "../detect/loops.mjs";
 import { classifyProviderError } from "../detect/provider.mjs";
 import { cacheStorm } from "../detect/tokens.mjs";
-import { applyImageLoad } from "./sessions.mjs";
+import { redact, truncate } from "../util/text.mjs";
+import { applyImageLoad, entryMs } from "./sessions.mjs";
 
 // Match SessionTracker's retained assistant usage turns, without loading the transcript.
 const STORM_HISTORY = 200;
+const ASSISTANT_ERROR_HISTORY = 100;
 
 /**
  * Token usage read from a senpi session JSONL file the way omo's own `/session`
@@ -391,7 +395,7 @@ function consumeEntry(totals, entry, skipUsage = false) {
 }
 
 const USAGE_MARKERS = ['"usage"', '"assistant"', '"prompt-cache-prewarm"'];
-const STAT_MARKERS = ['"isError"', '"image"', '"toolCall"', '"compaction"'];
+const STAT_MARKERS = ['"isError"', '"toolResult"', '"image"', '"toolCall"', '"compaction"'];
 
 // A standalone JSON string token survives arbitrary separator whitespace.
 // An escape anywhere may hide a relevant key or value from either marker set.
@@ -1179,6 +1183,37 @@ function consumeTimelineStats(stats, entry) {
 	}
 }
 
+function loopErrorText(content) {
+	if (typeof content === "string") return content;
+	return Array.isArray(content) ? content.filter((item) => item?.type === "text" && typeof item.text === "string").map((item) => item.text).join("\n") : "";
+}
+
+function consumeLoopHistory({ errors, toolHistory }, entry) {
+	if (entry?.type !== "message") return;
+	const message = entry.message;
+	// Project only D10's inputs, matching SessionTracker's retained histories.
+	if (message?.role === "assistant") {
+		const ms = entryMs(entry);
+		if (message.stopReason === "error") {
+			const text = message.errorMessage ?? loopErrorText(message.content);
+			errors.push({ ms, text: typeof text === "string" ? truncate(redact(text), 300) : "" });
+			if (errors.length > ASSISTANT_ERROR_HISTORY) errors.shift();
+		} else if (message.stopReason !== "aborted" && Array.isArray(message.content)) {
+			for (const call of message.content) {
+				if (call?.type !== "toolCall") continue;
+				toolHistory.push({ id: call.id, name: call.name, ms });
+				if (toolHistory.length > STORM_HISTORY) toolHistory.shift();
+			}
+		}
+	} else if (message?.role === "toolResult") {
+		const call = toolHistory.findLast((item) => item.id === message.toolCallId);
+		if (call) {
+			call.isError = Boolean(message.isError);
+			if (call.isError) call.errHead = truncate(redact(loopErrorText(message.content)), 120);
+		}
+	}
+}
+
 function consumeTimelineScanner(totals, stats, scanner, fragment = false) {
 	stats.largeRecords += 1;
 	const entry = consumeScannerRecord(totals, scanner, fragment);
@@ -1223,6 +1258,7 @@ function consumeTimelineRecord(totals, stats, acc) {
 	if (usageWanted) consumeEntry(totals, entry);
 	else totals.diagnostics.skippedLines += 1;
 	consumeTimelineStats(stats, entry);
+	consumeLoopHistory(stats.loopHistory, entry);
 }
 
 function consumeTimelineFragment(totals, stats, acc) {
@@ -1251,7 +1287,7 @@ function consumeTimelineFragment(totals, stats, acc) {
  * error classes, tool counts and image peaks. Returns null for a missing file
  * or one above `maxFileBytes`.
  */
-export function usageTimeline(file, { cacheStormWrite = Infinity, cacheStormReadFrac = 0, maxFileBytes = 256 * 1024 * 1024 } = {}) {
+export function usageTimeline(file, { cacheStormWrite = Infinity, cacheStormReadFrac = 0, loops = DEFAULT_CONFIG.loops, maxFileBytes = 256 * 1024 * 1024 } = {}) {
 	const started = performance.now();
 	let fd;
 	try {
@@ -1271,6 +1307,7 @@ export function usageTimeline(file, { cacheStormWrite = Infinity, cacheStormRead
 			hours: new Map(),
 			topTurns: [],
 			errors: { count: 0, byClass: {} },
+			loopHistory: { errors: [], toolHistory: [] },
 			tools: new Map(),
 			stormHistory: [],
 			stormNext: 0,
@@ -1311,6 +1348,7 @@ export function usageTimeline(file, { cacheStormWrite = Infinity, cacheStormRead
 		const [storm] = cacheStorm({ turns }, { cacheStormWrite, cacheStormReadFrac });
 		// The scanner projects turn counters and time, but not content or error details.
 		const incomplete = stats.largeRecords > 0;
+		const errorStormTimings = incomplete ? null : [...errorStormGroups(stats.loopHistory).values()].map(({ ms }) => ms);
 		return {
 			totals,
 			largeRecords: stats.largeRecords,
@@ -1323,6 +1361,10 @@ export function usageTimeline(file, { cacheStormWrite = Infinity, cacheStormRead
 				stormTurns: storm?.data.turns ?? 0,
 			},
 			errors: { ...stats.errors, incomplete },
+			errorStorm: errorStormTimings && errorStormFact(errorStormTimings, loops),
+			// The worker only receives token cutoffs. Carry anonymous, bounded groups so
+			// the audit can use the current D10 count/window without sending error text.
+			errorStormTimings,
 			tools: {
 				rows: [...stats.tools]
 					.map(([name, value]) => ({ name, calls: value.calls, errors: value.errors }))

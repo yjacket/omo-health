@@ -1,5 +1,6 @@
 import { AUDIT_REASON_CODES, reasonCode } from "../audit-codes.mjs";
 import { detectorThresholdsHash } from "../config-reload.mjs";
+import { errorStormFact } from "../detect/loops.mjs";
 import { redact, truncate } from "../util/text.mjs";
 import { parseAnalystOutput } from "./analyst.mjs";
 import { laneModels, modelFamily, modelName } from "./lane.mjs";
@@ -427,7 +428,7 @@ function modelsOf(models) {
 	return rows.map((model) => ({ key: textOf(model?.key), tokens: numOf(model?.tokens), cost: numOf(model?.cost) }));
 }
 
-function tokensOf(record, timeline) {
+function tokensOf(record, timeline, errorStorm) {
 	const totals = timeline?.totals?.modelsIncomplete === false ? timeline.totals : isObject(record?.tokens) ? record.tokens : {};
 	return {
 		total: numOf(totals.total),
@@ -454,6 +455,7 @@ function tokensOf(record, timeline) {
 		topTurnsIncomplete: boolOf(timeline?.topTurnsIncomplete),
 		cache: { hitRate: numOf(timeline?.cache?.hitRate), stormTurns: numOf(timeline?.cache?.stormTurns) },
 		errors: { count: numOf(timeline?.errors?.count), byClass: Object.fromEntries(Object.entries(isObject(timeline?.errors?.byClass) ? timeline.errors.byClass : {}).map(([key, value]) => [key, numOf(value)])), incomplete: boolOf(timeline?.errors?.incomplete) },
+		errorStorm: { detected: boolOf(errorStorm?.detected), maxMatchingCount: numOf(errorStorm?.maxMatchingCount) },
 		tools: {
 			rows: (Array.isArray(timeline?.tools?.rows) ? timeline.tools.rows : []).map((tool) => ({ name: textOf(tool?.name), calls: numOf(tool?.calls), errors: numOf(tool?.errors) })),
 			incomplete: boolOf(timeline?.tools?.incomplete),
@@ -538,6 +540,10 @@ export function auditBundle(record, timeline, { config, now, configDecisions = [
 		return [detector, continuousFromStart && keys.every((key) => cutoffs?.includes(key)) &&
 			findingThresholds(config, detector, kind) !== undefined];
 	}));
+	// Review the incident as of session end, not as of the (possibly much later) audit.
+	const errorStorm = Array.isArray(timeline?.errorStormTimings) && findingThresholds(config, "D10", "error-storm")
+		? errorStormFact(timeline.errorStormTimings, config.loops, numOf(session.endedMs) ?? now)
+		: null;
 	const allFindings = findingsOf(health.findings, continuousSinceMs, config);
 	// Coverage is judged on every finding, before any cut: an answer cannot be
 	// required to cover more detectors than it has checks.
@@ -569,7 +575,7 @@ export function auditBundle(record, timeline, { config, now, configDecisions = [
 			terminalKind: textOf(session.terminalKind ?? session.terminal?.kind),
 			childCount: numOf(session.childCount) ?? children.length,
 		},
-		tokens: tokensOf(record, timeline),
+		tokens: tokensOf(record, timeline, errorStorm),
 		children: children.map((child) => ({
 			sessionId: textOf(child?.sessionId),
 			taskId: textOf(child?.taskId),
@@ -635,7 +641,7 @@ function suggestedDetectors(bundle) {
 	const out = [];
 	// usageTimeline computes stormTurns with D4's cacheStorm rule.
 	if (known?.D4 === true && (tokens.cache?.stormTurns ?? 0) > 0) out.push("D4");
-	if (known?.D10 === true && (tokens.tools?.rows ?? []).some((tool) => (tool.errors ?? 0) > 0)) out.push("D10");
+	if (known?.D10 === true && tokens.errorStorm?.detected === true) out.push("D10");
 	return out;
 }
 

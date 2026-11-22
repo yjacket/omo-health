@@ -5,9 +5,12 @@ import path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { readUsage, usageTimeline } from "../src/collect/usage.mjs";
+import { SessionTracker } from "../src/collect/sessions.mjs";
 import { DEFAULT_CONFIG } from "../src/config.mjs";
 import { detectorThresholdsHash } from "../src/config-reload.mjs";
 import { appendDecision } from "../src/decisions.mjs";
+import { detect as detectLoops } from "../src/detect/loops.mjs";
+import { detect as detectTokens } from "../src/detect/tokens.mjs";
 import { loadDetectors } from "../src/engine.mjs";
 import { AUDIT_REASON_CODES, reasonCode } from "../src/audit-codes.mjs";
 import { AUDIT_REASON_LABELS } from "../src/ui/labels.mjs";
@@ -299,8 +302,63 @@ test("(IS-8) the audit bundle and prompt distinguish incomplete statistics from 
 	assert.equal(tokens.errors.incomplete, true);
 	const document = auditDocument(bundle);
 	assert.match(document, /Treat incomplete statistics as unknown, not zero\./);
-	assert.match(document, /aggregates suggest should have fired \(D10\)/);
 });
+
+const TOOL_ERROR = "fixture-tool-error-do-not-export";
+
+function toolErrorsFile(t, offsets, errorAt = () => TOOL_ERROR) {
+	const dir = tmpDir("omoh-audit-error-storm-");
+	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+	const file = path.join(dir, "session.jsonl");
+	writeJsonl(file, offsets.flatMap((offset, i) => [
+		{ type: "message", timestamp: iso(T0 + offset), message: {
+			role: "assistant", content: [{ type: "toolCall", id: `call${i}`, name: "bash", arguments: { command: `fixture ${i}` } }],
+		} },
+		{ type: "message", timestamp: iso(T0 + offset + 1), message: {
+			role: "toolResult", toolCallId: `call${i}`, toolName: "bash", isError: true,
+			content: [{ type: "text", text: errorAt(i) }],
+		} },
+	]));
+	return file;
+}
+
+function detectorWorld(file, config, now) {
+	const tracker = new SessionTracker({ file });
+	tracker.read();
+	tracker.advance(now);
+	return { sessions: new Map([[tracker.state.id, tracker.state]]), config, now, warmup: () => null, events: { all: () => [] } };
+}
+
+for (const { name, offsets, errorAt, loops, expected } of [
+	{ name: "one tool error", offsets: [0], expected: false },
+	{ name: "five matching tool errors inside the default window", offsets: [0, 1000, 2000, 3000, 60_000], expected: true },
+	{ name: "five distinct error prefixes", offsets: [0, 1000, 2000, 3000, 4000], errorAt: (i) => `${TOOL_ERROR}-${i}`, expected: false },
+	{ name: "five matching tool errors outside a custom window", offsets: [0, 1000, 2000, 3000, 4000], loops: { errorStormWindowMs: 3999 }, expected: false },
+	{ name: "a storm under a custom count and window", offsets: [0, 15_000, 90_000], loops: { errorStormCount: 3, errorStormWindowMs: 90_000 }, expected: true },
+]) {
+	test(`IS-8 D10 detector parity: ${name}`, (t) => {
+		const file = toolErrorsFile(t, offsets, errorAt);
+		const config = { ...DEFAULT_CONFIG, loops: { ...DEFAULT_CONFIG.loops, ...loops } };
+		const now = T0 + HOUR;
+		const world = detectorWorld(file, config, now);
+		assert.deepEqual(detectLoops(world).map(({ kind }) => kind), expected ? ["error-storm"] : []);
+		// The audit worker receives token cutoffs, not loop cutoffs.
+		const timeline = structuredClone(usageTimeline(file, config.tokens));
+		const record = emptyRecord();
+		const bundle = auditBundle(record, timeline, { config, now, configDecisions: [{ ms: T0, thresholdsHash: detectorThresholdsHash(config) }] });
+		assert.equal(bundle.inferenceThresholdsKnown.D10, true);
+		assert.equal(/^Also write one check.*\bD10\b/m.test(auditDocument(bundle)), expected);
+		assert.deepEqual(bundle.requiredDetectors, expected ? ["D10"] : []);
+		assert.equal(bundle.tokens.errorStorm?.detected, expected);
+		if (expected) assert.equal(bundle.tokens.errorStorm?.maxMatchingCount, offsets.length);
+		assert.equal(JSON.stringify(bundle).includes(TOOL_ERROR), false);
+
+		const unknown = auditBundle(record, timeline, { config, now });
+		assert.equal(unknown.inferenceThresholdsKnown.D10, false);
+		assert.doesNotMatch(auditDocument(unknown), /^Also write one check.*\bD10\b/m);
+		assert.deepEqual(unknown.requiredDetectors, []);
+	});
+}
 
 test("IS-8: D4 findings straddling a config decision use only applicable thresholds", (t) => {
 	const root = tmpDir("omoh-audit-thresholds-");
@@ -597,6 +655,7 @@ function fastStormFile() {
 
 test("plan64: fast turns with a cache storm suggest D4, not D5", () => {
 	const file = fastStormFile();
+	assert.equal(detectTokens(detectorWorld(file, DEFAULT_CONFIG, T0 + HOUR)).some(({ kind }) => kind === "cache-storm"), true);
 	const bundle = auditBundle(emptyRecord(), usageTimeline(file, DEFAULT_CONFIG.tokens), {
 		config: DEFAULT_CONFIG, now: T0 + HOUR, configDecisions: [defaultConfigDecision],
 	});
@@ -623,6 +682,7 @@ test("IS-8: sustained low hit rate without a cache storm is context only", () =>
 			},
 		};
 	}));
+	assert.equal(detectTokens(detectorWorld(file, DEFAULT_CONFIG, T0 + HOUR)).some(({ kind }) => kind === "cache-storm"), false);
 	const bundle = auditBundle(emptyRecord(), usageTimeline(file, DEFAULT_CONFIG.tokens), {
 		config: DEFAULT_CONFIG, now: T0 + HOUR, configDecisions: [defaultConfigDecision],
 	});
