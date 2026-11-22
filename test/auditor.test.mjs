@@ -25,7 +25,7 @@ import { createUsageIndex, fresh } from "../src/usage-index.mjs";
 import { createUsageTracker } from "../src/usage-tracker.mjs";
 import { createRecordingSpawn } from "./fakes/runner.mjs";
 import { readJsonSafe } from "../src/util/fsx.mjs";
-import { E, appendJsonl, writeJsonl, writeTask } from "./helpers/fixtures.mjs";
+import { E, appendJsonl, earlyCacheStormEntries, writeJsonl, writeTask } from "./helpers/fixtures.mjs";
 import { indexLiveParentTranscript } from "./helpers/live-parent-transcript.mjs";
 
 const BASE = Date.parse("2026-11-20T12:00:00Z");
@@ -360,6 +360,34 @@ for (const [complete, restart] of [[false, false], [false, true], [true, true]])
 		assert.equal(h.runner.starts.length, 1);
 		assert.deepEqual(h.budget().jobs, [launched.jobId]);
 		assert.equal(h.budget().count, 1);
+	});
+}
+
+for (const complete of [false, true]) {
+	test(`(IS-8) an early D4 cache storm survives 201 ordinary turns: ${complete ? "judging D4 finishes done" : "omitting D4 fails"}`, async (t) => {
+		const entries = earlyCacheStormEntries(BASE - 300_000, DEFAULT_CONFIG.tokens.cacheStormWrite);
+		const h = harness({ entries });
+		t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+		appendDecision(h.paths, { ts: new Date(BASE - 3_600_000).toISOString(), event: "config", result: "startup", thresholdsHash: detectorThresholdsHash(h.config) });
+		const auditor = h.auditor();
+		h.request("m1");
+		await h.prepare(auditor);
+		const launched = h.record("m1");
+		assert.equal(launched.status, "running");
+		assert.deepEqual(launched.firedDetectors, []);
+
+		const checks = [...TOKEN_ONLY_ANSWER.checks];
+		if (complete) checks.push({ item: "D4", judgment: "missed", explanation: "캐시 폭풍을 놓쳤습니다.", evidence: ["T"] });
+		h.runner.script = () => ({ ...DONE, result: { ...TOKEN_ONLY_ANSWER, checks } });
+		h.tick(auditor);
+		const state = h.record("m1");
+		assert.equal(state.status, complete ? "done" : "failed");
+		assert.equal(state.reason, complete ? null : "incomplete-checks");
+		assert.deepEqual(state.result?.checks ?? null, complete ? checks : null);
+
+		assert.deepEqual(launched.requiredDetectors, ["D4"]);
+		const document = fs.readFileSync(path.join(h.paths.health.jobsDir, launched.jobId, "bundle.md"), "utf8");
+		assert.match(document, /"stormTurns":2/);
 	});
 }
 

@@ -69,6 +69,10 @@ function sessionSubject(session, key) {
 	return { sessionId: session.id, taskId: session.taskId, parentSessionId: session.parentSessionId, key };
 }
 
+export function isCacheStormTurn(turn, previous, cfg) {
+	return turn.cacheWrite >= cfg.cacheStormWrite && turn.cacheRead < cfg.cacheStormReadFrac * contextOf(previous);
+}
+
 /** 4a: the latest run of >= 2 consecutive storm turns. */
 export function cacheStorm(session, cfg) {
 	const turns = session.turns ?? [];
@@ -77,13 +81,12 @@ export function cacheStorm(session, cfg) {
 	let prevContext;
 	for (let i = 1; i < turns.length; i += 1) {
 		const turn = turns[i];
-		const context = contextOf(turns[i - 1]);
-		const storm = turn.cacheWrite >= cfg.cacheStormWrite && turn.cacheRead < cfg.cacheStormReadFrac * context;
-		if (!storm) {
+		const previous = turns[i - 1];
+		if (!isCacheStormTurn(turn, previous, cfg)) {
 			run = [];
 			continue;
 		}
-		if (!run.length) prevContext = context;
+		if (!run.length) prevContext = contextOf(previous);
 		run.push(turn);
 		if (run.length >= 2) best = { turns: [...run], prevContext };
 	}

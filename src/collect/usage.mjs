@@ -5,12 +5,12 @@ import { StringDecoder } from "node:string_decoder";
 import { DEFAULT_CONFIG } from "../config.mjs";
 import { errorStormFact, errorStormGroups } from "../detect/loops.mjs";
 import { classifyProviderError } from "../detect/provider.mjs";
-import { cacheStorm } from "../detect/tokens.mjs";
+import { isCacheStormTurn } from "../detect/tokens.mjs";
 import { redact, truncate } from "../util/text.mjs";
 import { applyImageLoad, entryMs } from "./sessions.mjs";
 
-// Match SessionTracker's retained assistant usage turns, without loading the transcript.
-const STORM_HISTORY = 200;
+// Match SessionTracker's retained tool calls, without loading the transcript.
+const TOOL_HISTORY = 200;
 const ASSISTANT_ERROR_HISTORY = 100;
 
 /**
@@ -1085,12 +1085,16 @@ function consumeStormTurn(stats, entry) {
 	if (entry?.type !== "message" || entry.message?.role !== "assistant") return;
 	const { usage } = entry.message;
 	if (!isObject(usage)) return;
-	stats.stormHistory[stats.stormNext] = {
+	const turn = {
 		input: stormCounter(usage.input),
 		cacheRead: stormCounter(usage.cacheRead),
 		cacheWrite: stormCounter(usage.cacheWrite),
 	};
-	stats.stormNext = (stats.stormNext + 1) % STORM_HISTORY;
+	const storm = stats.cacheStorm;
+	storm.run = storm.previous && isCacheStormTurn(turn, storm.previous, storm.thresholds) ? storm.run + 1 : 0;
+	storm.previous = turn;
+	// Like D4, keep the latest qualifying run, even after later turns break it.
+	if (storm.run >= 2) storm.turns = storm.run;
 }
 
 function consumeTimelineTurn(stats, message, ms) {
@@ -1205,7 +1209,7 @@ function consumeLoopHistory(stats, entry) {
 			for (const call of message.content) {
 				if (call?.type !== "toolCall") continue;
 				toolHistory.push({ id: call.id, name: call.name, ms });
-				if (toolHistory.length > STORM_HISTORY) toolHistory.shift();
+				if (toolHistory.length > TOOL_HISTORY) toolHistory.shift();
 			}
 		}
 	} else if (message?.role === "toolResult") {
@@ -1319,8 +1323,7 @@ export function usageTimeline(file, { cacheStormWrite = Infinity, cacheStormRead
 			errorStorm: { detected: false, maxMatchingCount: 0 },
 			errorStormWindows: [],
 			tools: new Map(),
-			stormHistory: [],
-			stormNext: 0,
+			cacheStorm: { thresholds: { cacheStormWrite, cacheStormReadFrac }, previous: null, run: 0, turns: 0 },
 			peakCount: 0,
 			peakBytes: 0,
 			images: 0,
@@ -1351,11 +1354,6 @@ export function usageTimeline(file, { cacheStormWrite = Infinity, cacheStormRead
 		}
 		if (acc) consumeTimelineFragment(totals, stats, acc);
 		const denominator = totals.input + totals.cacheRead + totals.cacheWrite;
-		const { stormHistory, stormNext } = stats;
-		const turns = stormHistory.length === STORM_HISTORY
-			? [...stormHistory.slice(stormNext), ...stormHistory.slice(0, stormNext)]
-			: stormHistory;
-		const [storm] = cacheStorm({ turns }, { cacheStormWrite, cacheStormReadFrac });
 		// The scanner projects turn counters and time, but not content or error details.
 		const incomplete = stats.largeRecords > 0;
 		return {
@@ -1367,7 +1365,7 @@ export function usageTimeline(file, { cacheStormWrite = Infinity, cacheStormRead
 			topTurnsIncomplete: stats.turnStatsIncomplete,
 			cache: {
 				hitRate: denominator > 0 ? totals.cacheRead / denominator : null,
-				stormTurns: storm?.data.turns ?? 0,
+				stormTurns: stats.cacheStorm.turns,
 			},
 			errors: { ...stats.errors, incomplete },
 			errorStorm: incomplete ? null : stats.errorStorm,

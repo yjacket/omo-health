@@ -4,10 +4,11 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { tmpDir } from "./helpers/fixtures.mjs";
+import { earlyCacheStormEntries, tmpDir, writeJsonl } from "./helpers/fixtures.mjs";
 import { makeWorld } from "./helpers/world.mjs";
 import { SessionTracker } from "../src/collect/sessions.mjs";
 import { addUsage, createRecordScanner, emptyUsage, modelsOfEntry, readUsage, usageOfEntry, usageTimeline, USAGE_TOOLS_KEY } from "../src/collect/usage.mjs";
+import { DEFAULT_CONFIG } from "../src/config.mjs";
 import { classifyProviderError } from "../src/detect/provider.mjs";
 import { detect as detectTokens } from "../src/detect/tokens.mjs";
 
@@ -1783,6 +1784,21 @@ for (const [label, usages, expected] of [
 		assert.equal(usageTimeline(transcript, tokens).cache.stormTurns, storms[0]?.data.turns ?? 0);
 	});
 }
+
+test("(IS-8) an early D4 cache storm survives 201 ordinary turns in the timeline", (t) => {
+	const { file } = setup(t);
+	const transcript = file();
+	const tokens = DEFAULT_CONFIG.tokens;
+	const entries = earlyCacheStormEntries(T0, tokens.cacheStormWrite);
+	writeJsonl(transcript, entries);
+
+	// Give the real detector the full transcript's turns, not SessionTracker's capped live view.
+	const turns = entries.map(({ timestamp, message }) => ({ ...message.usage, ms: Date.parse(timestamp) }));
+	const world = makeWorld({ now: turns.at(-1).ms, config: { tokens }, sessions: [{ turns }] });
+	const storms = detectTokens(world).filter(({ kind }) => kind === "cache-storm");
+	assert.deepEqual(storms.map(({ data }) => [data.startMs, data.turns]), [[T0 + 1000, 2]]);
+	assert.equal(usageTimeline(transcript, tokens).cache.stormTurns, storms[0].data.turns);
+});
 
 test("(IS-8) an oversized tool-result image marks statistics incomplete without changing usage", (t) => {
 	const { file } = setup(t);
