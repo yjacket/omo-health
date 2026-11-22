@@ -318,6 +318,12 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		delete record.terminationUnconfirmed;
 		delete record.deadlineMs;
 	};
+	const markUnconfirmedTermination = (record, deadlineMs) => {
+		if (record.terminationUnconfirmed === true && record.deadlineMs === deadlineMs) return;
+		record.terminationUnconfirmed = true;
+		record.deadlineMs = deadlineMs;
+		save(record);
+	};
 	const fail = (record, reason, detail, now) => {
 		clearUnconfirmedTermination(record);
 		record.status = "failed";
@@ -539,11 +545,7 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 
 	function finish(record, out, now) {
 		if (out.status === "running" && out.terminationUnconfirmed === true) {
-			if (record.terminationUnconfirmed !== true || record.deadlineMs !== out.deadlineMs) {
-				record.terminationUnconfirmed = true;
-				record.deadlineMs = out.deadlineMs;
-				save(record);
-			}
+			markUnconfirmedTermination(record, out.deadlineMs);
 		} else if (out.status === "done") {
 			const metadata = readJsonSafe(path.join(jobsDir, record.jobId, "refs.json"));
 			const refs = Array.isArray(metadata) ? metadata : metadata?.refs;
@@ -585,6 +587,8 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 			if (lookup(record, "running-adopt", () => jobs.adoptJob(record.jobId, adoptOptions(record))) === "absent") fail(record, "no-job", null, now);
 		} catch (error) {
 			log?.warn?.("audit_adopt_pending", { sessionId: record.sessionId, jobId: record.jobId, error: error.message });
+			const deadlineMs = (record.startedMs ?? record.launchMs) + config.audit.timeoutMs;
+			if (now > deadlineMs) markUnconfirmedTermination(record, deadlineMs);
 		}
 	}
 

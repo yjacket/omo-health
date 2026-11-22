@@ -595,7 +595,7 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			const restart = isRestart(from, result);
 			entry.state = "ok";
 			entry.gone = false;
-			entry.complete = restart ? result.done === true : entry.complete === true || result.done === true;
+			entry.complete = result.done === true || (!restart && !result.pending && entry.complete === true);
 			entry.size = result.size;
 			entry.mtimeMs = result.mtimeMs;
 			entry.offset = result.offset;
@@ -610,7 +610,7 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			entry.scanOffset = result.scanOffset;
 			entry.partial = result.partial;
 			if (result.done === true) entry.published = result.effective;
-			else if (restart) entry.published = null;
+			else if (restart || result.pending) entry.published = null;
 			const slots = boundedModels(entry, USAGE_INDEX_MODEL_BUDGET - named);
 			admit(entry, slots);
 			return result.bytesRead;

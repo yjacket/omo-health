@@ -1394,18 +1394,56 @@ test("a job the runner no longer knows is adopted before it ends no-job; the sec
 	assert.equal(h.runner.starts.length, 2);
 });
 
-test("a no-job answer with a throwing lookup keeps the record running", async () => {
-	const h = harness();
-	h.runner.script = () => ({ status: "failed", reason: "no-job", result: null, exitCode: null });
-	h.runner.adopt = () => {
-		throw new Error("cim down");
-	};
-	const a = h.auditor();
+test("IS-10 missing meta: a throwing adoption lookup keeps the record running and warns after the deadline", async () => {
+	const h = harness({ sessions: ["m1", "m2"] });
+	h.config.audit.timeoutMs = 2 * POLL;
+	let lookupUnavailable = true;
+	let lookups = 0;
+	const recording = createRecordingSpawn();
+	const runner = createRunner({
+		paths: h.paths, clock: h.clock, env: {},
+		spawnImpl: recording.spawnImpl,
+		isAlive: () => lookupUnavailable,
+		identify: () => ({ ctimeMs: BASE, cmdSha1: "audit-job" }),
+		findJobProcess() {
+			lookups++;
+			if (lookupUnavailable) throw new Error("cim down");
+			return null;
+		},
+	});
+	const a = h.auditor({ runner });
+	const kills = () => recording.calls.filter(({ command }) => command === "taskkill");
 	h.request("m1");
+	h.request("m2");
 	await h.prepare(a);
+	const { jobId, startedMs } = h.record("m1");
+	const deadlineMs = startedMs + h.config.audit.timeoutMs;
+	fs.unlinkSync(path.join(runner.jobDir(jobId), "meta.json"));
 	h.tick(a);
 	assert.equal(h.record("m1").status, "running");
 	assert.equal(a.busy(), true);
+	assert.equal(lookups, 1);
+	assert.equal(h.record("m1").terminationUnconfirmed, undefined);
+	h.tick(a);
+	assert.equal(h.state.now, deadlineMs);
+	assert.equal(h.record("m1").terminationUnconfirmed, undefined, "the deadline has not passed yet");
+	h.tick(a);
+	assert.equal(lookups, 3);
+	assert.equal(h.record("m1").status, "running");
+	assert.equal(h.record("m2").status, "queued");
+	assert.equal(recording.calls.length, 1, "only the first audit has spawned");
+	assert.deepEqual(kills(), [], "no kill may use an unverified identity");
+	assert.deepEqual([h.record("m1").terminationUnconfirmed, h.record("m1").deadlineMs], [true, deadlineMs]);
+
+	lookupUnavailable = false;
+	h.tick(a);
+	const finished = h.record("m1");
+	assert.deepEqual([finished.status, finished.reason, finished.terminationUnconfirmed, finished.deadlineMs],
+		["failed", "no-job", undefined, undefined]);
+	assert.deepEqual(kills(), []);
+	assert.equal(h.record("m2").status, "queued");
+	await h.prepare(a);
+	assert.equal(h.record("m2").status, "running");
 });
 
 test("an expired request ends failed expired and starts nothing", () => {

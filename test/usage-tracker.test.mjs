@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { runInNewContext } from "node:vm";
 import { createSessionFileLocator } from "../src/collect/session-files.mjs";
 import { SessionRegistry } from "../src/collect/sessions.mjs";
-import { readUsage } from "../src/collect/usage.mjs";
+import { readUsage, usageTimeline } from "../src/collect/usage.mjs";
 import { E, iso, tmpDir, writeJsonl } from "./helpers/fixtures.mjs";
 import { makeWorld, sessionState, taskRecord } from "./helpers/world.mjs";
 import { compactUsage, createUsageIndex, readUsageIndex, USAGE_TICK_BYTES } from "../src/usage-index.mjs";
@@ -72,6 +72,86 @@ function writeLines(file, lines) {
 }
 
 const emptyWorld = (clock) => makeWorld({ now: clock.now(), sessions: [] });
+
+function singleRecordModelOracle(file) {
+	const { message } = JSON.parse(fs.readFileSync(file, "utf8"));
+	const { input, output, cacheRead, cacheWrite, cost } = message.usage;
+	return { [`${message.provider}/${String(message.model)}`]: {
+		input, output, cacheRead, cacheWrite, tokens: input + output + cacheRead + cacheWrite, cost: cost.total,
+	} };
+}
+
+test("(IS-2, IS-12) four medium live fragments publish together after an eight-byte append", (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const bytes = 10 * 1024 * 1024;
+	const sessions = Array.from({ length: 4 }, (_, i) => {
+		const id = `resume-${i}`;
+		const file = mainFile(s.paths, id);
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, bigRecord(bytes + 1, usage(i + 1, 2, 3, 4, 0.5)).slice(0, -1));
+		return sessionState({ id, file, cwd: s.cwd });
+	});
+	const world = makeWorld({ now: s.clock.now(), sessions });
+	s.tracker.tick(world);
+	s.tracker.tick(world);
+	for (const { id, file } of sessions) {
+		assert.equal(s.index.get(id).scanOffset, bytes);
+		assert.equal(s.index.get(id).offset, 0);
+		fs.appendFileSync(file, "}\n");
+	}
+
+	let actual = 0;
+	const readSync = fs.readSync;
+	const spy = t.mock.method(fs, "readSync", (...args) => {
+		const n = readSync(...args);
+		actual += n;
+		return n;
+	});
+	const tick = s.tracker.tick(world);
+	spy.mock.restore();
+	t.diagnostic(`closing tick: ${actual} actual, ${tick.bytesRead} scan bytes`);
+	const expected = sessions.map(({ file }) => singleRecordModelOracle(file));
+	assert.deepEqual(sessions.map(({ id }) => s.tracker.tokensOf(id)?.tokens?.total), expected.map((models) => models["p/m"].tokens));
+	assert.deepEqual(sessions.map(({ id }) => s.index.get(id).published.models), expected);
+	assert.deepEqual(sessions.map(({ file }) => usageTimeline(file).totals.models), expected);
+	assert.equal(tick.bytesRead, 8, "only the closing bytes are scanned");
+	assert.ok(actual <= USAGE_TICK_BYTES, `actual reads: ${actual}`);
+});
+
+test("(IS-2, IS-12) an over-capture identity waits until the exact reread fits", (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const bytes = 2 * 1024 * 1024;
+	const id = "uncertain";
+	const file = mainFile(s.paths, id);
+	const busy = mainFile(s.paths, "busy");
+	const world = makeWorld({ now: s.clock.now(), sessions: [sessionState({ id: "busy", file: busy }), sessionState({ id, file })] });
+	const identity = `{"label":"${"m".repeat(128 * 1024)}"}`;
+	const record = bigRecord(bytes + 1 - (identity.length - 3), usage(42)).replace('"m"', identity);
+	assert.equal(Buffer.byteLength(record), bytes + 1);
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	fs.writeFileSync(file, record.slice(0, -1));
+	fs.writeFileSync(busy, "");
+	s.tracker.tick(world);
+	assert.equal(s.index.get(id).scanOffset, bytes);
+
+	// Leave only 1 MiB of scan budget when the record completes.
+	const busyLine = bigRecord(1023, usage(1)) + "\n";
+	fs.writeFileSync(busy, busyLine.repeat((USAGE_TICK_BYTES - bytes / 2) / busyLine.length));
+	fs.appendFileSync(file, "}\n");
+	const tick = s.tracker.tick(world);
+	assert.equal(s.tracker.tokensOf(id)?.pending, true);
+	assert.equal(s.tracker.tokensOf(id)?.tokens, undefined);
+	assert.equal(s.index.get(id).offset, 0, "inexact usage is not committed");
+	assert.equal(tick.bytesRead, USAGE_TICK_BYTES - bytes / 2 + 2, "the reread is not partially attempted");
+
+	assert.equal(s.tracker.tick(world).bytesRead, bytes + 1, "reread starts at the record and excludes the already scanned delimiter");
+	const expected = singleRecordModelOracle(file);
+	assert.deepEqual(s.index.get(id).published.models, expected);
+	assert.deepEqual(usageTimeline(file).totals.models, expected);
+	assert.equal(s.tracker.tokensOf(id).tokens.total, 42);
+});
 
 test("tracker tokens resolve by session id or by a unique task id when the session id is absent", () => {
 	const s = setup();

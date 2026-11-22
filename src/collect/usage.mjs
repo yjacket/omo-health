@@ -453,6 +453,26 @@ function truncatedIdentity(prefix) {
 
 const TRUNCATED_NONSTRING_ID = Object.freeze({ [Symbol.toPrimitive]: () => MODEL_ID_TOO_LONG });
 
+function hasTruncatedIdentity(entry) {
+	let owner;
+	switch (entry?.type) {
+		case "usage": owner = entry; break;
+		case "message":
+			if (entry.message?.role === "assistant" ||
+				(entry.message?.role === "toolResult" && isObject(entry.message.usage))) owner = entry.message;
+			break;
+		case "custom":
+			if (entry.customType === "prompt-cache-prewarm") owner = entry.data;
+			break;
+		case "compaction":
+		case "branch_summary":
+			if (isObject(entry.usage)) owner = entry;
+			break;
+	}
+	const truncated = (value) => value === TRUNCATED_NONSTRING_ID || value?.[TRUNCATED_STRING_ID] !== undefined;
+	return truncated(owner?.provider) || truncated(owner?.model) || truncated(owner?.responseModel);
+}
+
 /** Validating projection for records above the buffer limit. Only a selected
  * value can own the capture buffer. The stack below the projected objects is
  * just container-kind bits: ancestors always resume in STATE_AFTER. */
@@ -735,32 +755,55 @@ function newAccumulator(start) {
 	return { [RECORD_ACCUMULATOR]: true, start, kind: "buffer", parts: [], len: 0 };
 }
 
-function appendBytes(accumulator, bytes) {
-	if (!bytes.length) return accumulator;
-	let acc = accumulator;
-	if (acc.kind === "buffer") {
-		if (acc.len + bytes.length > RECORD_PARSE_LIMIT) {
-			const scanner = createRecordScanner();
-			const parts = [...acc.parts, bytes];
-			let skip = 0;
-			if (acc.start === 0) {
-				const first = parts[0].length < 3 ? Buffer.concat(parts.slice(0, 3), 3) : parts[0];
-				if (stripBomBuffer(first) !== first) skip = 3;
-			}
-			for (const part of parts) {
-				const consumed = Math.min(skip, part.length);
-				skip -= consumed;
-				scanner.push(part.subarray(consumed));
-			}
-			acc = { [RECORD_ACCUMULATOR]: true, start: acc.start, kind: "scanner", scanner };
+const USAGE_MARKER_BYTES = Math.max(...USAGE_MARKERS.map((marker) => marker.length)) - 1;
+
+function pushScanner(acc, bytes) {
+	if (acc.markerTail) {
+		const boundary = Buffer.concat([acc.markerTail, bytes.subarray(0, USAGE_MARKER_BYTES)]);
+		if (wantsUsage(boundary.toString("utf8")) || bytes.includes(0x5c) || USAGE_MARKERS.some((marker) => bytes.includes(marker))) {
+			acc.markerTail = undefined;
 		} else {
-			acc.parts.push(Buffer.from(bytes));
-			acc.len += bytes.length;
+			acc.markerTail = Buffer.from((bytes.length >= USAGE_MARKER_BYTES ? bytes : boundary).subarray(-USAGE_MARKER_BYTES));
 		}
-	} else {
-		acc.scanner.push(bytes);
+	}
+	acc.scanner.push(bytes);
+}
+
+function scannerAccumulator(start, parts, len) {
+	const acc = { [RECORD_ACCUMULATOR]: true, start, kind: "scanner", scanner: createRecordScanner(), len,
+		markerTail: len <= RECORD_PARSE_LIMIT ? Buffer.alloc(0) : undefined };
+	let skip = 0;
+	if (start === 0) {
+		const first = parts[0].length < 3 ? Buffer.concat(parts.slice(0, 3), 3) : parts[0];
+		if (stripBomBuffer(first) !== first) skip = 3;
+	}
+	for (const part of parts) {
+		const consumed = Math.min(skip, part.length);
+		skip -= consumed;
+		pushScanner(acc, part.subarray(consumed));
 	}
 	return acc;
+}
+
+function appendBytes(accumulator, bytes) {
+	if (!bytes.length) return accumulator;
+	const acc = accumulator;
+	if (acc.kind === "buffer") {
+		if (acc.len + bytes.length > RECORD_PARSE_LIMIT) {
+			return scannerAccumulator(acc.start, [...acc.parts, bytes], acc.len + bytes.length);
+		}
+		acc.parts.push(Buffer.from(bytes));
+	} else {
+		if (acc.len + bytes.length > RECORD_PARSE_LIMIT) acc.markerTail = undefined;
+		pushScanner(acc, bytes);
+	}
+	acc.len += bytes.length;
+	return acc;
+}
+
+function needsWholeRecord(acc) {
+	return acc.len <= RECORD_PARSE_LIMIT && acc.kind === "scanner" && !acc.markerTail &&
+		(acc.scanner.oversized || hasTruncatedIdentity(acc.scanner.preview()));
 }
 
 function accumulatorText(acc) {
@@ -772,7 +815,8 @@ function accumulatorText(acc) {
 
 function finishRecord(totals, acc) {
 	if (acc.kind === "scanner") {
-		consumeScannerRecord(totals, acc.scanner);
+		if (acc.markerTail) totals.diagnostics.skippedLines += 1;
+		else consumeScannerRecord(totals, acc.scanner);
 		return;
 	}
 	const text = accumulatorText(acc);
@@ -894,12 +938,11 @@ export function readUsage(file, from, { maxBytes = Infinity } = {}) {
 			usage = savedUsage;
 			offset = from.offset;
 			const resumable = from.partial?.[RECORD_ACCUMULATOR] === true && Number.isInteger(from.scanOffset) && from.partial.start === offset;
-			if (resumable && from.partial.kind === "reread" && size === from.size) {
+			if (resumable && size === from.size && from.evaluatedTo === size) {
 				cachedOverlay = cloneUsage(from.overlay);
 			}
-			const reusePartial = resumable && (from.partial.kind !== "reread" || cachedOverlay);
-			scanOffset = reusePartial ? from.scanOffset : offset;
-			partial = reusePartial ? from.partial : undefined;
+			scanOffset = resumable ? from.scanOffset : offset;
+			partial = resumable ? from.partial : undefined;
 			headLen = from.headLen;
 			head = from.head;
 			if (headLen < HEAD_LIMIT && size > headLen) {
@@ -909,11 +952,25 @@ export function readUsage(file, from, { maxBytes = Infinity } = {}) {
 		}
 
 		let position = scanOffset;
-		const end = Math.min(size, scanOffset + maxBytes);
 		let bytesRead = 0;
 		let acc = partial;
-		while (position < end) {
-			const want = Math.min(READ_CHUNK, end - position);
+		const reread = (start, len) => {
+			if (len > maxBytes - bytesRead) return undefined;
+			const bytes = readRange(fd, start, len);
+			bytesRead += bytes.length;
+			if (bytes.length !== len) return undefined;
+			return { start, kind: "buffer", parts: [bytes], len };
+		};
+		if (acc?.kind === "reread") {
+			const whole = reread(acc.start, position - acc.start - 1);
+			if (whole) {
+				finishRecord(usage, whole);
+				offset = position;
+				acc = undefined;
+			}
+		}
+		scan: while (acc?.kind !== "reread" && position < size && bytesRead < maxBytes) {
+			const want = Math.min(READ_CHUNK, size - position, maxBytes - bytesRead);
 			const chunk = readRange(fd, position, want);
 			if (!chunk.length) break;
 			const chunkStart = position;
@@ -928,6 +985,16 @@ export function readUsage(file, from, { maxBytes = Infinity } = {}) {
 					break;
 				}
 				acc = appendBytes(acc, chunk.subarray(index, newline));
+				if (needsWholeRecord(acc)) {
+					const whole = reread(acc.start, acc.len);
+					if (!whole) {
+						// Remember the delimiter, not the record or the rest of the chunk.
+						position = chunkStart + newline + 1;
+						acc = { [RECORD_ACCUMULATOR]: true, start: acc.start, kind: "reread" };
+						break scan;
+					}
+					acc = whole;
+				}
 				finishRecord(usage, acc);
 				offset = chunkStart + newline + 1;
 				acc = newline + 1 >= chunk.length ? undefined : newAccumulator(chunkStart + newline + 1);
@@ -937,19 +1004,32 @@ export function readUsage(file, from, { maxBytes = Infinity } = {}) {
 		}
 
 		const overlay = cachedOverlay ?? emptyUsage();
-		if (!cachedOverlay && acc && position === size) {
-			if (acc.kind === "scanner") consumeScannerRecord(overlay, acc.scanner, true);
-			else {
-				const entry = finalFragment(acc);
+		let pending = acc?.kind === "reread";
+		if (acc?.kind === "buffer" && acc.len > USAGE_BUFFER_LIMIT) {
+			// Keep the bounded projection at a budget boundary or EOF. If the
+			// first EOF preview needs full parsing, the bytes are still at hand.
+			const buffered = acc;
+			acc = scannerAccumulator(buffered.start, buffered.parts, buffered.len);
+			if (position === size && needsWholeRecord(acc)) {
+				const entry = finalFragment(buffered);
 				if (entry !== undefined) consumeEntry(overlay, entry);
-				// Keep the preview, not the medium record's bytes. Growth restarts
-				// at offset so the eventual commit uses whole-record parsing too.
-				if (acc.len > USAGE_BUFFER_LIMIT) {
-					acc = { [RECORD_ACCUMULATOR]: true, start: acc.start, kind: "reread" };
+				cachedOverlay = overlay;
+			}
+		}
+		if (!cachedOverlay && acc && !pending && position === size) {
+			if (acc.kind === "scanner" && !needsWholeRecord(acc)) {
+				if (!acc.markerTail) consumeScannerRecord(overlay, acc.scanner, true);
+			} else {
+				const whole = acc.kind === "buffer" ? acc : reread(acc.start, acc.len);
+				if (whole) {
+					const entry = finalFragment(whole);
+					if (entry !== undefined) consumeEntry(overlay, entry);
+				} else {
+					pending = true;
 				}
 			}
 		}
-		const evaluatedTo = position;
+		const evaluatedTo = pending ? offset : position;
 		const effective = cloneUsage(usage);
 		mergeUsage(effective, overlay);
 		const tailLength = Math.min(offset, HEAD_LIMIT);
@@ -968,6 +1048,7 @@ export function readUsage(file, from, { maxBytes = Infinity } = {}) {
 			overlay,
 			effective,
 			done: evaluatedTo === size,
+			pending,
 			evaluatedTo,
 			bytesRead,
 		};
