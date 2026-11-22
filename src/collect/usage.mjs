@@ -39,6 +39,7 @@ const NINE = 0x39;
 const VALUE_RAW_LIMIT = 64 * 1024;
 const KEY_RAW_LIMIT = 128;
 const MODEL_ID_TOO_LONG = "(model id too long)";
+const MODEL_ID_UNREADABLE = "(model id unreadable)";
 const TRUNCATED_STRING_ID = Symbol("truncatedStringIdentity");
 const TRUNCATED_USAGE = Symbol("truncatedUsage");
 const TRUNCATED_VALUE = Object.freeze({});
@@ -165,6 +166,37 @@ function mergeUsage(into, extra) {
 	for (const key of Object.keys(extra.usedModels)) into.usedModels[key] = true;
 }
 
+function billingPart(value) {
+	if (typeof value === "string") return value;
+	try {
+		return String(value);
+	} catch {
+		return MODEL_ID_UNREADABLE;
+	}
+}
+
+/** Billing key text for values a JSON line can put where a model id belongs. */
+function billingKey(provider, model) {
+	return `${billingPart(provider)}/${billingPart(model)}`;
+}
+
+/** The usage object a record's type/role/customType selects, or undefined. */
+function usageCarrier(entry) {
+	if (!isObject(entry)) return undefined;
+	const type = entry.type;
+	if ((type === "usage" || type === "branch_summary" || type === "compaction") && isObject(entry.usage)) return entry.usage;
+	if (type === "custom" && entry.customType === "prompt-cache-prewarm") {
+		const data = entry.data;
+		if (isObject(data) && data.phase === "warmed" && isObject(data.usage)) return data.usage;
+		return undefined;
+	}
+	const message = entry.message;
+	if (type === "message" && isObject(message) && isObject(message.usage)) {
+		if (message.role === "toolResult" || message.role === "assistant") return message.usage;
+	}
+	return undefined;
+}
+
 /**
  * The usage a single session record contributes, or undefined. Checked in the
  * order omo's `/session` uses.
@@ -173,7 +205,7 @@ export function usageOfEntry(entry) {
 	if (!isObject(entry)) return undefined;
 	const type = entry.type;
 	if (type === "usage" && isObject(entry.usage)) {
-		return { usage: entry.usage, key: `${entry.provider}/${entry.model}` };
+		return { usage: entry.usage, key: billingKey(entry.provider, entry.model) };
 	}
 	if ((type === "branch_summary" || type === "compaction") && isObject(entry.usage)) {
 		return { usage: entry.usage, key: USAGE_TOOLS_KEY };
@@ -192,7 +224,7 @@ export function usageOfEntry(entry) {
 		if (message.role === "assistant" && isObject(message.usage)) {
 			return {
 				usage: message.usage,
-				key: `${message.provider}/${message.responseModel ?? message.model}`,
+				key: billingKey(message.provider, message.responseModel ?? message.model),
 				turn: true,
 			};
 		}
@@ -294,7 +326,9 @@ function sha1(buffer) {
 }
 
 const COST_FIELDS = { total: "usage" };
-const USAGE_FIELDS = { input: "usage", output: "usage", cacheRead: "usage", cacheWrite: "usage", costUnknown: "usage", cost: COST_FIELDS };
+// costUnknown is only compared to `true`, so an over-cap value keeps its prefix
+// instead of marking the counted usage as unusable.
+const USAGE_FIELDS = { input: "usage", output: "usage", cacheRead: "usage", cacheWrite: "usage", costUnknown: "value", cost: COST_FIELDS };
 const ROOT_FIELDS = {
 	type: "value", customType: "value", provider: "identity", model: "identity", usage: USAGE_FIELDS,
 	message: { role: "value", provider: "identity", model: "identity", responseModel: "identity", usage: USAGE_FIELDS },
@@ -596,9 +630,11 @@ export function createRecordScanner() {
 		},
 		get oversized() {
 			if (!finished || malformed || !entry) return false;
-			const truncatedUsage = (parent) => parent?.[TRUNCATED_USAGE]?.has("usage") ||
-				parent?.usage?.[TRUNCATED_USAGE] !== undefined || parent?.usage?.cost?.[TRUNCATED_USAGE] !== undefined;
-			return Boolean(truncatedUsage(entry) || truncatedUsage(entry.message) || truncatedUsage(entry.data));
+			const carrier = usageCarrier(entry);
+			if (!carrier) return false;
+			if (carrier[TRUNCATED_USAGE]?.size) return true;
+			const cost = carrier.cost;
+			return isObject(cost) && (cost[TRUNCATED_USAGE]?.size ?? 0) > 0;
 		},
 	};
 }
@@ -896,7 +932,7 @@ function consumeTimelineStats(stats, entry, options) {
 		if (usage) {
 			stats.turns.push({
 				ms,
-				key: `${message.provider}/${message.responseModel ?? message.model}`,
+				key: billingKey(message.provider, message.responseModel ?? message.model),
 				input,
 				output,
 				cacheRead,

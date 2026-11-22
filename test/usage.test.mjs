@@ -1126,6 +1126,62 @@ test("(gate 6) only a winning oversized non-number usage leaf skips usage", (t) 
 	}
 });
 
+const gate7Usage = { input: 7, output: 2, cacheRead: 3, cacheWrite: 1, cost: { total: 0.125 } };
+const gate7Message = { role: "assistant", provider: "p", model: "alpha", usage: gate7Usage };
+const gate7Make = (attrs) => `{${gate6Gap}${JSON.stringify(attrs).slice(1)}`;
+
+test("(gate 7) an oversized unused top-level usage keeps an assistant message's usage", (t) => {
+	const line = gate7Make({ type: "message", usage: { input: gate6Long }, message: gate7Message });
+	const got = assertLargeRecordParity(t, line);
+	assert.equal(got.total, 13);
+	assert.deepEqual(got.models, { "p/alpha": { tokens: 13, cost: 0.125 } });
+	assert.deepEqual(got.diagnostics, { badLines: 0, skippedLines: 0 });
+});
+
+test("(gate 7) an oversized unused data.usage keeps a type usage entry's usage", (t) => {
+	const line = gate7Make({ data: { usage: { output: gate6Long } }, provider: "p", model: "alpha", usage: gate7Usage, type: "usage" });
+	const got = assertLargeRecordParity(t, line);
+	assert.equal(got.total, 13);
+	assert.deepEqual(got.models, { "p/alpha": { tokens: 13, cost: 0.125 } });
+	assert.deepEqual(got.diagnostics, { badLines: 0, skippedLines: 0 });
+});
+
+test("(gate 7) an oversized costUnknown keeps its prefix and still bills the counters", (t) => {
+	const line = gate7Make({ type: "message", message: { ...gate7Message, usage: { ...gate7Usage, costUnknown: gate6Long } } });
+	const got = assertLargeRecordParity(t, line);
+	assert.equal(got.total, 13);
+	assert.equal(got.costUnknown, false);
+	assert.deepEqual(got.models, { "p/alpha": { tokens: 13, cost: 0.125 } });
+	assert.deepEqual(got.diagnostics, { badLines: 0, skippedLines: 0 });
+});
+
+test("(gate 7) a non-coercible provider bills a small record under an unreadable model id", (t) => {
+	const { file } = setup(t);
+	const entry = { type: "usage", provider: { toString: "p" }, model: "alpha", usage: gate7Usage };
+	writeRecords(file(), [entry]);
+	assert.throws(() => `${JSON.parse(fs.readFileSync(file(), "utf8")).provider}`);
+	const got = readUsage(file()).effective;
+	assert.equal(got.total, 13);
+	assert.equal(got.cost, 0.125);
+	assert.deepEqual(got.models, { "(model id unreadable)/alpha": { tokens: 13, cost: 0.125 } });
+	assert.deepEqual(got.diagnostics, { badLines: 0, skippedLines: 0 });
+	assert.deepEqual(usageTimeline(file()).totals, got);
+});
+
+test("(gate 7) a non-coercible provider bills a >16 MiB record under an unreadable model id", (t) => {
+	const { file } = setup(t);
+	const line = gate7Make({ type: "usage", provider: { toString: "p" }, model: "alpha", usage: gate7Usage });
+	assert.ok(Buffer.byteLength(line) > 16 * MiB);
+	fs.writeFileSync(file(), `${line}\n`);
+	const got = readUsage(file()).effective;
+	assert.equal(got.total, 13);
+	assert.equal(got.cost, 0.125);
+	assert.deepEqual(got.models, { "(model id unreadable)/alpha": { tokens: 13, cost: 0.125 } });
+	assert.deepEqual(got.usedModels, {});
+	assert.deepEqual(got.diagnostics, { badLines: 0, skippedLines: 0 });
+	assert.deepEqual(usageTimeline(file()).totals, got);
+});
+
 test("returns null for a missing file", (t) => {
 	const { file } = setup(t);
 	assert.equal(readUsage(file("absent.jsonl")), null);
