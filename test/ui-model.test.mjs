@@ -686,13 +686,22 @@ describe("ui model", () => {
 			assert.equal(rows.get("unindexed").tokensState, "pending");
 		});
 
-		it("finds an entry by the taskId alias when the session id does not match", () => {
+		it("does not use a taskId alias when the session id does not match", () => {
 			const home = makeHome();
 			writeUsage(home.paths, [{ id: "01a20000-0000-7000-8000-0000000000aa", total: 100, meta: { taskId: "st_alias" } }]);
 			writeRows(home.paths, [row("01a20000-0000-7000-8000-0000000000bb", NOW - 1000, { taskId: "st_alias" })]);
 			const [r] = uiState({ paths: home.paths, env: home.env, now: NOW }).ended.rows;
-			assert.equal(r.tokensState, "ok");
-			assert.equal(r.tokens.total, 100);
+			assert.equal(r.tokensState, "pending");
+			assert.equal(r.tokens, null);
+		});
+
+		it("resolves only a unique taskId alias for a history row without a session id", () => {
+			const r = row(null, NOW - 1000, { kind: "child", taskId: "st_x" });
+			const entry = { id: "a", taskId: "st_x", state: "ok", complete: true, published: { total: 100 } };
+			const index = new Map([["a", entry]]);
+			assert.equal(endedRow(r, 0, index).tokens.total, 100);
+			index.set("b", { ...entry, id: "b" });
+			assert.equal(endedRow(r, 0, index).tokensState, "pending");
 		});
 
 		it("keeps the last total of a complete entry whose file was then deleted, and marks a never-found row missing", () => {

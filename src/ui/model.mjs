@@ -4,7 +4,7 @@ import { getPath, pauseState, SWITCHES } from "../control.mjs";
 import { readDecisions } from "../decisions.mjs";
 import { createInvestigations, RESOLVED } from "../investigations.mjs";
 import { readEnded } from "../session-ledger.mjs";
-import { compactUsage, readUsageIndex, treeTotals } from "../usage-index.mjs";
+import { compactUsage, readUsageIndex, treeTotals, usageEntryFor } from "../usage-index.mjs";
 import { listDirSafe, readJsonSafe, statSafe } from "../util/fsx.mjs";
 import { redact, truncate } from "../util/text.mjs";
 import { VERSION } from "../version.mjs";
@@ -130,18 +130,6 @@ function boardTokens(tokens) {
 	return out;
 }
 
-/** The index entry for a ledger row: by the id given, then by the entry's taskId alias. */
-function usageLookup(usage) {
-	if (typeof usage === "function") return usage;
-	const values = usage instanceof Map ? [...usage.values()] : [];
-	return (id) => {
-		if (typeof id !== "string" || !id) return null;
-		const direct = usage instanceof Map ? usage.get(id) : undefined;
-		if (direct) return direct;
-		return values.find((entry) => entry?.taskId === id) ?? null;
-	};
-}
-
 /** A folder as the board shows it: the whole path when short, else its last two segments after an ellipsis. */
 function shortPath(cwd) {
 	if (!cwd || cwd.length <= PATH_SHORT_MAX) return cwd ?? null;
@@ -253,8 +241,7 @@ export function endedRow(r, childRows = 0, usage = null, trees = null, full = us
 	const startedMs = num(r.startedMs);
 	const endedMs = num(r.endedMs);
 	const cwd = clean(r.cwd, 300);
-	const entryOf = usageLookup(usage);
-	const entry = entryOf(text(r.sessionId, 80)) ?? entryOf(text(r.taskId, 80));
+	const entry = usageEntryFor(usage, r.sessionId, r.taskId);
 	const tokens = compactUsage(entry);
 	const tree = entry && trees instanceof Map ? trees.get(entry.id) ?? null : null;
 	return {
@@ -303,7 +290,6 @@ export function buildEnded(inputs) {
 	const shownChildren = children.slice(0, ENDED_LIMIT);
 	const selected = new Set([...shownMains, ...shownChildren]);
 	const usage = inputs.usage instanceof Map ? inputs.usage : new Map();
-	const entryOf = usageLookup(usage);
 	const trees = treeTotals(usage);
 	return {
 		sinceMs: inputs.now - ENDED_WINDOW_MS,
@@ -313,7 +299,7 @@ export function buildEnded(inputs) {
 		counts: [...tally].map(([outcome, count]) => ({ outcome, outcomeKo: outcomeLabel(outcome), count })),
 		shown: { main: shownMains.length, child: shownChildren.length },
 		totals: { main: mains.length, child: children.length },
-		rows: all.filter((r) => selected.has(r)).map((r) => endedRow(r, childRows.get(r.sessionId), entryOf, trees, usage.full === true)),
+		rows: all.filter((r) => selected.has(r)).map((r) => endedRow(r, childRows.get(r.sessionId), usage, trees)),
 	};
 }
 

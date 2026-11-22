@@ -1149,15 +1149,27 @@ test("markMissing keeps a complete entry's published total and marks it gone, wh
 	assert.equal(saved.get("s1").published.total, 10);
 });
 
-test("get and has resolve the taskId alias", (t) => {
+test("get and has resolve only an explicit, unique taskId alias without a session id", (t) => {
 	const { fileOf, indexOf } = setup(t);
 	const file = fileOf();
 	writeText(file, `${line()}\n`);
 	const index = indexOf();
 	index.update("s1", file, { kind: "child", taskId: "st_01a2" });
-	assert.equal(index.get("st_01a2"), index.get("s1"));
-	assert.equal(index.has("st_01a2"), true);
-	assert.equal(index.has("st_absent"), false);
+	assert.equal(index.get(undefined, "st_01a2"), index.get("s1"));
+	assert.equal(index.has(undefined, "st_01a2"), true);
+	assert.equal(index.has(undefined, "st_absent"), false);
+});
+
+test("get and has never cross session identities or resolve ambiguous task ids", (t) => {
+	const { fileOf, indexOf } = setup(t);
+	const file = fileOf();
+	writeText(file, `${line()}\n`);
+	const index = indexOf();
+	index.update("child-a", file, { kind: "child", taskId: "st_x" });
+	assert.deepEqual([index.get("child-b", "st_x"), index.get("st_x"), index.has("st_x")], [undefined, undefined, false]);
+	index.update("child-b", file, { kind: "child", taskId: "st_x" });
+	assert.deepEqual([index.get(null, "st_x"), index.has(null, "st_x")], [undefined, false]);
+	assert.equal(index.get("child-b", "st_x").id, "child-b");
 });
 
 test("prune drops entries by checkedMs against the injected clock", (t) => {

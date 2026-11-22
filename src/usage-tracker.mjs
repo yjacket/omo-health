@@ -229,8 +229,8 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 		 * `{pending:true}` while an entry's first full read has not finished, and
 		 * null when nothing is known.
 		 */
-		tokensOf(id) {
-			const entry = index.get(id);
+		tokensOf(sessionId, taskId) {
+			const entry = index.get(sessionId, taskId);
 			if (!entry) return null;
 			if (entry.state === "full") return { state: "full" };
 			if (entry.readError === true) return null;

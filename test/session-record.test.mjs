@@ -208,6 +208,16 @@ test("an unindexed main session does not inherit another main's tokens through a
 	assert.equal(unindexedRecord.tokens, null, "a null task id is not an alias for another main session");
 });
 
+test("task-only record rows join one decision subject, not two subjects sharing a task id", () => {
+	const row = childRow(null, "st_x", "s-main");
+	const a = { fp: "a", event: "opened", subject: { sessionId: "child-a", taskId: row.taskId }, ts: iso(T0 + MIN) };
+	const resolved = { ...a, event: "resolved", ts: iso(T0 + 2 * MIN) };
+	const b = { ...a, fp: "b", subject: { sessionId: "child-b", taskId: row.taskId } };
+	const record = (decisions) => buildSessionRecord({ id: row.taskId, row, decisions });
+	assert.deepEqual(fprs(record([a, resolved]), "findings"), ["a", "a"]);
+	assert.deepEqual(fprs(record([a, resolved, b]), "findings"), []);
+});
+
 test("two main sessions whose records all carry taskId null do not leak into each other", () => {
 	const fixture = corpus();
 	const main = fixture.rows[0];

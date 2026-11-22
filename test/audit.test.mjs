@@ -6,6 +6,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { readUsage, usageTimeline } from "../src/collect/usage.mjs";
 import { DEFAULT_CONFIG } from "../src/config.mjs";
+import { appendDecision } from "../src/decisions.mjs";
 import { loadDetectors } from "../src/engine.mjs";
 import { AUDIT_REASON_CODES, reasonCode } from "../src/audit-codes.mjs";
 import * as audit from "../src/judge/audit.mjs";
@@ -20,7 +21,9 @@ import {
 	resolveAuditModel,
 	validateAudit,
 } from "../src/judge/audit.mjs";
-import { buildSessionRecord } from "../src/session-record.mjs";
+import { resolvePaths } from "../src/paths.mjs";
+import { appendEnded } from "../src/session-ledger.mjs";
+import { buildSessionRecord, loadSessionRecord } from "../src/session-record.mjs";
 import { compactUsage, createUsageIndex } from "../src/usage-index.mjs";
 import { tmpDir, iso } from "./helpers/fixtures.mjs";
 
@@ -374,6 +377,17 @@ test("a record whose coverage.infoFindings is true sends coverage.infoFindings t
 	const record = buildSessionRecord({ id: "s1", row, ledger: [row], decisions, investigations: [], messages: [] });
 	assert.equal(record.coverage.infoFindings, true);
 	assert.deepEqual(auditBundle(record, null, { config: DEFAULT_CONFIG, now: T0 }).coverage, { infoFindings: true });
+});
+
+test("an audit sends info finding coverage from a retained marker 31 days before the session", () => {
+	const root = tmpDir("omoh-audit-old-coverage-");
+	const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health") });
+	const row = { sessionId: "s1", kind: "main", startedMs: T0, endedMs: T0 + HOUR, outcome: "answered" };
+	appendEnded(paths, row, { nowMs: row.endedMs });
+	appendDecision(paths, { event: "coverage", ts: iso(T0 - 31 * 24 * HOUR), infoFindings: true });
+	const record = loadSessionRecord({ paths, id: row.sessionId, now: row.endedMs });
+	assert.deepEqual([record.coverage, auditBundle(record, null, { config: DEFAULT_CONFIG, now: row.endedMs }).coverage],
+		[{ infoFindings: true }, { infoFindings: true }]);
 });
 
 test("a session predating coverage sends coverage.infoFindings false, whether false or absent", () => {

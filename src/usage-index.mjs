@@ -373,6 +373,21 @@ function* indexChunks(entries, weights, full) {
 	}
 }
 
+const isId = (value) => typeof value === "string" && value.length > 0;
+
+/** Session ids are authoritative; a task id is only a lookup for a sessionless row. */
+export function usageEntryFor(usage, sessionId, taskId) {
+	if (isId(sessionId)) return usage?.get(sessionId);
+	if (!isId(taskId)) return undefined;
+	let match;
+	for (const entry of usage?.values() ?? []) {
+		if (entry?.taskId !== taskId) continue;
+		if (match) return undefined;
+		match = entry;
+	}
+	return match;
+}
+
 /**
  * `{file, clock, log, read}`: `file` is the only path ever written, and only
  * `save()` writes it. The file is loaded here, so a fresh process resumes every
@@ -385,13 +400,6 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 	const { entries, weights } = loaded;
 	let { named, bytes, full } = loaded;
 	let dirty = loaded.truncated;
-
-	const alias = (id) => {
-		const direct = entries.get(id);
-		if (direct) return direct;
-		for (const entry of entries.values()) if (entry.taskId === id) return entry;
-		return undefined;
-	};
 
 	const unweigh = (id) => {
 		const weight = weights.get(id);
@@ -426,13 +434,13 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 	return {
 		file,
 		get full() { return full; },
-		get(id) {
+		get(sessionId, taskId) {
 			// No rejected path or id is retained. While saturated, an absent row
 			// cannot be distinguished from one skipped at the capacity boundary.
-			return alias(id) ?? (full && typeof id === "string" && id ? FULL_ENTRY : undefined);
+			return usageEntryFor(entries, sessionId, taskId) ?? (full && (isId(sessionId) || isId(taskId)) ? FULL_ENTRY : undefined);
 		},
-		has(id) {
-			return alias(id) !== undefined;
+		has(sessionId, taskId) {
+			return usageEntryFor(entries, sessionId, taskId) !== undefined;
 		},
 		values: () => entries.values(),
 		/**

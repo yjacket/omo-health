@@ -10,9 +10,13 @@ import { createAuditor, readAuditState, requestAudit } from "../src/auditor.mjs"
 import { loadConfig } from "../src/config.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 import { emptyUsage } from "../src/collect/usage.mjs";
+import { appendDecision } from "../src/decisions.mjs";
+import { appendEnded } from "../src/session-ledger.mjs";
 import { createDetailWorker, createSessionDetail, createStartAudit } from "../src/ui/cli.mjs";
-import { daemonStatus, loadDaemonInputs } from "../src/ui/model.mjs";
+import { daemonStatus, loadDaemonInputs, uiState } from "../src/ui/model.mjs";
 import { createUiServer } from "../src/ui/server.mjs";
+import { createUsageIndex } from "../src/usage-index.mjs";
+import { writeTask } from "./helpers/fixtures.mjs";
 
 const TOKEN = "test-token-abc_123";
 const STATE = { generatedMs: 1, overview: { level: "ok" } };
@@ -680,6 +684,41 @@ describe("ui server", { timeout: 20_000 }, () => {
 			function requestFileOf(world) {
 				return path.join(world.paths.health.auditRequestsDir, `${AUDIT_ID}.json`);
 			}
+
+			it("isolates ended children with task id st_x in two project stores", async () => {
+				const world = makeWorld();
+				try {
+					const children = ["child-a", "child-b"].map((sessionId) => ({
+						sessionId, kind: "child", taskId: "st_x", cwd: path.join(world.dir, sessionId),
+						startedMs: world.nowMs - 1_000, endedMs: world.nowMs, outcome: "answered",
+					}));
+					const [a, b] = children;
+					const files = children.map((child) => {
+						appendEnded(world.paths, child, { nowMs: world.nowMs });
+						return writeTask(child.cwd, { task_id: child.taskId, child_session_id: child.sessionId, status: "completed" }, [
+							{ type: "session", id: child.sessionId },
+							{ type: "message", message: { role: "assistant", provider: "anthropic", model: "claude-used", usage: { input: 42 }, stopReason: "stop" } },
+						]);
+					});
+					const index = createUsageIndex({ file: world.paths.health.usageIndexFile, clock: { now: world.now } });
+					index.update(a.sessionId, files[0], { kind: "child", taskId: a.taskId });
+					index.save();
+					appendDecision(world.paths, { event: "opened", fp: "finding-a", detector: "D8", kind: "dead-child", severity: "warn", subject: { sessionId: a.sessionId, taskId: a.taskId }, ts: new Date(world.nowMs).toISOString() });
+
+					const history = new Map(uiState({ paths: world.paths, env: world.env, now: world.nowMs }).ended.rows.map((row) => [row.sessionId, row]));
+					const indexed = await world.detail(a.sessionId);
+					const unindexed = await world.detail(b.sessionId);
+					assert.deepEqual({
+						indexed: [history.get(a.sessionId).tokens?.total, indexed.tokens?.total, indexed.health.counts.findings, indexed.audit.planned?.model],
+						unindexed: [history.get(b.sessionId).tokensState, history.get(b.sessionId).tokens, unindexed.tokens, unindexed.health.counts.findings, unindexed.audit.blocked],
+					}, {
+						indexed: [42, 42, 1, "openai/gpt-review:high"],
+						unindexed: ["pending", null, null, 0, "models-unknown"],
+					});
+				} finally {
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				}
+			});
 
 			it("shows a request as queued, stalls on a stale heartbeat and shows the finished record as done", async () => {
 				const world = makeWorld();

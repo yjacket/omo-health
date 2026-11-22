@@ -67,6 +67,16 @@ function writeLines(file, lines) {
 
 const emptyWorld = (clock) => makeWorld({ now: clock.now(), sessions: [] });
 
+test("tracker tokens resolve by session id or by a unique task id when the session id is absent", () => {
+	const s = setup();
+	const file = childFile(s.cwd, "st_x", "child-a");
+	writeLines(file, [bigRecord(0, usage(42))]);
+	s.index.update("child-a", file, { kind: "child", taskId: "st_x" });
+	assert.equal(s.tracker.tokensOf("child-a").tokens.total, 42);
+	assert.deepEqual([s.tracker.tokensOf("child-b", "st_x"), s.tracker.tokensOf("st_x")], [null, null]);
+	assert.equal(s.tracker.tokensOf(null, "st_x").tokens.total, 42);
+});
+
 test("(gate 16) saturation marks uncounted rows full, logs once, and prune lets the backlog count again", (t) => {
 	const s = setup("usage-full-");
 	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
