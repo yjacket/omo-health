@@ -3,15 +3,82 @@ import crypto from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig } from "../config.mjs";
+import { createSessionFileLocator } from "../collect/session-files.mjs";
 import { listSubjectsNow, runDiagnose } from "../diagnose.mjs";
 import { createLogger } from "../log.mjs";
+import { loadSessionRecord } from "../session-record.mjs";
+import { listDirSafe, statSafe } from "../util/fsx.mjs";
 import { uiState } from "./model.mjs";
 import { createUiServer } from "./server.mjs";
+import { buildSessionView } from "./session-view.mjs";
 
 const DEFAULT_IDLE_MINUTES = 30;
 /** Env keys that mean "tests or staging": the launcher must not open a browser on the operator's desktop. OMO_HEALTH_CONFIG is a real user setting, so it is not one. */
 const SANDBOX_MARKERS = new Set(["OMO_HEALTH_HOME", "OMO_HEALTH_OMO_HOME", "OMO_HEALTH_CLAUDE_HOME", "NODE_TEST_CONTEXT"]);
 const DEFAULT_BIN_PATH = fileURLToPath(new URL("../../bin/omo-health.mjs", import.meta.url));
+const SESSION_CACHE_MAX = 20;
+
+const fileStamp = (file) => {
+	const stat = statSafe(file);
+	return stat?.isFile() ? { size: stat.size, mtimeMs: stat.mtimeMs } : null;
+};
+
+const dirMtime = (dir) => {
+	const stat = statSafe(dir);
+	return stat?.isDirectory() ? stat.mtimeMs : null;
+};
+
+/** The newest decision file mtime, or null when the log is empty. */
+function newestDecisionMs(decisionsDir) {
+	let newest = null;
+	for (const name of listDirSafe(decisionsDir)) {
+		const stamp = fileStamp(path.join(decisionsDir, name));
+		if (stamp && (newest === null || stamp.mtimeMs > newest)) newest = stamp.mtimeMs;
+	}
+	return newest;
+}
+
+/**
+ * The dashboard's memoized `sessionDetail` (plan todo 8): it caches the
+ * historical record only, keyed by every file the reader consumes, and rebuilds
+ * the labels with `buildSessionView` on every call so the audit block and daemon
+ * status (todo 13) are always read fresh. The cache holds at most 20 ids.
+ */
+export function createSessionDetail({ paths, now = Date.now, load = loadSessionRecord, maxEntries = SESSION_CACHE_MAX } = {}) {
+	const locator = createSessionFileLocator({ paths, clock: { now } });
+	const cache = new Map();
+
+	const sessionFileOf = (record) => {
+		const session = record?.session;
+		if (!session) return undefined;
+		if (session.taskId) return locator.childFile({ taskId: session.taskId, sessionId: session.sessionId, cwds: session.cwd ? [session.cwd] : [] });
+		return locator.mainFile(session.sessionId);
+	};
+
+	const signatureOf = (file) =>
+		JSON.stringify({
+			file: fileStamp(file),
+			decisions: newestDecisionMs(paths.health.decisionsDir),
+			investigations: dirMtime(paths.health.investigationsDir),
+			ledger: dirMtime(paths.health.sessionsDir),
+			usage: fileStamp(paths.health.usageIndexFile)?.mtimeMs ?? null,
+		});
+
+	return function sessionDetail(id) {
+		const cached = cache.get(id);
+		if (cached && signatureOf(cached.file) === cached.signature) {
+			cache.delete(id);
+			cache.set(id, cached);
+			return buildSessionView(cached.record, { audit: null });
+		}
+		if (cached) cache.delete(id);
+		const record = load({ paths, id, now: now(), locator });
+		const file = record?.found === true ? sessionFileOf(record) : undefined;
+		cache.set(id, { record, file, signature: signatureOf(file) });
+		while (cache.size > maxEntries) cache.delete(cache.keys().next().value);
+		return buildSessionView(record, { audit: null });
+	};
+}
 
 /** Opens url in the default browser without waiting for it: resolves to { ok, error? }. */
 export function defaultOpenBrowser(url, { platform = process.platform, spawnImpl = spawn } = {}) {
@@ -103,7 +170,7 @@ async function runServer(options, { paths, env, proc }) {
 		const { config } = loadConfig({ env, paths });
 		return id ? runDiagnose({ paths, config, id }) : listSubjectsNow({ paths, config });
 	};
-	const server = createUiServer({ paths, token, idleMs, getState: () => uiState({ paths, env, now: Date.now() }), diagnose, log: (event, data) => logger.error(event, data) });
+	const server = createUiServer({ paths, token, idleMs, getState: () => uiState({ paths, env, now: Date.now() }), diagnose, sessionDetail: createSessionDetail({ paths }), log: (event, data) => logger.error(event, data) });
 	const { port } = await server.listen();
 	proc.send?.({ type: "listening", port }, () => proc.disconnect?.());
 	return new Promise((resolve) => {

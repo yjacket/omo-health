@@ -4,6 +4,7 @@ import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { clearPause, setSwitch, writePause } from "../control.mjs";
+import { writeUiPrefs } from "./prefs.mjs";
 
 const DEFAULT_STATIC_DIR = fileURLToPath(new URL("./static", import.meta.url));
 const MAX_BODY_BYTES = 4096;
@@ -32,9 +33,16 @@ const API_ROUTES = Object.freeze({
 	"/api/resume": "POST",
 	"/api/switch": "POST",
 	"/api/diagnose": "GET",
+	"/api/session": "GET",
+	"/api/prefs": "POST",
 });
 /** A task id or session id, as `omo-health diagnose` takes it. */
 const SUBJECT_ID = /^[A-Za-z0-9_-]{4,80}$/;
+/** The session detail lists, as the record names them; `children` lives on the record, the rest under `health`. */
+const SESSION_LISTS = Object.freeze(["children", "findings", "actions", "investigations", "messages"]);
+const SESSION_QUERY_KEYS = Object.freeze(new Set(["id", "list", "offset"]));
+const SESSION_PAGE = 50;
+const NON_NEGATIVE_INT = /^\d+$/;
 
 const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const hasExactKeys = (obj, keys) => {
@@ -65,6 +73,11 @@ function runAction(paths, route, body, nowMs) {
 			if (!hasExactKeys(body, [])) throw invalid;
 			clearPause(paths);
 			return [200, { ok: true }];
+		}
+		case "/api/prefs": {
+			if (!hasExactKeys(body, ["hideChildren"]) || typeof body.hideChildren !== "boolean") throw invalid;
+			if (!writeUiPrefs(paths, body).ok) throw invalid;
+			return [200, { ok: true, hideChildren: body.hideChildren }];
 		}
 		case "/api/switch": {
 			if (!hasExactKeys(body, ["key", "value"])) throw invalid;
@@ -97,7 +110,7 @@ function readBody(req) {
 	});
 }
 
-export function createUiServer({ paths, token, getState, diagnose, idleMs = 30 * 60_000, now = Date.now, staticDir = DEFAULT_STATIC_DIR, log = () => {} }) {
+export function createUiServer({ paths, token, getState, diagnose, sessionDetail, idleMs = 30 * 60_000, now = Date.now, staticDir = DEFAULT_STATIC_DIR, log = () => {} }) {
 	const expectedDigest = digest(token);
 	let lastRequestMs = now();
 	let port = 0;
@@ -135,6 +148,60 @@ export function createUiServer({ paths, token, getState, diagnose, idleMs = 30 *
 		send(res, 200, await diagnose(id ?? undefined));
 	}
 
+	/** `/api/session` params: exact id, an optional known list and a page offset. Anything else is invalid. */
+	function parseSessionQuery(url) {
+		const query = url.includes("?") ? url.slice(url.indexOf("?") + 1) : "";
+		const params = new URLSearchParams(query);
+		for (const key of params.keys()) if (!SESSION_QUERY_KEYS.has(key)) throw new HttpFailure(422, { error: "invalid" });
+		const id = params.get("id");
+		if (id === null || !SUBJECT_ID.test(id)) throw new HttpFailure(422, { error: "invalid" });
+		const list = params.get("list");
+		const offsetText = params.get("offset");
+		if (list === null) {
+			if (offsetText !== null) throw new HttpFailure(422, { error: "invalid" });
+			return { id, list: null, offset: 0 };
+		}
+		if (!SESSION_LISTS.includes(list)) throw new HttpFailure(422, { error: "invalid" });
+		if (offsetText !== null && !NON_NEGATIVE_INT.test(offsetText)) throw new HttpFailure(422, { error: "invalid" });
+		return { id, list, offset: offsetText === null ? 0 : Number(offsetText) };
+	}
+
+	/** One list of the detail, wherever the record keeps it. */
+	function sessionList(detail, name) {
+		const health = isPlainObject(detail.health) ? detail.health : {};
+		const items = name === "children" ? detail.children : health[name];
+		return Array.isArray(items) ? items : [];
+	}
+
+	/** The default response: the first page of every list plus the whole-record counts. */
+	function sessionFirstPage(detail) {
+		const health = isPlainObject(detail.health) ? detail.health : {};
+		const lists = Object.fromEntries(SESSION_LISTS.map((name) => [name, sessionList(detail, name)]));
+		return {
+			...detail,
+			children: lists.children.slice(0, SESSION_PAGE),
+			health: {
+				...health,
+				findings: lists.findings.slice(0, SESSION_PAGE),
+				actions: lists.actions.slice(0, SESSION_PAGE),
+				investigations: lists.investigations.slice(0, SESSION_PAGE),
+				messages: lists.messages.slice(0, SESSION_PAGE),
+			},
+			counts: Object.fromEntries(SESSION_LISTS.map((name) => [name, lists[name].length])),
+		};
+	}
+
+	/** GET /api/session?id=<task|session>[&list=<name>&offset=<n>]. */
+	async function serveSession(req, res) {
+		const query = parseSessionQuery(req.url);
+		if (!sessionDetail) throw new HttpFailure(404, { error: "not-found" });
+		const detail = await sessionDetail(query.id);
+		if (!isPlainObject(detail) || detail.found === false) throw new HttpFailure(404, { error: "not-found" });
+		if (query.list === null) return send(res, 200, sessionFirstPage(detail));
+		const all = sessionList(detail, query.list);
+		send(res, 200, { list: query.list, offset: query.offset, total: all.length, items: all.slice(query.offset, query.offset + SESSION_PAGE) });
+	}
+
 	async function serveStatic(req, res, pathname) {
 		const entry = Object.hasOwn(STATIC_FILES, pathname) ? STATIC_FILES[pathname] : undefined;
 		if (!entry) throw new HttpFailure(404, { error: "not-found" });
@@ -160,11 +227,13 @@ export function createUiServer({ paths, token, getState, diagnose, idleMs = 30 *
 		const provided = req.headers["x-omo-health-token"] ?? "";
 		if (!crypto.timingSafeEqual(digest(provided), expectedDigest)) throw new HttpFailure(401, { error: "unauthorized" });
 		const isAutoRefresh = req.method === "GET" && pathname === "/api/state" && req.headers["x-omo-health-auto"] === "1";
-		if (!isAutoRefresh) lastRequestMs = now();
+		const isSessionAuto = req.method === "GET" && pathname === "/api/session" && req.headers["x-omo-health-auto"] === "1";
+		if (!isAutoRefresh && !isSessionAuto) lastRequestMs = now();
 		const method = Object.hasOwn(API_ROUTES, pathname) ? API_ROUTES[pathname] : undefined;
 		if (!method) throw new HttpFailure(404, { error: "not-found" });
 		if (req.method !== method) throw new HttpFailure(405, { error: "method-not-allowed" });
 		if (pathname === "/api/diagnose") return serveDiagnose(req, res);
+		if (pathname === "/api/session") return serveSession(req, res);
 		if (method === "GET") return send(res, 200, getState());
 		return servePost(req, res, pathname);
 	}

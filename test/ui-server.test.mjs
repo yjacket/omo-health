@@ -7,11 +7,31 @@ import os from "node:os";
 import path from "node:path";
 import { after, before, beforeEach, describe, it } from "node:test";
 import { resolvePaths } from "../src/paths.mjs";
+import { createSessionDetail } from "../src/ui/cli.mjs";
 import { createUiServer } from "../src/ui/server.mjs";
 
 const TOKEN = "test-token-abc_123";
 const STATE = { generatedMs: 1, overview: { level: "ok" } };
 const IDLE_MS = 60_000;
+const KNOWN_ID = "st_known";
+
+const messages = Array.from({ length: 60 }, (_, i) => ({ ms: 1_000 + i, recipient: KNOWN_ID, text: `m${i}` }));
+const SESSION_DETAIL = {
+	found: true,
+	id: KNOWN_ID,
+	session: { sessionId: KNOWN_ID, kind: "child", title: "known", outcome: "answered", outcomeKo: "응답 후 종료", terminalLabel: null },
+	tokens: null,
+	children: Array.from({ length: 60 }, (_, i) => ({ sessionId: `c${i}`, outcomeKo: "종료됨" })),
+	health: {
+		findings: Array.from({ length: 55 }, (_, i) => ({ fp: `fp-${i}`, titleKo: "도구 호출 멈춤" })),
+		actions: [{ actionKo: "원인 프로세스 종료", resultKo: "실행" }],
+		investigations: [{ id: "fp-1", verdictKo: "의심", verdictHistory: [] }],
+		messages,
+		counts: { findings: 55, actions: 1, investigations: 1, messages: 60 },
+	},
+	audit: null,
+};
+const sessionDetail = async (id) => (id === KNOWN_ID ? SESSION_DETAIL : { found: false, id });
 
 let root;
 let paths;
@@ -29,7 +49,7 @@ before(async () => {
 	fs.writeFileSync(path.join(staticDir, "app.css"), "body{}\n");
 	clock = 1_000_000;
 	const diagnose = async (id) => (id ? { found: true, id } : { subjects: [{ id: "st_c" }] });
-	server = createUiServer({ paths, token: TOKEN, getState: () => STATE, diagnose, idleMs: IDLE_MS, now: () => clock, staticDir });
+	server = createUiServer({ paths, token: TOKEN, getState: () => STATE, diagnose, sessionDetail, idleMs: IDLE_MS, now: () => clock, staticDir });
 	({ port } = await server.listen());
 });
 
@@ -41,6 +61,7 @@ after(async () => {
 beforeEach(() => {
 	fs.rmSync(paths.health.configFile, { force: true });
 	fs.rmSync(paths.health.pauseFile, { force: true });
+	fs.rmSync(paths.health.uiPrefsFile, { force: true });
 });
 
 /** One request on a fresh connection; resolves { status, headers, body } with body parsed as JSON when possible. */
@@ -310,6 +331,150 @@ describe("ui server", { timeout: 20_000 }, () => {
 			assert.equal(server.checkIdle(last + IDLE_MS), true);
 			clock = last + IDLE_MS + 1;
 			assert.equal(server.checkIdle(), true);
+		});
+	});
+
+	describe("session detail", () => {
+		it("returns the first 50 items of every list with whole-record counts", async () => {
+			const res = await request({ path: `/api/session?id=${KNOWN_ID}` });
+			assert.equal(res.status, 200);
+			assert.equal(res.body.session.title, "known");
+			assert.equal(res.body.health.messages.length, 50);
+			assert.deepEqual(res.body.health.messages.map((m) => m.text), messages.slice(0, 50).map((m) => m.text));
+			assert.deepEqual(res.body.counts, { children: 60, findings: 55, actions: 1, investigations: 1, messages: 60 });
+			assert.equal(res.body.children.length, 50);
+			assert.equal(res.body.health.findings.length, 50);
+		});
+
+		it("pages one list with list and offset", async () => {
+			const res = await request({ path: `/api/session?id=${KNOWN_ID}&list=messages&offset=50` });
+			assert.equal(res.status, 200);
+			assert.equal(res.body.list, "messages");
+			assert.equal(res.body.offset, 50);
+			assert.equal(res.body.total, 60);
+			assert.deepEqual(res.body.items.map((m) => m.text), messages.slice(50).map((m) => m.text));
+			const empty = await request({ path: `/api/session?id=${KNOWN_ID}&list=actions&offset=400` });
+			assert.deepEqual([empty.status, empty.body.items.length, empty.body.total], [200, 0, 1]);
+		});
+
+		it("rejects an unknown list, a bad offset and unknown query params with 422", async () => {
+			assert.equal((await request({ path: `/api/session?id=${KNOWN_ID}&list=secrets` })).status, 422);
+			assert.equal((await request({ path: `/api/session?id=${KNOWN_ID}&list=messages&offset=-1` })).status, 422);
+			assert.equal((await request({ path: `/api/session?id=${KNOWN_ID}&list=messages&offset=1.5` })).status, 422);
+			assert.equal((await request({ path: `/api/session?id=${KNOWN_ID}&offset=1` })).status, 422);
+			assert.equal((await request({ path: `/api/session?id=${KNOWN_ID}&extra=1` })).status, 422);
+		});
+
+		it("rejects a malformed or missing id with 422", async () => {
+			assert.equal((await request({ path: "/api/session" })).status, 422);
+			assert.equal((await request({ path: "/api/session?id=..%2Fx" })).status, 422);
+			assert.equal((await request({ path: "/api/session?id=COM1x%2F.." })).status, 422);
+		});
+
+		it("answers 404 for an unknown id and when no callback is injected", async () => {
+			const missing = await request({ path: "/api/session?id=st_nope" });
+			assert.equal(missing.status, 404);
+			assert.deepEqual(missing.body, { error: "not-found" });
+			const bare = createUiServer({ paths, token: TOKEN, getState: () => STATE });
+			const { port: barePort } = await bare.listen();
+			try {
+				const res = await new Promise((resolve, reject) => {
+					const req = http.request({ host: "127.0.0.1", port: barePort, path: `/api/session?id=${KNOWN_ID}`, headers: { "x-omo-health-token": TOKEN }, agent: false }, (r) => {
+						const chunks = [];
+						r.on("data", (c) => chunks.push(c));
+						r.on("end", () => resolve({ status: r.statusCode, body: JSON.parse(Buffer.concat(chunks).toString("utf8")) }));
+					});
+					req.on("error", reject);
+					req.end();
+				});
+				assert.deepEqual([res.status, res.body], [404, { error: "not-found" }]);
+			} finally {
+				await bare.close();
+			}
+		});
+
+		it("checks the token before the route and rejects a POST with 405", async () => {
+			assert.equal((await request({ path: `/api/session?id=${KNOWN_ID}`, token: null })).status, 401);
+			const post = await postJson("/api/session", { id: KNOWN_ID });
+			assert.equal(post.status, 405);
+			assert.equal(post.headers.allow, "GET, POST");
+		});
+
+		it("does not extend idle for an auto GET but counts a plain GET", async () => {
+			const before = server.lastRequestMs;
+			clock = before + 4_000;
+			assert.equal((await request({ path: `/api/session?id=${KNOWN_ID}`, headers: { "x-omo-health-auto": "1" } })).status, 200);
+			assert.equal(server.lastRequestMs, before);
+			assert.equal((await request({ path: `/api/session?id=${KNOWN_ID}` })).status, 200);
+			assert.equal(server.lastRequestMs, clock);
+		});
+	});
+
+	describe("prefs", () => {
+		it("writes ui-prefs.json for hideChildren", async () => {
+			const res = await postJson("/api/prefs", { hideChildren: true });
+			assert.equal(res.status, 200);
+			assert.deepEqual(res.body, { ok: true, hideChildren: true });
+			assert.deepEqual(JSON.parse(fs.readFileSync(paths.health.uiPrefsFile, "utf8")), { v: 1, hideChildren: true });
+			assert.equal((await postJson("/api/prefs", { hideChildren: false })).status, 200);
+			assert.deepEqual(JSON.parse(fs.readFileSync(paths.health.uiPrefsFile, "utf8")), { v: 1, hideChildren: false });
+		});
+
+		it("rejects a non-boolean value and extra keys with 422 without writing", async () => {
+			assert.equal((await postJson("/api/prefs", { hideChildren: "yes" })).status, 422);
+			assert.equal((await postJson("/api/prefs", { hideChildren: true, extra: 1 })).status, 422);
+			assert.equal((await postJson("/api/prefs", {})).status, 422);
+			assert.equal(fs.existsSync(paths.health.uiPrefsFile), false);
+		});
+
+		it("rejects a foreign origin with 403 without writing", async () => {
+			const res = await postJson("/api/prefs", { hideChildren: true }, { origin: "http://evil.com" });
+			assert.equal(res.status, 403);
+			assert.deepEqual(res.body, { error: "forbidden-origin" });
+			assert.equal(fs.existsSync(paths.health.uiPrefsFile), false);
+		});
+	});
+
+	describe("session detail memo", () => {
+		const fakeRecord = (id) => ({ found: true, id, session: { sessionId: id, kind: "main", title: id, outcome: "closed" }, children: [], health: { findings: [], actions: [], investigations: [], messages: [], counts: { findings: 0, actions: 0, investigations: 0, messages: 0 } }, audit: null });
+
+		it("reuses one record while nothing changes and invalidates when a decision file changes", () => {
+			let calls = 0;
+			const load = ({ id }) => {
+				calls += 1;
+				return fakeRecord(id);
+			};
+			const detail = createSessionDetail({ paths, load });
+			assert.equal(detail("st_memo").session.title, "st_memo");
+			assert.equal(detail("st_memo").session.title, "st_memo");
+			assert.equal(calls, 1);
+			const file = path.join(paths.health.decisionsDir, "2026-11-21.jsonl");
+			fs.mkdirSync(paths.health.decisionsDir, { recursive: true });
+			fs.writeFileSync(file, "{}\n");
+			fs.utimesSync(file, clock + 10_000, clock + 10_000);
+			assert.equal(detail("st_memo").session.title, "st_memo");
+			assert.equal(calls, 2);
+			assert.equal(detail("st_memo").session.title, "st_memo");
+			assert.equal(calls, 2);
+		});
+
+		it("invalidates when the session file itself grows", () => {
+			let calls = 0;
+			const load = ({ id }) => {
+				calls += 1;
+				return fakeRecord(id);
+			};
+			const slug = path.join(paths.sessionsDir, "slug");
+			fs.mkdirSync(slug, { recursive: true });
+			const file = path.join(slug, "2026-11-21T00-00-00-000Z_grow01.jsonl");
+			fs.writeFileSync(file, "{}\n");
+			const detail = createSessionDetail({ paths, load });
+			detail("grow01");
+			detail("grow01");
+			assert.equal(calls, 1);
+			fs.appendFileSync(file, "{\"type\":\"session\"}\n");
+			detail("grow01");
+			assert.equal(calls, 2);
 		});
 	});
 
