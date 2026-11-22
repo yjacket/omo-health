@@ -47,6 +47,23 @@ test("mainFile finds a main session file by the id in its file name", (t) => {
 	assert.equal(locator.mainFile("sess-unknown"), undefined);
 });
 
+test("(IS-3) mainFile maps cold files by their headers, not a conflicting name", (t) => {
+	const { paths, clock, locator } = setup(t);
+	const file = writeMain(paths, "wrong-id");
+	fs.writeFileSync(file, '{"type":"session","id":"header-id"}\n');
+	const unnamed = path.join(path.dirname(file), `${STAMP}_.jsonl`);
+	fs.writeFileSync(unnamed, '{"type":"session","id":"unnamed-id"}\n');
+
+	assert.equal(locator.mainFile("wrong-id"), undefined, "a header for another session disproves the filename");
+	assert.equal(locator.mainFile("header-id"), file);
+	assert.equal(locator.mainFile("unnamed-id"), unnamed);
+	fs.writeFileSync(unnamed, '{"type":"session","id":"new-id"}\n');
+	assert.equal(locator.mainFile("new-id"), undefined, "a new header ID is not picked up inside the rescan interval");
+	clock.advance(RESCAN);
+	assert.equal(locator.mainFile("new-id"), unnamed);
+	assert.equal(locator.mainFile("unnamed-id"), undefined);
+});
+
 test("(plan 41) mainFile uses a saved custom path only while its first line matches", (t) => {
 	const { paths, root, clock, locator } = setup(t);
 	const id = "sess-review";

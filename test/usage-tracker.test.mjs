@@ -11,6 +11,7 @@ import { makeWorld, sessionState, taskRecord } from "./helpers/world.mjs";
 import { compactUsage, createUsageIndex, readUsageIndex, USAGE_TICK_BYTES } from "../src/usage-index.mjs";
 import { endedRow } from "../src/ui/model.mjs";
 import { createUsageTracker } from "../src/usage-tracker.mjs";
+import { backfillOnce } from "../src/session-backfill.mjs";
 import { appendEnded, appendEndedLocated, ENDED_LOCATION, streamEnded } from "../src/session-ledger.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 import { buildSessionSnapshot, detectEnded } from "../src/session-board.mjs";
@@ -213,6 +214,31 @@ test("(plan 41) a sensor-reported review.jsonl keeps the live token total in his
 	assert.equal(saved.get(id)?.file, file);
 	assert.equal(history.tokensGone, false);
 	assert.equal(history.tokens?.total, liveRow.tokens.total);
+});
+
+test("(IS-3) cold backlog shows tokens in history for a backfilled review.jsonl", (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const id = "review-session";
+	const file = path.join(s.paths.sessionsDir, "proj", "review.jsonl");
+	const endedMs = T0 - 60 * 60_000;
+	writeJsonl(file, [E.header(id, s.cwd, endedMs - 5000), E.assistant({ ms: endedMs, usage: usage(38, 4) })]);
+	fs.utimesSync(file, endedMs / 1000, endedMs / 1000);
+
+	assert.equal(backfillOnce(s.paths, s.clock.now()).counts.written, 1);
+	const rows = [...streamEnded(s.paths, { withLocation: true })];
+	assert.deepEqual(rows.map((row) => row.sessionId), [id]);
+	assert.equal(s.index.has(id), false);
+	assert.equal(fs.existsSync(s.paths.health.usageIndexFile), false);
+	assert.equal(s.tracker.queueLedger(rows.values()), 1);
+	s.tracker.tick(emptyWorld(s.clock));
+
+	const saved = readUsageIndex(s.paths.health.usageIndexFile);
+	const history = endedRow(rows[0], 0, saved);
+	assert.equal(history.tokensState, "ok");
+	assert.equal(history.tokens?.total, 42);
+	assert.equal(history.tokensGone, false);
+	assert.equal(saved.get(id)?.file, file);
 });
 
 test("(plan 41) main file verification rejects wrong, missing, and oversized headers but trusts matching filenames", (t) => {

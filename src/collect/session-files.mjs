@@ -11,7 +11,7 @@ export function mainSessionFileMatches(file, sessionId) {
 /**
  * Locate the session JSONL behind an ended-session ledger row (GAP-2).
  *
- * Main sessions live at `<agentDir>/sessions/<slug>/<timestamp>_<sessionId>.jsonl`
+ * Main sessions live under `<agentDir>/sessions/<slug>/`, usually named `<timestamp>_<sessionId>.jsonl`
  * (`src/session-backfill.mjs`, `src/collect/sessions.mjs`).
  * Child sessions live at `<senpiTaskStoreDir(cwd)>/children/<taskId>/sessions/<taskId>/<timestamp>_<sessionId>.jsonl`
  * (`src/collect/tasks.mjs` `senpiTaskStoreDir`, `findChildSessionFile`).
@@ -60,14 +60,22 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 			for (const name of listDirSafe(dir)) {
 				if (!name.endsWith(".jsonl")) continue;
 				const file = path.join(dir, name);
-				if (statSafe(file)?.isFile()) found.set(idFromFileName(file), file);
+				if (!statSafe(file)?.isFile()) continue;
+				const nameId = idFromFileName(file);
+				const headerId = readSessionHeader(file)?.id;
+				if (typeof headerId === "string" && headerId && headerId !== nameId) {
+					// A differing header identifies this file, but don't displace a matching filename for that id.
+					if (!found.has(headerId)) found.set(headerId, file);
+				} else if (nameId) {
+					found.set(nameId, file);
+				}
 			}
 		}
 		mainFiles = found;
 		mainScannedMs = nowMs();
 	};
 
-	/** Prefer the indexed custom path; otherwise look up the filename id. The tracker supplies its in-memory path (or null). */
+	/** Prefer the indexed custom path; otherwise use the scan's header/filename map. */
 	const mainFile = (sessionId, indexedFile = indexedMainFile(sessionId)) => {
 		if (!sessionId) return undefined;
 		if (indexedFile && idFromFileName(indexedFile) !== sessionId && mainSessionFileMatches(indexedFile, sessionId)) return indexedFile;
