@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createSessionFileLocator } from "./collect/session-files.mjs";
-import { actionDetail, readDecisions } from "./decisions.mjs";
+import { actionDetail, readDecisions, streamDecisions } from "./decisions.mjs";
 import { streamEnded } from "./session-ledger.mjs";
 import { compactUsage, readUsageIndex, treeTotals } from "./usage-index.mjs";
 import { reasonCode } from "./audit-codes.mjs";
@@ -11,7 +11,8 @@ import { redact, truncate } from "./util/text.mjs";
 /**
  * The per-session record (plan todo 7, GAP-6): everything omo-health itself
  * recorded about one ended session and its descendants. The loader reads the
- * 30-day ledger, the token index, the full decision log, every investigation
+ * 30-day ledger, the token index, recent decisions plus retained machine
+ * incident history, every investigation
  * file and the `omo-health` transcript entries of the session and its
  * descendants; `buildSessionRecord` is pure and does the joining.
  *
@@ -106,47 +107,32 @@ function subjectMatches(subject, allowed) {
 	return ["sessionId", "taskId", "parentSessionId", "rootSessionId"].some((key) => nonEmpty(subject[key]) && allowed.has(subject[key]));
 }
 
-/** Per fp: the [opened, resolved] intervals built from the lifecycle rows, oldest first. */
-function intervalsOf(rows) {
-	const intervals = [];
-	let start = null;
-	for (const { ts, event } of rows) {
-		if (event === "opened" || event === "reopened") {
-			if (start === null) start = ts;
-		} else if (event === "resolved" && start !== null) {
-			intervals.push({ start, end: ts });
-			start = null;
-		}
-	}
-	if (start !== null) intervals.push({ start, end: null });
-	return intervals;
-}
-
 /**
  * Machine-wide incidents (no subject session or task) whose active interval
- * overlaps [startedMs, endMs]. Each is returned once, with its opened row.
+ * overlaps the session window. Consume lifecycle rows oldest first and keep
+ * only the open intervals and the first overlapping opener per fingerprint.
  */
-function machineFindings(decisions, startedMs, endMs) {
-	const byFp = new Map();
+function machineFindings(decisions, row) {
+	const startedMs = msOf(row.startedMs);
+	const endedMs = msOf(row.endedMs);
+	const startMs = Number.isFinite(startedMs) ? startedMs : -Infinity;
+	const endMs = Number.isFinite(endedMs) ? endedMs : Number.isFinite(startedMs) ? startedMs : Infinity;
+	const open = new Map();
+	const matched = new Map();
 	for (const entry of decisions) {
 		if (!isRecord(entry) || !FINDING_EVENTS.has(entry.event) || !nonEmpty(entry.fp)) continue;
+		const { fp, event, subject } = entry;
 		const ts = timeOf(entry);
-		if (!Number.isFinite(ts)) continue;
-		const rows = byFp.get(entry.fp) ?? [];
-		rows.push({ ts, event: entry.event, entry });
-		byFp.set(entry.fp, rows);
+		if (!Number.isFinite(ts) || matched.has(fp)) continue;
+		if (event === "resolved") {
+			const opened = open.get(fp);
+			if (opened && ts >= startMs) matched.set(fp, opened);
+			open.delete(fp);
+		} else if (ts <= endMs && !open.has(fp) && !nonEmpty(subject?.sessionId) && !nonEmpty(subject?.taskId)) {
+			open.set(fp, machineRow(entry, fp, ts));
+		}
 	}
-	const out = [];
-	for (const [fp, rows] of byFp) {
-		rows.sort((a, b) => a.ts - b.ts);
-		const subject = rows.find((r) => isRecord(r.entry.subject))?.entry.subject;
-		if (isRecord(subject) && (nonEmpty(subject.sessionId) || nonEmpty(subject.taskId))) continue;
-		const overlap = intervalsOf(rows).some(({ start, end }) => start <= endMs && (end === null || end >= startedMs));
-		if (!overlap) continue;
-		const opened = rows.find((r) => r.event === "opened") ?? rows[0];
-		out.push(machineRow(opened.entry, fp, opened.ts));
-	}
-	return out;
+	return [...matched.values(), ...open.values()];
 }
 
 function machineRow(entry, fp, ts) {
@@ -314,7 +300,7 @@ export function buildSessionRecord(inputs = {}) {
 			scope: "session",
 			evidence: cleanLines(entry.evidence, EVIDENCE_LINES_MAX, EVIDENCE_LINE_MAX),
 		}));
-	const machine = machineFindings(decisions, Number.isFinite(startedMs) ? startedMs : -Infinity, Number.isFinite(endedMs) ? endedMs : Number.isFinite(startedMs) ? startedMs : Infinity);
+	const machine = inputs.machineFindings ?? machineFindings(decisions.filter((entry) => Number.isFinite(timeOf(entry))).sort((a, b) => timeOf(a) - timeOf(b)), row);
 	const allFindings = [...findings, ...machine].sort(byNewest);
 
 	const actions = selected
@@ -568,6 +554,7 @@ export function loadSessionRecord({ paths, id, now = Date.now(), messageScanMaxB
 	const { row, descendants, ancestors, scanned } = joined;
 	const startedMs = msOf(row.startedMs);
 	const decisions = readDecisions(paths, (Number.isFinite(startedMs) ? startedMs : now) - 30 * DAY_MS);
+	const machine = machineFindings(streamDecisions(paths), row);
 	const investigations = readAllInvestigations(paths);
 	const loc = locator ?? createSessionFileLocator({ paths, clock: { now: () => now } });
 
@@ -595,5 +582,5 @@ export function loadSessionRecord({ paths, id, now = Date.now(), messageScanMaxB
 		for (const message of scanMessages(file) ?? []) messages.push({ ...message, recipient: sessionId });
 	}
 
-	return buildSessionRecord({ id, row, descendants, usage, decisions, investigations, messages, truncated: { messagesSkipped: skipped } });
+	return buildSessionRecord({ id, row, descendants, usage, decisions, machineFindings: machine, investigations, messages, truncated: { messagesSkipped: skipped } });
 }

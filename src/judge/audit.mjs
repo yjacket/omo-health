@@ -51,6 +51,7 @@ const DETECTOR_ID = /^D\d+$/;
 const AUDIT_CHECK_MAX = 40;
 /** The bundle's finding slots before truncation. */
 const FINDING_SLOTS = 50;
+const MACHINE_FINDING_SLOTS = 20;
 
 /** The fixed question the reviewer answers; it is the only free prose in the bundle. */
 export const AUDIT_QUESTION = "Review whether omo-health's findings, actions and token accounting for this session were right.";
@@ -218,26 +219,31 @@ function firedDetectorIds(findings) {
 }
 
 /**
- * Cut findings to `slots` while keeping the first finding of every fired
- * detector: representatives first, then the remaining rows in their original
- * order. Throws when the representatives alone do not fit.
+ * Reserve a finding for every fired detector before filling the remaining
+ * slots in record order. Prefer session representatives so that only
+ * machine-only detectors require machine slots.
  */
-function selectFindings(findings, fired, slots) {
-	if (findings.length <= slots) return findings;
-	const firedSet = new Set(fired);
-	const chosen = new Set();
-	const represented = new Set();
-	for (let i = 0; i < findings.length && chosen.size < slots; i += 1) {
-		const { detector } = findings[i];
-		if (!firedSet.has(detector) || represented.has(detector)) continue;
-		represented.add(detector);
-		chosen.add(i);
+function selectFindings(findings, fired) {
+	if (fired.length > AUDIT_CHECK_MAX || fired.length > FINDING_SLOTS) throw new Error("evidence-too-large");
+	if (findings.length <= FINDING_SLOTS && findings.filter(({ scope }) => scope === "machine").length <= MACHINE_FINDING_SLOTS) return findings;
+	const representatives = new Map(fired.map((detector) => [detector, null]));
+	for (const finding of findings) {
+		const current = representatives.get(finding.detector);
+		if (current === null || (current?.scope === "machine" && finding.scope !== "machine")) representatives.set(finding.detector, finding);
 	}
-	if (represented.size < firedSet.size) throw new Error("evidence-too-large");
-	for (let i = 0; i < findings.length && chosen.size < slots; i += 1) {
-		if (!chosen.has(i)) chosen.add(i);
+	const chosen = new Set(representatives.values());
+	let machine = [...chosen].filter(({ scope }) => scope === "machine").length;
+	if (machine > MACHINE_FINDING_SLOTS) throw new Error("evidence-too-large");
+	for (const finding of findings) {
+		if (chosen.size === FINDING_SLOTS) break;
+		if (chosen.has(finding)) continue;
+		if (finding.scope === "machine") {
+			if (machine === MACHINE_FINDING_SLOTS) continue;
+			machine += 1;
+		}
+		chosen.add(finding);
 	}
-	return [...chosen].sort((a, b) => a - b).map((index) => findings[index]);
+	return findings.filter((finding) => chosen.has(finding));
 }
 
 function actionsOf(list) {
@@ -407,7 +413,8 @@ export function auditBundle(record, timeline, { config, now } = {}) {
 	// Coverage is judged on every finding, before any cut: an answer cannot be
 	// required to cover more detectors than it has checks.
 	const fired = firedDetectorIds(allFindings);
-	if (fired.length > AUDIT_CHECK_MAX) throw new Error("evidence-too-large");
+	const findings = selectFindings(allFindings, fired);
+	truncated.findings = findings.length < allFindings.length;
 	const bundle = {
 		session: {
 			sessionId: textOf(session.sessionId),
@@ -456,10 +463,7 @@ export function auditBundle(record, timeline, { config, now } = {}) {
 			truncated.topTurns = true;
 		}
 		if (sizeOf(bundle) > BUNDLE_MAX_CHARS) {
-			if (bundle.omo_health_record.findings.length > FINDING_SLOTS) {
-				bundle.omo_health_record.findings = selectFindings(allFindings, fired, FINDING_SLOTS);
-				truncated.findings = true;
-			}
+			bundle.omo_health_record.findings = findings;
 			if (bundle.omo_health_record.actions.length > 50) {
 				bundle.omo_health_record.actions = bundle.omo_health_record.actions.slice(0, 50);
 				truncated.actions = true;
@@ -475,6 +479,8 @@ export function auditBundle(record, timeline, { config, now } = {}) {
 		}
 		if (sizeOf(bundle) > BUNDLE_MAX_CHARS) throw new Error("evidence-too-large");
 	}
+	// The finding caps apply even when the byte budget did not require trimming.
+	bundle.omo_health_record.findings = findings;
 	assertBundleText(bundle);
 	// `now` is accepted so callers and tests use the same clock seam as the rest of the record path.
 	void now;

@@ -469,6 +469,19 @@ test("a fired detector whose only finding is the 60th keeps a representative row
 	assert.equal(audit.hasDetectorCoverage(covering, audit.firedDetectors(bundle), audit.detectorFindingRefs(bundle)), true);
 });
 
+test("the machine cap keeps the oldest finding when it alone represents D23", () => {
+	const findings = Array.from({ length: 25 }, (_, i) => finding(i, 1, {
+		ts: iso(T0 - i), detector: i === 24 ? "D23" : "D6", scope: "machine", subject: {},
+	}));
+	const bundle = auditBundle(emptyRecord({ health: { findings } }), timelineShell(), { config: DEFAULT_CONFIG, now: T0 });
+	assert.deepEqual(bundle.omo_health_record.findings.map(({ ref }) => ref), [
+		...Array.from({ length: 19 }, (_, i) => `F${i + 1}`), "F25",
+	]);
+	assert.equal(bundle.truncated.findings, true);
+	assert.deepEqual(audit.firedDetectors(bundle), ["D6", "D23"]);
+	assert.match(auditDocument(bundle), /^Fired detectors: D6, D23\. Write at least one check per fired detector\./m);
+});
+
 test("more than 40 fired detectors throw evidence-too-large even when the bundle fits", () => {
 	const findings = Array.from({ length: 41 }, (_, i) => finding(i, 1, { detector: `D${i + 1}` }));
 	assert.throws(() => auditBundle(emptyRecord({ health: { findings } }), timelineShell(), { config: DEFAULT_CONFIG, now: T0 }), /evidence-too-large/);

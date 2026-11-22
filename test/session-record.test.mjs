@@ -256,6 +256,26 @@ test("a machine outage opened before the session and resolved during it is inclu
 	assert.deepEqual(machine, ["fp-outage-open"]);
 });
 
+test("the loader includes overlapping machine incidents opened 31 days before the session", () => {
+	const { paths } = setup();
+	const openedMs = T0 - 31 * 24 * HOUR;
+	const incident = { subject: { key: "machine" }, detector: "D6", kind: "provider-down", severity: "warn" };
+	writeLedger(paths, [mainRow()]);
+	writeDecisions(paths, [
+		{ ...incident, fp: "fp-open", event: "opened", ts: iso(openedMs) },
+		{ ...incident, fp: "fp-during", event: "opened", ts: iso(openedMs + MIN) },
+		{ ...incident, fp: "fp-closed", event: "opened", ts: iso(openedMs + 2 * MIN) },
+		{ ...incident, fp: "fp-closed", event: "resolved", ts: iso(T0 - MIN) },
+		{ ...incident, fp: "fp-during", event: "resolved", ts: iso(T0 + MIN) },
+	]);
+	const record = loadSessionRecord({ paths, id: "s-main", now: T0 + 24 * HOUR });
+	const machine = record.health.findings.filter(({ scope }) => scope === "machine");
+	assert.deepEqual(machine.map(({ fp, ts, event }) => [fp, ts, event]), [
+		["fp-during", iso(openedMs + MIN), "opened"],
+		["fp-open", iso(openedMs), "opened"],
+	]);
+});
+
 test("transcript omo-health entries are collected; other custom types and a tool result quoting the string are ignored", () => {
 	const { paths } = setup();
 	writeLedger(paths, baseRows());
