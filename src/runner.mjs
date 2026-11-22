@@ -213,8 +213,9 @@ export function createRunner({ paths, spawnImpl = spawn, clock, env = process.en
 				}
 				const options = { cwd: cwd ?? f.dir, env: childEnv(env), windowsHide: true, stdio: ["ignore", ...fds] };
 				try {
-					// A shell job stays attached: DETACHED_PROCESS makes cmd.exe lose its redirected stdout and stderr. Windows does not end a
-					// child with its parent, so it still survives a daemon restart.
+					// A shell job stays attached: DETACHED_PROCESS makes cmd.exe lose its redirected stdout and stderr. An attached child is in
+					// libuv's kill-on-close job object, so a .cmd job ends with the daemon (seen in QA, 2026-11-22); only an .exe command such as
+					// omo.exe runs detached and survives a daemon restart.
 					child = useShell ? spawnImpl([command, ...args].map(quote).join(" "), [], { ...options, detached: false, shell: true }) : spawnImpl(command, args, { ...options, detached: true, shell: false });
 				} catch (error) {
 					throw spawnError(error, undefined);
