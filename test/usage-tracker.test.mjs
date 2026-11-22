@@ -605,6 +605,47 @@ test("tokensOf reports treeTokens only when a descendant pushes the tree above t
 	assert.deepEqual(s.tracker.tokensOf("c2"), { tokens: compactUsage(s.index.get("c2")), treeTokens: null });
 });
 
+test("sparse queued children recover ledger-only cwds in one pass per needed day", (t) => {
+	const s = setup("usage-tracker-sparse-");
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const files = new Map();
+	const reads = new Map();
+	const tracker = createUsageTracker({ paths: s.paths, index: s.index, locator: s.locator, clock: s.clock, ledgerFs: {
+		...fs,
+		openSync(file, ...args) {
+			const fd = fs.openSync(file, ...args);
+			files.set(fd, file);
+			return fd;
+		},
+		readSync(fd, ...args) {
+			const n = fs.readSync(fd, ...args);
+			const file = files.get(fd);
+			reads.set(file, (reads.get(file) ?? 0) + n);
+			return n;
+		},
+	} });
+	const rows = [];
+	const dayBytes = new Map();
+	for (const [i, total] of [42, 7, null, 19].entries()) {
+		const sessionId = `sparse-${i}`;
+		const taskId = `st_sparse_${i}`;
+		const cwd = path.join(s.cwd, `proj-${i}`);
+		const row = { sessionId, taskId, kind: "child", endedMs: i === 3 ? T0 - DAY : T0 + i };
+		const { location } = appendEndedLocated(s.paths, { ...row, cwd }, { nowMs: T0 });
+		dayBytes.set(location.file, fs.statSync(location.file).size);
+		if (total !== null) writeJsonl(childFile(cwd, taskId, sessionId), [E.assistant({ ms: T0, usage: usage(total) })]);
+		rows.push(row);
+	}
+	appendEnded(s.paths, { sessionId: "unrelated", cwd: s.cwd, endedMs: T0 - 2 * DAY }, { nowMs: T0 });
+	assert.equal(tracker.queueLedger(rows), 4);
+	const tick = tracker.tick(emptyWorld(s.clock));
+	const totals = rows.map(({ sessionId }) => tracker.tokensOf(sessionId)?.tokens?.total ?? null);
+	t.diagnostic(`totals=${JSON.stringify(totals)}, ledger bytes by day=${JSON.stringify([...reads.values()])}`);
+	assert.deepEqual(totals, [42, 7, null, 19]);
+	assert.equal(tick.missing, 1);
+	assert.deepEqual(reads, dayBytes);
+});
+
 test("(gate 20) a 128-child live burst reads each appended ledger line once, not the whole day", (t) => {
 	const s = setup("usage-tracker-live128-");
 	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));

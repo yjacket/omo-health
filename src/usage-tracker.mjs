@@ -1,6 +1,6 @@
 import { idFromFileName } from "./collect/sessions.mjs";
 import { pathKey } from "./paths.mjs";
-import { ENDED_LOCATION, readEndedCwd } from "./session-ledger.mjs";
+import { ENDED_LOCATION, readEndedCwd, readEndedCwds } from "./session-ledger.mjs";
 import { USAGE_TICK_BYTES, compactUsage, fresh as isFresh, treeTotals } from "./usage-index.mjs";
 
 /**
@@ -18,6 +18,7 @@ const DAY_MS = 24 * 60 * 60_000;
 const ANCESTOR_DEPTH = 8;
 
 const isNonEmptyString = (value) => typeof value === "string" && value.length > 0;
+const needsLedgerCwd = (row) => Object.hasOwn(row, ENDED_LOCATION) && !row[ENDED_LOCATION] && row.cwd === undefined;
 
 /**
  * @param {object} options
@@ -26,7 +27,7 @@ const isNonEmptyString = (value) => typeof value === "string" && value.length > 
  * @param {object} options.locator      createSessionFileLocator() instance
  * @param {object} options.clock        {now()}
  * @param {object} options.log          {info, error}
- * @param {object} [options.ledgerFs]   fs implementation for located ledger reads (tests count bytes)
+ * @param {object} [options.ledgerFs]   fs implementation for ledger cwd reads (tests count bytes)
  */
 export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs } = {}) {
 	const nowMs = () => (typeof clock?.now === "function" ? clock.now() : Date.now());
@@ -39,16 +40,8 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 	let fullLogged = false;
 	let sawBacklog = false;
 
-	const cwdCandidates = (row, liveSessions) => {
-		const cwds = [];
-		const push = (cwd) => {
-			if (isNonEmptyString(cwd) && !cwds.includes(cwd)) cwds.push(cwd);
-		};
-		const cwdOf = (node) => {
-			if (!paths || !node) return undefined;
-			return node[ENDED_LOCATION] ? readEndedCwd(paths, node, ledgerFs ? { fs: ledgerFs } : undefined) : node.cwd;
-		};
-		push(cwdOf(row));
+	const cwdChain = function* (row, liveSessions) {
+		yield row;
 		const seen = new Set();
 		if (isNonEmptyString(row?.sessionId)) seen.add(row.sessionId);
 		let current = row;
@@ -58,10 +51,18 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			seen.add(parentId);
 			const parent = ledgerRows.get(parentId) ?? index.get(parentId) ?? liveSessions?.get?.(parentId);
 			if (!parent) break;
-			push(cwdOf(parent));
+			yield parent;
 			current = parent;
 		}
-		return cwds;
+	};
+
+	const cwdCandidates = (row, liveSessions, cwdOf) => {
+		const cwds = new Set();
+		for (const node of cwdChain(row, liveSessions)) {
+			const cwd = cwdOf(node);
+			if (isNonEmptyString(cwd)) cwds.add(cwd);
+		}
+		return [...cwds];
 	};
 
 	const metaOf = (source) => ({
@@ -72,18 +73,18 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 	});
 
 	/** The live session's own file, only when it is the exact file the locator would choose. */
-	const verifiedFile = (session, liveSessions) => {
+	const verifiedFile = (session, liveSessions, cwdOf) => {
 		const file = session?.file;
 		if (!isNonEmptyString(file)) return undefined;
 		if (session.kind === "main") return idFromFileName(file) === session.id ? file : undefined;
 		if (session.kind !== "child" || !isNonEmptyString(session.taskId)) return undefined;
-		const found = locator?.childFile?.({ taskId: session.taskId, sessionId: session.id, cwds: cwdCandidates(session, liveSessions) });
+		const found = locator?.childFile?.({ taskId: session.taskId, sessionId: session.id, cwds: cwdCandidates(session, liveSessions, cwdOf) });
 		return found && pathKey(found) === pathKey(file) ? file : undefined;
 	};
 
-	const locate = (row, liveSessions) => {
+	const locate = (row, liveSessions, cwdOf) => {
 		if (row.kind === "child") {
-			return locator?.childFile?.({ taskId: row.taskId ?? row.sessionId, sessionId: row.sessionId, cwds: cwdCandidates(row, liveSessions) });
+			return locator?.childFile?.({ taskId: row.taskId ?? row.sessionId, sessionId: row.sessionId, cwds: cwdCandidates(row, liveSessions, cwdOf) });
 		}
 		return locator?.mainFile?.(row.sessionId);
 	};
@@ -108,8 +109,8 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 		 */
 		queueLedger(rows) {
 			const cutoff = nowMs() - 30 * DAY_MS;
-			// The daemon passes a stream for the daily window and a one-row
-			// array for live exits. Only sweep the old window on refresh.
+			// The daemon passes a stream for the daily window and an array
+			// for live exits. Only sweep the old window on refresh.
 			if (!Array.isArray(rows)) {
 				for (const [id, row] of ledgerRows) {
 					if (row.endedMs < cutoff) {
@@ -122,8 +123,8 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 				if (!isNonEmptyString(source?.sessionId)) continue;
 				const { sessionId, taskId, kind, endedMs, parentSessionId, rootSessionId } = source;
 				const row = { sessionId, taskId, kind, endedMs, parentSessionId, rootSessionId, [ENDED_LOCATION]: source[ENDED_LOCATION] };
-				// Direct callers that queue without a ledger position keep the cwd they supplied;
-				// located rows (every daemon path) resolve it from the ledger line instead.
+				// Unpositioned callers keep any supplied cwd. Daemon rows always
+				// have locations and resolve cwd from the ledger line instead.
 				if (!row[ENDED_LOCATION] && source.cwd !== undefined) row.cwd = source.cwd;
 				ledgerRows.set(row.sessionId, row);
 				const entry = index.get(row.sessionId);
@@ -150,11 +151,34 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			let budget = USAGE_TICK_BYTES;
 			const sessions = [...(world?.sessions?.values?.() ?? [])];
 			const liveSessions = new Map(sessions.filter((session) => isNonEmptyString(session?.id)).map((session) => [session.id, session]));
+			const ledgerOptions = ledgerFs ? { fs: ledgerFs } : undefined;
+			let sparseCwds;
+			const cwdOf = (node) => {
+				if (!paths) return undefined;
+				if (node[ENDED_LOCATION]) return readEndedCwd(paths, node, ledgerOptions);
+				if (!needsLedgerCwd(node)) return node.cwd;
+				if (!sparseCwds) {
+					// Share one scan across pending child lookups, including their
+					// ancestors. Do not retain recovered cwds past this tick.
+					const pending = new Set();
+					const collect = (row) => {
+						for (const candidate of cwdChain(row, liveSessions)) {
+							if (needsLedgerCwd(candidate)) pending.add(candidate);
+						}
+					};
+					for (const row of queue.values()) if (row.kind === "child") collect(row);
+					for (const session of liveSessions.values()) {
+						if (session.kind === "child" && isNonEmptyString(session.file) && isNonEmptyString(session.taskId)) collect(session);
+					}
+					sparseCwds = readEndedCwds(paths, pending, ledgerOptions);
+				}
+				return sparseCwds.get(node);
+			};
 			const liveAppends = [];
 			const liveFirstReads = [];
 			for (const session of sessions) {
 				if (!isNonEmptyString(session?.id)) continue;
-				const sessionFile = verifiedFile(session, liveSessions);
+				const sessionFile = verifiedFile(session, liveSessions, cwdOf);
 				if (!sessionFile) continue;
 				const entry = index.get(session.id);
 				const reads = entry?.state === "ok" && entry.complete === true ? liveAppends : liveFirstReads;
@@ -169,7 +193,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			// (c) the ended-session backlog, newest first
 			for (const [id, row] of queue) {
 				if (budget <= 0) break;
-				const rowFile = locate(row, liveSessions);
+				const rowFile = locate(row, liveSessions, cwdOf);
 				if (!rowFile) {
 					index.markMissing(id, metaOf(row));
 					queue.delete(id);

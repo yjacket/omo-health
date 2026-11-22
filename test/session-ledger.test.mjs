@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { resolvePaths } from "../src/paths.mjs";
-import { appendEnded, appendEndedLocated, ENDED_LOCATION, hasEnded, readEnded, readEndedCwd } from "../src/session-ledger.mjs";
+import { appendEnded, appendEndedBatch, appendEndedLocated, ENDED_LOCATION, hasEnded, readEnded, readEndedCwd } from "../src/session-ledger.mjs";
 
 function setup() {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "ledger-"));
@@ -75,4 +75,48 @@ test("appendEndedLocated reports the appended line's position and reads only tha
 
 	assert.deepEqual(appendEndedLocated(p, rec("a", now)), { appended: false, location: null });
 	assert.equal(appendEnded(p, rec("b", now)), true, "appendEnded still returns a boolean");
+});
+
+test("bounded live batch preserves sequential duplicate decisions, ledger bytes, and locations", () => {
+	const batch = setup();
+	const sequential = setup();
+	const now = Date.UTC(2026, 8, 28, 12);
+	const day = 86_400_000;
+	const seed = [
+		rec("cutoff", now - 30.25 * day),
+		rec("expired", now - 31 * day),
+		rec("future-cutoff", now - 30 * day),
+	];
+	for (const paths of [batch, sequential]) {
+		for (const row of seed) appendEnded(paths, row, { nowMs: now });
+	}
+	const rows = [
+		rec("cutoff", now),
+		rec("expired", now, { cwd: "C:/작업", reason: "가".repeat(400) }),
+		rec("expired", now),
+		rec("future-cutoff", now + day),
+		rec("future-cutoff", now),
+		rec("outside", now - 31 * day),
+		rec("outside", now),
+	];
+	const expected = rows.map((row) => appendEnded(sequential, row, { nowMs: now }));
+	assert.deepEqual(expected, [false, true, false, true, false, true, true]);
+	const results = appendEndedBatch(batch, rows, { nowMs: now });
+	assert.deepEqual(results.map(({ appended }) => appended), expected);
+	for (const [i, { location }] of results.entries()) {
+		if (!expected[i]) {
+			assert.equal(location, null);
+			continue;
+		}
+		const { file, offset, length } = location;
+		const bytes = fs.readFileSync(file);
+		assert.equal(JSON.parse(bytes.subarray(offset, offset + length)).sessionId, rows[i].sessionId);
+		assert.equal(JSON.parse(bytes.subarray(offset, offset + length)).endedMs, rows[i].endedMs);
+		assert.equal(bytes[offset + length], 10);
+	}
+	const names = fs.readdirSync(sequential.health.sessionsDir);
+	assert.deepEqual(fs.readdirSync(batch.health.sessionsDir), names);
+	for (const name of names) {
+		assert.deepEqual(fs.readFileSync(path.join(batch.health.sessionsDir, name)), fs.readFileSync(path.join(sequential.health.sessionsDir, name)));
+	}
 });

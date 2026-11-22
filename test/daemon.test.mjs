@@ -433,6 +433,82 @@ test("the daemon indexes a live session's tokens into sessions/usage.json and pu
 	assert.equal(row.tokensPending, false);
 });
 
+test("128 simultaneous live ends read at most one ledger day plus their appended lines", async (t) => {
+	const { paths } = fixture();
+	const start = Date.UTC(2026, 8, 28, 12);
+	const dayFile = path.join(paths.health.sessionsDir, "ended-2026-09-28.jsonl");
+	const seed = `${JSON.stringify({ sessionId: "seed", endedMs: start, reason: "x".repeat(128 * 1024) })}\n`;
+	const seedBytes = Buffer.byteLength(seed);
+	const cwd = path.join(path.dirname(paths.healthHome), "project");
+	const parent = sessionState({ id: "parent", cwd, startedMs: start });
+	const tasks = Array.from({ length: 128 }, (_, i) => taskRecord({
+		taskId: `st_burst_${i}`, childSessionId: `child-${i}`, parentSessionId: parent.id,
+		rootSessionId: parent.id, spawnCwd: cwd,
+	}));
+	const fds = new Set();
+	const { openSync, readSync, closeSync } = fs;
+	let tick = 0;
+	const ledgerBytes = [0, 0, 0, 0];
+	t.mock.method(fs, "openSync", (file, flags, ...args) => {
+		const fd = openSync(file, flags, ...args);
+		if (file === dayFile && flags === "r") fds.add(fd);
+		return fd;
+	});
+	t.mock.method(fs, "readSync", (fd, ...args) => {
+		const n = readSync(fd, ...args);
+		if (fds.has(fd)) ledgerBytes[tick] += n;
+		return n;
+	});
+	t.mock.method(fs, "closeSync", (fd) => {
+		fds.delete(fd);
+		return closeSync(fd);
+	});
+	const clock = { now: () => start + tick * 60_000 };
+	t.mock.method(Date, "now", clock.now);
+	const transcripts = tasks.map(({ taskId, childSessionId }) => path.join(cwd, ".omo", "senpi-task", "children", taskId,
+		"sessions", taskId, `2026-09-28T12-00-00-000Z_${childSessionId}.jsonl`));
+	const createEngine = () => ({
+		async tick() {
+			tick++;
+			if (tick === 2) {
+				fs.mkdirSync(paths.health.sessionsDir, { recursive: true });
+				fs.writeFileSync(dayFile, seed);
+			}
+			if (tick === 3) {
+				for (const [i, file] of transcripts.entries()) {
+					writeJsonl(file, [E.assistant({ ms: start, usage: { input: i + 1, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } })]);
+				}
+			}
+			const world = makeWorld({
+				now: clock.now(), procsFresh: true, sessions: [parent],
+				sensors: [{ sessionId: parent.id, pid: 4321, ts: clock.now(), idle: true }],
+				tasks: tick === 1 ? tasks : tick === 2 ? tasks.map((task) => ({
+					...task, status: "completed", terminal: true, active: false, terminalAtMs: clock.now(),
+				})) : [],
+			});
+			return { findings: [], world };
+		},
+		table: { all: () => [] }, close() {},
+	});
+	await runDaemon({
+		paths, clock, proc: fakeProc(), config: { ...DEFAULT_CONFIG, idleExitMs: 2 * 60_000 },
+		overrides: { createEngine, env: {}, procs: { kind: "fake" }, sleep: async () => {} },
+	});
+	t.mock.restoreAll();
+	const appended = fs.readFileSync(dayFile).subarray(seedBytes);
+	const rows = appended.toString("utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+	assert.deepEqual(rows.map((row) => row.sessionId).sort(), tasks.map((task) => task.childSessionId).sort());
+	t.diagnostic(`append=${ledgerBytes[2]} B, drain=${ledgerBytes[3]} B, seed=${seedBytes} B, appended=${appended.length} B`);
+	assert.ok(ledgerBytes[2] <= seedBytes + appended.length, `append read ${ledgerBytes[2]} ledger bytes`);
+	assert.ok(ledgerBytes[3] <= appended.length, `drain read ${ledgerBytes[3]} ledger bytes`);
+	const index = (await import("../src/usage-index.mjs")).readUsageIndex(paths.health.usageIndexFile);
+	for (const [i, task] of tasks.entries()) {
+		const entry = index.get(task.childSessionId);
+		assert.equal(entry?.published?.total, i + 1, task.childSessionId);
+		assert.equal(entry.file, transcripts[i]);
+	}
+});
+
 test("the idle exit is held while the auditor is busy, and the auditor ticks on the daemon clock in every mode", async () => {
 	const f = fixture();
 	const ticked = [];

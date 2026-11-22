@@ -110,8 +110,33 @@ export function readEndedCwd(paths, row, { fs: fsImpl = fs } = {}) {
 	}
 }
 
-function buildRecord(record) {
-	return { v: 1, ...record, reason: truncate(redact(String(record.reason ?? "")), REASON_MAX) };
+/** Resolve only the requested unpositioned rows, scanning each affected day once. */
+export function readEndedCwds(paths, rows, { fs: fsImpl = fs } = {}) {
+	const days = new Map();
+	for (const row of rows) {
+		const endedMs = Number(row.endedMs);
+		if (!Number.isFinite(endedMs) || Math.abs(endedMs) > 8.64e15) continue;
+		const file = ledgerFile(paths, endedMs);
+		if (!days.has(file)) days.set(file, new Map());
+		const ids = days.get(file);
+		if (!ids.has(row.sessionId)) ids.set(row.sessionId, new Set());
+		ids.get(row.sessionId).add(row);
+	}
+	const cwds = new Map();
+	for (const [file, ids] of days) {
+		for (const rec of streamFile(file, undefined, false, fsImpl)) {
+			const pending = ids.get(rec.sessionId);
+			if (!pending) continue;
+			for (const row of pending) {
+				if (rec.endedMs !== row.endedMs) continue;
+				cwds.set(row, rec.cwd);
+				pending.delete(row);
+			}
+			if (!pending.size) ids.delete(rec.sessionId);
+			if (!ids.size) break;
+		}
+	}
+	return cwds;
 }
 
 /** True when the sessionId appears in the ledger files of the last 30 days. */
@@ -136,7 +161,47 @@ export function appendEnded(paths, record, options = {}) {
  */
 export function appendEndedLocated(paths, record, { nowMs = Date.now() } = {}) {
 	if (hasEnded(paths, record.sessionId, { nowMs: Math.max(nowMs, Number(record.endedMs) || 0) })) return { appended: false, location: null };
-	const rec = buildRecord(record);
+	return writeEnded(paths, record);
+}
+
+/**
+ * Append live ends in input order. Only candidate ids are retained from disk,
+ * with their newest day so each row keeps its own 30-day duplicate cutoff.
+ * A failed write is reported on that row without dropping the rest of the batch.
+ */
+export function appendEndedBatch(paths, records, { nowMs = Date.now() } = {}) {
+	if (!records.length) return [];
+	const newest = new Map(records.map(({ sessionId }) => [sessionId, ""]));
+	let earliest = Infinity;
+	const cutoffs = records.map((record) => {
+		const ms = Math.max(nowMs, Number(record.endedMs) || 0) - DEDUPE_DAYS * DAY_MS;
+		const day = dayOf(ms);
+		earliest = Math.min(earliest, ms);
+		return `ended-${day}.jsonl`;
+	});
+	for (const file of ledgerFiles(paths, earliest)) {
+		const day = path.basename(file);
+		for (const { sessionId } of streamFile(file)) {
+			if (newest.get(sessionId) === "") newest.set(sessionId, day);
+		}
+	}
+	return records.map((record, i) => {
+		const id = record.sessionId;
+		const previous = newest.get(id);
+		if (previous >= cutoffs[i]) return { appended: false, location: null };
+		try {
+			const result = writeEnded(paths, record);
+			const day = path.basename(result.location.file);
+			if (typeof id === "string" && FILE_RE.test(day) && day > previous) newest.set(id, day);
+			return result;
+		} catch (error) {
+			return { appended: false, location: null, error };
+		}
+	});
+}
+
+function writeEnded(paths, record) {
+	const rec = { v: 1, ...record, reason: truncate(redact(String(record.reason ?? "")), REASON_MAX) };
 	ensureDir(paths.health.sessionsDir);
 	const file = ledgerFile(paths, Number(rec.endedMs));
 	const line = `${JSON.stringify(rec)}\n`;

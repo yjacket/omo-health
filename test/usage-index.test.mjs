@@ -279,10 +279,10 @@ if (stage === "fixture") {
 	if (stage === "retention") {
 		assert.equal(index.prune(now), 0);
 		const tracker = createUsageTracker({ paths, index, clock });
-		// Exercise the same prune/queue sequence on both the old and new reader.
+		// Queue positioned rows, like the daemon's daily retention path.
 		const read = ledger.streamEnded ?? ledger.readEnded;
 		const missing = 1030 - (index.entries().length - 1);
-		assert.equal(tracker.queueLedger(read(paths, { sinceMs: now - 30 * ${DAY} })), Math.max(0, missing) + 2);
+		assert.equal(tracker.queueLedger(read(paths, { sinceMs: now - 30 * ${DAY}, withLocation: true })), Math.max(0, missing) + 2);
 	} else {
 		const record = loadSessionRecord({ paths, id: "seed", now, index, messageScanMaxBytes: 0 });
 		assert.deepEqual(record.children.map(({ sessionId, depth }) => [sessionId, depth]), [["child", 1], ["grand", 2]]);
