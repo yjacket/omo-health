@@ -176,9 +176,13 @@ export function createRunner({ paths, spawnImpl = spawn, clock, env = process.en
 		return finish(f, meta, { status: "timeout", result: null, exitCode: null });
 	}
 
-	/** Can this job's verified pid still be trusted? Throws when the lookup fails (not knowing is never "gone"). */
+	/**
+	 * Can this job's verified pid still be trusted? Throws when the lookup fails (not knowing is never "gone").
+	 * `meta.final` is not consulted: a timed-out job is finalized the moment taskkill is sent, so its process may still
+	 * live after the record says `timeout`; only a fresh pid+creation time+command hash can say it is gone.
+	 */
 	function stillOurs(meta) {
-		if (!meta || meta.final || !meta.pid || !Number.isFinite(meta.ctimeMs)) return false;
+		if (!meta || !meta.pid || !Number.isFinite(meta.ctimeMs)) return false;
 		const seen = identify(meta.pid);
 		return Boolean(seen && seen.ctimeMs === meta.ctimeMs && seen.cmdSha1 === meta.cmdSha1);
 	}

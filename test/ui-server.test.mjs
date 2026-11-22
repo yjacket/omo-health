@@ -685,6 +685,99 @@ describe("ui server", { timeout: 20_000 }, () => {
 				}
 			});
 
+			it("plans around every analyst model a selected investigation used, not only the latest", () => {
+				const world = makeWorld({ lanes: { ultrabrain: ["openai/alpha-review"], architect: ["openai/beta-review"], "deep-high": ["openai/gamma-review"] } });
+				try {
+					writeJson(path.join(world.paths.health.investigationsDir, "F1.json"), {
+						id: "F1",
+						openedMs: world.nowMs - 300_000,
+						updatedMs: world.nowMs - 60_000,
+						trigger: "stall",
+						subject: { sessionId: AUDIT_ID },
+						status: "verdict",
+						model: "openai/beta-review",
+						verdict: null,
+					});
+					fs.mkdirSync(world.paths.health.decisionsDir, { recursive: true });
+					fs.appendFileSync(
+						path.join(world.paths.health.decisionsDir, "2026-11-22.jsonl"),
+						`${JSON.stringify({ ts: new Date(world.nowMs - 240_000).toISOString(), fp: "F1", event: "investigation", status: "analyzing", model: "openai/alpha-review" })}\n`,
+					);
+					assert.equal(world.detail(AUDIT_ID).audit.planned.model, "openai/gamma-review", "the first look's model is excluded too");
+					const posted = world.startAudit(AUDIT_ID);
+					assert.deepEqual([posted[0], posted[1].audit.planned.model], [202, "openai/gamma-review"]);
+				} finally {
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				}
+			});
+
+			function aliasWorld() {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omoh-audit-alias-"));
+				const env = { USERPROFILE: dir, OMO_HEALTH_HOME: path.join(dir, "health") };
+				const worldPaths = resolvePaths(env);
+				const nowMs = Date.parse("2026-11-22T00:00:00.000Z");
+				const sessionId = "s_child01";
+				const taskId = "st_child01";
+				const sessionFile = path.join(worldPaths.sessionsDir, "slug", `2026-11-22T00-00-00-000Z_${sessionId}.jsonl`);
+				fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+				fs.writeFileSync(sessionFile, `${JSON.stringify({ type: "session", id: sessionId })}\n`);
+				const stat = fs.statSync(sessionFile);
+				writeJson(worldPaths.health.usageIndexFile, {
+					v: 1,
+					entries: {
+						[sessionId]: {
+							id: sessionId,
+							file: sessionFile,
+							kind: "child",
+							taskId,
+							state: "ok",
+							complete: true,
+							gone: false,
+							size: stat.size,
+							mtimeMs: stat.mtimeMs,
+							offset: stat.size,
+							ino: stat.ino,
+							birthtimeMs: stat.birthtimeMs,
+							head: "",
+							headLen: 0,
+							tail: "",
+							evaluatedTo: stat.size,
+							checkedMs: nowMs,
+							published: { total: 10, input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0, costUnknown: false, turns: 1, models: {}, usedModels: { "anthropic/claude-used": true } },
+						},
+					},
+				});
+				writeJson(worldPaths.omoJsonc, { "[native]": { categories: { ultrabrain: { models: ["openai/gpt-review:high"] } } } });
+				writeJson(worldPaths.authFile, { anthropic: {}, openai: {} });
+				writeJson(worldPaths.health.daemonJson, { ts: nowMs, pid: process.pid, mode: "auto", version: "test" });
+				const record = { found: true, id: sessionId, session: { sessionId, taskId, kind: "child", title: "child" }, tokens: null, children: [], health: { findings: [], actions: [], investigations: [], messages: [], counts: { findings: 0, actions: 0, investigations: 0, messages: 0 } }, audit: null };
+				return { dir, env, paths: worldPaths, now: () => nowMs, sessionId, taskId, load: () => record };
+			}
+
+			it("resolves a task-id request to the ledger session id so the second request for the same child gets 409 running", async () => {
+				for (const [first, second] of [["s_child01", "st_child01"], ["st_child01", "s_child01"]]) {
+					const world = aliasWorld();
+					const auditServer = createUiServer({
+						paths: world.paths,
+						token: TOKEN,
+						getState: () => STATE,
+						startAudit: createStartAudit({ paths: world.paths, env: world.env, now: world.now, load: world.load }),
+						now: world.now,
+					});
+					const { port: auditPort } = await auditServer.listen();
+					try {
+						const accepted = await postAt(auditPort, "/api/audit", { sessionId: first });
+						assert.deepEqual([accepted.status, accepted.body.audit.sessionId], [202, world.sessionId], `${first} must be accepted as the canonical session`);
+						const refused = await postAt(auditPort, "/api/audit", { sessionId: second });
+						assert.deepEqual([refused.status, refused.body.error], [409, "running"], `${second} must find the first request`);
+						assert.deepEqual(fs.readdirSync(world.paths.health.auditRequestsDir), [`${world.sessionId}.json`]);
+					} finally {
+						await auditServer.close();
+						fs.rmSync(world.dir, { recursive: true, force: true });
+					}
+				}
+			});
+
 			it("POST returns 202 through the real daemon status path and writes only the request file", async () => {
 				const world = makeWorld();
 				const auditServer = createUiServer({ paths: world.paths, token: TOKEN, getState: () => STATE, sessionDetail: world.detail, startAudit: world.startAudit, now: world.now });

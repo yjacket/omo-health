@@ -12,8 +12,10 @@ import { GUARD_FLAGS } from "../src/judge/lane.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 import { appendEnded, readEnded } from "../src/session-ledger.mjs";
 import { loadSessionRecord } from "../src/session-record.mjs";
+import { createRunner } from "../src/runner.mjs";
 import { createUsageIndex, fresh } from "../src/usage-index.mjs";
 import { createUsageTracker } from "../src/usage-tracker.mjs";
+import { createRecordingSpawn } from "./fakes/runner.mjs";
 import { readJsonSafe } from "../src/util/fsx.mjs";
 import { E, appendJsonl, writeJsonl } from "./helpers/fixtures.mjs";
 
@@ -852,4 +854,46 @@ test("request helpers: safeAuditId, the atomic request file and the state a requ
 	assert.equal(readAuditState(h.paths, "m1").status, "done");
 	requestAudit(h.paths, "m1", h.state.now);
 	assert.equal(readAuditState(h.paths, "m1").status, "requested", "a rerun request shows before the daemon takes it");
+});
+
+test("two looks at one investigation exclude every analyst model through the production join and model choice", () => {
+	const h = harness();
+	fs.mkdirSync(h.paths.health.investigationsDir, { recursive: true });
+	fs.writeFileSync(
+		path.join(h.paths.health.investigationsDir, "F1.json"),
+		JSON.stringify({ id: "F1", openedMs: BASE - 300_000, updatedMs: BASE - 60_000, trigger: "stall", subject: { sessionId: "m1" }, status: "verdict", model: "openai/gpt-5-5", verdict: null }),
+	);
+	fs.mkdirSync(h.paths.health.decisionsDir, { recursive: true });
+	appendJsonl(path.join(h.paths.health.decisionsDir, "2026-11-20.jsonl"), [
+		{ ts: new Date(BASE - 290_000).toISOString(), fp: "F1", event: "investigation", status: "open" },
+		{ ts: new Date(BASE - 240_000).toISOString(), fp: "F1", event: "investigation", status: "analyzing", model: "google/gemini-3-pro" },
+	]);
+	const a = h.auditor();
+	h.request("m1");
+	h.tick(a);
+	assert.deepEqual([h.record("m1").model, h.record("m1").independence], ["xai/grok-5", "family"], "the first look's model is excluded too");
+});
+
+test("a failed first kill is retried by the real runner and the one-per-PC slot stays held until the verified pid is gone", () => {
+	const h = harness();
+	h.config.audit.timeoutMs = 60_000;
+	const identity = { ctimeMs: BASE - 1_000, cmdSha1: "audit-job" };
+	const processState = { alive: true };
+	const recording = createRecordingSpawn();
+	const runner = createRunner({ paths: h.paths, spawnImpl: recording.spawnImpl, clock: h.clock, env: {}, isAlive: () => processState.alive, identify: () => (processState.alive ? identity : null) });
+	const a = createAuditor({ paths: h.paths, config: h.config, clock: h.clock, log: silent, runner, env: {} });
+	const kills = () => recording.calls.filter((call) => call.command === "taskkill").length;
+	h.request("m1");
+	h.tick(a);
+	h.state.now += 61_000;
+	a.tick(h.state.now);
+	assert.deepEqual([h.record("m1").reason, h.record("m1").holdUntilExit], ["timeout", true]);
+	assert.equal(kills(), 1, "the timeout path sent the first taskkill");
+	h.tick(a, 30_000);
+	assert.equal(h.record("m1").holdUntilExit, true, "a failed first kill keeps the slot while the verified process lives");
+	assert.equal(kills(), 2, "the kill is retried");
+	processState.alive = false;
+	h.tick(a, 30_000);
+	assert.equal(h.record("m1").holdUntilExit, undefined);
+	assert.equal(a.busy(), false);
 });

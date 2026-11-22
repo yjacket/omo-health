@@ -186,6 +186,28 @@ test("an unrelated session is excluded even when it shares a cwd", () => {
 	assert.equal(record.health.actions.some((item) => item.recipient === "s-unrelated"), false);
 });
 
+test("an unindexed main session does not inherit another main's tokens through a null task id", () => {
+	const fixture = corpus();
+	const indexed = fixture.rows[0];
+	const unindexed = fixture.rows[1];
+	const usage = new Map([
+		[
+			indexed.sessionId,
+			{
+				id: indexed.sessionId,
+				taskId: null,
+				state: "ok",
+				complete: true,
+				published: { total: 157, input: 100, output: 20, cacheRead: 30, cacheWrite: 7, cost: 0, costUnknown: false, turns: 2, models: { "anthropic/claude-x": { tokens: 157, cost: 0 } }, usedModels: {} },
+			},
+		],
+	]);
+	const indexedRecord = buildSessionRecord({ id: indexed.sessionId, row: indexed, ledger: fixture.rows, decisions: [], investigations: [], usage });
+	assert.equal(indexedRecord.tokens.total, 157);
+	const unindexedRecord = buildSessionRecord({ id: unindexed.sessionId, row: unindexed, ledger: fixture.rows, decisions: [], investigations: [], usage });
+	assert.equal(unindexedRecord.tokens, null, "a null task id is not an alias for another main session");
+});
+
 test("two main sessions whose records all carry taskId null do not leak into each other", () => {
 	const fixture = corpus();
 	const main = fixture.rows[0];

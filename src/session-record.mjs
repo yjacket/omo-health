@@ -232,7 +232,11 @@ function modelRows(published) {
 
 function usageEntryOf(usage, row) {
 	if (!(usage instanceof Map)) return null;
-	return usage.get(row.sessionId) ?? usage.get(row.taskId) ?? [...usage.values()].find((entry) => entry?.taskId === row.taskId) ?? null;
+	const bySession = nonEmpty(row.sessionId) ? usage.get(row.sessionId) : undefined;
+	if (bySession) return bySession;
+	// A task id is an alias only when it is a non-empty string: two main rows both carry null and must not match.
+	if (!nonEmpty(row.taskId)) return null;
+	return usage.get(row.taskId) ?? [...usage.values()].find((entry) => entry?.taskId === row.taskId) ?? null;
 }
 
 /**

@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig } from "../config.mjs";
 import { createSessionFileLocator } from "../collect/session-files.mjs";
-import { auditsToday, readAuditState, requestAudit } from "../auditor.mjs";
+import { analystModelsOf, auditsToday, readAuditState, requestAudit } from "../auditor.mjs";
 import { listSubjectsNow, runDiagnose } from "../diagnose.mjs";
 import { resolveAuditModel } from "../judge/audit.mjs";
 import { createLogger } from "../log.mjs";
@@ -38,7 +38,6 @@ function modelsKnownOf(entry) {
 }
 
 const sessionModelsOf = (entry) => Object.keys(entry?.published?.usedModels ?? {});
-const analystModelsOf = (record) => (record?.health?.investigations ?? []).map((investigation) => investigation?.model).filter((model) => typeof model === "string" && model);
 
 /** The first refusal, in the order the detail and the POST agree on: disabled, daemon-off, cap, models-unknown, no-model. */
 function blockedOf({ config, daemon, usedToday, perDay, modelsKnown, planned }) {
@@ -61,7 +60,7 @@ export function createAuditDetail({ paths, env = process.env, now = Date.now, re
 		const usedToday = today(paths, at);
 		const entry = usageEntryFor(readUsageIndex(paths.health.usageIndexFile), record, id);
 		const modelsKnown = modelsKnownOf(entry);
-		const choice = modelsKnown ? resolveModel(paths, config, { sessionModels: sessionModelsOf(entry), sessionModelsKnown: true, analystModels: analystModelsOf(record) }) : null;
+		const choice = modelsKnown ? resolveModel(paths, config, { sessionModels: sessionModelsOf(entry), sessionModelsKnown: true, analystModels: analystModelsOf(record, { paths }) }) : null;
 		const planned = choice && !choice.blocked ? choice : null;
 		const blocked = blockedOf({ config, daemon, usedToday, perDay, modelsKnown, planned });
 		return { state, planned, blocked, stalled: isAuditActive(state) && daemon.state !== "running", usedToday, perDay };
@@ -79,20 +78,23 @@ export function createStartAudit({ paths, env = process.env, now = Date.now, loa
 		const at = now();
 		const record = load({ paths, id: sessionId, now: at });
 		if (!record?.found) return refuse(404, "not-found");
+		// The ledger accepts a session id or a task id; every audit file is keyed by the row's canonical session id,
+		// so an alias request finds the same active record and the same request file.
+		const canonicalId = typeof record.session?.sessionId === "string" && record.session.sessionId ? record.session.sessionId : sessionId;
 		const { config } = loadConfig({ env, paths });
 		if (config.audit?.enabled !== true) return refuse(409, "disabled");
 		const daemon = daemonStatus(daemonInputs({ paths, env, now: at }));
 		if (daemon.state !== "running") return refuse(409, "daemon-off");
-		const state = readState(paths, sessionId);
+		const state = readState(paths, canonicalId);
 		if (isAuditActive(state)) return refuse(409, "running");
 		const perDay = config.audit.perDay;
 		if (Number.isFinite(perDay) && today(paths, at) >= perDay) return refuse(429, "cap");
-		const entry = usageEntryFor(readUsageIndex(paths.health.usageIndexFile), record, sessionId);
+		const entry = usageEntryFor(readUsageIndex(paths.health.usageIndexFile), record, canonicalId);
 		if (!modelsKnownOf(entry)) return refuse(409, "models-unknown");
-		const choice = resolveModel(paths, config, { sessionModels: sessionModelsOf(entry), sessionModelsKnown: true, analystModels: analystModelsOf(record) });
+		const choice = resolveModel(paths, config, { sessionModels: sessionModelsOf(entry), sessionModelsKnown: true, analystModels: analystModelsOf(record, { paths }) });
 		if (!choice || choice.blocked) return refuse(409, "no-model");
-		request(paths, sessionId, at);
-		return [202, { ok: true, audit: { sessionId, status: "queued", statusKo: auditStatusLabel("queued"), planned: choice } }];
+		request(paths, canonicalId, at);
+		return [202, { ok: true, audit: { sessionId: canonicalId, status: "queued", statusKo: auditStatusLabel("queued"), planned: choice } }];
 	};
 }
 

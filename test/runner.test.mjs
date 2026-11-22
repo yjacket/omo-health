@@ -569,6 +569,23 @@ test("alive and terminate re-verify pid, creation time and command hash", () => 
 	assert.throws(() => runner.terminate("j1"), /ETIMEDOUT/);
 });
 
+test("a timed-out job stays ours while its verified process lives, and a failed kill is retried", () => {
+	let lookup = SAME_PROCESS;
+	const { runner, calls, clock } = setup({ isAlive: () => true, identify: () => lookup() });
+	runner.start(baseJob);
+	clock.advance(baseJob.timeoutMs + 1);
+	assert.deepEqual(runner.poll("j1"), { status: "timeout", result: null, exitCode: null });
+	assert.equal(readMeta(runner).final.status, "timeout");
+	assert.equal(runner.alive("j1"), true, "a persisted timeout is not proof that the process exited");
+	const kills = () => calls.filter((call) => call.command === "taskkill").length;
+	assert.equal(kills(), 1);
+	assert.equal(runner.terminate("j1"), "sent");
+	assert.equal(kills(), 2, "the kill is retried while the verified process lives");
+	lookup = () => null;
+	assert.equal(runner.alive("j1"), false);
+	assert.equal(runner.terminate("j1"), "gone");
+});
+
 test("a process that only mentions the bundle path is not adopted and nothing is killed", () => {
 	let box;
 	const finder = (jobId, args) => findJobProcess({ jobsDir: box.paths.health.jobsDir, jobId, args, exec: () => cimLine(9, 1, T, "notepad.exe " + path.join(box.paths.health.jobsDir, jobId, "bundle.md")) });
