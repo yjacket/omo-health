@@ -1310,7 +1310,12 @@ test("(IS-3, IS-7) history includes a retained older child in its parent's detai
 	const published = load();
 	const inputs = loadUiInputs({ paths: s.paths, env: {}, now: T0 });
 	const history = buildEnded(inputs);
-	const parentOnly = buildEnded({ ...inputs, usage: new Map([["p-old", inputs.usage.get("p-old")]]) });
+	// The list cannot discover old children itself; simulate tracker discovery
+	// before the child's token count is published.
+	const parentOnly = buildEnded({ ...inputs, usage: new Map([
+		["p-old", inputs.usage.get("p-old")],
+		["c-old", { id: "c-old", parentSessionId: "p-old", state: "pending" }],
+	]) });
 	assert.deepEqual({
 		coldChildren: cold.children.map((c) => c.sessionId),
 		coldMessages: cold.health.messages.map((m) => [m.recipient, m.text]),

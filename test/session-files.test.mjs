@@ -56,6 +56,20 @@ test("(IS-1, IS-4, IS-7) filename IDs strip only the senpi timestamp", () => {
 	}
 });
 
+test("date-only session filenames resolve the whole ID without a header or suffix match", (t) => {
+	const { paths, locator, proj } = setup(t);
+	const child = writeChild(paths, proj, "st_review", "2026-11-22_run_review.1.jsonl");
+	const main = path.join(paths.sessionsDir, "--proj--", "2026-11-22_a_b.jsonl");
+	fs.mkdirSync(path.dirname(main), { recursive: true });
+	fs.writeFileSync(main, '{"type":"message"}\n');
+	assert.equal(idFromFileName(main), "a_b");
+	assert.equal(idFromFileName("2026-11-22_a?.jsonl"), undefined);
+	assert.equal(locator.mainFile("a_b"), main);
+	assert.equal(locator.mainFile("b"), undefined);
+	assert.equal(locator.childFile({ taskId: "st_review", sessionId: "run_review.1", cwds: [proj] }), child);
+	assert.equal(locator.childFile({ taskId: "st_review", sessionId: "review.1", cwds: [proj] }), undefined);
+});
+
 test("(IS-3) mainFile maps cold files by their headers, not a conflicting name", (t) => {
 	const { paths, clock, locator } = setup(t);
 	const file = writeMain(paths, "wrong-id");

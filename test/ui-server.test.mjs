@@ -334,6 +334,56 @@ describe("ui server", { timeout: 20_000 }, () => {
 		});
 	});
 
+	it("/api/state never opens retained ledger files on the HTTP thread", async (t) => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ui-state-retained-"));
+		t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+		const env = { USERPROFILE: dir, OMO_HEALTH_HOME: dir, OMO_HEALTH_OMO_HOME: path.join(dir, ".omo") };
+		const paths = resolvePaths(env);
+		const nowMs = Date.UTC(2026, 10, 22, 12);
+		const now = () => nowMs;
+		const day = 86_400_000;
+		const endedMs = nowMs - 29 * day;
+		appendEnded(paths, { sessionId: "visible", kind: "main", cwd: dir, startedMs: endedMs - 1_000, endedMs, outcome: "answered" }, { nowMs });
+
+		const retained = new Set();
+		for (const age of [31, 32, 33]) {
+			const olderMs = nowMs - age * day;
+			const file = path.join(paths.health.sessionsDir, `ended-${new Date(olderMs).toISOString().slice(0, 10)}.jsonl`);
+			retained.add(file);
+			let rows = "";
+			for (let i = 0; i < 2_000; i++) {
+				rows += JSON.stringify({ sessionId: `old-${age}-${i}`, parentSessionId: `unrelated-${i}`, endedMs: olderMs }) + "\n";
+			}
+			fs.writeFileSync(file, rows);
+		}
+
+		const ui = createUiServer({ paths, token: TOKEN, getState: () => uiState({ paths, env, now: now() }), now });
+		try {
+			const { port } = await ui.listen();
+			const opened = new Set();
+			for (const [target, methods] of [
+				[fs, ["openSync", "readFileSync", "createReadStream", "open", "readFile"]],
+				[fs.promises, ["open", "readFile"]],
+			]) for (const method of methods) {
+				const original = target[method];
+				t.mock.method(target, method, function (file, ...args) {
+					const name = file instanceof URL ? fileURLToPath(file) : Buffer.isBuffer(file) ? file.toString() : file;
+					if (typeof name === "string" && retained.has(path.resolve(name))) opened.add(path.basename(name));
+					return original.call(this, file, ...args);
+				});
+			}
+			syncBuiltinESMExports();
+			const { status, body } = await getAt(port, "/api/state");
+			assert.equal(status, 200);
+			assert.deepEqual(body.ended.rows.map((row) => row.sessionId), ["visible"]);
+			assert.deepEqual([...opened], [], "/api/state opened retained ledger files");
+		} finally {
+			t.mock.reset();
+			syncBuiltinESMExports();
+			await ui.close();
+		}
+	});
+
 	describe("diagnose", () => {
 		it("lists subjects without an id, diagnoses a well-formed id, and rejects a malformed id, a missing token and a POST", async () => {
 			const list = await request({ path: "/api/diagnose" });

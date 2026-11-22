@@ -559,27 +559,26 @@ export function usageTreeLink(usage, row, ambiguous) {
 	return id ? { id, parentSessionId } : { id: row.taskId, parentSessionId, unresolved: true };
 }
 
-/** Add older ledger links only below a supplied row, not as new history roots. */
+/** Stream older descendants of the supplied history rows, one pass per depth. */
 export function* retainedTreeRows(paths, rows, { beforeMs, withLocation } = {}) {
-	const parents = new Set();
+	let parents = new Set();
 	for (const row of rows ?? []) {
 		if (nonEmpty(row?.sessionId)) parents.add(row.sessionId);
 		yield row;
 	}
-	if (!parents.size) return;
-	const children = new Map();
-	for (const row of streamEnded(paths, { beforeMs, withLocation })) {
-		const { sessionId, taskId, kind, endedMs, parentSessionId, rootSessionId } = row;
-		if (!nonEmpty(parentSessionId)) continue;
-		if (!children.has(parentSessionId)) children.set(parentSessionId, []);
-		children.get(parentSessionId).push({ sessionId, taskId, kind, endedMs, parentSessionId, rootSessionId, [ENDED_LOCATION]: row[ENDED_LOCATION] });
-	}
-	// Set iteration visits ids added below, once each even for cyclic links.
-	for (const parentId of parents) {
-		for (const child of children.get(parentId) ?? []) {
-			yield child;
-			parents.add(child.sessionId);
+	const seen = new Set(parents);
+	for (let depth = 0; depth < DEPTH_MAX && parents.size; depth += 1) {
+		const next = new Set();
+		for (const row of streamEnded(paths, { beforeMs, withLocation })) {
+			const { sessionId, taskId, kind, endedMs, parentSessionId, rootSessionId } = row;
+			if (!parents.has(parentSessionId) || !nonEmpty(sessionId)) continue;
+			yield { sessionId, taskId, kind, endedMs, parentSessionId, rootSessionId, [ENDED_LOCATION]: row[ENDED_LOCATION] };
+			if (!seen.has(sessionId)) {
+				seen.add(sessionId);
+				next.add(sessionId);
+			}
 		}
+		parents = next;
 	}
 }
 
@@ -982,7 +981,7 @@ function findRecordFiles(paths, nodes, ancestors, locator, usage, ambiguous) {
 			let found;
 			const exact = sessionId && sessionId !== taskId;
 			for (const name of dirNames(dir)) {
-				if (!name.endsWith(".jsonl") || (exact && !name.endsWith(`_${sessionId}.jsonl`))) continue;
+				if (!name.endsWith(".jsonl") || (exact && idFromFileName(name) !== sessionId)) continue;
 				if (found && !exact) return undefined;
 				if (!found || name < found) found = name;
 			}
@@ -1039,8 +1038,8 @@ function recordDescendants(subject, rows, usage) {
 		const aliases = new Map(frontier.filter((node) => nonEmpty(node.taskId)).map((node) => [node.taskId, node.startedMs]));
 		const collisions = new Set();
 		const ids = new Map(frontier.map((node) => [node.sessionId, node.startedMs]));
-		// Buffer only the newest row per candidate, separating direct and alias
-		// matches until the scan can rule out competing alias owners.
+		// Stream both visible and retained rows once per depth. Buffer only the
+		// newest matching rows, separating direct matches from unverified aliases.
 		const direct = new Map();
 		const indirect = new Map();
 		const consider = (node, fromLedger) => {

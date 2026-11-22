@@ -479,8 +479,8 @@ export function entryMs(entry) {
 	return toMs(entry?.timestamp) ?? (Number.isFinite(entry?.message?.timestamp) ? entry.message.timestamp : undefined);
 }
 
-// Senpi replaces ":" and "." in the ISO timestamp with "-" before appending the ID.
-const SESSION_FILE_NAME = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_(.+)\.jsonl$/;
+// Accept a date alone or Senpi's ISO timestamp with ":" and "." replaced by "-".
+const SESSION_FILE_NAME = /^\d{4}-\d{2}-\d{2}(?:T\d{2}-\d{2}-\d{2}-\d{3}Z)?_(.+)\.jsonl$/;
 
 export function idFromFileName(file) {
 	return safeSubjectId(SESSION_FILE_NAME.exec(path.basename(file))?.[1]) ?? undefined;
