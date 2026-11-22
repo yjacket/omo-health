@@ -10,6 +10,7 @@ import { createFakeClock, iso } from "../src/util/time.mjs";
 import {
 	USAGE_INDEX_VERSION,
 	USAGE_TICK_BYTES,
+	INDEX_BYTE_BUDGET,
 	compactUsage,
 	createUsageIndex,
 	fresh,
@@ -79,6 +80,128 @@ function parseIndex(text) {
 function indexText({ v, entries }) {
 	return [JSON.stringify({ v }), ...Object.values(entries).map((entry) => JSON.stringify(entry))].join("\n") + "\n";
 }
+
+test("(gate 17) saturated index save, daemon reload, and audit preparation fit in 66 MiB", (t) => {
+	const { dir } = setup(t);
+	const program = `
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { getHeapSpaceStatistics } from "node:v8";
+import { createUsageIndex, INDEX_BYTE_BUDGET, INDEX_ENTRY_OVERHEAD } from ${JSON.stringify(new URL("../src/usage-index.mjs", import.meta.url).href)};
+import { resolvePaths } from ${JSON.stringify(new URL("../src/paths.mjs", import.meta.url).href)};
+import { createAuditor, requestAudit, readAuditState } from ${JSON.stringify(new URL("../src/auditor.mjs", import.meta.url).href)};
+import { appendEnded } from ${JSON.stringify(new URL("../src/session-ledger.mjs", import.meta.url).href)};
+import { DEFAULT_CONFIG } from ${JSON.stringify(new URL("../src/config.mjs", import.meta.url).href)};
+
+const [stage, shape, dir] = process.argv.slice(1);
+const paths = resolvePaths({ USERPROFILE: dir, OMO_HEALTH_HOME: path.join(dir, "health"), OMO_HEALTH_OMO_HOME: path.join(dir, ".omo") });
+const file = paths.health.usageIndexFile;
+const now = ${T0};
+let checked = now;
+const clock = { now: () => checked };
+const transcript = path.join(dir, "session.jsonl");
+const oldSpace = () => getHeapSpaceStatistics()
+	.filter(({ space_name }) => !space_name.startsWith("new") && !space_name.startsWith("read_only"))
+	.reduce((sum, space) => sum + space.space_used_size, 0);
+global.gc();
+const base = oldSpace();
+const index = createUsageIndex({ file, clock });
+let peak = oldSpace();
+const sample = () => { peak = Math.max(peak, oldSpace()); };
+if (stage === "write") {
+	fs.writeFileSync(transcript, '{"type":"usage","provider":"openai","model":"gpt-5-5","usage":{"input":42,"cost":{"total":0.0001}}}\\n');
+	index.update("reviewed", transcript, { kind: "main" });
+	for (let i = 0; i < 200000 && !index.full; i++) {
+		checked--;
+		const id = "01aaa000-0000-7000-8000-" + String(i).padStart(12, "0");
+		const parentSessionId = "group" + (i % 100);
+		if (shape === "models") {
+			index.update(id, transcript, { kind: "main", parentSessionId });
+		} else {
+			const file = shape === "mixed" ? "C:/작업/" + ("a".repeat(194) + "/").repeat(24) + id + ".jsonl"
+				: shape === "korean" ? "C:/" + ("작".repeat(195) + "/").repeat(18) + "업".repeat(7) + id : null;
+			index.markMissing(id, { kind: "main", parentSessionId: shape === "dense" ? parentSessionId : null, file });
+		}
+		if (i % 1000 === 0) sample();
+	}
+	assert.ok(index.full);
+	sample();
+	assert.ok(index.save());
+} else if (stage === "audit") {
+	fs.mkdirSync(path.dirname(paths.omoJsonc), { recursive: true });
+	fs.mkdirSync(path.dirname(paths.authFile), { recursive: true });
+	fs.writeFileSync(paths.omoJsonc, JSON.stringify({ "[native]": { categories: { ultrabrain: { models: ["google/gemini-3-pro"] } } } }));
+	fs.writeFileSync(paths.authFile, JSON.stringify({ google: {} }));
+	appendEnded(paths, { sessionId: "reviewed", kind: "main", startedMs: now - 120000, endedMs: now - 60000, outcome: "completed" });
+	requestAudit(paths, "reviewed", now);
+	let starts = 0;
+	const auditor = createAuditor({ paths, index, config: DEFAULT_CONFIG, clock, env: {}, timelineMaxBytes: 0, runner: {
+		start() { starts++; sample(); return { pid: 1 }; },
+	} });
+	auditor.tick(now + 1);
+	assert.equal(starts, 1);
+	assert.equal(readAuditState(paths, "reviewed").status, "running");
+}
+assert.equal(index.full, true);
+assert.equal(index.get("reviewed")?.published?.total, 42);
+sample();
+global.gc();
+let rows = 0;
+for (const row of index.values()) rows++;
+console.log(JSON.stringify({ stage, shape, rows, disk: fs.statSync(file).size, peak, retained: oldSpace() - base, budget: INDEX_BYTE_BUDGET, overhead: INDEX_ENTRY_OVERHEAD }));
+`;
+	const errors = [];
+	for (const shape of ["mixed", "korean", "dense", "models"]) {
+		const home = path.join(dir, shape);
+		fs.mkdirSync(home);
+		let rows;
+		for (const stage of ["write", "daemon", "audit"]) {
+			const result = spawnSync(process.execPath, ["--max-old-space-size=66", "--expose-gc", "--input-type=module", "--eval", program, stage, shape, home], { encoding: "utf8" });
+			if (result.status !== 0) {
+				errors.push(`${shape} ${stage}, exit ${result.status}:\n${result.stderr}\n${result.error ?? ""}`);
+				if (stage === "write") break;
+				continue;
+			}
+			t.diagnostic(result.stdout.trim());
+			const measurement = JSON.parse(result.stdout);
+			assert.ok(measurement.rows > 1);
+			if (stage === "write") rows = measurement.rows;
+			else assert.equal(measurement.rows, rows, `${shape} ${stage} must retain every saved row`);
+		}
+	}
+	assert.deepEqual(errors, []);
+});
+
+test("(gate 17) corrupt lines do not hide the next intact publication in a saturated index", (t) => {
+	const { dir, fileOf, indexOf, clock } = setup(t);
+	const index = indexOf();
+	const transcript = fileOf();
+	writeText(transcript, `${line()}\n`);
+	index.update("oldest", transcript);
+	clock.advance(1);
+	for (let i = 0; !index.full; i++) index.markMissing(`missing-${i}`);
+	index.save();
+	const clean = fs.readFileSync(path.join(dir, "usage.json"));
+	const last = clean.lastIndexOf(10, clean.length - 2) + 1;
+	const damaged = fileOf("damaged.jsonl");
+	const junk = Buffer.alloc(64 * 1024, "!");
+	assert.equal(compactUsage(readUsageIndex(path.join(dir, "usage.json")).get("oldest"))?.total, 10);
+	const results = [];
+	for (const size of [1, 8192, junk.length + 9, Math.ceil(INDEX_BYTE_BUDGET * 1.5) + junk.length]) {
+		const fd = fs.openSync(damaged, "w");
+		try {
+			fs.writeSync(fd, clean.subarray(0, last));
+			for (let left = size; left > 0; left -= junk.length) fs.writeSync(fd, junk.subarray(0, left));
+			fs.writeSync(fd, "\n");
+			fs.writeSync(fd, clean.subarray(last));
+		} finally {
+			fs.closeSync(fd);
+		}
+		results.push([size, compactUsage(readUsageIndex(damaged).get("oldest"))?.total]);
+	}
+	assert.deepEqual(results, results.map(([size]) => [size, 10]));
+});
 
 const longPathProgram = `
 import assert from "node:assert/strict";

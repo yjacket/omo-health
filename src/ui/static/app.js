@@ -200,7 +200,7 @@
 
 	/**
 	 * A session's own total by what the token index knows of it: the compact count, 계산 중 until its file is read to the end,
-	 * - when no file was found. `title` is the tooltip: the exact count, or why there is no number.
+	 * - when no file was found or the index is full. `title` gives the exact count or the reason it is unavailable.
 	 */
 	function tokenReading(stateKey, total) {
 		if (stateKey === "ok") return { text: compactCount(total), title: fullCount(total) };
@@ -502,13 +502,10 @@
 	/** The session's tokens, split the way omo's own /session splits them: input is the whole prompt, and the cache served part of it. */
 	function endedTokenFacts(t) {
 		if (!Number.isFinite(t?.total)) {
-			if (t?.state === "full") {
-				const reading = tokenReading("full");
-				return el("span", { title: reading.title, text: reading.text });
-			}
-			const missing = t?.state === "missing";
-			const reading = tokenReading(missing ? "missing" : "pending");
-			return missing ? empty(reading.title) : [empty(reading.text), note(reading.title)];
+			const state = t?.state === "missing" || t?.state === "full" ? t.state : "pending";
+			const reading = tokenReading(state);
+			if (state === "full") return el("span", { title: reading.title, text: reading.text });
+			return state === "missing" ? empty(reading.title) : [empty(reading.text), note(reading.title)];
 		}
 		const promptTokens = t.input + t.cacheRead + t.cacheWrite;
 		const hit = promptTokens > 0 ? ` (${((t.cacheRead / promptTokens) * 100).toFixed(1)}%)` : "";

@@ -19,9 +19,11 @@ export const USAGE_INDEX_VERSION = 3;
 const INDEX_HEADER = JSON.stringify({ v: USAGE_INDEX_VERSION });
 const FULL_HEADER = JSON.stringify({ v: USAGE_INDEX_VERSION, full: true });
 const FULL_ENTRY = Object.freeze({ state: "full" });
-/** Serialized row bytes plus the measured cost of the row and its bookkeeping. */
-export const INDEX_ENTRY_OVERHEAD = 1280;
-export const INDEX_BYTE_BUDGET = 55 * 1024 * 1024;
+/** Fixed per-row allowance for V8 objects, map entries and writer bookkeeping. */
+export const INDEX_ENTRY_OVERHEAD = 1536;
+export const INDEX_BYTE_BUDGET = 40 * 1024 * 1024;
+// Separate from resident rows: only one serialized/decoded line is processed at a time.
+const INDEX_LINE_BYTE_BUDGET = 8 * 1024 * 1024;
 /** Per-tick byte budget for live appends, first reads and the backlog. */
 export const USAGE_TICK_BYTES = 32 * 1024 * 1024;
 /** Total named model slots, including repeats between rows or counter maps. */
@@ -34,6 +36,7 @@ const isObject = (value) => typeof value === "object" && value !== null;
 const META_KEYS = ["kind", "taskId", "parentSessionId", "rootSessionId"];
 const MEMORY_ONLY_KEYS = ["scanOffset", "partial", "readError"];
 const USAGE_KEYS = ["usage", "overlay", "published"];
+const ENTRY_STRING_KEYS = ["id", "file", ...META_KEYS, "state", "head", "tail"];
 const OTHER_MODELS = "(other models)";
 const SPILL_KEYS = new Set([OTHER_MODELS, "(model id too long)", "(model id unreadable)"]);
 export const isSpillModelKey = (key) => SPILL_KEYS.has(key);
@@ -343,10 +346,26 @@ function invalidated(id, row) {
 
 const serializeEntry = (entry) => JSON.stringify(persisted(entry), encodeNonFinite);
 
-function entryBytes(line) {
-	let bytes = line.length + INDEX_ENTRY_OVERHEAD;
-	for (let i = 0; i < line.length; i++) if (line.charCodeAt(i) > 127) bytes++;
-	return bytes;
+function stringBytes(value) {
+	return typeof value === "string" ? value.length * (/[^\x00-\xff]/.test(value) ? 2 : 1) : 0;
+}
+
+function entryBytes(entry, line) {
+	let strings = 0;
+	for (const key of ENTRY_STRING_KEYS) strings += stringBytes(entry[key]);
+	for (const name of USAGE_KEYS) {
+		for (const key in entry[name]?.models) strings += stringBytes(key);
+		for (const key in entry[name]?.usedModels) strings += stringBytes(key);
+	}
+	// The serialized weight also approximates variable-size non-string data (e.g. model
+	// counters). It is a floor, not a measure of the resident strings' encoding.
+	let serialized = line.length;
+	for (let i = 0; i < line.length; i++) if (line.charCodeAt(i) > 127) serialized++;
+	return INDEX_ENTRY_OVERHEAD + Math.max(strings, serialized);
+}
+
+function fitsIndexLine(text) {
+	return stringBytes(text) <= INDEX_LINE_BYTE_BUDGET && Buffer.byteLength(text) <= INDEX_LINE_BYTE_BUDGET;
 }
 
 function* indexChunks(entries, weights, full) {
@@ -386,8 +405,9 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 	};
 
 	const admit = (entry, slots) => {
-		const size = entryBytes(serializeEntry(entry));
-		if (bytes + size > INDEX_BYTE_BUDGET) {
+		const line = serializeEntry(entry);
+		const size = entryBytes(entry, line);
+		if (bytes + size > INDEX_BYTE_BUDGET || !fitsIndexLine(line)) {
 			if (entries.delete(entry.id) || !full) dirty = true;
 			full = true;
 			return FULL_ENTRY;
@@ -539,26 +559,29 @@ function* indexLines(file) {
 		const buffer = Buffer.allocUnsafe(64 * 1024);
 		let parts = [];
 		let carried = 0;
+		let skipping = false;
 		let header = true;
 		let size;
 		while ((size = fs.readSync(fd, buffer, 0, buffer.length, null)) > 0) {
 			const chunk = buffer.subarray(0, size);
 			let start = 0;
 			for (let end; (end = chunk.indexOf(10, start)) !== -1; start = end + 1) {
-				const tail = chunk.subarray(start, end);
-				yield parts.length ? Buffer.concat([...parts, tail]) : tail;
+				if (!skipping && carried + end - start <= INDEX_LINE_BYTE_BUDGET) {
+					const tail = chunk.subarray(start, end);
+					yield parts.length ? Buffer.concat([...parts, tail]) : tail;
+				} else if (header) return;
 				parts = [];
 				carried = 0;
+				skipping = false;
 				header = false;
 			}
-			if (start < size) {
+			if (start < size && !skipping) {
 				if (header && start === 0 && size > FULL_HEADER.length + 1) return;
 				carried += size - start;
-				if (carried > INDEX_BYTE_BUDGET * 1.5) {
-					yield null; // Too large even at the largest UTF-8 to estimated-byte ratio.
-					return;
-				}
-				parts.push(Buffer.from(chunk.subarray(start)));
+				if (carried > INDEX_LINE_BYTE_BUDGET) {
+					parts = [];
+					skipping = true; // Discard only through this line's newline, even across chunks.
+				} else parts.push(Buffer.from(chunk.subarray(start)));
 			}
 		}
 		if (parts.length) yield Buffer.concat(parts);
@@ -585,14 +608,11 @@ function loadUsageIndex(file, trackWeights = true) {
 				header = false;
 				continue;
 			}
-			if (line === null || bytes + line.length * (2 / 3) + INDEX_ENTRY_OVERHEAD > INDEX_BYTE_BUDGET) {
-				full = truncated = true;
-				break;
-			}
 			let text;
 			let row;
 			try {
 				text = decoder.decode(line);
+				if (stringBytes(text) > INDEX_LINE_BYTE_BUDGET) continue;
 				row = JSON.parse(text);
 			} catch {
 				continue;
@@ -602,8 +622,9 @@ function loadUsageIndex(file, trackWeights = true) {
 			const slots = validateEntry(row, USAGE_INDEX_MODEL_BUDGET - named);
 			// Keep only a pending marker for an identifiable but invalid row.
 			const entry = slots < 0 ? invalidated(id, row) : row;
-			const size = entryBytes(slots < 0 ? serializeEntry(entry) : text.trimEnd());
+			const size = entryBytes(entry, slots < 0 ? serializeEntry(entry) : text.trimEnd());
 			if (bytes + size > INDEX_BYTE_BUDGET) {
+				if (slots < 0) continue;
 				full = truncated = true;
 				break;
 			}

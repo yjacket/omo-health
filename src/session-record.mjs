@@ -234,9 +234,15 @@ function usageEntryOf(usage, row) {
 	const bySession = nonEmpty(row.sessionId) ? usage.get(row.sessionId) : undefined;
 	if (bySession && bySession.state !== "full") return bySession;
 	// A task id is an alias only when it is a non-empty string: two main rows both carry null and must not match.
-	if (!nonEmpty(row.taskId)) return bySession ?? null;
-	return usage.get(row.taskId) ?? (usage instanceof Map ? [...usage.values()].find((entry) => entry?.taskId === row.taskId) : null) ?? bySession ?? null;
+	if (nonEmpty(row.taskId)) {
+		const byTask = usage.get(row.taskId) ?? (usage instanceof Map ? [...usage.values()].find((entry) => entry?.taskId === row.taskId) : null);
+		if (byTask) return byTask;
+	}
+	// The disk-backed Map carries saturation on the index, not on an absent row.
+	return bySession ?? (usage.full === true ? FULL_USAGE : null);
 }
+
+const FULL_USAGE = Object.freeze({ state: "full" });
 
 /**
  * Join every stored record about `inputs.row` and its descendants. Pure: the

@@ -8,11 +8,14 @@ import { runInNewContext } from "node:vm";
 import { SWITCH_KEYS } from "../src/config.mjs";
 import { SWITCHES } from "../src/control.mjs";
 import { resolvePaths } from "../src/paths.mjs";
+import { appendEnded } from "../src/session-ledger.mjs";
+import { loadSessionRecord } from "../src/session-record.mjs";
 import { createFakeClock } from "../src/util/time.mjs";
-import { createUsageIndex } from "../src/usage-index.mjs";
+import { createUsageIndex, readUsageIndex, USAGE_INDEX_VERSION } from "../src/usage-index.mjs";
 import { ACTION_LABELS, EXIT_REASON_LABELS, GOAL_STATUS_LABELS, INVESTIGATION_STATUS_LABELS, OUTCOME_LABELS, SESSION_STATE_LABELS, TASK_STATUS_LABELS, TERMINAL_LABELS, TRIGGER_LABELS } from "../src/ui/labels.mjs";
 import { buildHistory } from "../src/ui/history.mjs";
 import { buildOverview, buildSessions, buildSettings, buildUiState, daemonStatus, endedRow, loadDaemonInputs, loadUiInputs, uiState } from "../src/ui/model.mjs";
+import { buildSessionView } from "../src/ui/session-view.mjs";
 
 const NOW = Date.parse("2026-09-29T03:00:00.000Z"); // 12:00 KST
 const DAY = 24 * 3600_000;
@@ -62,6 +65,47 @@ it("(gate 16) history and board show a dash with the full-index tooltip", () => 
 		assert.equal(reading.text, "-");
 		assert.equal(reading.title, "토큰 색인이 가득 차 세지 않았습니다");
 	}
+});
+
+it("(gate 17) the disk-backed full state renders a dash in history, detail, and child rows until recount", () => {
+	const { paths } = makeHome();
+	const file = paths.health.usageIndexFile;
+	const row = { sessionId: "root", kind: "main", startedMs: NOW - HOUR, endedMs: NOW, outcome: "completed" };
+	appendEnded(paths, row);
+	appendEnded(paths, { ...row, sessionId: "child", kind: "child", parentSessionId: "root", taskId: "st_child", outcome: "answered" });
+	write(file, `${JSON.stringify({ v: USAGE_INDEX_VERSION, full: true })}\n`);
+	const clock = createFakeClock(NOW);
+	const index = createUsageIndex({ file, clock });
+	const transcript = path.join(path.dirname(file), "transcript.jsonl");
+	write(transcript, '{"type":"usage","provider":"p","model":"m","usage":{"input":42}}\n');
+	const view = () => buildSessionView(loadSessionRecord({ paths, id: "root", now: clock.now() }));
+	const app = fs.readFileSync(new URL("../src/ui/static/app.js", import.meta.url), "utf8");
+	const el = (tag, attrs, ...children) => ({ tag, ...attrs, children });
+	const format = runInNewContext(
+		["tokenReading", "endedTokenFacts", "endedChild"].map((name) => app.match(new RegExp(`function ${name}\\([^]*?\\n\\t\\}`))[0]).join("\n") +
+			"\n({ tokenReading, endedTokenFacts, endedChild })",
+		{ el, empty: (text) => el("p", { text }), note: (text) => el("p", { text }), OUTCOME_TONE: {}, lastState: {} },
+	);
+	const history = endedRow(row, 1, readUsageIndex(file));
+	const detail = view();
+	const renderedDetail = format.endedTokenFacts(detail.tokens);
+	const renderedChild = format.endedChild(detail.children[0]).children[0].children[2].children[1];
+	const tooltip = "토큰 색인이 가득 차 세지 않았습니다";
+	const reading = format.tokenReading(history.tokensState);
+	assert.deepEqual(
+		[history.tokensState, detail.tokens?.state, detail.children[0].tokensState, reading.text, reading.title,
+			renderedDetail.text, renderedDetail.title, renderedChild.text, renderedChild.title],
+		["full", "full", "full", "-", tooltip, "-", tooltip, "토큰 -", tooltip],
+	);
+
+	index.markMissing("old");
+	assert.equal(index.prune(NOW + DAY, 0), 1);
+	index.update("root", transcript);
+	index.update("child", transcript, { parentSessionId: "root" });
+	index.save();
+	const recovered = view();
+	assert.equal(recovered.tokens.total, 42);
+	assert.equal(recovered.children[0].tokens.total, 42);
 });
 
 describe("ui model", () => {
