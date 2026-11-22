@@ -11,6 +11,9 @@ import { AUDIT_CONTRACT, REQUEST_TTL_MS, auditsToday, createAuditor, readAuditSt
 import { createSessionFileLocator } from "../src/collect/session-files.mjs";
 import { usageTimeline } from "../src/collect/usage.mjs";
 import { DEFAULT_CONFIG } from "../src/config.mjs";
+import { appendDecision } from "../src/decisions.mjs";
+import { createInvestigations } from "../src/investigations.mjs";
+import { AUDIT_LIST_CAPS } from "../src/judge/audit.mjs";
 import { GUARD_FLAGS } from "../src/judge/lane.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 import { appendEnded, readEnded } from "../src/session-ledger.mjs";
@@ -801,6 +804,60 @@ test("(IS-1, IS-9) reviewer launch excludes an identity learned only by the resi
 		assert.equal(h.runner.starts.length, 1);
 		assert.equal(modelOf(h.runner.starts[0]), changed ? "google/gemini-3-pro" : "openai/gpt-5-5");
 	}
+});
+
+async function prepareWithFrozenRecord(h, mutate) {
+	const signal = new Int32Array(new SharedArrayBuffer(8));
+	const auditor = h.auditor({ createWorker(_url, options) {
+		return new Worker(new URL("./helpers/audit-prepare-probe.mjs", import.meta.url), {
+			...options, workerData: { paths: h.paths, mode: "block-after-record", signal },
+		});
+	} });
+	h.request("m1");
+	h.tick(auditor);
+	try {
+		await Atomics.waitAsync(signal, 0, 0, 30_000).value;
+		assert.equal(Atomics.load(signal, 0), 1, "worker finished the record join");
+		assert.equal(h.runner.starts.length, 0);
+		assert.equal(h.budget(), undefined);
+		mutate();
+	} finally {
+		Atomics.store(signal, 1, 1);
+		Atomics.notify(signal, 1);
+	}
+	await auditor.preparing();
+	h.tick(auditor);
+}
+
+test("(IS-9 launch refresh) a late analyzing decision for an older decision-only fp changes the launched model", async () => {
+	for (const change of ["none", "unrelated", "selected"]) {
+		const h = harness();
+		const ts = new Date(BASE).toISOString();
+		for (let i = 0; i <= AUDIT_LIST_CAPS.findings; i++) {
+			appendDecision(h.paths, { ts: new Date(BASE + i).toISOString(), fp: `f-${i}`, detector: "D1", event: "opened", subject: { sessionId: "m1" } });
+		}
+		await prepareWithFrozenRecord(h, () => {
+			if (change === "none") return;
+			const event = { ts, event: "investigation", status: "analyzing", model: LANES.ultrabrain[0] };
+			appendDecision(h.paths, { ...event, fp: "other-session" });
+			appendDecision(h.paths, { ...event, fp: "f-0", status: "open" });
+			if (change === "selected") appendDecision(h.paths, { ...event, fp: "f-0" });
+		});
+		assert.equal(h.record("m1").status, "running");
+		assert.equal(h.runner.starts.length, 1);
+		assert.equal(modelOf(h.runner.starts[0]), change === "selected" ? LANES.architect[0] : LANES.ultrabrain[0], change);
+		assert.equal(h.budget().count, 1);
+	}
+});
+
+test("(IS-9 launch refresh) a changed investigation file joins prepared models and prevents a charge", async () => {
+	const h = harness({ providers: ["google", "openai"] });
+	const store = createInvestigations(h);
+	store.open({ id: "investigation", subject: { sessionId: "m1" }, model: LANES.architect[0] });
+	await prepareWithFrozenRecord(h, () => store.attach("investigation", { model: LANES.ultrabrain[0] }));
+	assert.equal(h.runner.starts.length, 0, "neither the previous nor the current analyst may review");
+	assert.equal(h.record("m1").reason, "no-model");
+	assert.equal(h.budget(), undefined);
 });
 
 test("(IS-9) an unindexed append after preparation retries before selecting a reviewer", async (t) => {

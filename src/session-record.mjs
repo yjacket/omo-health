@@ -496,7 +496,7 @@ function joinSessionDecisions(row, descendants, investigations, decisions, bound
 			if (rows === null) investigation.verdictHistoryTooLarge = true;
 			else investigation.verdictHistory = rows.sort(byVerdictTime);
 		}
-		return { analystModels: [...analystModels] };
+		return { analystModels: [...analystModels], selectedFps: [...fpSet] };
 	}
 	return { selectedInvestigations, fpSet, about, selected: [...new Set([...about, ...delivered])] };
 }
@@ -526,6 +526,7 @@ function recordHealth(inputs, row, descendants) {
 	return {
 		infoFindings,
 		analystModels: [...analystModels],
+		selectedFps: [...fpSet],
 		health: {
 			findings: allFindings, actions, investigations: investigationRows, messages,
 			counts: { findings: allFindings.length, actions: actions.length, investigations: investigationRows.length, messages: messages.length },
@@ -580,7 +581,7 @@ export function buildSessionRecord(inputs = {}) {
 	const endedMs = msOf(row.endedMs);
 	const descendants = inputs.descendants ?? collectDescendants(row, ledger, usage.values());
 	const ambiguous = inputs.ambiguous ?? ambiguousLedgerTaskIds(ledger);
-	const { health, infoFindings, analystModels } = recordHealth({ ...inputs, decisions, investigations, messages: messagesIn }, row, descendants);
+	const { health, infoFindings, analystModels, selectedFps } = recordHealth({ ...inputs, decisions, investigations, messages: messagesIn }, row, descendants);
 
 	const entry = usageEntryOf(usage, row, ambiguous);
 	const compact = compactUsage(entry);
@@ -626,6 +627,7 @@ export function buildSessionRecord(inputs = {}) {
 		children,
 		coverage: { infoFindings },
 		analystModels,
+		selectedFps,
 		truncated: { messagesSkipped: Array.isArray(truncated.messagesSkipped) ? truncated.messagesSkipped : [] },
 		health,
 	};

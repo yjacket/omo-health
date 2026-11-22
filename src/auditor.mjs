@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { Worker } from "node:worker_threads";
 import { usageTimeline } from "./collect/usage.mjs";
+import { createInvestigations } from "./investigations.mjs";
 import { auditBundle, auditDocument, detectorFindingRefs, firedDetectors, hasDetectorCoverage, resolveAuditModel, validateAudit } from "./judge/audit.mjs";
 import { ANALYST_POLL_MS, parseAnalystOutput, unavailableReason } from "./judge/analyst.mjs";
 import { laneArgs } from "./judge/lane.mjs";
@@ -10,6 +11,7 @@ import { usageEntryOf } from "./session-record.mjs";
 import { auditReasonLabel } from "./ui/labels.mjs";
 import { fresh, isSpillModelKey, readUsageIndex, relatedUsageEntries } from "./usage-index.mjs";
 import { atomicWriteFile, atomicWriteJson, ensureDir, listDirSafe, readJsonSafe, readTextSafe, removeSafe, statSafe } from "./util/fsx.mjs";
+import { JsonlTail } from "./util/tail.mjs";
 import { redact, truncate } from "./util/text.mjs";
 
 /**
@@ -167,6 +169,46 @@ function sameAuditVersion(a, b) {
 	return b && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ino === b.ino && a.birthtimeMs === b.birthtimeMs;
 }
 
+function decisionVersions(paths) {
+	const files = new Map();
+	for (const name of listDirSafe(paths.health.decisionsDir)) {
+		if (!name.endsWith(".jsonl")) continue;
+		const file = path.join(paths.health.decisionsDir, name);
+		const version = auditFileVersion(file);
+		if (version) files.set(file, version);
+	}
+	return files;
+}
+
+function launchAnalystModels(paths, investigations, loaded, selectedFps, before) {
+	const models = new Set(loaded.analystModels);
+	const fps = new Set(selectedFps);
+	if (!fps.size) return models;
+	const add = (model) => { if (typeof model === "string" && model) models.add(model); };
+	for (const fp of fps) {
+		const current = investigations.get(fp);
+		if (current?.id === fp) add(current.model);
+	}
+	// The daemon appends complete decision lines. Track file boundaries rather than
+	// comparing event timestamps: even a backdated append or a new day is covered.
+	for (const [file, version] of decisionVersions(paths)) {
+		const start = before.get(file);
+		if (start && sameAuditVersion(start, version)) continue;
+		const tail = new JsonlTail(file, { maxReadBytes: 64 * 1024 });
+		if (start && start.ino === version.ino && start.birthtimeMs === version.birthtimeMs && start.size < version.size) {
+			tail.offset = start.size;
+		}
+		let batch;
+		do {
+			batch = tail.readNew();
+			for (const row of batch.entries) {
+				if (row?.event === "investigation" && row.status === "analyzing" && fps.has(row.fp)) add(row.model);
+			}
+		} while (batch.more);
+	}
+	return models;
+}
+
 export function readVersionedAuditTimeline(file, tokens, { maxFileBytes = TIMELINE_MAX_BYTES, timeline = usageTimeline, log } = {}) {
 	const version = auditFileVersion(file);
 	if (!version || version.size > maxFileBytes) return { full: null };
@@ -191,6 +233,7 @@ export function readAuditTimeline(file, tokens, options) {
 export function createAuditor({ paths, config, clock, log, runner, index, env = process.env, timelineMaxBytes = TIMELINE_MAX_BYTES, createWorker = (url, options) => new Worker(url, options), afterStart } = {}) {
 	const auditsDir = paths.health.auditsDir;
 	const jobsDir = paths.health.jobsDir;
+	const investigations = createInvestigations({ paths, clock });
 	let worker;
 	let pending; // Memory only. The file remains queued until a tick consumes the reply.
 	const records = new Map();
@@ -294,7 +337,7 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		}
 	}
 
-	function launchPrepared(record, now, { loaded, full, warning, timelineSource }, changedVersions) {
+	function launchPrepared(record, now, { loaded, selectedFps, full, warning, timelineSource }, changedVersions, decisionStart) {
 		if (config.audit?.enabled !== true) return fail(record, "disabled", null, now);
 		if (!loaded?.found) return fail(record, "not-found", null, now);
 		if (readBudget(paths, now).count >= config.audit.perDay) return fail(record, "cap", null, now);
@@ -306,8 +349,7 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		}
 		// The resident index may have learned identities since the worker prepared the evidence.
 		const facts = auditModelFacts(index ? usageEntryOf(index, loaded.session ?? {}) : null, full);
-		// The record join already collected every analyst model for its selected fps, including decision-only fps.
-		const analystModels = loaded.analystModels ?? [];
+		const analystModels = launchAnalystModels(paths, investigations, loaded, selectedFps, decisionStart);
 		const choice = resolveAuditModel(paths, config, { ...facts, analystModels });
 		if (choice?.blocked === "models-unknown") return fail(record, "models-unknown", null, now);
 		if (!choice) return fail(record, "no-model", null, now);
@@ -380,6 +422,7 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 				owner.on("exit", (code) => lostWorker(owner, `preparation worker exited (${code})`));
 			}
 			worker.ref();
+			pending.decisionStart = decisionVersions(paths);
 			// The daemon passes its resident index; an auditor built without one reads the file here, never in the worker.
 			const source = index ?? readUsageIndex(paths.health.usageIndexFile);
 			worker.postMessage({ sessionId: record.sessionId, now, indexEntries: relatedUsageEntries(source, record.sessionId), indexFull: source?.full === true, bounds: {
@@ -398,11 +441,11 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		for (const record of recovering) resolveLaunching(record);
 		if (recovering.length || slotHeld()) return;
 		if (pending) {
-			const { record, result, error, changedVersions } = pending;
+			const { record, result, error, changedVersions, decisionStart } = pending;
 			if (!result && error === undefined) return;
 			pending = undefined;
 			if (error !== undefined) return fail(record, "prepare-error", error, now);
-			return launchPrepared(record, now, result, changedVersions);
+			return launchPrepared(record, now, result, changedVersions, decisionStart);
 		}
 		const next = [...records.values()].filter((record) => record.status === "queued").sort((a, b) => a.requestedMs - b.requestedMs)[0];
 		if (next) startPreparation(next, now);

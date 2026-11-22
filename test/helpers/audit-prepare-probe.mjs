@@ -8,19 +8,21 @@ parentPort.on("message", (job) => {
 	if (mode === "crash") throw new Error("failed preparation: " + "x".repeat(500));
 	if (mode === "exit") process.exit(7);
 	const observed = { scans: [], timelines: [] };
+	const block = () => {
+		Atomics.store(signal, 0, 1);
+		Atomics.notify(signal, 0);
+		if (Atomics.wait(signal, 1, 0, 30_000) === "timed-out") throw new Error("test did not release preparation");
+	};
 	const result = prepareAudit(job, {
 		paths,
 		loadRecord(options) {
-			if (mode === "block") {
-				Atomics.store(signal, 0, 1);
-				Atomics.notify(signal, 0);
-				if (Atomics.wait(signal, 1, 0, 30_000) === "timed-out") throw new Error("test did not release preparation");
-			}
+			if (mode === "block") block();
 			const { messageScanTotalBytes, messageScanMaxBytes, descendantScanMax } = options;
 			observed.options = { messageScanTotalBytes, messageScanMaxBytes, descendantScanMax };
 			if (mode === "bounds") return { found: false };
 			if (mode === "scans") options.scanMessages = (file) => (observed.scans.push(file), []);
 			const record = loadSessionRecord(options);
+			if (mode === "block-after-record") block();
 			if (mode === "oversized") record.tokens = { models: Array.from({ length: 3000 }, (_, i) => ({ key: `${"m".repeat(60)}${i}`, tokens: 1, cost: 0 })) };
 			return record;
 		},

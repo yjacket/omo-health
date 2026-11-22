@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
 import { DEFAULT_CONFIG } from "../src/config.mjs";
-import { auditBundle } from "../src/judge/audit.mjs";
+import { AUDIT_LIST_CAPS, auditBundle } from "../src/judge/audit.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 import { buildSessionRecord, loadSessionRecord, scanOmoHealthMessages } from "../src/session-record.mjs";
 import * as sessionRecord from "../src/session-record.mjs";
@@ -148,6 +148,32 @@ for (const auditRetention of [false, true]) {
 		assert.deepEqual(record.health.messages.map(({ kind }) => kind), ["scope-check", null]);
 	});
 }
+
+test("(IS-9 launch refresh) full and bounded records retain the exact join keys outside the row caps", () => {
+	const { paths } = setup();
+	const row = mainRow();
+	const subject = { sessionId: row.sessionId };
+	writeLedger(paths, [row]);
+	const findings = Array.from({ length: AUDIT_LIST_CAPS.findings + 1 }, (_, i) => ({
+		ts: iso(T0 + i), fp: `decision-${i}`, event: "opened", detector: "D1", subject, evidence: ["private evidence"],
+	}));
+	writeDecisions(paths, [...findings, { fp: "machine-only", event: "opened", detector: "D2" }]);
+	const investigations = Array.from({ length: AUDIT_LIST_CAPS.investigations + 1 }, (_, i) => ({
+		id: `file-${i}`, subject, openedMs: T0 + i, evidence: ["private evidence"],
+	}));
+	for (const investigation of investigations) writeInvestigation(paths, investigation);
+	const expected = [...findings.map(({ fp }) => fp), ...investigations.map(({ id }) => id)].sort();
+	for (const auditRetention of [true, false]) {
+		const record = loadSessionRecord({ paths, id: row.sessionId, now: row.endedMs, auditRetention });
+		if (auditRetention) {
+			assert.ok(!record.health.findings.some(({ fp }) => fp === "decision-0"));
+			assert.ok(!record.health.investigations.some(({ id }) => id === "file-0"));
+		}
+		assert.ok(Array.isArray(record.selectedFps), "the record must expose the selected investigation fingerprints");
+		assert.deepEqual(record.selectedFps.toSorted(), expected);
+		assert.doesNotMatch(JSON.stringify(auditBundle(record, null, { config: DEFAULT_CONFIG, now: row.endedMs })), /selectedFps|decision-0"|file-0"/);
+	}
+});
 
 test("IS-10: bounded normal session produces the same bundle without dashboard prose", () => {
 	const { paths } = setup();
