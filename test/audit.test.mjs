@@ -329,6 +329,47 @@ function detectorWorld(file, config, now) {
 	return { sessions: new Map([[tracker.state.id, tracker.state]]), config, now, warmup: () => null, events: { all: () => [] } };
 }
 
+test("IS-8: an early D10 storm survives 201 later successful tool calls", (t) => {
+	const offsets = [0, 1000, 2000, 3000, 60_000];
+	const file = toolErrorsFile(t, offsets);
+	assert.deepEqual(detectLoops(detectorWorld(file, DEFAULT_CONFIG, T0 + 61_000)).map(({ kind }) => kind), ["error-storm"]);
+
+	const later = Array.from({ length: 201 }, (_, i) => {
+		const ms = T0 + 61_000 + 2 * i;
+		const id = `successful-${i}`;
+		return [
+			{ type: "message", timestamp: iso(ms), message: {
+				role: "assistant", content: [{ type: "toolCall", id, name: "bash", arguments: { command: id } }],
+			} },
+			{ type: "message", timestamp: iso(ms + 1), message: {
+				role: "toolResult", toolCallId: id, toolName: "bash", isError: false,
+			} },
+		];
+	}).flat();
+	fs.appendFileSync(file, later.map((entry) => `${JSON.stringify(entry)}\n`).join(""));
+
+	const timeline = structuredClone(usageTimeline(file, DEFAULT_CONFIG.tokens));
+	const bundleFor = (config) => auditBundle(emptyRecord(), timeline, {
+		config, now: T0 + HOUR, configDecisions: [{ ms: T0, thresholdsHash: detectorThresholdsHash(config) }],
+	});
+	const bundle = bundleFor(DEFAULT_CONFIG);
+	const shorter = bundleFor({ ...DEFAULT_CONFIG, loops: { ...DEFAULT_CONFIG.loops, errorStormWindowMs: 3000, errorStormCount: 4 } });
+	assert.doesNotMatch(JSON.stringify({ timeline, bundle, shorter }), /fixture-tool-error-do-not-export/);
+	assert.deepEqual({
+		timeline: timeline.errorStorm,
+		audit: bundle.tokens.errorStorm,
+		required: bundle.requiredDetectors,
+		custom: shorter.tokens.errorStorm,
+		customRequired: shorter.requiredDetectors,
+	}, {
+		timeline: { detected: true, maxMatchingCount: 5 },
+		audit: { detected: true, maxMatchingCount: 5 },
+		required: ["D10"],
+		custom: { detected: true, maxMatchingCount: 4 },
+		customRequired: ["D10"],
+	});
+});
+
 for (const { name, offsets, errorAt, loops, expected } of [
 	{ name: "one tool error", offsets: [0], expected: false },
 	{ name: "five matching tool errors inside the default window", offsets: [0, 1000, 2000, 3000, 60_000], expected: true },

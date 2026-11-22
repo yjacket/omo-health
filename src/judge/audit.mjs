@@ -540,9 +540,9 @@ export function auditBundle(record, timeline, { config, now, configDecisions = [
 		return [detector, continuousFromStart && keys.every((key) => cutoffs?.includes(key)) &&
 			findingThresholds(config, detector, kind) !== undefined];
 	}));
-	// Review the incident as of session end, not as of the (possibly much later) audit.
-	const errorStorm = Array.isArray(timeline?.errorStormTimings) && findingThresholds(config, "D10", "error-storm")
-		? errorStormFact(timeline.errorStormTimings, config.loops, numOf(session.endedMs) ?? now)
+	// Audit conditions that held during the session, even if the live finding has aged out.
+	const errorStorm = Array.isArray(timeline?.errorStormWindows) && findingThresholds(config, "D10", "error-storm")
+		? errorStormFact(timeline.errorStormWindows, config.loops)
 		: null;
 	const allFindings = findingsOf(health.findings, continuousSinceMs, config);
 	// Coverage is judged on every finding, before any cut: an answer cannot be

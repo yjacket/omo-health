@@ -153,6 +153,58 @@ test("(IS-2, IS-12) an over-capture identity waits until the exact reread fits",
 	assert.equal(s.tracker.tokensOf(id).tokens.total, 42);
 });
 
+test("(IS-1, IS-2) four oversized non-numeric counters publish without rereads", (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const bytes = 10 * 1024 * 1024;
+	const partial = bigRecord(bytes + 1, usage("9".repeat(70 * 1024), 42)).slice(0, -1);
+	assert.equal(Buffer.byteLength(partial), bytes);
+	const sessions = Array.from({ length: 4 }, (_, i) => {
+		const id = `large-counter-${i}`;
+		const file = mainFile(s.paths, id);
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, partial);
+		return sessionState({ id, file, cwd: s.cwd });
+	});
+	const world = makeWorld({ now: s.clock.now(), sessions });
+	s.tracker.tick(world);
+	s.tracker.tick(world);
+	for (const { id, file } of sessions) {
+		assert.equal(s.index.get(id).scanOffset, bytes);
+		assert.equal(s.index.get(id).offset, 0);
+		fs.appendFileSync(file, "}\n");
+	}
+
+	let actual = 0;
+	const readSync = fs.readSync;
+	const spy = t.mock.method(fs, "readSync", (...args) => {
+		const n = readSync(...args);
+		actual += n;
+		return n;
+	});
+	const tick = s.tracker.tick(world);
+	spy.mock.restore();
+	t.diagnostic(`closing tick: ${actual} actual, ${tick.bytesRead} scan bytes (budget ${USAGE_TICK_BYTES})`);
+	assert.ok(actual <= USAGE_TICK_BYTES, `actual reads: ${actual}`);
+	assert.deepEqual(sessions.map(({ id }) => s.tracker.tokensOf(id)?.tokens?.total), [42, 42, 42, 42]);
+	assert.equal(tick.bytesRead, 8, "only the closing bytes are scanned");
+
+	const counter = (value) => typeof value === "number" ? value : 0;
+	for (const { id, file } of sessions) {
+		const { message } = JSON.parse(fs.readFileSync(file, "utf8"));
+		const { input, output, cacheRead, cacheWrite } = message.usage;
+		const expected = {
+			[`${message.provider}/${message.model}`]: {
+				input: counter(input), output: counter(output), cacheRead: counter(cacheRead), cacheWrite: counter(cacheWrite),
+				tokens: counter(input) + counter(output) + counter(cacheRead) + counter(cacheWrite), cost: counter(message.usage.cost?.total),
+			},
+		};
+		assert.deepEqual(s.index.get(id).published.models, expected);
+		assert.deepEqual(readUsage(file).effective.models, expected);
+		assert.deepEqual(usageTimeline(file).totals.models, expected);
+	}
+});
+
 test("(IS-2) a deferred exact reread keeps the last published tokens on the board and in history", (t) => {
 	const s = setup();
 	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));

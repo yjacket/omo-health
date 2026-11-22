@@ -1404,14 +1404,15 @@ test("(gate 6) oversized non-string identities bill as too long and mark the mod
 	assert.equal(got.modelsIncomplete, true);
 });
 
-test("(gate 6) only a winning oversized non-number usage leaf skips usage", (t) => {
+test("(gate 6, IS-1) a winning oversized non-number usage leaf contributes zero", (t) => {
 	const { file } = setup(t);
 	const prefix = `{${gate6Gap}"type":"usage","provider":"p","model":"alpha","usage":{"output":2,"input":"${gate6Long}"`;
-	for (const [suffix, skipped, total] of [["}}\n", 1, 0], [',"input":7}}\n', 0, 9], ["}}", 1, 0]]) {
+	for (const [suffix, input] of [["}}\n", 0], [',"input":7}}\n', 7], ["}}", 0]]) {
 		fs.writeFileSync(file(), prefix + suffix);
 		for (const got of [readUsage(file()).effective, usageTimeline(file()).totals]) {
-			assert.equal(got.total, total);
-			assert.deepEqual(got.diagnostics, { badLines: 0, skippedLines: skipped });
+			assert.equal(got.total, input + 2);
+			assert.deepEqual(got.models, { "p/alpha": { input, output: 2, cacheRead: 0, cacheWrite: 0, tokens: input + 2, cost: 0 } });
+			assert.deepEqual(got.diagnostics, { badLines: 0, skippedLines: 0 });
 			assert.deepEqual(got.usedModels, { "p/alpha": true });
 			assert.equal(got.modelsIncomplete, false);
 		}

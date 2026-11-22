@@ -55,7 +55,6 @@ const MODEL_ID_UNREADABLE = "(model id unreadable)";
 const OTHER_MODELS = "(other models)";
 const modelMapSizes = new WeakMap();
 const TRUNCATED_STRING_ID = Symbol("truncatedStringIdentity");
-const TRUNCATED_USAGE = Symbol("truncatedUsage");
 const TRUNCATED_VALUE = Object.freeze({});
 const RECORD_ACCUMULATOR = Symbol("recordAccumulator");
 
@@ -263,23 +262,6 @@ function billingKey(provider, model) {
 	return left.length + 1 + right.length > MODEL_KEY_LENGTH ? MODEL_ID_TOO_LONG : `${left}/${right}`;
 }
 
-/** The usage object a record's type/role/customType selects, or undefined. */
-function usageCarrier(entry) {
-	if (!isObject(entry)) return undefined;
-	const type = entry.type;
-	if ((type === "usage" || type === "branch_summary" || type === "compaction") && isObject(entry.usage)) return entry.usage;
-	if (type === "custom" && entry.customType === "prompt-cache-prewarm") {
-		const data = entry.data;
-		if (isObject(data) && data.phase === "warmed" && isObject(data.usage)) return data.usage;
-		return undefined;
-	}
-	const message = entry.message;
-	if (type === "message" && isObject(message) && isObject(message.usage)) {
-		if (message.role === "toolResult" || message.role === "assistant") return message.usage;
-	}
-	return undefined;
-}
-
 /**
  * The usage a single session record contributes, or undefined. Checked in the
  * order omo's `/session` uses.
@@ -383,12 +365,9 @@ export function modelsOfEntry(entry) {
 	return out;
 }
 
-function consumeEntry(totals, entry, skipUsage = false) {
-	if (skipUsage) totals.diagnostics.skippedLines += 1;
-	else {
-		const hit = usageOfEntry(entry);
-		if (hit) addUsage(totals, hit);
-	}
+function consumeEntry(totals, entry) {
+	const hit = usageOfEntry(entry);
+	if (hit) addUsage(totals, hit);
 	const models = modelsOfEntry(entry);
 	for (const id of models.ids) addUsedModel(totals, id);
 	if (models.incomplete) totals.modelsIncomplete = true;
@@ -523,7 +502,7 @@ export function createRecordScanner() {
 
 	function beginObject(plan, value) {
 		openContainer(true);
-		projected.push({ depth, plan, value, truncations: new Set() });
+		projected.push({ depth, plan, value });
 	}
 
 	function keep(byte) {
@@ -537,6 +516,10 @@ export function createRecordScanner() {
 				frame.value[key] = JSON.parse(raw.toString("utf8", 0, length));
 			} else if (decimal) {
 				frame.value[key] = roundedDecimal(decimal);
+			} else if (plan === "usage") {
+				// The value is known to be non-numeric: bill zero without
+				// turning an invalid prewarm counter into a valid number.
+				frame.value[key] = null;
 			} else if (plan === "timestamp") {
 				// A clipped string can parse as a different date. Never use its prefix.
 				delete frame.value[key];
@@ -546,7 +529,6 @@ export function createRecordScanner() {
 					: undefined;
 				if (plan === "identity") frame.value[key] = prefix === undefined ? TRUNCATED_NONSTRING_ID : truncatedIdentity(prefix);
 				else frame.value[key] = prefix ?? TRUNCATED_VALUE;
-				if (plan === "usage" || plan === USAGE_FIELDS || plan === COST_FIELDS) frame.truncations.add(key);
 			}
 			capture = undefined;
 		}
@@ -555,10 +537,7 @@ export function createRecordScanner() {
 
 	function closeContainer() {
 		const frame = projected.at(-1);
-		if (frame?.depth === depth) {
-			if (frame.truncations.size) frame.value[TRUNCATED_USAGE] = frame.truncations;
-			projected.pop();
-		}
+		if (frame?.depth === depth) projected.pop();
 		depth -= 1;
 		finishValue();
 	}
@@ -574,7 +553,6 @@ export function createRecordScanner() {
 			const key = pendingKey;
 			const plan = pendingPlan;
 			pendingPlan = undefined;
-			frame.truncations.delete(key);
 			if (typeof plan === "object" && byte === OPEN_OBJECT) {
 				const value = {};
 				frame.value[key] = value;
@@ -747,14 +725,6 @@ export function createRecordScanner() {
 		get incomplete() {
 			return !malformed && state !== STATE_END;
 		},
-		get oversized() {
-			if (malformed || state !== STATE_END || !entry) return false;
-			const carrier = usageCarrier(entry);
-			if (!carrier) return false;
-			if (carrier[TRUNCATED_USAGE]?.size) return true;
-			const cost = carrier.cost;
-			return isObject(cost) && (cost[TRUNCATED_USAGE]?.size ?? 0) > 0;
-		},
 	};
 }
 
@@ -810,7 +780,7 @@ function appendBytes(accumulator, bytes) {
 
 function needsWholeRecord(acc) {
 	return acc.len <= RECORD_PARSE_LIMIT && acc.kind === "scanner" && !acc.markerTail &&
-		(acc.scanner.oversized || hasTruncatedIdentity(acc.scanner.preview()));
+		hasTruncatedIdentity(acc.scanner.preview());
 }
 
 function accumulatorText(acc) {
@@ -858,7 +828,7 @@ function finalFragment(acc) {
 function consumeScannerRecord(totals, scanner, fragment = false) {
 	if (fragment) {
 		const entry = scanner.preview();
-		if (entry) consumeEntry(totals, entry, scanner.oversized);
+		if (entry) consumeEntry(totals, entry);
 		return entry;
 	}
 	const entry = scanner.finish();
@@ -866,7 +836,7 @@ function consumeScannerRecord(totals, scanner, fragment = false) {
 		totals.diagnostics.badLines += 1;
 		return;
 	}
-	consumeEntry(totals, entry, scanner.oversized);
+	consumeEntry(totals, entry);
 	return entry;
 }
 
@@ -1188,16 +1158,49 @@ function loopErrorText(content) {
 	return Array.isArray(content) ? content.filter((item) => item?.type === "text" && typeof item.text === "string").map((item) => item.text).join("\n") : "";
 }
 
-function consumeLoopHistory({ errors, toolHistory }, entry) {
+function rememberErrorStorm(stats, head, ms) {
+	if (head === undefined) return;
+	const { loopHistory, errorStormWindows, errorStorm, loops } = stats;
+	const timestamps = errorStormGroups(loopHistory).get(head).ms;
+	const fact = errorStormFact([timestamps], loops);
+	errorStorm.maxMatchingCount = Math.max(errorStorm.maxMatchingCount, fact.maxMatchingCount);
+	errorStorm.detected ||= fact.detected;
+
+	// The worker doesn't know the audit's window setting. For each possible
+	// count, keep only its shortest window across all live-history snapshots.
+	// A new best must contain this error; sorting also handles out-of-order ms.
+	timestamps.sort((a, b) => a - b);
+	const pivot = timestamps.indexOf(ms);
+	for (let count = 1; count <= timestamps.length; count += 1) {
+		const previous = errorStormWindows[count - 1];
+		let span = previous ? previous.at(-1) - previous[0] : Infinity;
+		if (span === 0) continue;
+		let start;
+		for (let i = Math.max(0, pivot - count + 1); i <= Math.min(pivot, timestamps.length - count); i += 1) {
+			const candidate = timestamps[i + count - 1] - timestamps[i];
+			if (candidate < span) {
+				span = candidate;
+				start = i;
+				if (span === 0) break;
+			}
+		}
+		if (start !== undefined) errorStormWindows[count - 1] = timestamps.slice(start, start + count);
+	}
+}
+
+function consumeLoopHistory(stats, entry) {
 	if (entry?.type !== "message") return;
+	const { errors, toolHistory } = stats.loopHistory;
 	const message = entry.message;
 	// Project only D10's inputs, matching SessionTracker's retained histories.
 	if (message?.role === "assistant") {
 		const ms = entryMs(entry);
 		if (message.stopReason === "error") {
 			const text = message.errorMessage ?? loopErrorText(message.content);
-			errors.push({ ms, text: typeof text === "string" ? truncate(redact(text), 300) : "" });
+			const error = { ms, text: typeof text === "string" ? truncate(redact(text), 300) : "" };
+			errors.push(error);
 			if (errors.length > ASSISTANT_ERROR_HISTORY) errors.shift();
+			rememberErrorStorm(stats, errorStormGroups({ errors: [error] }).keys().next().value, ms);
 		} else if (message.stopReason !== "aborted" && Array.isArray(message.content)) {
 			for (const call of message.content) {
 				if (call?.type !== "toolCall") continue;
@@ -1209,7 +1212,10 @@ function consumeLoopHistory({ errors, toolHistory }, entry) {
 		const call = toolHistory.findLast((item) => item.id === message.toolCallId);
 		if (call) {
 			call.isError = Boolean(message.isError);
-			if (call.isError) call.errHead = truncate(redact(loopErrorText(message.content)), 120);
+			if (call.isError) {
+				call.errHead = truncate(redact(loopErrorText(message.content)), 120);
+				rememberErrorStorm(stats, errorStormGroups({ toolHistory: [call] }).keys().next().value, call.ms);
+			}
 		}
 	}
 }
@@ -1227,7 +1233,7 @@ function consumeTimelineScanner(totals, stats, scanner, fragment = false) {
 	const { message } = entry;
 	if (entry.type !== "message" || message?.role !== "assistant" || !isObject(message.usage)) return;
 	const ms = timestampOf(entry, message);
-	if (Number.isFinite(ms) && !scanner.oversized) consumeTimelineTurn(stats, message, ms);
+	if (Number.isFinite(ms)) consumeTimelineTurn(stats, message, ms);
 	else stats.turnStatsIncomplete = true;
 }
 
@@ -1258,7 +1264,7 @@ function consumeTimelineRecord(totals, stats, acc) {
 	if (usageWanted) consumeEntry(totals, entry);
 	else totals.diagnostics.skippedLines += 1;
 	consumeTimelineStats(stats, entry);
-	consumeLoopHistory(stats.loopHistory, entry);
+	consumeLoopHistory(stats, entry);
 }
 
 function consumeTimelineFragment(totals, stats, acc) {
@@ -1279,6 +1285,7 @@ function consumeTimelineFragment(totals, stats, acc) {
 	}
 	if (usageWanted) consumeEntry(totals, entry);
 	consumeTimelineStats(stats, entry);
+	consumeLoopHistory(stats, entry);
 }
 
 /**
@@ -1308,6 +1315,9 @@ export function usageTimeline(file, { cacheStormWrite = Infinity, cacheStormRead
 			topTurns: [],
 			errors: { count: 0, byClass: {} },
 			loopHistory: { errors: [], toolHistory: [] },
+			loops,
+			errorStorm: { detected: false, maxMatchingCount: 0 },
+			errorStormWindows: [],
 			tools: new Map(),
 			stormHistory: [],
 			stormNext: 0,
@@ -1348,7 +1358,6 @@ export function usageTimeline(file, { cacheStormWrite = Infinity, cacheStormRead
 		const [storm] = cacheStorm({ turns }, { cacheStormWrite, cacheStormReadFrac });
 		// The scanner projects turn counters and time, but not content or error details.
 		const incomplete = stats.largeRecords > 0;
-		const errorStormTimings = incomplete ? null : [...errorStormGroups(stats.loopHistory).values()].map(({ ms }) => ms);
 		return {
 			totals,
 			largeRecords: stats.largeRecords,
@@ -1361,10 +1370,8 @@ export function usageTimeline(file, { cacheStormWrite = Infinity, cacheStormRead
 				stormTurns: storm?.data.turns ?? 0,
 			},
 			errors: { ...stats.errors, incomplete },
-			errorStorm: errorStormTimings && errorStormFact(errorStormTimings, loops),
-			// The worker only receives token cutoffs. Carry anonymous, bounded groups so
-			// the audit can use the current D10 count/window without sending error text.
-			errorStormTimings,
+			errorStorm: incomplete ? null : stats.errorStorm,
+			errorStormWindows: incomplete ? null : stats.errorStormWindows,
 			tools: {
 				rows: [...stats.tools]
 					.map(([name, value]) => ({ name, calls: value.calls, errors: value.errors }))
