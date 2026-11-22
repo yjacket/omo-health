@@ -275,6 +275,20 @@ export function buildSessionRecord(inputs = {}) {
 	const fpSet = new Set(selectedInvestigations.map((record) => record.id).filter(nonEmpty));
 	for (const entry of decisions) if (isRecord(entry) && FINDING_EVENTS.has(entry.event) && nonEmpty(entry.fp) && subjectMatches(entry.subject, allAllowed)) fpSet.add(entry.fp);
 
+	// 2b. every model that may have analyzed a selected fp: each selected investigation file's current model plus
+	// the analyzing decisions recorded for the fp. An fp known only from decisions has no investigation file, so the
+	// decision rows are the only source for its analyst model.
+	const analystModels = [];
+	const addAnalystModel = (model) => {
+		if (!nonEmpty(model) || analystModels.includes(model)) return;
+		analystModels.push(model);
+	};
+	for (const record of selectedInvestigations) addAnalystModel(record.model);
+	for (const entry of decisions) {
+		if (!isRecord(entry) || entry.event !== "investigation" || !fpSet.has(entry.fp)) continue;
+		addAnalystModel(entry.model);
+	}
+
 	// 3. decisions about the session; 4. decisions delivered to it or its descendants
 	const about = decisions.filter((entry) => isRecord(entry) && ((nonEmpty(entry.fp) && fpSet.has(entry.fp)) || subjectMatches(entry.subject, allAllowed) || entry.sessionId === row.sessionId));
 	const delivered = decisions.filter((entry) => isRecord(entry) && isRecord(entry.outcome) && nonEmpty(entry.outcome.sessionId) && deliveredAllowed.has(entry.outcome.sessionId));
@@ -353,6 +367,7 @@ export function buildSessionRecord(inputs = {}) {
 		tokens,
 		children,
 		coverage,
+		analystModels,
 		truncated: { messagesSkipped: Array.isArray(truncated.messagesSkipped) ? truncated.messagesSkipped : [] },
 		health: {
 			findings: allFindings,

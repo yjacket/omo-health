@@ -69,6 +69,28 @@ function postAt(targetPort, target, value, extra = {}) {
 	});
 }
 
+/** One GET against an arbitrary port; resolves { status, body } with body parsed as JSON. */
+function getAt(targetPort, target) {
+	return new Promise((resolve, reject) => {
+		const req = http.request({ host: "127.0.0.1", port: targetPort, method: "GET", path: target, headers: { "x-omo-health-token": TOKEN }, agent: false }, (res) => {
+			const chunks = [];
+			res.on("data", (c) => chunks.push(c));
+			res.on("end", () => {
+				const text = Buffer.concat(chunks).toString("utf8");
+				let parsed = text;
+				try {
+					parsed = JSON.parse(text);
+				} catch {
+					// keep text
+				}
+				resolve({ status: res.statusCode, body: parsed });
+			});
+		});
+		req.on("error", reject);
+		req.end();
+	});
+}
+
 before(async () => {
 	root = fs.mkdtempSync(path.join(os.tmpdir(), "omoh-ui-server-"));
 	paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health") });
@@ -711,6 +733,30 @@ describe("ui server", { timeout: 20_000 }, () => {
 				}
 			});
 
+			it("excludes a decision-only fp's analyzing model from the detail and the POST", () => {
+				const world = makeWorld({ lanes: { ultrabrain: ["openai/alpha-review"], architect: ["openai/beta-review"] } });
+				try {
+					fs.mkdirSync(world.paths.health.decisionsDir, { recursive: true });
+					fs.appendFileSync(
+						path.join(world.paths.health.decisionsDir, "2026-11-22.jsonl"),
+						[
+							{ ts: new Date(world.nowMs - 290_000).toISOString(), fp: "F9", event: "opened", subject: { sessionId: AUDIT_ID } },
+							{ ts: new Date(world.nowMs - 240_000).toISOString(), fp: "F9", event: "investigation", status: "analyzing", model: "openai/alpha-review" },
+						]
+							.map((entry) => JSON.stringify(entry))
+							.join("\n") + "\n",
+					);
+					const detail = world.detail(AUDIT_ID).audit;
+					assert.equal(detail.planned.model, "openai/beta-review", "the decision-only fp's analyst model is not offered");
+					const posted = world.startAudit(AUDIT_ID);
+					assert.equal(posted[0], 202);
+					assert.equal(posted[1].audit.planned.model, "openai/beta-review", "the POST must not launch the analyst model either");
+					assert.notEqual(posted[1].audit.planned.model, "openai/alpha-review");
+				} finally {
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				}
+			});
+
 			function aliasWorld() {
 				const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omoh-audit-alias-"));
 				const env = { USERPROFILE: dir, OMO_HEALTH_HOME: path.join(dir, "health") };
@@ -775,6 +821,35 @@ describe("ui server", { timeout: 20_000 }, () => {
 						await auditServer.close();
 						fs.rmSync(world.dir, { recursive: true, force: true });
 					}
+				}
+			});
+
+			it("shows a child's pending request as queued through both the task id and the session id", async () => {
+				const world = aliasWorld();
+				fs.mkdirSync(world.paths.health.sessionsDir, { recursive: true });
+				fs.writeFileSync(
+					path.join(world.paths.health.sessionsDir, "ended-2026-11-22.jsonl"),
+					`${JSON.stringify({ v: 1, sessionId: world.sessionId, taskId: world.taskId, kind: "child", outcome: "answered", startedMs: world.now() - 1_000, endedMs: world.now() })}\n`,
+				);
+				writeJson(path.join(world.paths.health.auditRequestsDir, `${world.sessionId}.json`), { v: 1, sessionId: world.sessionId, requestedMs: world.now() - 1_000 });
+				const auditServer = createUiServer({
+					paths: world.paths,
+					token: TOKEN,
+					getState: () => STATE,
+					sessionDetail: createSessionDetail({ paths: world.paths, env: world.env, now: world.now }),
+					now: world.now,
+				});
+				const { port: auditPort } = await auditServer.listen();
+				try {
+					const byTask = await getAt(auditPort, `/api/session?id=${world.taskId}`);
+					const bySession = await getAt(auditPort, `/api/session?id=${world.sessionId}`);
+					assert.deepEqual([byTask.status, bySession.status], [200, 200]);
+					assert.equal(byTask.body.audit.state.status, "queued", "the task id resolves to the ledger session's request");
+					assert.equal(bySession.body.audit.state.status, "queued");
+					assert.deepEqual([byTask.body.audit.state.status, byTask.body.audit.state.statusKo], ["queued", "대기 중"]);
+				} finally {
+					await auditServer.close();
+					fs.rmSync(world.dir, { recursive: true, force: true });
 				}
 			});
 

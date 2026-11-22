@@ -383,6 +383,21 @@ test("coverage.infoFindings is true only for a coverage event that precedes the 
 	assert.equal(late.coverage.infoFindings, false);
 });
 
+test("analystModels collects decision-only fps' analyzing models plus the investigation file's model", () => {
+	const fixture = corpus();
+	fixture.investigations.find((record) => record.id === "fp-fp").model = "openai/file-review";
+	fixture.decisions.push(
+		{ fp: "fp-decision-only", event: "opened", detector: "D1", kind: "stall", severity: "warn", subject: { sessionId: "s-child", taskId: "st_a" } },
+		{ fp: "fp-decision-only", event: "investigation", status: "analyzing", model: "openai/first-review" },
+		{ fp: "fp-decision-only", event: "investigation", status: "analyzing", model: "openai/second-review" },
+		{ fp: "fp-unrelated", event: "investigation", status: "analyzing", model: "openai/unrelated-review" },
+	);
+	const row = fixture.rows[0];
+	const record = buildSessionRecord({ id: row.sessionId, row, ledger: fixture.rows, decisions: fixture.decisions, investigations: fixture.investigations });
+	assert.equal(record.health.investigations.some((investigation) => investigation.id === "fp-decision-only"), false, "no investigation file exists for the fp");
+	assert.deepEqual(record.analystModels, ["openai/file-review", "openai/first-review", "openai/second-review"], "the unrelated fp's model stays out");
+});
+
 const MIB = 1024 * 1024;
 const FILLER_LINE = '{"type":"message","id":"f"}\n';
 const FILLER_BLOCK = Buffer.from(FILLER_LINE.repeat(Math.floor(MIB / FILLER_LINE.length)));

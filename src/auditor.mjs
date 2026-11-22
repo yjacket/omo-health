@@ -2,7 +2,6 @@ import crypto from "node:crypto";
 import path from "node:path";
 import { createSessionFileLocator } from "./collect/session-files.mjs";
 import { usageTimeline } from "./collect/usage.mjs";
-import { readDecisions } from "./decisions.mjs";
 import { auditBundle, auditDocument, resolveAuditModel, validateAudit } from "./judge/audit.mjs";
 import { ANALYST_POLL_MS, parseAnalystOutput, unavailableReason } from "./judge/analyst.mjs";
 import { laneArgs } from "./judge/lane.mjs";
@@ -34,31 +33,6 @@ export const AUDIT_CONTRACT = Object.freeze({ parse: (out) => parseAnalystOutput
 /** The id when it is safe as a file name (an id that matched a ledger row looks like this), else null. */
 export function safeAuditId(id) {
 	return typeof id === "string" && SAFE_ID.test(id) ? id : null;
-}
-
-/**
- * Every model that may have analyzed the record's selected investigations: each investigation's current model plus
- * the `analyzing` decisions recorded for it, so an investigation looked at twice keeps both analyst models. The
- * reviewer excludes all of them; excluding only the latest lets a model that ran the first look review its own work.
- * `decisions` is injectable for tests; production reads the stored log from the oldest selected investigation.
- */
-export function analystModelsOf(record, { paths, decisions, sinceMs } = {}) {
-	const investigations = Array.isArray(record?.health?.investigations) ? record.health.investigations : [];
-	const fps = new Set();
-	const models = new Set();
-	let openedMs = Infinity;
-	for (const investigation of investigations) {
-		if (typeof investigation?.id === "string" && investigation.id) fps.add(investigation.id);
-		if (typeof investigation?.model === "string" && investigation.model) models.add(investigation.model);
-		if (Number.isFinite(investigation?.openedMs)) openedMs = Math.min(openedMs, investigation.openedMs);
-	}
-	if (!fps.size) return [...models];
-	const list = Array.isArray(decisions) ? decisions : paths ? readDecisions(paths, Number.isFinite(sinceMs) ? sinceMs : Number.isFinite(openedMs) ? openedMs : 0) : [];
-	for (const entry of list) {
-		if (entry?.event !== "investigation" || !fps.has(entry.fp)) continue;
-		if (typeof entry.model === "string" && entry.model) models.add(entry.model);
-	}
-	return [...models];
 }
 
 const dayOf = (ms) => new Date(ms).toISOString().slice(0, 10);
@@ -244,7 +218,8 @@ export function createAuditor({ paths, config, clock, log, runner, env = process
 		const timelineKnown = full !== null && full.totals?.modelsIncomplete !== true;
 		const indexKnown = entry?.complete === true && fresh(entry) && entry.published?.modelsIncomplete !== true;
 		const sessionModels = [...new Set([...Object.keys(full?.totals?.usedModels ?? {}), ...(entry?.complete === true ? Object.keys(entry.published?.usedModels ?? {}) : [])])];
-		const analystModels = analystModelsOf(loaded, { paths });
+		// The record join already collected every analyst model for its selected fps, including decision-only fps.
+		const analystModels = loaded.analystModels ?? [];
 		const choice = resolveAuditModel(paths, config, { sessionModels, sessionModelsKnown: timelineKnown || indexKnown, analystModels });
 		if (choice?.blocked === "models-unknown") return fail(record, "models-unknown", null, now);
 		if (!choice) return fail(record, "no-model", null, now);

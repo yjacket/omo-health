@@ -874,6 +874,23 @@ test("two looks at one investigation exclude every analyst model through the pro
 	assert.deepEqual([h.record("m1").model, h.record("m1").independence], ["xai/grok-5", "family"], "the first look's model is excluded too");
 });
 
+test("a decision-only fp's analyzing model is excluded from the daemon's model choice", () => {
+	const h = harness();
+	assert.equal([...LANES.ultrabrain][0], "openai/gpt-5-5", "the analyst model is the first lane candidate");
+	fs.mkdirSync(h.paths.health.decisionsDir, { recursive: true });
+	appendJsonl(path.join(h.paths.health.decisionsDir, "2026-11-20.jsonl"), [
+		{ ts: new Date(BASE - 290_000).toISOString(), fp: "F9", event: "opened", subject: { sessionId: "m1" } },
+		{ ts: new Date(BASE - 240_000).toISOString(), fp: "F9", event: "investigation", status: "analyzing", model: "openai/gpt-5-5" },
+	]);
+	assert.equal(fs.existsSync(path.join(h.paths.health.investigationsDir, "F9.json")), false, "no investigation file exists for the fp");
+	const a = h.auditor();
+	h.request("m1");
+	h.tick(a);
+	assert.equal(h.runner.starts.length, 1);
+	assert.equal(h.record("m1").model, "google/gemini-3-pro", "the next lane candidate is chosen");
+	assert.notEqual(modelOf(h.runner.starts[0]), "openai/gpt-5-5");
+});
+
 test("a failed first kill is retried by the real runner and the one-per-PC slot stays held until the verified pid is gone", () => {
 	const h = harness();
 	h.config.audit.timeoutMs = 60_000;
