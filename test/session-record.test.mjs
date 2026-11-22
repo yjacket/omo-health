@@ -135,6 +135,71 @@ const ohealth = (ms, text) => ({ type: "custom_message", customType: "omo-health
 const mainRow = (extra = {}) => ({ sessionId: "s-main", kind: "main", parentSessionId: null, taskId: null, title: "main", cwd: "C:/work/a", terminal: { kind: "wt" }, omoVersion: "0.8.0", startedMs: T0, endedMs: T0 + 2 * HOUR, childCount: 2, ...extra });
 const childRow = (sessionId, taskId, parentSessionId, extra = {}) => ({ sessionId, kind: "child", parentSessionId, taskId, title: sessionId, cwd: "C:/work/a", terminal: null, omoVersion: null, startedMs: T0 + 10 * MIN, endedMs: T0 + 70 * MIN, ...extra });
 
+test("IS-10: bounded normal session produces the same bundle without dashboard prose", () => {
+	const { paths } = setup();
+	const subject = { sessionId: "s-main" };
+	writeLedger(paths, [mainRow()]);
+	writeDecisions(paths, [
+		{ fp: "inv", event: "opened", detector: "D1", subject, evidence: ["quiet:10ms", "private evidence", "quiet:20ms"] },
+		{ fp: "inv", event: "investigation", model: "p/old", analyst: { verdict: "wait", reason: "timeout: analyst notes", diagnosis: "private diagnosis" } },
+		{ ts: iso(T0 + MIN), outcome: { sessionId: subject.sessionId }, action: { kind: "notify" }, result: "would" },
+		{ ts: iso(T0 + MIN), subject, action: { kind: "nudge" }, result: "would" },
+		{ ts: iso(T0 - MIN), fp: "machine", event: "opened", detector: "D2", evidence: ["commit:90%", "machine prose"] },
+	]);
+	writeInvestigation(paths, { id: "inv", subject, model: "p/current", evidence: ["private evidence"], verdict: { verdict: "wait", reason: "timeout: notes", diagnosis: "private diagnosis" }, actions: [{ kind: "nudge", delivered: false, advice: "private advice" }] });
+	mainSessionFile(paths, subject.sessionId, [ohealth(T0, "private message")]);
+	const options = { paths, id: subject.sessionId, now: T0 + 2 * HOUR };
+	const full = loadSessionRecord(options);
+	const bounded = loadSessionRecord({ ...options, auditRetention: true });
+	const bundle = (record) => auditBundle(record, null, { config: DEFAULT_CONFIG, now: options.now });
+	assert.deepEqual(bundle(bounded), bundle(full));
+	assert.deepEqual(bounded.health.counts, { findings: 2, actions: 2, investigations: 1, messages: 1 });
+	assert.deepEqual(bounded.analystModels, ["p/current", "p/old"]);
+	assert.doesNotMatch(JSON.stringify(bounded.health), /private|machine prose/);
+	assert.match(JSON.stringify(full.health), /private message/);
+});
+
+test("IS-10: bounded scan keeps oldest detector representatives and exact history counts", () => {
+	const { paths } = setup();
+	const subject = { sessionId: "s-main" };
+	writeLedger(paths, [mainRow()]);
+	writeDecisions(paths, [
+		{ fp: "oldest", event: "opened", detector: "D25", subject },
+		{ fp: "old-machine", event: "opened", detector: "D24" },
+		...Array.from({ length: 60 }, (_, i) => {
+			const ts = iso(T0 + (60 - i) * MIN);
+			return [
+				{ ts, fp: `f-${i}`, event: "opened", detector: "D1", subject },
+				{ ts, fp: `machine-${i}`, event: "opened", detector: "D2" },
+				{ ts, subject, action: { kind: "nudge" }, result: "would" },
+			];
+		}).flat(),
+		{ fp: "inv-0", event: "investigation", model: "p/old" },
+		{ fp: "inv-0", event: "notice-withdrawn", result: "withdrawn" },
+	]);
+	for (let i = 0; i < 35; i++) writeInvestigation(paths, { id: `inv-${i}`, subject, openedMs: T0 + i, model: i === 0 ? "p/old-file" : "p/current" });
+	mainSessionFile(paths, subject.sessionId, Array.from({ length: 60 }, (_, i) => ohealth(T0 + (60 - i) * MIN, "private message")));
+	const options = { paths, id: subject.sessionId, now: T0 + 2 * HOUR };
+	const bounded = loadSessionRecord({ ...options, auditRetention: true });
+	const full = loadSessionRecord(options);
+	const { health } = bounded;
+	assert.deepEqual(health.counts, full.health.counts);
+	assert.deepEqual(health.counts, { findings: 122, actions: 61, investigations: 35, messages: 60 });
+	assert.equal(health.findings.filter(({ scope }) => scope === "session").length, 51);
+	assert.equal(health.findings.filter(({ scope }) => scope === "machine").length, 21);
+	assert.deepEqual(health.findings.slice(-2).map(({ fp }) => fp), ["oldest", "old-machine"]);
+	assert.deepEqual(health.firedDetectors, ["D1", "D2", "D25", "D24"]);
+	assert.deepEqual(bounded.analystModels, full.analystModels);
+	assert.deepEqual(health.actions.map(({ ts }) => ts), full.health.actions.slice(0, 50).map(({ ts }) => ts));
+	assert.deepEqual(health.investigations.map(({ id }) => id), full.health.investigations.slice(0, 30).map(({ id }) => id));
+	assert.deepEqual(health.messages.map(({ ms }) => ms), full.health.messages.slice(0, 50).map(({ ms }) => ms));
+	const bundle = auditBundle(bounded, null, { config: DEFAULT_CONFIG, now: options.now });
+	assert.equal(bundle.omo_health_record.findings.length, 50);
+	assert.equal(bundle.omo_health_record.findings.filter(({ scope }) => scope === "machine").length, 20);
+	assert.deepEqual(bundle.omo_health_record.findings.slice(-2).map(({ detector }) => detector), ["D25", "D24"]);
+	assert.ok(["findings", "actions", "messages", "investigations"].every((key) => bundle.truncated[key]));
+});
+
 test("(plan 35) loadSessionRecord selects the exact ledger session ID and endedMs", () => {
 	const { paths } = setup();
 	const id = "st_shared";

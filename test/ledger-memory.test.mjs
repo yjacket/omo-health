@@ -116,6 +116,14 @@ test("IS-10: session decision join fits a 96 MiB heap with over 96 MiB of unrela
 	t.diagnostic(result.stdout.trim());
 });
 
+test("IS-10: daemon audit fits a 96 MiB heap with over 96 MiB of matching decisions", (t) => {
+	const dir = fs.mkdtempSync(path.join(root, "audit-own-decisions-"));
+	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+	const result = invoke(96, "audit-own-decisions", dir);
+	assertsExit(result, "daemon audit of matching decisions");
+	t.diagnostic(result.stdout.trim());
+});
+
 test("plan38 IS-10: one 96 MiB child joins a small record from oversized unrelated sources", (t) => {
 	const dir = fs.mkdtempSync(path.join(root, "all-sources-"));
 	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

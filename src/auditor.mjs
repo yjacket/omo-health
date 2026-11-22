@@ -44,8 +44,15 @@ const dayOf = (ms) => new Date(ms).toISOString().slice(0, 10);
 function readBudget(paths, now) {
 	const day = dayOf(now);
 	const raw = readJsonSafe(paths.health.auditBudgetFile);
-	if (raw?.day === day && Number.isFinite(raw.count) && Array.isArray(raw.jobs)) return { day, count: raw.count, jobs: raw.jobs.filter((job) => typeof job === "string") };
-	return { day, count: 0, jobs: [] };
+	if (raw?.day === day && Number.isFinite(raw.count) && Array.isArray(raw.jobs)) {
+		return {
+			day,
+			count: raw.count,
+			jobs: raw.jobs.filter((job) => typeof job === "string"),
+			refunded: Array.isArray(raw.refunded) ? raw.refunded.filter((job) => typeof job === "string") : [],
+		};
+	}
+	return { day, count: 0, jobs: [], refunded: [] };
 }
 
 /** Publish a complete request without replacing an existing claim for the id. */
@@ -193,14 +200,24 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 
 	function charge(jobId, now) {
 		const budget = readBudget(paths, now);
-		if (budget.jobs.includes(jobId)) return;
-		atomicWriteJson(paths.health.auditBudgetFile, { day: budget.day, count: budget.count + 1, jobs: [...budget.jobs, jobId] });
+		if (budget.jobs.includes(jobId) || budget.refunded.includes(jobId)) return;
+		atomicWriteJson(paths.health.auditBudgetFile, {
+			day: budget.day,
+			count: budget.count + 1,
+			jobs: [...budget.jobs, jobId],
+			...(budget.refunded.length ? { refunded: budget.refunded } : {}),
+		});
 	}
 
-	function refund(jobId, now) {
-		const budget = readBudget(paths, now);
-		if (!budget.jobs.includes(jobId)) return;
-		atomicWriteJson(paths.health.auditBudgetFile, { day: budget.day, count: Math.max(0, budget.count - 1), jobs: budget.jobs.filter((job) => job !== jobId) });
+	function refund(jobId, chargedMs) {
+		const budget = readBudget(paths, chargedMs);
+		if (!budget.jobs.includes(jobId) || budget.refunded.includes(jobId)) return;
+		atomicWriteJson(paths.health.auditBudgetFile, {
+			...budget,
+			count: Math.max(0, budget.count - 1),
+			jobs: budget.jobs.filter((job) => job !== jobId),
+			refunded: [...budget.refunded, jobId],
+		});
 	}
 
 	const commandOf = () => env.OMO_HEALTH_OMO ?? config.analyst?.command ?? "omo";
@@ -268,7 +285,7 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 	function prepare(record, now) {
 		if (config.audit?.enabled !== true) return fail(record, "disabled", null, now);
 		const usage = index ?? readUsageIndex(paths.health.usageIndexFile);
-		const loaded = loadRecord({ paths, id: record.sessionId, now, messageScanMaxBytes: timelineMaxBytes, messageScanTotalBytes: MESSAGE_SCAN_TOTAL_BYTES, descendantScanMax: DESCENDANT_SCAN_MAX, locator, index: usage });
+		const loaded = loadRecord({ paths, id: record.sessionId, now, messageScanMaxBytes: timelineMaxBytes, messageScanTotalBytes: MESSAGE_SCAN_TOTAL_BYTES, descendantScanMax: DESCENDANT_SCAN_MAX, auditRetention: true, locator, index: usage });
 		if (!loaded?.found) return fail(record, "not-found", null, now);
 		if (readBudget(paths, now).count >= config.audit.perDay) return fail(record, "cap", null, now);
 
@@ -353,6 +370,10 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 			fail(record, "timeout", null, now);
 		} else if (out.status === "unavailable") {
 			fail(record, `unavailable:${out.reason}`, out.detail ? truncate(redact(String(out.detail)), 300) : null, now);
+		} else if (out.status === "failed" && out.spawned === false) {
+			// Refund first: a restart before fail() saves the record can replay this outcome safely.
+			refund(record.jobId, record.launchMs ?? now);
+			fail(record, "spawn-error", out.detail ? truncate(redact(String(out.detail)), 300) : null, now);
 		} else if (out.status === "failed" && out.reason === "no-job") {
 			try {
 				if (runner.adoptJob(record.jobId, adoptOptions(record)) === "absent") fail(record, "no-job", null, now);

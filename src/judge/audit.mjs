@@ -22,7 +22,7 @@ export const AUDIT_JUDGMENTS = Object.freeze(["sound", "exaggerated", "overreach
 export const AUDIT_TOKEN_JUDGMENTS = Object.freeze(["normal", "high", "wasteful", "unclear"]);
 /** Characters accepted as the bundle's largest string and the audit's largest payload. */
 const BUNDLE_STRING_MAX = 120;
-const BUNDLE_MAX_CHARS = 100_000;
+export const BUNDLE_MAX_CHARS = 100_000;
 const HANGUL = /[\uAC00-\uD7A3]/;
 const REF_TOKEN = /\b(?:[FAIM]\d+|T)\b/g;
 const METRIC_VALUE = /^-?\d+(\.\d+)?(ms|s|m|h|%|MB\/min|MB|KiB|MiB|GiB|B)?$/;
@@ -46,9 +46,9 @@ export const AUDIT_METRIC_KEYS = Object.freeze([
 	"medianTps", "sessions", // tps
 ]);
 const RULE_ID = /^R\d+[a-z]*$/;
-const DETECTOR_ID = /^D\d+$/;
+export const AUDIT_DETECTOR_ID = /^D\d+$/;
 /** The answer's check limit and the most fired detectors one answer can require. */
-const AUDIT_CHECK_MAX = 40;
+export const AUDIT_CHECK_MAX = 40;
 /** The bundle's finding slots before truncation. */
 const FINDING_SLOTS = 50;
 const MACHINE_FINDING_SLOTS = 20;
@@ -163,10 +163,10 @@ export function resolveAuditModel(paths, config, { sessionModels = [], sessionMo
 	return null;
 }
 
-function metricsOf(evidence) {
+export function auditEvidence(evidence) {
 	const metrics = {};
 	let droppedEvidence = 0;
-	for (const line of Array.isArray(evidence) ? evidence : []) {
+	for (const line of evidence) {
 		if (typeof line !== "string") {
 			droppedEvidence += 1;
 			continue;
@@ -189,7 +189,7 @@ function metricsOf(evidence) {
 
 function findingsOf(list) {
 	return (Array.isArray(list) ? list : []).map((finding, index) => {
-		const { metrics, droppedEvidence } = metricsOf(finding?.evidence);
+		const { metrics, droppedEvidence } = finding?.auditEvidence ?? auditEvidence(Array.isArray(finding?.evidence) ? finding.evidence : []);
 		const subject = isObject(finding?.subject) ? finding.subject : {};
 		return {
 			ref: `F${index + 1}`,
@@ -211,7 +211,7 @@ function firedDetectorIds(findings) {
 	const ids = [];
 	const seen = new Set();
 	for (const { detector } of findings) {
-		if (!DETECTOR_ID.test(detector) || seen.has(detector)) continue;
+		if (!AUDIT_DETECTOR_ID.test(detector) || seen.has(detector)) continue;
 		seen.add(detector);
 		ids.push(detector);
 	}
@@ -280,8 +280,8 @@ function verdictOf(value) {
 	};
 }
 
-function verdictHistoryOf(list) {
-	return (Array.isArray(list) ? list : []).map((row) => ({
+export function auditHistoryRow(row) {
+	return {
 		ts: textOf(row?.ts),
 		verdict: textOf(row?.verdict),
 		assessment: textOf(row?.assessment),
@@ -289,7 +289,7 @@ function verdictHistoryOf(list) {
 		confidence: numOf(row?.confidence),
 		failed: boolOf(row?.failed),
 		reason: reasonCode(row?.reason),
-	}));
+	};
 }
 
 function investigationsOf(list) {
@@ -308,7 +308,7 @@ function investigationsOf(list) {
 			lane: textOf(investigation?.lane),
 			failures: numOf(investigation?.failures) ?? 0,
 			verdict: verdictOf(investigation?.verdict),
-			verdictHistory: verdictHistoryOf(investigation?.verdictHistory),
+			verdictHistory: (Array.isArray(investigation?.verdictHistory) ? investigation.verdictHistory : []).map(auditHistoryRow),
 			actions: (Array.isArray(investigation?.actions) ? investigation.actions : []).map((action) => ({
 				kind: textOf(action?.kind),
 				delivered: boolOf(action?.delivered),
@@ -412,9 +412,13 @@ export function auditBundle(record, timeline, { config, now } = {}) {
 	const allFindings = findingsOf(health.findings);
 	// Coverage is judged on every finding, before any cut: an answer cannot be
 	// required to cover more detectors than it has checks.
-	const fired = firedDetectorIds(allFindings);
+	const fired = health.firedDetectors ?? firedDetectorIds(allFindings);
 	const findings = selectFindings(allFindings, fired);
-	truncated.findings = findings.length < allFindings.length;
+	truncated.findings = findings.length < Math.max(health.counts?.findings ?? 0, allFindings.length);
+	for (const key of ["actions", "messages", "investigations"]) {
+		truncated[key] = health.counts?.[key] > (health[key]?.length ?? 0);
+	}
+	if (Array.isArray(health.investigations) && health.investigations.some((row) => row?.verdictHistoryTooLarge)) throw new Error("evidence-too-large");
 	const bundle = {
 		session: {
 			sessionId: textOf(session.sessionId),
@@ -490,7 +494,7 @@ export function auditBundle(record, timeline, { config, now } = {}) {
 /** Session and machine findings share the bundle's ordered F refs. */
 export function detectorFindingRefs(bundle) {
 	return Object.fromEntries(bundle.omo_health_record.findings
-		.filter(({ detector }) => DETECTOR_ID.test(detector))
+		.filter(({ detector }) => AUDIT_DETECTOR_ID.test(detector))
 		.map(({ ref, detector }) => [ref, detector]));
 }
 

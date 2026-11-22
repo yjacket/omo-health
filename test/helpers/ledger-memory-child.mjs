@@ -92,6 +92,42 @@ if (operation === "all-sources") {
 	assert.deepEqual(result.health.investigations.map(({ id }) => id), ["related"]);
 	assert.deepEqual(result.health.messages, [{ ms: Date.parse(ts), recipient: childId, text: "related notice" }]);
 	console.log("all source matches found");
+} else if (operation === "audit-own-decisions") {
+	const sessionId = "seed";
+	const ts = new Date(now - 1000).toISOString();
+	assert.equal(appendEnded(paths, { sessionId, kind: "main", startedMs: now - 30_000, endedMs: now }, { nowMs: now }), true);
+	put(path.join(paths.sessionsDir, "probe", `2026-11-22_${sessionId}.jsonl`), usageLine);
+	put(paths.omoJsonc, JSON.stringify({ "[native]": { categories: { ultrabrain: { models: ["other/reviewer"] } } } }));
+	put(paths.authFile, '{"other":{}}');
+	const file = path.join(paths.health.decisionsDir, `${ts.slice(0, 10)}.jsonl`);
+	put(file, "");
+	const row = JSON.stringify({ ts, event: "opened", fp: "own-finding", detector: "D1", subject: { sessionId }, evidence: ["quiet:5ms", "x".repeat(256 * 1024)] }) + "\n";
+	const block = Buffer.from(row.repeat(8));
+	const fd = fs.openSync(file, "a");
+	try {
+		for (let i = 0; i < 52; i++) fs.writeSync(fd, block);
+	} finally {
+		fs.closeSync(fd);
+	}
+	const bytes = fs.statSync(file).size;
+	assert.ok(bytes > 96 * 1024 * 1024);
+	console.log(`DECISIONS matching bytes=${bytes}`);
+	requestAudit(paths, sessionId, now);
+	let starts = 0;
+	createAuditor({ paths, config: DEFAULT_CONFIG, clock, env: {}, runner: {
+		start() { starts++; return { pid: 1 }; },
+	} }).tick(now);
+	const state = readAuditState(paths, sessionId);
+	if (state?.status === "running") {
+		assert.equal(starts, 1);
+		const refs = JSON.parse(fs.readFileSync(path.join(paths.health.jobsDir, state.jobId, "refs.json"), "utf8"));
+		assert.equal(Object.keys(refs.findingRefs).length, 50);
+		assert.deepEqual(state.firedDetectors, ["D1"]);
+	} else {
+		assert.equal(starts, 0);
+		assert.equal(state?.reason, "evidence-too-large", JSON.stringify(state));
+	}
+	console.log(`AUDIT matching decisions: ${state.reason ?? state.status}`);
 } else if (operation === "decision-join") {
 	const { loadSessionRecord } = await load("session-record");
 	const { appendDecision } = await load("decisions");

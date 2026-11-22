@@ -7,6 +7,7 @@ import { streamInvestigations } from "./investigations.mjs";
 import { streamEnded } from "./session-ledger.mjs";
 import { compactUsage, readUsageIndex, treeTotals, usageEntryFor } from "./usage-index.mjs";
 import { reasonCode } from "./audit-codes.mjs";
+import { AUDIT_CHECK_MAX, AUDIT_DETECTOR_ID, BUNDLE_MAX_CHARS, auditEvidence, auditHistoryRow } from "./judge/audit.mjs";
 import { statSafe } from "./util/fsx.mjs";
 import { redact, truncate } from "./util/text.mjs";
 
@@ -111,6 +112,46 @@ function byNewest(a, b) {
 	return (Number.isFinite(bm) ? bm : 0) - (Number.isFinite(am) ? am : 0);
 }
 
+// Limit payloads, not join keys or counts. Equal timestamps keep scan order;
+// the decision join puts about rows before recipient-only rows on a tie.
+function newest(limit, compare) {
+	const rows = [];
+	let count = 0;
+	return {
+		add(row) {
+			count++;
+			if (rows.length === limit && compare(row, rows.at(-1)) >= 0) return;
+			rows.push(row);
+			rows.sort(compare);
+			if (rows.length > limit) rows.pop();
+		},
+		get rows() { return rows; },
+		get count() { return count; },
+	};
+}
+
+function auditFindings(limit, compare) {
+	const byOrder = (a, b) => compare(a, b) || a.retentionOrder - b.retentionOrder;
+	const list = newest(limit, byOrder);
+	const representatives = new Map();
+	return {
+		add(row) {
+			row.retentionOrder = list.count;
+			list.add(row);
+			if (!AUDIT_DETECTOR_ID.test(row.detector)) return;
+			const current = representatives.get(row.detector);
+			if (!representatives.has(row.detector) || (current && byOrder(row, current) < 0)) {
+				// The bundle rejects this many detectors; keep counting IDs, not payloads.
+				representatives.set(row.detector, representatives.size < AUDIT_CHECK_MAX || current ? row : null);
+			}
+		},
+		get count() { return list.count; },
+		get representatives() { return representatives; },
+		get rows() { return list.rows; },
+		byOrder,
+	};
+}
+
 /**
  * Descendant sessions and tasks, recursively over `parentSessionId` in the
  * ledger rows and the usage index (depth <= 8). A parent may be named by its
@@ -174,13 +215,14 @@ function trackOwner(owners, taskId, identity) {
  * Consume lifecycle rows oldest first and keep only the open intervals and
  * the openers of closed intervals that overlap the session.
  */
-function scanDecisionHistory(decisions, row) {
+function scanDecisionHistory(decisions, row, retained) {
 	const startedMs = msOf(row.startedMs);
 	const endedMs = msOf(row.endedMs);
 	const startMs = Number.isFinite(startedMs) ? startedMs : -Infinity;
 	const endMs = Number.isFinite(endedMs) ? endedMs : Number.isFinite(startedMs) ? startedMs : Infinity;
 	const open = new Map();
-	const matched = [];
+	const matched = retained ? null : [];
+	const keep = (finding) => retained ? retained.add(finding) : matched.push(finding);
 	const coverageEnd = Number.isFinite(startedMs) ? startedMs : Number.isFinite(endedMs) ? endedMs : Infinity;
 	let coverageMs = -Infinity;
 	for (const entry of decisions) {
@@ -192,28 +234,40 @@ function scanDecisionHistory(decisions, row) {
 		if (!FINDING_EVENTS.has(event) || !nonEmpty(fp)) continue;
 		if (event === "resolved") {
 			const opened = open.get(fp);
-			if (opened && ts >= startMs) matched.push(opened);
+			if (opened && ts >= startMs) keep(opened);
 			open.delete(fp);
 		} else if (ts <= endMs && !open.has(fp) && !nonEmpty(subject?.sessionId) && !nonEmpty(subject?.taskId)) {
-			open.set(fp, machineRow(entry, fp, ts));
+			open.set(fp, machineRow(entry, fp, ts, Boolean(retained)));
 		}
 	}
-	return { machine: [...matched, ...open.values()], infoFindings: Number.isFinite(coverageMs) };
+	for (const finding of open.values()) keep(finding);
+	return { machine: matched, infoFindings: Number.isFinite(coverageMs) };
 }
 
-function machineRow(entry, fp, ts) {
+function findingRow(entry, { fp = entry.fp ?? null, ts = entry.ts ?? null, scope = "session", bounded = false } = {}) {
+	const subject = entry.subject ?? {};
 	return {
 		fp,
-		ts: new Date(ts).toISOString(),
-		event: entry.event ?? "opened",
+		ts,
+		event: entry.event,
 		detector: clean(entry.detector, 20),
 		kind: clean(entry.kind, 80),
 		severity: clean(entry.severity, 20),
-		titleKo: clean(entry.titleKo, TITLE_MAX),
-		subject: cleanValue(entry.subject ?? {}),
-		scope: "machine",
-		evidence: cleanLines(entry.evidence),
+		scope,
+		...(bounded ? {
+			subject: cleanValue({ sessionId: subject.sessionId, taskId: subject.taskId }),
+			auditEvidence: auditEvidence((function* () {
+				for (const line of Array.isArray(entry.evidence) ? entry.evidence : []) {
+					const cleaned = cleanDetail(line);
+					if (cleaned) yield cleaned;
+				}
+			})()),
+		} : { titleKo: clean(entry.titleKo, TITLE_MAX), subject: cleanValue(subject), evidence: cleanLines(entry.evidence) }),
 	};
+}
+
+function machineRow(entry, fp, ts, bounded) {
+	return findingRow(entry, { fp, ts: new Date(ts).toISOString(), scope: "machine", bounded });
 }
 
 function factsOf(entry) {
@@ -230,7 +284,7 @@ function factsOf(entry) {
 	};
 }
 
-function actionRow(entry, subjectByFp) {
+function actionRow(entry, subjectByFp, bounded = false) {
 	let kind = entry.action?.kind;
 	let result = entry.result;
 	let facts = factsOf(entry);
@@ -254,42 +308,61 @@ function actionRow(entry, subjectByFp) {
 			else if (entry.event !== "park-gated") return null;
 			facts = { ...facts, error: result === "launch-failed" };
 		} else return null;
-	} else {
+	} else if (!bounded) {
 		detail = actionDetail(isRecord(entry.outcome) ? entry.outcome : {}, entry.rule) ?? "";
 	}
+	const factsRow = { ts: entry.ts ?? null, detector: clean(entry.detector, 20), kind: clean(kind, 80), result: clean(result, 120), facts };
+	if (bounded) return factsRow;
 	const subject = entry.subject ?? (!isRecord(entry.action) ? subjectByFp.get(entry.fp) : null) ?? {};
 	const recipient = isRecord(entry.outcome) && nonEmpty(entry.outcome.sessionId) ? entry.outcome.sessionId : nonEmpty(subject.sessionId) ? subject.sessionId : null;
 	return {
-		ts: entry.ts ?? null,
-		detector: clean(entry.detector, 20),
+		...factsRow,
 		// An engine action decision carries the finding's kind at top level and the action's kind under `action`.
-		kind: clean(kind, 80),
 		findingKind: clean(entry.kind, 80),
-		result: clean(result, 120),
 		detail,
 		recipient,
 		subject: cleanValue(subject),
-		facts,
 	};
 }
+
+function verdictFacts(entry) {
+	const a = entry.analyst;
+	if (!isRecord(a) || !nonEmpty(a.verdict)) return null;
+	return {
+		ts: entry.ts ?? null,
+		verdict: a.verdict,
+		assessment: a.assessment ?? null,
+		cause: a.cause ?? null,
+		confidence: Number.isFinite(a.confidence) ? a.confidence : null,
+		failed: a.failed === true || entry.result === "analyst-failed",
+	};
+}
+
+const byVerdictTime = (a, b) => (msOf(a.ts) || 0) - (msOf(b.ts) || 0);
 
 function verdictRows(decisions, fp) {
 	const rows = [];
 	for (const entry of decisions) {
 		if (!isRecord(entry) || entry.fp !== fp || entry.event !== "investigation") continue;
-		const a = entry.analyst;
-		if (!isRecord(a) || !nonEmpty(a.verdict)) continue;
-		rows.push({
-			ts: entry.ts ?? null,
-			verdict: a.verdict,
-			assessment: a.assessment ?? null,
-			cause: a.cause ?? null,
-			confidence: Number.isFinite(a.confidence) ? a.confidence : null,
-			failed: a.failed === true || entry.result === "analyst-failed",
-			...verdictText(a),
-		});
+		const facts = verdictFacts(entry);
+		if (facts) rows.push({ ...facts, ...verdictText(entry.analyst) });
 	}
-	return rows.sort((a, b) => (msOf(a.ts) || 0) - (msOf(b.ts) || 0));
+	return rows.sort(byVerdictTime);
+}
+
+// Copy just the inputs to investigationsOf; keep the dashboard's normalization
+// for these fields but never build its prose-heavy raw record for an audit.
+function investigationFacts(record) {
+	const { id, openedMs, trigger, status, detector, cls, model, lane, failures, rule, verdict, actions } = record;
+	return cleanValue({
+		id, openedMs, trigger, status, detector, cls, model, lane, failures,
+		rule: isRecord(rule) ? { id: rule.id, confidence: rule.confidence } : null,
+		verdict: isRecord(verdict) ? {
+			verdict: verdict.verdict, assessment: verdict.assessment, cause: verdict.cause, confidence: verdict.confidence,
+			reused: verdict.reused, failed: verdict.failed, reason: reasonCode(cleanDetail(verdict.reason)), notReached: verdict.notReached,
+		} : null,
+		actions: Array.isArray(actions) ? actions.slice(0, 500).map((action) => ({ kind: action?.kind, delivered: action?.delivered })) : [],
+	});
 }
 
 function investigationRow(record, decisions) {
@@ -343,7 +416,7 @@ export function usageEntryOf(usage, row, ambiguous) {
 
 const FULL_USAGE = Object.freeze({ state: "full" });
 
-function joinSessionDecisions(row, descendants, investigations, decisions) {
+function joinSessionDecisions(row, descendants, investigations, decisions, bounded) {
 	const nodes = [row, ...descendants];
 	const sessionAllowed = new Set(nodes.map((node) => node.sessionId).filter(nonEmpty));
 	// D8 addresses the parent session but names the affected child by its task id.
@@ -372,24 +445,121 @@ function joinSessionDecisions(row, descendants, investigations, decisions) {
 
 	// 1. investigations about the session or its descendants
 	const selectedInvestigations = [];
+	const fpSet = new Set();
+	const analystModels = new Set();
+	const addModel = (model) => { if (nonEmpty(model)) analystModels.add(model); };
 	for (const record of investigations()) {
-		if (isRecord(record) && subjectMatches(record.subject)) selectedInvestigations.push(record);
+		if (!isRecord(record) || !subjectMatches(record.subject)) continue;
+		if (nonEmpty(record.id)) fpSet.add(record.id);
+		if (bounded) {
+			addModel(record.model);
+			bounded.investigations.add({ ...investigationFacts(record), historyId: record.id });
+		} else selectedInvestigations.push(record);
 	}
 
 	// 2. the fp set: selected investigations plus lifecycle rows whose subject matches
-	const fpSet = new Set(selectedInvestigations.map((record) => record.id).filter(nonEmpty));
 	for (const entry of decisions()) if (isRecord(entry) && FINDING_EVENTS.has(entry.event) && nonEmpty(entry.fp) && subjectMatches(entry.subject)) fpSet.add(entry.fp);
 
 	// 3. decisions about the session; 4. decisions delivered to it or its descendants.
 	// Scan again so an action written before the lifecycle row can still join by fp.
 	const about = [];
 	const delivered = [];
+	const histories = new Map(bounded?.investigations.rows.map(({ historyId }) => [historyId, { rows: [], chars: 2 }]));
 	for (const entry of decisions()) {
 		if (!isRecord(entry)) continue;
-		if ((nonEmpty(entry.fp) && fpSet.has(entry.fp)) || subjectMatches(entry.subject) || (nonEmpty(row.sessionId) && entry.sessionId === row.sessionId)) about.push(entry);
-		else if (sessionAllowed.has(entry.outcome?.sessionId)) delivered.push(entry);
+		const related = (nonEmpty(entry.fp) && fpSet.has(entry.fp)) || subjectMatches(entry.subject) || (nonEmpty(row.sessionId) && entry.sessionId === row.sessionId);
+		if (!related && !sessionAllowed.has(entry.outcome?.sessionId)) continue;
+		if (!bounded) {
+			(related ? about : delivered).push(entry);
+			continue;
+		}
+		if (FINDING_EVENTS.has(entry.event)) bounded.findings.add({ ...findingRow(entry, { bounded: true }), deliveredOnly: !related });
+		const action = actionRow(entry, null, true);
+		if (action) bounded.actions.add({ ...action, deliveredOnly: !related });
+		if (related && entry.event === "investigation") {
+			if (fpSet.has(entry.fp)) addModel(entry.model);
+			const history = histories.get(entry.fp);
+			const facts = history?.rows && verdictFacts(entry);
+			if (!facts) continue;
+			const projected = auditHistoryRow({ ...facts, reason: cleanDetail(entry.analyst.reason) });
+			history.chars += JSON.stringify(projected).length + (history.rows.length ? 1 : 0);
+			// This history alone can make the final bundle too large. Keep a
+			// sentinel rather than accumulating a list the bundle can't send.
+			if (history.chars > BUNDLE_MAX_CHARS) history.rows = null;
+			else history.rows.push(projected);
+		}
+	}
+	if (bounded) {
+		for (const investigation of bounded.investigations.rows) {
+			const { rows } = histories.get(investigation.historyId);
+			delete investigation.historyId;
+			if (rows === null) investigation.verdictHistoryTooLarge = true;
+			else investigation.verdictHistory = rows.sort(byVerdictTime);
+		}
+		return { analystModels: [...analystModels] };
 	}
 	return { selectedInvestigations, fpSet, about, selected: [...new Set([...about, ...delivered])] };
+}
+
+function recordHealth(inputs, row, descendants) {
+	if (inputs.auditHealth) return { ...inputs.auditHealth, ...inputs.decisionJoin };
+	const { decisions, investigations, messages: messagesIn } = inputs;
+	const { selectedInvestigations, fpSet, about, selected } = inputs.decisionJoin ?? joinSessionDecisions(row, descendants, () => investigations, () => decisions);
+	const analystModels = new Set();
+	const addModel = (model) => { if (nonEmpty(model)) analystModels.add(model); };
+	for (const record of selectedInvestigations) addModel(record.model);
+	for (const entry of about) {
+		if (entry.event === "investigation" && fpSet.has(entry.fp)) addModel(entry.model);
+	}
+	const findings = selected.filter((entry) => FINDING_EVENTS.has(entry.event)).map((entry) => findingRow(entry));
+	const { machine, infoFindings } = inputs.decisionHistory ?? scanDecisionHistory(decisions.filter((entry) => Number.isFinite(timeOf(entry))).sort((a, b) => timeOf(a) - timeOf(b)), row);
+	const allFindings = [...findings, ...machine].sort(byNewest);
+	const subjectByFp = new Map(selectedInvestigations.map(({ id, subject }) => [id, subject]));
+	for (const entry of about) {
+		if (FINDING_EVENTS.has(entry.event) && nonEmpty(entry.fp) && isRecord(entry.subject) && !subjectByFp.has(entry.fp)) subjectByFp.set(entry.fp, entry.subject);
+	}
+	const actions = selected.map((entry) => actionRow(entry, subjectByFp)).filter(Boolean).sort(byNewest);
+	const investigationRows = selectedInvestigations.map((record) => investigationRow(record, about)).sort(byInvestigationTime);
+	const messages = messagesIn.filter(isRecord).map((message) => ({
+		ms: Number.isFinite(message.ms) ? message.ms : null, recipient: clean(message.recipient, 200), text: cleanDetail(message.text),
+	})).sort(byMessageTime);
+	return {
+		infoFindings,
+		analystModels: [...analystModels],
+		health: {
+			findings: allFindings, actions, investigations: investigationRows, messages,
+			counts: { findings: allFindings.length, actions: actions.length, investigations: investigationRows.length, messages: messages.length },
+		},
+	};
+}
+
+const byInvestigationTime = (a, b) => (b.openedMs ?? 0) - (a.openedMs ?? 0);
+const byMessageTime = (a, b) => (b.ms ?? 0) - (a.ms ?? 0);
+const byDecisionTime = (a, b) => byNewest(a, b) || Number(a.deliveredOnly) - Number(b.deliveredOnly);
+
+function auditRecordHealth(retained, infoFindings) {
+	const { findings, machine, actions, investigations, messages } = retained;
+	const sessionReps = findings.representatives;
+	const machineReps = machine.representatives;
+	const sortFindings = (session, global) => [
+		...session.sort(findings.byOrder), ...global.sort(machine.byOrder),
+	].sort(byNewest);
+	const orderedReps = sortFindings([...sessionReps.values()].filter(Boolean), [...machineReps.values()].filter(Boolean));
+	const firedDetectors = [...new Set([...orderedReps.map(({ detector }) => detector), ...sessionReps.keys(), ...machineReps.keys()])];
+	return {
+		infoFindings,
+		health: {
+			findings: sortFindings(
+				[...new Set([...findings.rows, ...[...sessionReps.values()].filter(Boolean)])],
+				[...new Set([...machine.rows, ...[...machineReps].filter(([id, row]) => row && !sessionReps.has(id)).map(([, row]) => row)])],
+			),
+			actions: actions.rows,
+			investigations: investigations.rows,
+			messages: messages.rows,
+			firedDetectors,
+			counts: { findings: findings.count + machine.count, actions: actions.count, investigations: investigations.count, messages: messages.count },
+		},
+	};
 }
 
 /**
@@ -410,54 +580,7 @@ export function buildSessionRecord(inputs = {}) {
 	const endedMs = msOf(row.endedMs);
 	const descendants = inputs.descendants ?? collectDescendants(row, ledger, usage.values());
 	const ambiguous = inputs.ambiguous ?? ambiguousLedgerTaskIds(ledger);
-	const { selectedInvestigations, fpSet, about, selected } = inputs.decisionJoin ?? joinSessionDecisions(row, descendants, () => investigations, () => decisions);
-
-	// 2b. every model that may have analyzed a selected fp: each selected investigation file's current model plus
-	// the analyzing decisions recorded for the fp. An fp known only from decisions has no investigation file, so the
-	// decision rows are the only source for its analyst model.
-	const analystModels = [];
-	const addAnalystModel = (model) => {
-		if (!nonEmpty(model) || analystModels.includes(model)) return;
-		analystModels.push(model);
-	};
-	for (const record of selectedInvestigations) addAnalystModel(record.model);
-	for (const entry of about) {
-		if (entry.event !== "investigation" || !fpSet.has(entry.fp)) continue;
-		addAnalystModel(entry.model);
-	}
-
-	const findings = selected
-		.filter((entry) => FINDING_EVENTS.has(entry.event))
-		.map((entry) => ({
-			fp: entry.fp ?? null,
-			ts: entry.ts ?? null,
-			event: entry.event,
-			detector: clean(entry.detector, 20),
-			kind: clean(entry.kind, 80),
-			severity: clean(entry.severity, 20),
-			titleKo: clean(entry.titleKo, TITLE_MAX),
-			subject: cleanValue(entry.subject ?? {}),
-			scope: "session",
-			evidence: cleanLines(entry.evidence),
-		}));
-	const { machine, infoFindings } = inputs.decisionHistory ?? scanDecisionHistory(decisions.filter((entry) => Number.isFinite(timeOf(entry))).sort((a, b) => timeOf(a) - timeOf(b)), row);
-	const allFindings = [...findings, ...machine].sort(byNewest);
-
-	const subjectByFp = new Map(selectedInvestigations.map(({ id, subject }) => [id, subject]));
-	for (const entry of about) {
-		if (FINDING_EVENTS.has(entry.event) && nonEmpty(entry.fp) && isRecord(entry.subject) && !subjectByFp.has(entry.fp)) subjectByFp.set(entry.fp, entry.subject);
-	}
-	const actions = selected
-		.map((entry) => actionRow(entry, subjectByFp))
-		.filter(Boolean)
-		.sort(byNewest);
-
-	const investigationRows = selectedInvestigations.map((record) => investigationRow(record, about)).sort((a, b) => (b.openedMs ?? 0) - (a.openedMs ?? 0));
-
-	const messages = messagesIn
-		.filter(isRecord)
-		.map((message) => ({ ms: Number.isFinite(message.ms) ? message.ms : null, recipient: clean(message.recipient, 200), text: cleanDetail(message.text) }))
-		.sort((a, b) => (b.ms ?? 0) - (a.ms ?? 0));
+	const { health, infoFindings, analystModels } = recordHealth({ ...inputs, decisions, investigations, messages: messagesIn }, row, descendants);
 
 	const entry = usageEntryOf(usage, row, ambiguous);
 	const compact = compactUsage(entry);
@@ -504,13 +627,7 @@ export function buildSessionRecord(inputs = {}) {
 		coverage: { infoFindings },
 		analystModels,
 		truncated: { messagesSkipped: Array.isArray(truncated.messagesSkipped) ? truncated.messagesSkipped : [] },
-		health: {
-			findings: allFindings,
-			actions,
-			investigations: investigationRows,
-			messages,
-			counts: { findings: allFindings.length, actions: actions.length, investigations: investigationRows.length, messages: messages.length },
-		},
+		health,
 	};
 }
 
@@ -527,12 +644,15 @@ const SCAN_MARKER = Buffer.from('"customType":"omo-health"', "utf8");
  * `omo-health` message line is small, so it is never one).
  */
 export function scanOmoHealthMessages(file) {
-	const out = [];
+	return [...streamOmoHealthMessages(file)];
+}
+
+function* streamOmoHealthMessages(file, bounded = false) {
 	let fd;
 	try {
 		fd = fs.openSync(file, "r");
 	} catch {
-		return out;
+		return;
 	}
 	const consume = (bytes) => {
 		if (!bytes.length || !bytes.includes(SCAN_MARKER)) return;
@@ -544,8 +664,10 @@ export function scanOmoHealthMessages(file) {
 		}
 		if (!isRecord(entry) || (entry.type !== "custom_message" && entry.type !== "custom") || entry.customType !== "omo-health") return;
 		const ms = msOf(entry.timestamp);
+		const message = { ms: Number.isFinite(ms) ? ms : null };
+		if (bounded) return message;
 		const text = typeof entry.content === "string" ? entry.content : isRecord(entry.content) ? JSON.stringify(entry.content) : "";
-		out.push({ ms: Number.isFinite(ms) ? ms : null, text: cleanDetail(text) });
+		return { ...message, text: cleanDetail(text) };
 	};
 	try {
 		const chunk = Buffer.allocUnsafe(SCAN_CHUNK);
@@ -576,19 +698,22 @@ export function scanOmoHealthMessages(file) {
 				} else if ((carry?.length ?? 0) + piece.length > SCAN_LINE_MAX) {
 					carry = null;
 				} else {
-					consume(carry ? Buffer.concat([carry, piece]) : piece);
+					const message = consume(carry ? Buffer.concat([carry, piece]) : piece);
+					if (message) yield message;
 					carry = null;
 				}
 				pos = newline + 1;
 			}
 		}
-		if (!overlong && carry) consume(carry);
+		if (!overlong && carry) {
+			const message = consume(carry);
+			if (message) yield message;
+		}
 	} catch {
-		return out;
+		return;
 	} finally {
 		fs.closeSync(fd);
 	}
-	return out;
 }
 
 function* dirNames(directory) {
@@ -764,9 +889,10 @@ function recordLedger(rows, id, endedMs, usage, descendantScanMax) {
 /**
  * Read everything the record needs and join it. A file that exceeds the
  * per-file limit or the remaining total message scan budget is skipped and
- * listed in `truncated.messagesSkipped`. The dashboard defaults to no limits.
+ * listed in `truncated.messagesSkipped`. `auditRetention` keeps only the
+ * daemon's audit samples; the dashboard defaults to no retention limit.
  */
-export function loadSessionRecord({ paths, id, endedMs, now = Date.now(), messageScanMaxBytes = Infinity, messageScanTotalBytes = Infinity, descendantScanMax = Infinity, scanMessages = scanOmoHealthMessages, locator, index } = {}) {
+export function loadSessionRecord({ paths, id, endedMs, now = Date.now(), messageScanMaxBytes = Infinity, messageScanTotalBytes = Infinity, descendantScanMax = Infinity, scanMessages, auditRetention = false, locator, index } = {}) {
 	if (!nonEmpty(id)) return { found: false, id };
 	const usage = index ?? readUsageIndex(paths.health.usageIndexFile);
 	const joined = recordLedger(() => streamEnded(paths, { sinceMs: now - 30 * DAY_MS }), id, endedMs, usage, descendantScanMax);
@@ -774,8 +900,15 @@ export function loadSessionRecord({ paths, id, endedMs, now = Date.now(), messag
 	const { row, descendants, ancestors, scanned, ambiguous } = joined;
 	const startedMs = msOf(row.startedMs);
 	const sinceMs = (Number.isFinite(startedMs) ? startedMs : now) - 30 * DAY_MS;
-	const decisionHistory = scanDecisionHistory(streamDecisions(paths), row);
-	const decisionJoin = joinSessionDecisions(row, descendants, () => streamInvestigations(paths), () => streamDecisions(paths, sinceMs));
+	const retained = auditRetention ? {
+		findings: auditFindings(50, byDecisionTime),
+		machine: auditFindings(20, byNewest),
+		actions: newest(50, byDecisionTime),
+		investigations: newest(30, byInvestigationTime),
+		messages: newest(50, byMessageTime),
+	} : null;
+	const decisionHistory = scanDecisionHistory(streamDecisions(paths), row, retained?.machine);
+	const decisionJoin = joinSessionDecisions(row, descendants, () => streamInvestigations(paths), () => streamDecisions(paths, sinceMs), retained);
 	const files = findRecordFiles(paths, [row, ...scanned], ancestors, locator);
 
 	const messages = [];
@@ -789,8 +922,12 @@ export function loadSessionRecord({ paths, id, endedMs, now = Date.now(), messag
 			continue;
 		}
 		scannedBytes += stat.size;
-		for (const message of scanMessages(file) ?? []) messages.push({ ...message, recipient: sessionId });
+		for (const message of (scanMessages ? scanMessages(file) : streamOmoHealthMessages(file, auditRetention)) ?? []) {
+			if (!retained) messages.push({ ...message, recipient: sessionId });
+			else if (isRecord(message)) retained.messages.add({ ms: Number.isFinite(message.ms) ? message.ms : null });
+		}
 	}
 
-	return buildSessionRecord({ id, row, descendants, ambiguous, usage, decisionJoin, decisionHistory, messages, truncated: { messagesSkipped: skipped } });
+	const auditHealth = retained && auditRecordHealth(retained, decisionHistory.infoFindings);
+	return buildSessionRecord({ id, row, descendants, ambiguous, usage, decisionJoin, decisionHistory, auditHealth, messages, truncated: { messagesSkipped: skipped } });
 }

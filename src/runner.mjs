@@ -160,10 +160,12 @@ export function createRunner({ paths, spawnImpl = spawn, clock, env = process.en
 		const text = `${stderr}\n${stdout}`;
 		if (exitCode === 0 || (!exit && handler.parse?.(stdout) != null)) return finish(f, meta, { status: "done", result: handler.parse ? handler.parse(stdout) : stdout, exitCode });
 		const detail = truncate(redact(text.trim()), 300);
-		const reason = handler.unavailableReason?.(text) ?? null;
+		// A child error alone is not proof: Node can also emit it after assigning a pid.
+		const errored = Boolean(exit?.error) && exitCode === null;
+		const notSpawned = errored && (meta.pid === undefined || meta.pid === null);
+		const reason = notSpawned ? null : handler.unavailableReason?.(text) ?? null;
 		if (reason) return finish(f, meta, { status: "unavailable", reason, detail, result: null, exitCode });
-		// The process never started (the spawn's error event): nothing reached the model.
-		if (exit?.error && exitCode === null) return finish(f, meta, { status: "failed", reason: `spawn-error:${exit.error}`, detail, result: null, exitCode });
+		if (errored) return finish(f, meta, { status: "failed", reason: `spawn-error:${exit.error}`, ...(notSpawned ? { spawned: false } : {}), detail, result: null, exitCode });
 		return finish(f, meta, { status: "failed", reason: exit ? `exit-${exitCode}` : "no-result", detail, result: null, exitCode });
 	}
 

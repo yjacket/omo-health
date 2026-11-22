@@ -1,7 +1,7 @@
 import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { EventEmitter } from "node:events";
+import { EventEmitter, once } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
@@ -185,12 +185,30 @@ test("a non-zero exit is unavailable when unavailableReason names a reason for s
 	assert.equal(runner.poll("j3").reason, "exit-3", "no unavailableReason given: a plain failure");
 });
 
-test("a spawn error exit (the process never started) is failed with spawn-error", () => {
+test("an error from a child with a pid is failed with spawn-error but is not a confirmed non-launch", () => {
 	const { runner } = setup({ isAlive: DEAD_PID });
 	runner.start({ ...baseJob, unavailableReason: (text) => (text.includes("not logged in") ? "auth" : null) });
 	writeExit(runner, { code: null, error: "spawn C:/fake/tool.exe ENOENT" });
 	const polled = runner.poll("j1");
 	assert.deepEqual([polled.status, polled.reason, polled.exitCode], ["failed", "spawn-error:spawn C:/fake/tool.exe ENOENT", null]);
+	assert.notEqual(polled.spawned, false);
+});
+
+test("(IS-10) a real missing executable is a confirmed non-launch, also on a restarted runner", async () => {
+	let spawnError;
+	const { runner, home } = setup({ identify: () => null, spawnImpl: (...args) => {
+		const child = spawn(...args);
+		spawnError = once(child, "error");
+		return child;
+	} });
+	const command = path.join(home, "missing-tool.exe");
+	const started = runner.start({ ...baseJob, command, cwd: undefined });
+	assert.equal(started.pid, undefined);
+	const [error] = await spawnError;
+	assert.equal(error.code, "ENOENT");
+	const polled = runner.poll("j1");
+	assert.deepEqual(polled, { status: "failed", reason: `spawn-error:${error.message}`, spawned: false, detail: "", result: null, exitCode: null });
+	assert.deepEqual(setup({ home }).runner.poll("j1"), polled);
 });
 
 test("a process that is gone without exit.json is done when the stdout parses, else unavailable or failed with no-result", () => {

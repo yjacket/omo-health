@@ -1,6 +1,7 @@
 import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -486,7 +487,71 @@ test("a pre-spawn throw (spawned:false) refunds the charge and ends spawn-error"
 	assert.equal(record.status, "failed");
 	assert.equal(record.reason, "spawn-error");
 	assert.equal(record.detail, "EACCES");
-	assert.deepEqual(h.budget(), { day: "2026-11-20", count: 0, jobs: [] });
+	assert.deepEqual(h.budget(), { day: "2026-11-20", count: 0, jobs: [], refunded: [record.jobId] });
+	assert.equal(a.busy(), false);
+});
+
+test("(IS-10) only a confirmed non-launch refunds, even when its poll result is replayed after restart", (t) => {
+	const h = harness({ sessions: ["m1", "m2"] });
+	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+	h.runner.writeMeta = false;
+	h.runner.start = ({ jobId }) => {
+		h.runner.starts.push(jobId);
+		return { jobId };
+	};
+	h.runner.script = (jobId) => ({
+		status: "failed",
+		reason: "spawn-error:ENOENT",
+		...(jobId.endsWith("-m2") ? { spawned: false } : {}),
+	});
+	const a = h.auditor();
+	h.request("m1");
+	h.tick(a);
+	h.tick(a);
+	const { jobId: uncertainId, status, reason } = h.record("m1");
+	assert.deepEqual([status, reason, h.budget().count], ["failed", "spawn-error:ENOENT", 1]);
+
+	h.request("m2");
+	h.tick(a);
+	const running = h.record("m2");
+	assert.equal(running.status, "running");
+	assert.equal(h.budget().count, 2);
+	h.tick(a);
+	assert.deepEqual([h.record("m2").status, h.record("m2").reason, h.budget().count], ["failed", "spawn-error", 1]);
+	const refundedBudget = { day: "2026-11-20", count: 1, jobs: [uncertainId], refunded: [running.jobId] };
+	assert.deepEqual(h.budget(), refundedBudget);
+	h.tick(a);
+	assert.deepEqual(h.budget(), refundedBudget);
+
+	// Replay the running record left by a crash after the budget write but before the failure record write.
+	fs.writeFileSync(path.join(h.paths.health.auditsDir, "m2.json"), JSON.stringify(running));
+	h.tick(h.auditor());
+	assert.deepEqual([h.record("m2").status, h.record("m2").reason], ["failed", "spawn-error"]);
+	assert.deepEqual(h.budget(), refundedBudget);
+	assert.deepEqual(h.runner.starts, [uncertainId, running.jobId]);
+	assert.deepEqual(h.runner.polls, [uncertainId, running.jobId, running.jobId]);
+});
+
+test("(IS-10) a nonexistent OMO_HEALTH_OMO executable ends spawn-error without spending the daily budget", async (t) => {
+	const h = harness();
+	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+	const env = { OMO_HEALTH_OMO: path.join(h.root, "missing-omo.exe") };
+	let spawnError;
+	const runner = createRunner({ paths: h.paths, clock: h.clock, env, spawnImpl: (...args) => {
+		const child = spawn(...args);
+		spawnError = once(child, "error");
+		return child;
+	} });
+	const a = h.auditor({ runner, env });
+	assert.equal(auditsToday(h.paths, h.state.now), 0);
+	h.request("m1");
+	h.tick(a);
+	assert.equal(h.record("m1").status, "running");
+	assert.equal(auditsToday(h.paths, h.state.now), 1);
+	const [error] = await spawnError;
+	assert.equal(error.code, "ENOENT");
+	h.tick(a);
+	assert.deepEqual([h.record("m1").status, h.record("m1").reason, auditsToday(h.paths, h.state.now)], ["failed", "spawn-error", 0]);
 	assert.equal(a.busy(), false);
 });
 
