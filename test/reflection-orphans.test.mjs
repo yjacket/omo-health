@@ -74,7 +74,9 @@ test("a finished timed_out run's node and bun children are killed once, quietly"
 	assert.equal(entries[0].result, "execute");
 	assert.equal(entries[0].outcome.killed.length, 2);
 	await h.engine.tick();
-	assert.equal(h.decisions.length, 1);
+	// Killed once: the second tick adds no action. The info finding now logs its lifecycle, so its `opened` is the only other entry.
+	assert.equal(h.decisions.filter((d) => d.action).length, 1);
+	assert.deepEqual(h.decisions.filter((d) => !d.action).map((d) => d.event), ["opened"]);
 });
 
 test("grace is honored exactly: untouched at the edge, killed one ms after", async () => {

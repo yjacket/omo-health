@@ -4,6 +4,7 @@ import path from "node:path";
 import { writeLedgers } from "./align/ledger.mjs";
 import { isOurDaemon, killHungHolder } from "./death.mjs";
 import { acceptReports, importLegacyIntake } from "./reports/intake.mjs";
+import { appendDecision } from "./decisions.mjs";
 import { VERSION } from "./version.mjs";
 import { createLogger } from "./log.mjs";
 import { createNotifier } from "./act/notify.mjs";
@@ -240,6 +241,13 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 		log.error("downtime_error", { error: String(error?.message ?? error) });
 	}
 	pruneDeaths(paths, clock.now(), config.history.retentionDays);
+	// Plan todo 7: every start of this version records info-level findings, so a session record can tell whether
+	// the period it covers had that history (coverage.infoFindings). Logging only; no action depends on it.
+	try {
+		appendDecision(paths, { event: "coverage", infoFindings: true });
+	} catch (error) {
+		log.error("coverage_decision_failed", { error: String(error?.message ?? error) });
+	}
 	runRetention(paths, clock.now(), log);
 	let lastRetentionMs = clock.now();
 	// Reports queued under the old layout (care/intake) join the intake queue once; the legacy directory goes.

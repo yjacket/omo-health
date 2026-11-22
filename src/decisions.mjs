@@ -8,6 +8,16 @@ import { redact } from "./util/text.mjs";
  * healthHome/decisions/<YYYY-MM-DD>.jsonl. Machine-readable evidence of every
  * action, would-action, skip and judge call.
  */
+const isRecord = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+const detail = (parts) => parts.filter(Boolean).join("; ").slice(0, 200);
+
+/** The one-line outcome of an action decision, as the history samples and the session record show it. */
+export function actionDetail(entry) {
+	const o = isRecord(entry.outcome) ? entry.outcome : {};
+	const pids = (list) => (Array.isArray(list) && list.length ? list.map((p) => p?.pid ?? p).join(",") : null);
+	return detail([pids(o.killed) && `killed ${pids(o.killed)}`, pids(o.survived) && `survived ${pids(o.survived)}`, o.delivered !== undefined && `delivered ${o.delivered}`, o.via && `via ${o.via}`, o.error && `error ${o.error}`, entry.rule && `rule ${isRecord(entry.rule) ? entry.rule.id : entry.rule}`]);
+}
+
 export function appendDecision(paths, entry) {
 	const ts = entry.ts ?? new Date().toISOString();
 	const file = path.join(paths.health.decisionsDir, `${ts.slice(0, 10)}.jsonl`);

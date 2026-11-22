@@ -1188,7 +1188,7 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 						record.lastActionKind = req.kind;
 					}
 					record.history.push({ atMs: now, kind: req.kind, status: verdict });
-					decision({ fp: finding.fp, detector: finding.detector, kind: finding.kind, cls: finding.cls, rule: finding.data?.classification?.rule, action: { key: req.key, kind: req.kind, params }, result: verdict, evidence: finding.evidence });
+					decision({ fp: finding.fp, detector: finding.detector, kind: finding.kind, cls: finding.cls, rule: finding.data?.classification?.rule, action: { key: req.key, kind: req.kind, params }, result: verdict, subject: pickSubject(finding.subject), evidence: finding.evidence });
 					results.push({ fp: finding.fp, kind: req.kind, result: verdict });
 					continue;
 				}
@@ -1213,7 +1213,7 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 					items.push({ description: finding.data.description, monitorId: finding.data.monitorId, count: record.killedCount, persistent: Boolean(finding.data.persistent), killed: result.outcome.killed.map((proc) => `${proc.pid}:${proc.ctime}`), sessionFile: sessionFileFor(finding.data.sessionDir, finding.subject.sessionId) });
 					stoppedMonitors.set(finding.subject.sessionId, items);
 				}
-				decision({ fp: finding.fp, detector: finding.detector, kind: finding.kind, cls: finding.cls, rule: finding.data?.classification?.rule, action: { key: req.key, kind: req.kind, params }, result: "execute", outcome: summarize(result), evidence: finding.evidence, ...(req.reportId ? { reportId: req.reportId } : {}) });
+				decision({ fp: finding.fp, detector: finding.detector, kind: finding.kind, cls: finding.cls, rule: finding.data?.classification?.rule, action: { key: req.key, kind: req.kind, params }, result: "execute", outcome: summarize(result), subject: pickSubject(finding.subject), evidence: finding.evidence, ...(req.reportId ? { reportId: req.reportId } : {}) });
 				results.push({ fp: finding.fp, kind: req.kind, result: "execute", outcome: result });
 			}
 		};
@@ -1229,17 +1229,15 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 			const previousResolvedMs = record.resolvedMs;
 			record.finding = finding;
 			record.lastSeenMs = now;
-			if (finding.severity !== "info") {
-				// `logged`: an opened/reopened line exists, so the matching `resolved` may be written (G33).
-				if (!isNew && previousResolvedMs) {
-					decision({ event: "reopened", fp: finding.fp, detector: finding.detector, kind: finding.kind, cls: finding.cls, severity: finding.severity, subject: finding.subject, evidence: finding.evidence, afterMs: now - previousResolvedMs });
-					record.logged = true;
-					opened.push(finding);
-				} else if (!record.logged) {
-					decision({ fp: finding.fp, detector: finding.detector, kind: finding.kind, cls: finding.cls, severity: finding.severity, event: "opened", subject: finding.subject, evidence: finding.evidence });
-					record.logged = true;
-					opened.push(finding);
-				}
+			// `logged`: an opened/reopened line exists, so the matching `resolved` may be written (G33).
+			if (!isNew && previousResolvedMs) {
+				decision({ event: "reopened", fp: finding.fp, detector: finding.detector, kind: finding.kind, cls: finding.cls, severity: finding.severity, subject: finding.subject, evidence: finding.evidence, afterMs: now - previousResolvedMs });
+				record.logged = true;
+				opened.push(finding);
+			} else if (!record.logged) {
+				decision({ fp: finding.fp, detector: finding.detector, kind: finding.kind, cls: finding.cls, severity: finding.severity, event: "opened", subject: finding.subject, evidence: finding.evidence });
+				record.logged = true;
+				opened.push(finding);
 			}
 			record.resolvedMs = undefined;
 			if (finding.severity === "crit" && (isNew || previousSeverity !== "crit")) writeReport(paths, finding, record, now);
@@ -1332,9 +1330,7 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 				record.state = "resolved";
 				if (!stillOwes && record.invStatus && !RESOLVED.has(record.invStatus)) investigate(record.finding, record, { status: "closed", retryAtMs: null }, { row: { result: "finding-resolved" } });
 				record.resolution = record.history.length ? "원인 신호가 사라졌습니다(도구 결과 도착 또는 조건 해소)" : "조건이 해소되었습니다";
-				if (record.logged) {
-					decision({ fp, detector: record.finding.detector, kind: record.finding.kind, cls: record.finding.cls, event: "resolved", subject: record.finding.subject, afterMs: now - record.firstSeenMs });
-				}
+				decision({ fp, detector: record.finding.detector, kind: record.finding.kind, cls: record.finding.cls, event: "resolved", subject: record.finding.subject, afterMs: now - record.firstSeenMs });
 				if (record.history.length || record.reportPath) writeReport(paths, record.finding, record, now);
 			}
 			if (now - record.resolvedMs > RECORD_KEEP_MS) records.delete(fp);
