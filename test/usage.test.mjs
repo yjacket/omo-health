@@ -256,6 +256,20 @@ test("(IS-1) a 1e999 counter is Infinity like senpi", (t) => {
 	assert.deepEqual(core(usageTimeline(file()).totals), core(got));
 });
 
+test("(IS-1) missing cacheWrite contributes zero instead of senpi's NaN", (t) => {
+	const { file } = setup(t);
+	writeRecords(file(), [
+		usageEntry({ input: 1, output: 2, cacheRead: 3, cost: { total: 0 } }),
+		usageEntry(use()),
+	]);
+	const got = readUsage(file()).effective;
+	const timeline = usageTimeline(file()).totals;
+	assert.equal(senpiUsageTotals(file()).total, NaN, "senpi's raw addition propagates the missing cacheWrite as NaN");
+	assert.equal(got.cacheWrite, 4, "only the complete record contributes cacheWrite");
+	assert.equal(got.total, 16, "unlike senpi's NaN, the two records sum to 6 + 10");
+	assert.deepEqual(timeline, got, "both readers preserve the same totals when senpi yields NaN");
+});
+
 test("(IS-1) a non-number counter counts 0 (senpi's coercion is not reproduced)", (t) => {
 	const { file } = setup(t);
 	fs.writeFileSync(file(), '{"type":"usage","provider":"p","model":"s","usage":{"input":"5","output":-3,"cacheRead":"7","cacheWrite":0,"cost":{"total":"0.5"}}}\n');

@@ -1568,6 +1568,27 @@ test("request helpers: safeAuditId, the atomic request file and the state a requ
 	assert.equal(readAuditState(h.paths, "m1").status, "requested", "a rerun request shows before the daemon takes it");
 });
 
+test("IS-8: a config reload after audit preparation still hides current D4 thresholds", async (t) => {
+	const h = harness();
+	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+	appendDecision(h.paths, {
+		ts: new Date(BASE - 120_000).toISOString(), event: "opened", fp: "cache-storm", detector: "D4",
+		kind: "cache-storm", subject: { sessionId: "m1" }, evidence: ["cacheWrite:10000"],
+	});
+	const auditor = h.auditor();
+	h.request("m1");
+	h.tick(auditor);
+	await auditor.preparing();
+	h.config.tokens.cacheStormWrite = 100_000;
+	appendDecision(h.paths, { ts: new Date(h.state.now).toISOString(), event: "config", result: "applied", changed: ["tokens.cacheStormWrite"] });
+	auditor.tick(h.state.now);
+	assert.equal(h.record("m1").status, "running");
+	const document = fs.readFileSync(path.join(h.runner.starts[0].cwd, "bundle.md"), "utf8");
+	const bundle = JSON.parse(document.split("\n").find((line) => line.startsWith('{"session":')));
+	assert.deepEqual(bundle.omo_health_record.findings.map(({ detector, thresholdsKnown }) => [detector, thresholdsKnown]), [["D4", false]]);
+	assert.doesNotMatch(document, /"cacheStormWrite":/);
+});
+
 test("two looks at one investigation exclude every analyst model through the production join and model choice", async () => {
 	const h = harness();
 	fs.mkdirSync(h.paths.health.investigationsDir, { recursive: true });

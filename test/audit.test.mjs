@@ -258,6 +258,33 @@ test("(IS-8) the audit bundle and prompt distinguish incomplete statistics from 
 	assert.match(document, /aggregates suggest should have fired \(D10\)/);
 });
 
+test("IS-8: D4 findings straddling a config decision use only applicable thresholds", (t) => {
+	const root = tmpDir("omoh-audit-thresholds-");
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health"), OMO_HEALTH_OMO_HOME: path.join(root, "omo") });
+	const row = { ...emptyRecord().session, taskId: null };
+	appendEnded(paths, row);
+	const finding = (offset, fp, cacheWrite) => ({
+		ts: iso(T0 + offset), fp, event: "opened", detector: "D4", kind: "cache-storm",
+		subject: { sessionId: row.sessionId }, evidence: [`cacheWrite:${cacheWrite}`],
+	});
+	appendDecision(paths, finding(1, "old", 10_000));
+	appendDecision(paths, { ts: iso(T0 + 2), event: "config", result: "applied", changed: ["tokens.cacheStormWrite"] });
+	appendDecision(paths, finding(3, "new", 200_000));
+	const config = structuredClone(DEFAULT_CONFIG);
+	config.tokens.cacheStormWrite = 100_000;
+	const now = row.endedMs + 1;
+	const record = loadSessionRecord({ paths, id: row.sessionId, now, auditRetention: true });
+	const bundle = auditBundle(record, timelineShell(), { config, now });
+	const { findings } = bundle.omo_health_record;
+	assert.deepEqual(findings.map(({ ts, detector, thresholdsKnown }) => [ts, detector, thresholdsKnown]),
+		[[iso(T0 + 3), "D4", true], [iso(T0 + 1), "D4", false]]);
+	assert.equal(findings[0].thresholds.cacheStormWrite, 100_000);
+	assert.equal(Object.hasOwn(findings[1], "thresholds"), false);
+	assert.doesNotMatch(JSON.stringify(bundle.thresholds), /cacheStormWrite/);
+	assert.match(auditDocument(bundle), /When a finding has thresholdsKnown: false, do not judge it as exaggerated by threshold\./);
+});
+
 /* ---------------------------------------------------------------- allowlist */
 
 test("IS-11: the audit bundle keeps delivered message kinds without text or other details", () => {
@@ -317,6 +344,8 @@ test("IS-8: the audit bundle keeps warning severity and structured evidence from
 	assert.deepEqual(findings[0], {
 		ref: "F1", ts, event: "severity", detector: "D1", kind: "stall", severity: "warn", scope: "session",
 		subject: { sessionId: "s1", taskId: null }, metrics: { count: "6" }, droppedEvidence: 1,
+		thresholdsKnown: true,
+		thresholds: { quietMs: DEFAULT_CONFIG.stall.quietMs, unknownJudgeMs: DEFAULT_CONFIG.stall.unknownJudgeMs, progressingMaxMs: DEFAULT_CONFIG.stall.progressingMaxMs },
 	});
 	assert.doesNotMatch(JSON.stringify(bundle), /QA-PRIVATE/);
 });
