@@ -79,6 +79,43 @@ function writeLines(file, lines) {
 
 const emptyWorld = (clock) => makeWorld({ now: clock.now(), sessions: [] });
 
+test("cwd-less queue lookup finds a unique indexed child and rejects a cross-project collision", (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const row = { sessionId: "seed", taskId: "st_seed", kind: "child", endedMs: T0 };
+	const own = sub(s, row.sessionId);
+	const otherCwd = path.join(s.root, "other");
+	const other = sub(s, row.sessionId, otherCwd);
+	const query = subjectOf(row);
+	appendEnded(s.paths, { ...row, cwd: s.cwd }, { nowMs: T0 });
+	for (const [subject, cwd, count] of [[own, s.cwd, 42], [other, otherCwd, 7]]) {
+		const file = childFile(cwd, row.taskId, row.sessionId);
+		writeJsonl(file, [E.assistant({ ms: T0, usage: usage(count) })]);
+		if (count === 7) {
+			assert.equal(s.index.get(subjectKey(query))?.published?.total, 42);
+			assert.equal(s.tracker.tokensOf(query)?.tokens?.total, 42);
+		}
+		s.index.update(subject, file, row);
+	}
+	assert.equal(s.index.get(subjectKey(query)), undefined);
+	assert.equal(s.tracker.tokensOf(query)?.tokens?.total, undefined);
+	assert.equal(s.tracker.tokensOf(own)?.tokens?.total, 42);
+	assert.equal(s.tracker.tokensOf(other)?.tokens?.total, 7);
+});
+
+test("cwd-less queue lookup recovers the scoped child cursor from a stripped ledger stream", (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const row = { sessionId: "seed", taskId: "st_seed", kind: "child", endedMs: T0 };
+	const file = childFile(s.cwd, row.taskId, row.sessionId);
+	writeJsonl(file, [E.assistant({ ms: T0, usage: usage(42) })]);
+	appendEnded(s.paths, { ...row, cwd: s.cwd }, { nowMs: T0 });
+	s.tracker.queueLedger([row].values());
+	s.tracker.tick(emptyWorld(s.clock));
+	assert.equal(s.tracker.tokensOf(sub(s, row.sessionId))?.tokens?.total, 42);
+	assert.equal(s.index.get(subjectKey(subjectOf(row)))?.published?.total, 42);
+});
+
 function projectCollision(t) {
 	const s = setup();
 	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));

@@ -54,6 +54,22 @@ test("mainFile finds a main session file by the id in its file name", (t) => {
 	assert.equal(locator.mainFile(sub("sess-unknown", proj)), undefined);
 });
 
+test("cwd-less mainFile lookup resumes bounded discovery and rejects two projects with the same id", (t) => {
+	const { paths, locator, clock, proj } = setup(t);
+	const id = "review.1";
+	const query = sub(id);
+	const dir = path.join(paths.sessionsDir, "probe");
+	fs.mkdirSync(dir, { recursive: true });
+	const file = path.join(dir, `2026-11-22_${id}.jsonl`);
+	fs.writeFileSync(file, '{"type":"usage","usage":{"input":42}}\n');
+	assert.deepEqual(locator.findMainFile(query, null, { maxBytes: 0 }), { file: undefined, pending: true, bytesRead: 0 });
+	assert.equal(locator.mainFile(query), file);
+	const duplicate = writeMain(paths, proj, id);
+	clock.advance(RESCAN);
+	assert.equal(locator.mainFile(query), undefined);
+	assert.equal(locator.mainFile(sub(id, proj)), duplicate);
+});
+
 test("(IS-1, IS-4, IS-7) filename IDs strip only the senpi timestamp", () => {
 	assert.deepEqual(["review.1", "run_review.1", "a_b"].map((id) => idFromFileName(`${STAMP}_${id}.jsonl`)),
 		["review.1", "run_review.1", "a_b"]);

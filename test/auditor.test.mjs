@@ -976,6 +976,42 @@ test("evidence-too-large charges nothing and never starts", async () => {
 	assert.equal(h.budget(), undefined);
 });
 
+for (const shape of ["orig", "distinct", "family", "indexed family", "ambiguous"]) {
+	test(`cwd-less audit: ${shape} probe transcript`, async (t) => {
+		const h = harness({ sessions: [] });
+		t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+		const sessionId = "seed";
+		const subject = subjectOf({ sessionId });
+		const ended = { kind: "main", endedMs: BASE - 1000, startedMs: BASE - 30_000 };
+		appendEnded(h.paths, { ...ended, sessionId }, { nowMs: BASE });
+		const rows = [];
+		const family = shape.endsWith("family");
+		for (let i = 0; i < (family ? 1030 : 2); i++) {
+			rows.push({ ...ended, sessionId: `01aaa000-0000-7000-8000-${String(i).padStart(12, "0")}`,
+				cwd: path.join(h.root, shape === "orig" ? "same" : `project-${i}`),
+				...(family ? { kind: "child", parentSessionId: sessionId, taskId: `st_${i}` } : {}) });
+		}
+		fs.appendFileSync(path.join(h.paths.health.sessionsDir, "ended-2026-11-20.jsonl"), rows.map((row) => JSON.stringify(row) + "\n").join(""));
+		const usage = [{ type: "usage", provider: "p", model: "one", usage: { input: 42 } }];
+		writeJsonl(path.join(h.paths.sessionsDir, "probe", "2026-11-20_seed.jsonl"), usage);
+		if (shape === "ambiguous") writeJsonl(path.join(h.paths.sessionsDir, projectKeyOf(h.root), "2026-11-20_seed.jsonl"), usage);
+		const index = createUsageIndex({ clock: h.clock });
+		if (shape === "indexed family" || shape === "ambiguous") {
+			const file = path.join(h.root, "seed.jsonl");
+			writeJsonl(file, usage);
+			index.update(subject, file, { kind: "main" });
+			if (family) fs.appendFileSync(file, "\n"); // Require the probe transcript rather than the stale cursor.
+		}
+		const a = h.auditor({ index });
+		t.after(() => a.close());
+		requestAudit(h.paths, subject, BASE);
+		await h.prepare(a);
+		const result = readAuditState(h.paths, subject);
+		assert.equal(result.reason ?? result.status, family ? "evidence-too-large" : shape === "ambiguous" ? "models-unknown" : "running");
+		assert.equal(h.runner.starts.length, family || shape === "ambiguous" ? 0 : 1);
+	});
+}
+
 function openaiLine(extra = {}) {
 	return E.assistant({ ms: BASE - 60_000, id: "a-late", model: "gpt-5-5", provider: "openai", ...extra });
 }

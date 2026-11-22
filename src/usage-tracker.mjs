@@ -77,6 +77,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 	let sawBacklog = false;
 
 	const keyOf = (row) => subjectKey(subjectOf(row));
+	const exactEntry = (key) => (index.getExact ?? index.get).call(index, key);
 	const liveIdentities = new WeakMap();
 	const identityOf = (row) => liveIdentities.get(row) ?? row;
 	const linkedSubject = (row, field) => {
@@ -94,7 +95,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			const subject = linkedSubject(current, "parent");
 			if (!subject || seen.has(subject)) break;
 			seen.set(subject, true);
-			const parent = ledgerRows.get(subject) ?? liveSessions?.get(subject) ?? index.get(subjectKey(subject));
+			const parent = ledgerRows.get(subject) ?? liveSessions?.get(subject) ?? exactEntry(subjectKey(subject));
 			if (!parent?.sessionId && !parent?.id) break;
 			yield parent;
 			current = parent;
@@ -242,7 +243,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 				if (row[PACKED_PROJECT] === null) compactProject(row, resolve(row).projectKey);
 				else row[PACKED_PROJECT] = ledgerRows.canonicalProject(row[PACKED_PROJECT]);
 				ledgerRows.set(row, row);
-				const entry = index.get(keyOf(row));
+				const entry = ledgerUsageSessionId(row) ? index.get(keyOf(row)) : exactEntry(keyOf(row));
 				if (row.kind === "child" && !ledgerUsageSessionId(row) && (entry?.state === "ok" || taskOnlyChecks.has(row))) {
 					taskOnlyChecks.set(row, row);
 				}
@@ -322,7 +323,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 				if (session?.kind !== "main" || session.file !== file) liveHeaders.delete(id);
 			}
 			for (const session of liveSessions.values()) {
-				const entry = index.get(keyOf(identityOf(session)));
+				const entry = exactEntry(keyOf(identityOf(session)));
 				const reads = entry?.state === "ok" && entry.complete === true ? liveAppends : liveFirstReads;
 				reads.push({ session, entry });
 			}
@@ -362,7 +363,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			for (const [key, row] of taskOnlyChecks.subjects()) {
 				const id = subjectKey(key);
 				const { file } = locate(row, liveSessions, cwdOf, 0);
-				const entry = index.get(id);
+				const entry = exactEntry(id);
 				const withdraw = file === null || (file !== undefined && pathKey(file) !== pathKey(entry?.file));
 				if (entry?.state === "ok" && (withdraw || (file === undefined && (!entry.gone || entry.ownershipUnique !== true)))) {
 					index.markMissing(subjectOf(row), metaOf(row), { withdraw });
@@ -370,7 +371,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 				}
 				if (file) {
 					checkedFiles.set(key, file);
-					if (!isFresh(index.get(id))) queue.set(key, row);
+				if (!isFresh(exactEntry(id))) queue.set(key, row);
 					else if (index.recordOwnership(id, true)) ownershipChanged = true;
 				} else {
 					queue.delete(key);
@@ -409,7 +410,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 				budget = Math.max(0, budget - index.update(subjectOf(row), rowFile, metaOf(row), {
 					maxBytes: budget, ownershipUnique: taskOnly ? true : null,
 				}));
-				const entry = index.get(id);
+				const entry = exactEntry(id);
 				// Missing/gone files are retried by queueLedger, not every tick.
 				if (entry.readError === true) continue;
 				if (entry.state === "missing" || entry.state === "full" || entry.gone === true ||

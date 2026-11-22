@@ -43,6 +43,18 @@ export function parseSubjectKey(key) {
 	return null;
 }
 
+/** undefined for no match, null for ambiguity. Never retain the candidates. */
+export function uniqueMatch(candidates, select) {
+	let found;
+	for (const candidate of candidates) {
+		const match = select(candidate);
+		if (match === undefined) continue;
+		if (found !== undefined) return null;
+		found = match;
+	}
+	return found;
+}
+
 /** Keep unusually long ledger identities losslessly, including distinct paths with a common prefix. */
 export function packScopedText(text) {
 	if (text == null) return null;
@@ -88,6 +100,14 @@ export class SubjectMap {
 		if (!subject) return undefined;
 		const slot = this.#projects.get(this.#project(subject))?.ids.get(subject.sessionId ?? subject.id);
 		return this.#order ? slot?.value : slot;
+	}
+
+	/** Read-side resolution only: a null project is a bare ID, not a preferred bucket. */
+	getForSubject(subject) {
+		if (subject.projectKey != null) return this.get(subject);
+		const id = subject.sessionId ?? subject.id;
+		const slot = uniqueMatch(this.#projects.values(), ({ ids }) => ids.get(id));
+		return this.#order && slot != null ? slot.value : slot;
 	}
 
 	has(key) { return this.get(key) !== undefined; }

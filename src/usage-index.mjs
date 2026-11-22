@@ -2,7 +2,7 @@ import fs from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { addModelCounters, emptyModelBilling, MODEL_KEY_LENGTH, MODEL_KEY_LIMIT, readUsage } from "./collect/usage.mjs";
 import { pathKey } from "./paths.mjs";
-import { parseSubjectKey, SubjectMap, subjectKey, subjectOf } from "./session-subject.mjs";
+import { parseSubjectKey, SubjectMap, subjectKey, subjectOf, uniqueMatch } from "./session-subject.mjs";
 import { atomicWriteChunks, statSafe } from "./util/fsx.mjs";
 
 /**
@@ -479,13 +479,16 @@ const isId = (value) => typeof value === "string" && value.length > 0;
 
 /** The dashboard can look up aliases using only the daemon's published ownership. */
 export function publishedUsageView(usage) {
-	return { get: (id) => usage.get(id), values: () => usage.values(), full: usage.full, publishedOwnership: true };
+	return { get: (id) => usage.get(id), getForSubject: (subject) => usageEntryFor(usage, subject), values: () => usage.values(), full: usage.full, publishedOwnership: true };
 }
 
 /** Session ids are authoritative; a task id is only a lookup for a sessionless row. */
 export function usageEntryFor(usage, subject, taskId) {
-	const key = subjectKey(subject);
-	if (key) return usage?.get(key);
+	if (subject?.sessionId) {
+		if (usage?.getForSubject) return usage.getForSubject(subject);
+		if (subject.projectKey != null) return usage?.get(subjectKey(subject));
+		return uniqueMatch(usage?.values() ?? [], (entry) => entry?.id === subject.sessionId ? entry : undefined);
+	}
 	if (!isId(taskId)) return undefined;
 	let match;
 	for (const entry of usage?.values() ?? []) {
@@ -509,7 +512,7 @@ export function relatedUsageEntries(index, sessionId) {
 		let matches = entry.id === sessionId || entry.rootSessionId === sessionId;
 		let parent = parentSubject(entry);
 		for (let depth = 0; !matches && parent && depth < TREE_DEPTH; depth += 1) {
-			const ancestor = index.get(subjectKey(parent));
+			const ancestor = (index.getExact ?? index.get).call(index, subjectKey(parent));
 			matches = ancestor?.id === sessionId;
 			parent = ancestor && parentSubject(ancestor);
 		}
@@ -572,15 +575,19 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 	return {
 		file,
 		get full() { return full; },
+		getExact(key) { return entries.get(key) ?? (full && key ? FULL_ENTRY : undefined); },
+		getForSubject: (subject) => entries.getForSubject(subject),
 		get(key, taskId) {
 			if (typeof key === "object" && key !== null) return usageEntryFor(entries, key, taskId) ?? (full && taskId ? FULL_ENTRY : undefined);
 			// No rejected path or id is retained. While saturated, an absent row
 			// cannot be distinguished from one skipped at the capacity boundary.
-			return entries.get(key) ?? (full && key ? FULL_ENTRY : undefined);
+			const subject = parseSubjectKey(key);
+			return (subject ? entries.getForSubject(subject) : undefined) ?? (full && key ? FULL_ENTRY : undefined);
 		},
 		has(key, taskId) {
-			if (typeof key === "object" && key !== null) return usageEntryFor(entries, key, taskId) !== undefined;
-			return entries.has(key);
+			if (typeof key === "object" && key !== null) return usageEntryFor(entries, key, taskId) != null;
+			const subject = parseSubjectKey(key);
+			return subject != null && entries.getForSubject(subject) != null;
 		},
 		values: () => entries.values(),
 		recordOwnership(id, unique) {

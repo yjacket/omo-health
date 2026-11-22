@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { listDirSafe, statSafe } from "../util/fsx.mjs";
 import { isInside, pathKey } from "../paths.mjs";
-import { packScopedText, SubjectMap } from "../session-subject.mjs";
+import { packScopedText, SubjectMap, uniqueMatch } from "../session-subject.mjs";
 import { fresh, readUsageIndex, soleChildSessionFile } from "../usage-index.mjs";
 import { idFromFileName } from "./sessions.mjs";
 import { senpiTaskStoreDir } from "./tasks.mjs";
@@ -62,16 +62,25 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 		const file = paths.health?.usageIndexFile;
 		const stat = file && statSafe(file);
 		const stamp = stat?.isFile() ? `${stat.ino}:${stat.birthtimeMs}:${stat.mtimeMs}:${stat.size}` : null;
-		if (stamp !== usageStamp) {
-			usageStamp = stamp;
-			indexedMainEntries = new SubjectMap();
-			if (stamp !== null) {
-				for (const entry of readUsageIndex(file).values()) {
-					if (entry.kind === "main" && entry.file && (!probeHeaders || idFromFileName(entry.file) !== entry.id)) indexedMainEntries.set(entry, entry);
+		let entry;
+		if (subject.projectKey == null) {
+			// Check uniqueness before filtering unusable entries; never keep the
+			// entire on-disk index just to locate custom paths.
+			if (stamp === null) return undefined;
+			entry = readUsageIndex(file).getForSubject(subject);
+		} else {
+			if (stamp !== usageStamp) {
+				usageStamp = stamp;
+				indexedMainEntries = new SubjectMap();
+				if (stamp !== null) {
+					for (const row of readUsageIndex(file).values()) {
+						if (row.kind === "main" && row.file && (!probeHeaders || idFromFileName(row.file) !== row.id)) indexedMainEntries.set(row, row);
+					}
 				}
 			}
+			entry = indexedMainEntries.get(subject);
 		}
-		const entry = indexedMainEntries.get(subject);
+		if (entry?.kind !== "main" || !entry.file || (probeHeaders && idFromFileName(entry.file) === entry.id)) return undefined;
 		if (!probeHeaders && (entry?.readError === true || !fresh(entry))) return undefined;
 		return entry?.file;
 	};
@@ -94,7 +103,26 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 			return probe;
 		};
 		const { sessionId, projectKey } = subject ?? {};
-		if (!sessionId || !projectKey || !/^--[^/\\:]*--$/.test(projectKey)) return result();
+		if (!sessionId) return result();
+		if (projectKey == null) {
+			let pending = false;
+			const file = uniqueMatch(listDirSafe(paths.sessionsDir, { withFileTypes: true }), (entry) => {
+				if (pending || !entry.isDirectory()) return undefined;
+				const found = scanProject(path.join(paths.sessionsDir, entry.name), entry.name, sessionId, header);
+				pending = found.pending;
+				return found.file;
+			});
+			if (file === null) return { ...result(), ambiguous: true };
+			if (pending || file) return result(file && !pending ? file : undefined, pending);
+			const custom = !probeHeaders ? readMainFile(subject) : indexedFile === undefined ? indexedMainFile(subject) : indexedFile;
+			if (!custom || isInside(custom, paths.sessionsDir)) return result();
+			if (!probeHeaders) return result(custom);
+			const stat = statSafe(custom);
+			if (!stat?.isFile()) return result();
+			const probe = header(custom, stat.size);
+			return result(probe.id === sessionId ? custom : undefined, probe.pending);
+		}
+		if (!/^--[^/\\:]*--$/.test(projectKey)) return result();
 		const dir = path.join(paths.sessionsDir, projectKey);
 		const owns = (file) => file && pathKey(path.dirname(file)) === pathKey(dir);
 		// An already verified custom transcript can live outside senpi’s sessions tree.
@@ -113,6 +141,12 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 				if (probe.id === sessionId) return result(indexedFile);
 			}
 		}
+		const { file, pending } = scanProject(dir, projectKey, sessionId, header);
+		return result(file, pending);
+	};
+
+	function scanProject(dir, projectKey, sessionId, header) {
+		const result = (file, pending = false) => ({ file, pending });
 		const packed = packScopedText(projectKey);
 		let project = projects.get(packed);
 		if (!project) projects.set(packed, project = { files: new Map(), scannedMs: -Infinity });
@@ -146,7 +180,7 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 		project.scannedMs = nowMs();
 		file = project.files.get(sessionId);
 		return result(file && statSafe(file)?.isFile() ? file : undefined);
-	};
+	}
 
 	const mainFile = (subject, indexedFile) => findMainFile(subject, indexedFile).file;
 

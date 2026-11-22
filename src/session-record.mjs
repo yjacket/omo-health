@@ -7,7 +7,7 @@ import { streamDecisions } from "./decisions.mjs";
 import { streamInvestigations } from "./investigations.mjs";
 import { safeSubjectId } from "./session-id.mjs";
 import { ENDED_LOCATION, endedKey, endedSelector, streamEnded } from "./session-ledger.mjs";
-import { sessionSubjects, subjectKey, subjectOf } from "./session-subject.mjs";
+import { sessionSubjects, subjectKey, subjectOf, uniqueMatch } from "./session-subject.mjs";
 import { compactUsage, fresh, readUsageIndex, usageEntryFor } from "./usage-index.mjs";
 import { reasonCode } from "./audit-codes.mjs";
 import { AUDIT_CHECK_MAX, AUDIT_DETECTOR_ID, AUDIT_LIST_CAPS, BUNDLE_MAX_CHARS, auditEvidence, auditHistoryRow, auditMessageKind } from "./judge/audit.mjs";
@@ -556,7 +556,7 @@ export function usageEntryOf(usage, row, ambiguous) {
 	const subject = { ...subjectOf(row), sessionId: ledgerUsageSessionId(ids) };
 	let entry = usageEntryFor(usage, subject, ids.taskId);
 	// An old cwd-less child may have been verified through a live parent not recorded in the ledger.
-	if (!entry && !subject.projectKey && ids.parentSessionId) {
+	if (entry === undefined && !subject.sessionId && !subject.projectKey && ids.parentSessionId) {
 		const matches = new Set();
 		for (const candidate of usage.values()) {
 			if (candidate.parentSessionId !== ids.parentSessionId ||
@@ -982,6 +982,7 @@ function* dirNames(directory) {
 function findRecordFiles(paths, nodes, ancestors, locator, usage, ambiguous) {
 	const wanted = new Set(nodes.filter((node) => !nonEmpty(node.taskId)).map((node) => subjectKey(subjectOf(node))));
 	const main = new Map();
+	const unscoped = new Map();
 	if (!locator && wanted.size) {
 		for (const slug of dirNames(paths.sessionsDir)) {
 			const dir = path.join(paths.sessionsDir, slug);
@@ -990,11 +991,16 @@ function findRecordFiles(paths, nodes, ancestors, locator, usage, ambiguous) {
 				const sid = idFromFileName(name);
 				const exact = subjectKey(subjectOf({ sessionId: sid, projectKey: slug }));
 				const unknown = subjectKey(subjectOf({ sessionId: sid }));
-				const key = wanted.has(exact) ? exact : wanted.has(unknown) ? unknown : null;
-				if (!key) continue;
+				if (!wanted.has(exact) && !wanted.has(unknown)) continue;
 				const file = path.join(dir, name);
-				const prior = main.get(key);
-				if ((!prior || file > prior) && statSafe(file)?.isFile()) main.set(key, file);
+				if (!statSafe(file)?.isFile()) continue;
+				if (wanted.has(exact) && (!main.has(exact) || file > main.get(exact))) main.set(exact, file);
+				if (wanted.has(unknown)) {
+					const prior = unscoped.get(unknown);
+					if (prior !== null) unscoped.set(unknown, prior?.slug === slug
+						? (file > prior.file ? { slug, file } : prior)
+						: uniqueMatch([prior, { slug, file }], (match) => match));
+				}
 			}
 		}
 	}
@@ -1015,7 +1021,8 @@ function findRecordFiles(paths, nodes, ancestors, locator, usage, ambiguous) {
 		const { sessionId, taskId } = node;
 		if (!nonEmpty(taskId)) {
 			const subject = subjectOf(node);
-			return { sessionId, file: locator ? locator.mainFile(subject) : main.get(subjectKey(subject)) };
+			const key = subjectKey(subject);
+			return { sessionId, file: locator ? locator.mainFile(subject) : subject.projectKey == null ? unscoped.get(key)?.file : main.get(key) };
 		}
 		// The tracker may have verified the transcript through a live ancestor whose cwd is absent from the ledger.
 		const entry = usageEntryOf(usage, node, ambiguous);
@@ -1087,7 +1094,9 @@ export function resolveLedgerSubject(paths, id, { row: selector, now = Date.now(
 	const wanted = subjectKey(subject);
 	for (const { row, isExact } of candidates.values()) {
 		let scoped = resolve(row);
-		if (!scoped.projectKey && usage) scoped = subjectOf(row, subjectOf(usageEntryOf(usage, row)));
+		// Explicit null selects the ledger identity; inferring a project for a
+		// token lookup must not change which audit request the row belongs to.
+		if (!scoped.projectKey && usage && subject?.projectKey !== null) scoped = subjectOf(row, subjectOf(usageEntryOf(usage, row)));
 		const key = subjectKey(scoped);
 		if (subject && key !== wanted) continue;
 		const matches = isExact ? exact : aliases;

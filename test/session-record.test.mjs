@@ -144,6 +144,27 @@ const ohealth = (ms, text) => ({ type: "custom_message", customType: "omo-health
 const mainRow = (extra = {}) => ({ sessionId: "s-main", kind: "main", parentSessionId: null, taskId: null, title: "main", cwd: "C:/work/a", terminal: { kind: "wt" }, omoVersion: "0.8.0", startedMs: T0, endedMs: T0 + 2 * HOUR, childCount: 2, ...extra });
 const childRow = (sessionId, taskId, parentSessionId, extra = {}) => ({ sessionId, kind: "child", parentSessionId, taskId, title: sessionId, cwd: "C:/work/a", terminal: null, omoVersion: null, startedMs: T0 + 10 * MIN, endedMs: T0 + 70 * MIN, ...extra });
 
+test("cwd-less detail keeps the ledger subject and joins only unique index entries and transcripts", (t) => {
+	const { root, paths } = setup();
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const sessionId = "review.1";
+	const subject = subjectOf({ sessionId });
+	const index = new Map();
+	const first = mainSessionFile(paths, sessionId);
+	const entry = (cwd, total) => ({ id: sessionId, projectKey: subjectOf({ cwd }).projectKey, state: "ok", complete: true, published: { total } });
+	index.set(key(sessionId, "C:/work/a"), entry("C:/work/a", 42));
+	writeLedger(paths, [mainRow({ sessionId, cwd: undefined })]);
+	const load = () => loadSessionRecord({ paths, subject, now: T0 + 3 * HOUR, index });
+	const unique = load();
+	assert.deepEqual(unique.subject, subject);
+	assert.equal(unique.tokens?.total, 42);
+	assert.deepEqual(unique.transcriptFiles, [first]);
+	mainSessionFile(paths, sessionId, [], "C:/work/b");
+	assert.deepEqual(load().transcriptFiles, []);
+	index.set(key(sessionId, "C:/work/b"), entry("C:/work/b", 7));
+	assert.equal(load().tokens?.total, undefined);
+});
+
 test("IS-7 indexed transcript: detail shows messages for a child and descendant located through a live parent", (t) => {
 	const { root, paths } = setup();
 	t.after(() => fs.rmSync(root, { recursive: true, force: true }));

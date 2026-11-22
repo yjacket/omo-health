@@ -435,9 +435,10 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		}
 	}
 
-	function launchPrepared(record, now, { loaded, selectedFps, auditSubjectIds, full, warning, timelineSource, indexVersion, discoveryTooLarge }, changedVersions, analystStart) {
+	function launchPrepared(record, now, { loaded, selectedFps, auditSubjectIds, full, warning, timelineSource, indexVersion, discoveryTooLarge, modelsAmbiguous }, changedVersions, analystStart) {
 		if (config.audit?.enabled !== true) return fail(record, "disabled", null, now);
 		if (discoveryTooLarge) return fail(record, "evidence-too-large", null, now);
+		if (modelsAmbiguous) return fail(record, "models-unknown", null, now);
 		if (!loaded?.found) return fail(record, "not-found", null, now);
 		if (readBudget(paths, now).count >= config.audit.perDay) return fail(record, "cap", null, now);
 		if (warning) log?.warn?.("audit_timeline_failed", warning);
