@@ -7,7 +7,8 @@ import os from "node:os";
 import path from "node:path";
 import { Worker } from "node:worker_threads";
 import { afterEach, test } from "node:test";
-import { AUDIT_CONTRACT, REQUEST_TTL_MS, auditsToday, createAuditor, readAuditState, requestAudit, safeAuditId } from "../src/auditor.mjs";
+import { AUDIT_CONTRACT, REQUEST_TTL_MS, auditsToday, createAuditor, readAuditState, requestAudit } from "../src/auditor.mjs";
+import { safeSubjectId } from "../src/session-id.mjs";
 import { createSessionFileLocator } from "../src/collect/session-files.mjs";
 import { usageTimeline } from "../src/collect/usage.mjs";
 import { DEFAULT_CONFIG } from "../src/config.mjs";
@@ -1830,10 +1831,35 @@ test("a duplicate audit request cannot replace the first claim", (t) => {
 	assert.deepEqual(fs.readdirSync(dir), ["m1.json"]);
 });
 
-test("request helpers: safeAuditId, the atomic request file and the state a request, a running record and a finished record show", async () => {
+test("plan77: direct audit requests and daemon intake reject unsafe file stems", async (t) => {
+	const h = harness({ sessions: [] });
+	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+	const { paths } = h;
+	const directAccepted = [];
+	for (const id of [".", "..", "../x", "a/b", "a\\b", "%2e%2e", "x.", "a\0b", "a\n", "x".repeat(81), "con", "nul.txt"]) {
+		try {
+			requestAudit(paths, id, BASE);
+			directAccepted.push(id);
+		} catch (error) {
+			if (error.message !== "invalid session id") directAccepted.push(`${id}: ${error.code ?? error.message}`);
+		}
+	}
+	const names = (dir) => fs.existsSync(dir) ? fs.readdirSync(dir) : [];
+	const directFiles = names(paths.health.auditRequestsDir);
+	fs.mkdirSync(paths.health.auditRequestsDir, { recursive: true });
+	fs.writeFileSync(path.join(paths.health.auditRequestsDir, "injected..json"), JSON.stringify({ v: 1, sessionId: "injected.", requestedMs: BASE - REQUEST_TTL_MS - 1 }));
+	const auditor = h.auditor();
+	auditor.tick(BASE);
+	assert.deepEqual({
+		directAccepted, directFiles, pending: names(paths.health.auditRequestsDir),
+		records: names(paths.health.auditsDir).filter((name) => name !== "requests"),
+	}, { directAccepted: [], directFiles: [], pending: [], records: [] });
+});
+
+test("request helpers: safeSubjectId, the atomic request file and the state a request, a running record and a finished record show", async () => {
 	const h = harness();
-	assert.equal(safeAuditId("abc-1.2_x"), "abc-1.2_x");
-	for (const bad of ["", "../x", "a/b", "a b", "_budget", 5, null, "x".repeat(200)]) assert.equal(safeAuditId(bad), null, String(bad));
+	assert.equal(safeSubjectId("abc-1.2_x"), "abc-1.2_x");
+	for (const bad of ["", "../x", "a/b", "a b", "_budget", 5, null, "x".repeat(200)]) assert.equal(safeSubjectId(bad), null, String(bad));
 	assert.throws(() => requestAudit(h.paths, "../x", BASE));
 	assert.equal(readAuditState(h.paths, "m1"), null);
 	const { request: { claimId } } = requestAudit(h.paths, "m1", BASE);

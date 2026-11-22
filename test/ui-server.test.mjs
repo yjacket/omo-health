@@ -734,24 +734,24 @@ describe("ui server", { timeout: 20_000 }, () => {
 				fs.writeFileSync(file, `${JSON.stringify({ v: USAGE_INDEX_VERSION })}\n${JSON.stringify(row)}\n`);
 			}
 
-			function makeWorld({ daemon = "running", enabled = true, usedModels = { "anthropic/claude-used": true }, lanes = { ultrabrain: ["anthropic/claude-used"], architect: ["openai/gpt-review:high"] }, providers = ["anthropic", "openai"], growFile = false, budgetCount = null, entries } = {}) {
+			function makeWorld({ sessionId = AUDIT_ID, daemon = "running", enabled = true, usedModels = { "anthropic/claude-used": true }, lanes = { ultrabrain: ["anthropic/claude-used"], architect: ["openai/gpt-review:high"] }, providers = ["anthropic", "openai"], growFile = false, budgetCount = null, entries } = {}) {
 				const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omoh-audit-ui-"));
 				const env = { USERPROFILE: dir, OMO_HEALTH_HOME: path.join(dir, "health") };
 				const worldPaths = resolvePaths(env);
 				const nowMs = Date.parse("2026-11-22T00:00:00.000Z");
 				const now = () => nowMs;
-				const sessionFile = path.join(worldPaths.sessionsDir, "slug", "2026-11-22T00-00-00-000Z_s_audit01.jsonl");
+				const sessionFile = path.join(worldPaths.sessionsDir, "slug", `2026-11-22T00-00-00-000Z_${sessionId}.jsonl`);
 				fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
-				const sessionLines = [{ type: "session", id: AUDIT_ID }, ...(entries ?? [])];
+				const sessionLines = [{ type: "session", id: sessionId }, ...(entries ?? [])];
 				fs.writeFileSync(sessionFile, `${sessionLines.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
 				const stat = fs.statSync(sessionFile);
 				fs.mkdirSync(worldPaths.health.sessionsDir, { recursive: true });
 				fs.writeFileSync(
 					path.join(worldPaths.health.sessionsDir, "ended-2026-11-22.jsonl"),
-					`${JSON.stringify({ v: 1, sessionId: AUDIT_ID, taskId: null, kind: "main", outcome: "answered", startedMs: nowMs - 1_000, endedMs: nowMs })}\n`,
+					`${JSON.stringify({ v: 1, sessionId, taskId: null, kind: "main", outcome: "answered", startedMs: nowMs - 1_000, endedMs: nowMs })}\n`,
 				);
 				writeIndexRow(worldPaths.health.usageIndexFile, {
-							id: AUDIT_ID,
+							id: sessionId,
 							file: sessionFile,
 							kind: "main",
 							taskId: null,
@@ -797,6 +797,42 @@ describe("ui server", { timeout: 20_000 }, () => {
 			function requestFileOf(world) {
 				return path.join(world.paths.health.auditRequestsDir, `${AUDIT_ID}.json`);
 			}
+
+			it("plan77: dotted history opens and queues an audit without accepting unsafe IDs", async (t) => {
+				const sessionId = "review.1";
+				const world = makeWorld({ sessionId });
+				const { paths, env, now } = world;
+				const ui = createUiServer({ paths, token: TOKEN, getState: () => STATE, sessionDetail: world.detail, startAudit: world.startAudit, now });
+				t.after(async () => {
+					await ui.close();
+					await world.detail.close();
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				});
+				const { port } = await ui.listen();
+				const invalid = { status: 422, body: { error: "invalid" } };
+				for (const id of ["..", ".", "../x", "a/b", "a\\b", "%2e%2e", "con", "cOn.txt", "x.", "review ", "review\0x", "review\n", "x".repeat(81)]) {
+					assert.deepEqual(await getAt(port, `/api/session?id=${encodeURIComponent(id)}`), invalid, JSON.stringify(id));
+					assert.deepEqual(await postAt(port, "/api/audit", { sessionId: id }), invalid, JSON.stringify(id));
+				}
+				assert.deepEqual(await getAt(port, "/api/session?id=%2e%2e"), invalid, "reject decoded dot segments");
+				assert.equal(fs.existsSync(paths.health.auditsDir), false, "unsafe requests write no audit artifacts");
+
+				const detail = await getAt(port, `/api/session?id=${encodeURIComponent(sessionId)}`);
+				const posted = await postAt(port, "/api/audit", { sessionId });
+				assert.deepEqual([detail.status, posted.status], [200, 202], "detail and audit must accept the same Senpi ID");
+				assert.equal(detail.body.session.sessionId, sessionId);
+				assert.equal(posted.body.audit.sessionId, sessionId);
+				assert.equal(readAuditState(paths, sessionId).status, "requested");
+				const auditor = createAuditor({ paths, config: loadConfig({ paths, env }).config, clock: { now }, runner: {}, env });
+				try {
+					auditor.tick(now());
+					assert.deepEqual(fs.readdirSync(paths.health.auditRequestsDir), []);
+					const record = readAuditState(paths, sessionId);
+					assert.deepEqual([record.sessionId, record.status], [sessionId, "queued"]);
+				} finally {
+					await auditor.close();
+				}
+			});
 
 			it("IS-4 keeps state responsive across bounded worker replies for a large detail and every next page", async (t) => {
 				const totals = { children: 51, findings: 5_000, actions: 5_000, investigations: 51, messages: 20_000 };

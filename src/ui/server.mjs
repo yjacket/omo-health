@@ -4,6 +4,7 @@ import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { clearPause, setSwitch, writePause } from "../control.mjs";
+import { safeSubjectId } from "../session-id.mjs";
 import { writeUiPrefs } from "./prefs.mjs";
 import { SESSION_LISTS } from "./session-view.mjs";
 
@@ -38,10 +39,6 @@ const API_ROUTES = Object.freeze({
 	"/api/audit": "POST",
 	"/api/prefs": "POST",
 });
-/** A task id or session id, as `omo-health diagnose` takes it. */
-const SUBJECT_ID = /^[A-Za-z0-9_-]{4,80}$/;
-/** Windows device names cannot be file names under audits/ even though they look like ids. */
-const RESERVED_ID = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$/i;
 const SESSION_QUERY_KEYS = Object.freeze(new Set(["id", "row", "list", "offset"]));
 const SESSION_ROW = /^[0-9a-f]{16}$/;
 const NON_NEGATIVE_INT = /^\d+$/;
@@ -68,9 +65,10 @@ function runAction(paths, route, body, nowMs, startAudit) {
 	const invalid = new HttpFailure(422, { error: "invalid" });
 	switch (route) {
 		case "/api/audit": {
-			if (!hasExactKeys(body, ["sessionId"]) || typeof body.sessionId !== "string" || !SUBJECT_ID.test(body.sessionId) || RESERVED_ID.test(body.sessionId)) throw invalid;
+			const id = safeSubjectId(body.sessionId);
+			if (!hasExactKeys(body, ["sessionId"]) || id === null) throw invalid;
 			if (!startAudit) throw new HttpFailure(404, { error: "not-found" });
-			return startAudit(body.sessionId);
+			return startAudit(id);
 		}
 		case "/api/pause": {
 			if (!hasExactKeys(body, ["minutes"]) || ![15, 60, null].includes(body.minutes)) throw invalid;
@@ -150,7 +148,7 @@ export function createUiServer({ paths, token, getState, diagnose, sessionDetail
 	async function serveDiagnose(req, res) {
 		const query = req.url.includes("?") ? req.url.slice(req.url.indexOf("?") + 1) : "";
 		const id = new URLSearchParams(query).get("id");
-		if (id !== null && !SUBJECT_ID.test(id)) throw new HttpFailure(422, { error: "invalid" });
+		if (id !== null && safeSubjectId(id) === null) throw new HttpFailure(422, { error: "invalid" });
 		if (!diagnose) throw new HttpFailure(404, { error: "not-found" });
 		send(res, 200, await diagnose(id ?? undefined));
 	}
@@ -160,8 +158,8 @@ export function createUiServer({ paths, token, getState, diagnose, sessionDetail
 		const query = url.includes("?") ? url.slice(url.indexOf("?") + 1) : "";
 		const params = new URLSearchParams(query);
 		for (const key of params.keys()) if (!SESSION_QUERY_KEYS.has(key)) throw new HttpFailure(422, { error: "invalid" });
-		const id = params.get("id");
-		if (id === null || !SUBJECT_ID.test(id)) throw new HttpFailure(422, { error: "invalid" });
+		const id = safeSubjectId(params.get("id"));
+		if (id === null) throw new HttpFailure(422, { error: "invalid" });
 		const row = params.get("row") ?? undefined;
 		if (row !== undefined && (!SESSION_ROW.test(row) || params.getAll("row").length !== 1)) {
 			throw new HttpFailure(422, { error: "invalid" });

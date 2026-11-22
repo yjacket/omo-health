@@ -7,6 +7,7 @@ import { createInvestigations } from "./investigations.mjs";
 import { auditBundle, auditDocument, detectorFindingRefs, firedDetectors, hasDetectorCoverage, resolveAuditModel, validateAudit } from "./judge/audit.mjs";
 import { ANALYST_POLL_MS, parseAnalystOutput, unavailableReason } from "./judge/analyst.mjs";
 import { laneArgs } from "./judge/lane.mjs";
+import { safeSubjectId } from "./session-id.mjs";
 import { collectAnalystDecisionModels, configDecisionFact, recoverPendingAnalystModels, usageEntryOf } from "./session-record.mjs";
 import { auditReasonLabel } from "./ui/labels.mjs";
 import { fresh, isSpillModelKey, readUsageIndex, relatedUsageEntries } from "./usage-index.mjs";
@@ -31,17 +32,11 @@ export const MESSAGE_SCAN_TOTAL_BYTES = 64 * 1024 * 1024;
 const DESCENDANT_SCAN_MAX = 50;
 const TIMELINE_MAX_BYTES = 256 * 1024 * 1024;
 const MAX_CHANGED_TIMELINES = 3;
-const SAFE_ID = /^[A-Za-z0-9][\w.-]{0,127}$/;
 const ACTIVE = new Set(["queued", "launching", "running"]);
 const LOOKUP_PENDING = Symbol("lookup pending");
 
 /** The audit job's two runner functions, module-level so the runner can be built before the auditor. */
 export const AUDIT_CONTRACT = Object.freeze({ parse: (out) => parseAnalystOutput(out, "overall"), unavailableReason });
-
-/** The id when it is safe as a file name (an id that matched a ledger row looks like this), else null. */
-export function safeAuditId(id) {
-	return typeof id === "string" && SAFE_ID.test(id) ? id : null;
-}
 
 const dayOf = (ms) => new Date(ms).toISOString().slice(0, 10);
 
@@ -61,7 +56,7 @@ function readBudget(paths, now) {
 
 /** Publish a complete request without replacing an existing claim for the id. */
 export function requestAudit(paths, sessionId, nowMs) {
-	const id = safeAuditId(sessionId);
+	const id = safeSubjectId(sessionId);
 	if (!id) throw new Error("invalid session id");
 	const request = { v: 1, sessionId: id, requestedMs: nowMs, claimId: crypto.randomUUID() };
 	const dir = ensureDir(paths.health.auditRequestsDir);
@@ -83,7 +78,7 @@ export function requestAudit(paths, sessionId, nowMs) {
 
 /** Withdraw a claim only if the pending request still belongs to that caller. */
 export function withdrawAuditRequest(paths, sessionId, claimId) {
-	const id = safeAuditId(sessionId);
+	const id = safeSubjectId(sessionId);
 	if (!id || typeof claimId !== "string") return;
 	const file = path.join(paths.health.auditRequestsDir, `${id}.json`);
 	const pending = readJsonSafe(file);
@@ -92,7 +87,7 @@ export function withdrawAuditRequest(paths, sessionId, claimId) {
 
 /** The session's audit record; an active one wins, else a waiting request, else the last finished record, else null. */
 export function readAuditState(paths, sessionId) {
-	const id = safeAuditId(sessionId);
+	const id = safeSubjectId(sessionId);
 	if (!id) return null;
 	const record = readJsonSafe(path.join(paths.health.auditsDir, `${id}.json`));
 	const held = record?.holdUntilExit === true;
@@ -283,7 +278,11 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 	let seq = 0;
 	let lastPruneMs = clock.now();
 
-	const recordFile = (sessionId) => path.join(auditsDir, `${sessionId}.json`);
+	const recordFile = (sessionId) => {
+		const id = safeSubjectId(sessionId);
+		if (id === null) throw new Error("invalid session id");
+		return path.join(auditsDir, `${id}.json`);
+	};
 	const save = (record) => atomicWriteJson(recordFile(record.sessionId), record);
 	const bundleFileOf = (jobId) => path.join(jobsDir, jobId, "bundle.md");
 	const held = (record) => record.holdUntilExit === true;
@@ -311,7 +310,7 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 	for (const name of listDirSafe(auditsDir)) {
 		if (!name.endsWith(".json") || name.startsWith("_")) continue;
 		const record = readJsonSafe(path.join(auditsDir, name));
-		if (record?.v !== 1 || !safeAuditId(record.sessionId) || typeof record.status !== "string") continue;
+		if (record?.v !== 1 || !safeSubjectId(record.sessionId) || typeof record.status !== "string") continue;
 		if (record.status === "failed" && record.reason === "timeout" && held(record)) resumeLegacyTimeout(record);
 		records.set(record.sessionId, record);
 	}
@@ -400,7 +399,7 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 			if (!name.endsWith(".json")) continue;
 			const file = path.join(dir, name);
 			const request = readJsonSafe(file);
-			const id = safeAuditId(request?.sessionId);
+			const id = safeSubjectId(request?.sessionId);
 			if (request?.v !== 1 || !id || `${id}.json` !== name || !Number.isFinite(request.requestedMs)) {
 				removeSafe(file);
 				continue;
