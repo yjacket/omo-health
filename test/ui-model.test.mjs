@@ -16,6 +16,8 @@ import { ACTION_LABELS, EXIT_REASON_LABELS, GOAL_STATUS_LABELS, INVESTIGATION_ST
 import { buildHistory } from "../src/ui/history.mjs";
 import { buildOverview, buildSessions, buildSettings, buildUiState, daemonStatus, endedRow, loadDaemonInputs, loadUiInputs, uiState } from "../src/ui/model.mjs";
 import { buildSessionView } from "../src/ui/session-view.mjs";
+import { buildSessionSnapshot } from "../src/session-board.mjs";
+import { makeWorld, sessionState, taskRecord } from "./helpers/world.mjs";
 
 const NOW = Date.parse("2026-09-29T03:00:00.000Z"); // 12:00 KST
 const DAY = 24 * 3600_000;
@@ -65,6 +67,35 @@ it("(gate 16) history and board show a dash with the full-index tooltip", () => 
 		assert.equal(reading.text, "-");
 		assert.equal(reading.title, "토큰 색인이 가득 차 세지 않았습니다");
 	}
+});
+
+it("(gate 16b) the board keeps a refused token state from the snapshot through the card and the child row", () => {
+	const world = makeWorld({
+		now: NOW,
+		sessions: [sessionState({ id: "m-full", startedMs: NOW - 5000 })],
+		tasks: [taskRecord({ taskId: "st_full", childSessionId: "c-full", parentSessionId: "m-full", name: "full child" })],
+		sensors: [{ sessionId: "m-full", pid: 100, ts: NOW - 1000, idle: true, executingTools: 0 }],
+		procsFresh: true,
+	});
+	const snapshot = buildSessionSnapshot(world, [], [], NOW, { tokensOf: (id) => (id === "m-full" || id === "c-full" ? { state: "full" } : null) });
+	const board = buildSessions({ now: NOW, sessionsSnapshot: snapshot }).groups[0].sessions[0];
+	assert.equal(board.tokensState, "full", "the main card keeps the snapshot's full state");
+	assert.equal(board.children[0].tokensState, "full", "the child row keeps the snapshot's full state");
+
+	const app = fs.readFileSync(new URL("../src/ui/static/app.js", import.meta.url), "utf8");
+	const el = (tag, attrs, ...children) => ({ tag, ...attrs, children: children.flat(Infinity).filter((child) => child != null) });
+	const format = runInNewContext(
+		["tokenReading", "boardTokenMarks", "childMeta", "tree"].map((name) => app.match(new RegExp(`function ${name}\\([^]*?\\n\\t\\}`))[0]).join("\n") +
+			"\n({ tokenReading, boardTokenMarks, childMeta, tree })",
+		{ el, lastState: {}, compactCount: (n) => String(n), fullCount: (n) => String(n), elapsedText: () => "1m", childTone: () => "idle" },
+	);
+	const tooltip = "토큰 색인이 가득 차 세지 않았습니다";
+	const mainMarks = format.boardTokenMarks(board);
+	assert.deepEqual([mainMarks[0].text, mainMarks[0].title], ["토큰 -", tooltip], "the main card's token line is a dash with the full-index title");
+	const childMeta = format.tree(board.children).children[0].children[0].children[2];
+	assert.equal(childMeta.text.endsWith("토큰 -"), true, "the child row's line is a dash");
+	assert.equal(childMeta.title, tooltip, "the child row carries the full-index title");
+	assert.equal(format.childMeta(board.children[0]).includes("토큰 계산 중"), false, "a full state never reads as 계산 중");
 });
 
 it("(gate 17) the disk-backed full state renders a dash in history, detail, and child rows until recount", () => {

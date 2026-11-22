@@ -421,21 +421,9 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 					} catch (error) {
 						log.error("usage_tick_failed", { error: error.message, stack: String(error.stack).slice(0, 800) });
 					}
-					const fullRows = new Set();
 					const board = buildSessionSnapshot(result.world, result.findings ?? [], boardInvestigations.list({ sinceMs: boardNow - 7 * DAY_MS }), boardNow, {
-						tokensOf(id) {
-							const tokens = usageTracker.tokensOf(id);
-							if (tokens?.state === "full") fullRows.add(id);
-							return tokens;
-						},
+						tokensOf: (id) => usageTracker.tokensOf(id),
 					});
-					if (fullRows.size) {
-						const markFull = (row) => {
-							if (fullRows.has(row.sessionId ?? row.taskId)) row.tokensState = "full";
-							row.children.forEach(markFull);
-						};
-						for (const group of board.groups) group.sessions.forEach(markFull);
-					}
 					atomicWriteJson(paths.health.sessionsSnapshotFile, board);
 					if (result.world.procsFresh !== false) {
 						const records = detectEnded(prevBoard, board, result.world, boardNow);

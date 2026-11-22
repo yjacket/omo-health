@@ -241,6 +241,30 @@ test("buildSessionSnapshot flags a row whose first token read has not finished",
 	assert.equal(m1.children[0].tokens.total, 5, "siblings of a pending row still carry their totals");
 });
 
+test("buildSessionSnapshot keeps the tokensState full of a refused lookup on the main and the child row", () => {
+	const full = new Set(["m1", "c1"]);
+	const tokensOf = (id) => (full.has(id) ? { state: "full" } : id.startsWith("c") ? { tokens: { total: 5, input: 3, output: 2 }, treeTokens: null } : null);
+	const m1 = rowsOf(buildSessionSnapshot(boardWorld(), [], [], NOW, { tokensOf })).get("m1");
+	assert.equal(m1.tokensState, "full");
+	assert.equal(m1.tokens, null);
+	assert.equal(m1.treeTokens, null);
+	assert.equal(m1.tokensPending, false);
+	const t1 = m1.children.find((c) => c.taskId === "t1");
+	assert.equal(t1.tokensState, "full", "a refused child lookup carries its own full state");
+	assert.equal(t1.tokens, null);
+	assert.equal(t1.tokensPending, false);
+	assert.equal(m1.children.find((c) => c.taskId === "t0").tokensState, undefined, "an indexed child is not marked full");
+	assert.equal(rowsOf(buildSessionSnapshot(boardWorld(), [], [], NOW, { tokensOf })).get("m2").tokensState, undefined, "an unknown main lookup is not marked full");
+});
+
+test("buildSessionSnapshot applies the full state per lookup, so an indexed main keeps its full child", () => {
+	const tokensOf = (id) => (id === "c1" ? { state: "full" } : { tokens: { total: 7, input: 5, output: 2 }, treeTokens: null });
+	const m1 = rowsOf(buildSessionSnapshot(boardWorld(), [], [], NOW, { tokensOf })).get("m1");
+	assert.equal(m1.tokensState, undefined);
+	assert.deepEqual(m1.tokens, { total: 7, input: 5, output: 2 });
+	assert.equal(m1.children.find((c) => c.taskId === "t1").tokensState, "full");
+});
+
 test("buildSessionSnapshot leaves every token field null without the tokensOf option", () => {
 	const snapshot = buildSessionSnapshot(boardWorld(), [], [], NOW);
 	const all = snapshot.groups.flatMap((g) => g.sessions);

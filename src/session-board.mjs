@@ -128,13 +128,19 @@ function countChildren(rows) {
  * @param {object[]} investigations investigation records (createInvestigations().list())
  * @param {number} nowMs
  * @param {{tokensOf?: (id: string) => ({tokens?: object, treeTokens?: number, pending?: boolean} | null | undefined)}} [options]
- *   tokensOf is the injected token index lookup: `{tokens, treeTokens}` for an indexed session, `{pending:true}` while its
- *   first read has not reached the end of the file, null when it is unknown. Every row carries the result.
+ *   tokensOf is the injected token index lookup: `{tokens, treeTokens}` for an indexed session, `{state:"full"}` when the
+ *   index refused the session, `{pending:true}` while its first read has not reached the end of the file, null when it is
+ *   unknown. Every row carries the result; a refused row also carries `tokensState: "full"`.
  */
 export function buildSessionSnapshot(world, findings = [], investigations = [], nowMs = world.now, { tokensOf } = {}) {
 	const tokenFields = (id) => {
 		const entry = tokensOf?.(id);
-		return { tokens: entry?.tokens ?? null, treeTokens: entry?.treeTokens ?? null, tokensPending: entry?.pending === true };
+		return {
+			tokens: entry?.tokens ?? null,
+			treeTokens: entry?.treeTokens ?? null,
+			tokensPending: entry?.pending === true,
+			...(entry?.state === "full" ? { tokensState: "full" } : {}),
+		};
 	};
 	const openInvestigations = (investigations ?? []).filter((inv) => !RESOLVED_INVESTIGATIONS.has(inv.status));
 	const healthFor = ({ sessionId, taskId }) => {
