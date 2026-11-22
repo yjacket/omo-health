@@ -96,34 +96,114 @@ export const AUDIT_SCHEMA = Object.freeze({
 
 /**
  * What each detector watches, in English, for the reviewer. Every id comes from
- * `loadDetectors()` plus D19 (`src/anomaly/signals.mjs`); the threshold keys are
- * the ones the detector actually reads from config.
+ * `loadDetectors()` plus D19 (`src/anomaly/signals.mjs`). Numeric cutoffs
+ * belong on the individual finding rows, not in these descriptions.
  */
 export const DETECTOR_CHECKS = Object.freeze([
-	{ id: "D1", checks: "Watches subagent tool calls for quiet, unknown-cause and overlong-progress stalls; thresholds stall.quietMs, stall.unknownJudgeMs, stall.progressingMaxMs." },
-	{ id: "D2", checks: "Watches process trees for memory, CPU and commit runaway; thresholds memory.growthMBPerMin, memory.growthWindowMs, memory.treeMaxBytes, memory.commitFrac, stall.runawayReadonlyMs." },
-	{ id: "D4", checks: "Watches token burn, cache rewrites, image accumulation and context growth; thresholds tokens.burnPerHour, tokens.burnMultiple, tokens.burnHoldMs, tokens.cacheRewriteCount, tokens.imageWarnBytes, tokens.contextMax." },
-	{ id: "D5", checks: "Watches assistant turn throughput for slow or collapsed TPS; thresholds tps.minTps, tps.window, tps.slowTurnMs, tps.slowTurns, tps.minOutput." },
-	{ id: "D6", checks: "Watches provider errors and outages; thresholds provider.burst, provider.burstWindowMs, provider.stormCount, provider.outageHumanMs." },
-	{ id: "D7", checks: "Watches settings.json edit/error pairs for config lint and auto-revert; thresholds config.autoRevert, config.revertErrorWindowMs, config.lkgQuietMs, config.laneOkLookbackMs." },
-	{ id: "D8", checks: "Watches dead children, unhandled child errors, hung turns and stopped-on-error sessions; thresholds orphans.deadChildMs, orphans.retryWaitMs, orphans.parentIdleMs, orphans.hungTurnMs, orphans.errorStopTurns." },
-	{ id: "D9", checks: "Watches attributed processes that outlive their task or session; threshold leftovers.minAgeMs." },
-	{ id: "D10", checks: "Watches repeated identical tool calls and error storms; thresholds loops.sameCallCount, loops.sameCallWindowMs, loops.errorStormCount, loops.errorStormWindowMs." },
-	{ id: "D11", checks: "Watches reload starvation of live work; threshold reload.starvationMs." },
-	{ id: "D12", checks: "Watches omo-health's own memory and CPU budget; thresholds selfBudget.rssBytes, selfBudget.cpuFrac." },
+	{ id: "D1", checks: "Watches subagent tool calls for quiet, unknown-cause and overlong-progress stalls." },
+	{ id: "D2", checks: "Watches process trees for memory, CPU and commit runaway." },
+	{ id: "D4", checks: "Watches token burn, cache rewrites, image accumulation and context growth." },
+	{ id: "D5", checks: "Watches assistant turn throughput for slow or collapsed TPS and child turns that hang." },
+	{ id: "D6", checks: "Watches provider errors and outages." },
+	{ id: "D7", checks: "Watches settings.json edit/error pairs for config lint and auto-revert." },
+	{ id: "D8", checks: "Watches dead children, unhandled child errors, hung turns and stopped-on-error sessions." },
+	{ id: "D9", checks: "Watches attributed processes that outlive their task or session." },
+	{ id: "D10", checks: "Watches repeated identical tool calls and error storms." },
+	{ id: "D11", checks: "Watches reload starvation of live work." },
+	{ id: "D12", checks: "Watches omo-health's own memory and CPU budget." },
 	{ id: "D14", checks: "Watches writes outside the workspace and writes to global config; it has no threshold key." },
-	{ id: "D15", checks: "Watches goal and todo drift between requests, steps and reviews; thresholds align.churnEdits, align.failRepeats, align.reviewLoops, align.stuckSteps, align.longRun.activeMs." },
-	{ id: "D16", checks: "Watches command monitors whose owner or shell is gone; threshold monitorOrphans.graceMs." },
-	{ id: "D17", checks: "Watches background relaunch loops; thresholds respawn.windowMs, respawn.minBirths, respawn.confirmMs, respawn.killAfterMs, respawn.maxHoldMs." },
-	{ id: "D18", checks: "Watches host crashes and their resume; thresholds crashResume.maxAgeMs, crashResume.perHour, crashResume.loopCount, crashResume.startupMs." },
-	{ id: "D19", checks: "Watches pending tool calls for unseen lineages, duration outliers, visible windows and System32 bash; thresholds anomaly.enabled, anomaly.minShapeSamples, anomaly.outlierFactor, anomaly.windowSignal." },
-	{ id: "D20", checks: "Watches usage-limit park records whose reset time has passed; threshold crashResume.perHour." },
-	{ id: "D21", checks: "Watches goal sessions waiting on dead, unfolded or idle wake sources; thresholds goalLiveness.livenessMs, goalLiveness.graceMs, goalLiveness.quietMs, goalLiveness.foldGraceMs, goalLiveness.idleWakeHoldMs." },
-	{ id: "D22", checks: "Watches leftover node or bun children of finished reflection runs; threshold reflectionOrphans.graceMs." },
-	{ id: "D23", checks: "Watches work lost across daemon downtime; thresholds bootGap.minGapMs, bootGap.settleMs, bootGap.windowMs." },
+	{ id: "D15", checks: "Watches goal and todo drift between requests, steps and reviews." },
+	{ id: "D16", checks: "Watches command monitors whose owner or shell is gone." },
+	{ id: "D17", checks: "Watches background relaunch loops." },
+	{ id: "D18", checks: "Watches host crashes and their resume." },
+	{ id: "D19", checks: "Watches pending tool calls for unseen lineages, duration outliers, visible windows and System32 bash." },
+	{ id: "D20", checks: "Watches usage-limit park records whose reset time has passed." },
+	{ id: "D21", checks: "Watches goal sessions waiting on dead, unfolded or idle wake sources." },
+	{ id: "D22", checks: "Watches leftover node or bun children of finished reflection runs." },
+	{ id: "D23", checks: "Watches work lost across daemon downtime." },
 	{ id: "D24", checks: "Watches goal sessions stopped by a provider policy refusal with unanswered tool calls; it has no threshold key." },
-	{ id: "D25", checks: "Watches omo login age and Claude CLI refresh expiry; thresholds omoLogin.warnAfterMs, omoLogin.warnBeforeMs." },
+	{ id: "D25", checks: "Watches omo login age and Claude CLI refresh expiry." },
 ]);
+
+// Numeric config inputs to each finding kind's rules, not switches or the
+// entire config group. A kind can combine rules (e.g. D1's stall classifier).
+// No configurable numeric cutoffs: D14 (src/detect/offtrack.mjs:86–126),
+// D20 (src/detect/parks.mjs:19–76), D24 (src/detect/refusal.mjs:43–79).
+const FINDING_CUTOFFS = Object.freeze({
+	// src/detect/stall.mjs:96,137,236–246; match.mjs:180–197;
+	// classify.mjs:101–270; collect/procs.mjs:326–349 (respawn signal).
+	"D1:stall": [
+		"stall.quietMs", "stall.unknownJudgeMs", "stall.progressingMaxMs",
+		"stall.softMs", "stall.restallMs", "stall.restallWindowMs",
+		"stall.inprocToolRelayMs", "stall.mainNotifyMs", "stall.boundGraceMs",
+		"stall.cpuSamples", "stall.cpuBusyFrac", "stall.cpuIdleFrac",
+		"stall.matchWindowBeforeMs", "stall.matchWindowAfterMs",
+		"stall.serverForegroundMs", "stall.blockedInputMs", "stall.runawayReadonlyMs",
+		"stall.sleepUnboundedSec", "stall.unboundedWaitMs",
+		"memory.growthWindowMs", "memory.growthMBPerMin", "memory.treeMaxBytes", "memory.commitFrac", "memory.pressureMinBytes",
+		"respawn.windowMs", "respawn.minSnapshots", "respawn.minBirths", "respawn.presenceFrac", "respawn.maxSurvivorFrac", "respawn.confirmMs",
+	],
+	// src/detect/runaway.mjs:28–34,50
+	"D2:process-runaway": ["memory.growthWindowMs", "memory.growthMBPerMin", "memory.treeMaxBytes", "stall.runawayReadonlyMs", "stall.cpuBusyFrac"],
+	"D2:machine-commit": ["memory.commitFrac"],
+	// src/detect/tokens.mjs:34–52,73–81,124–138,181–186,207–220,233–236,266–275,305
+	"D4:cache-storm": ["tokens.cacheStormWrite", "tokens.cacheStormReadFrac"],
+	"D4:cache-rewrite": ["tokens.cacheStormWrite", "tokens.cacheStormReadFrac", "tokens.cacheWarmMs", "tokens.cacheRewriteWindowMs", "tokens.cacheRewriteCount", "tokens.imageTrimBytes", "tokens.imageTrimCount"],
+	"D4:image-load": ["tokens.imageTrimBytes", "tokens.imageTrimCount", "tokens.imageWarnBytes", "tokens.imageWarnCount", "tokens.imageWarnChildBytes", "tokens.imageWarnChildCount"],
+	"D4:burn-spike": ["tokens.burnPerHour", "tokens.burnMultiple", "tokens.burnHoldMs"],
+	"D4:full-resend": ["tokens.resendCount"],
+	"D4:context-runaway": ["tokens.contextMax", "tokens.contextGrowth", "tokens.contextTurns"],
+	// src/detect/tps.mjs:18–36,70–82
+	"D5:tps-collapse": ["tps.minDurMs", "tps.minOutput", "tps.window", "tps.slowTurnMs", "tps.minTps", "tps.slowTurns"],
+	"D5:hung-turn-child": ["orphans.hungTurnMs"],
+	// src/detect/provider.mjs:235–245,274–288,317
+	"D6:not-configured-burst": ["provider.burst", "provider.burstWindowMs"],
+	"D6:usage-limit-storm": ["provider.stormCount", "provider.stormWindowMs"],
+	"D6:outage-human": ["provider.outageHumanMs"],
+	// src/detect/config.mjs:70–86
+	"D7:settings-broke-provider": ["config.revertErrorWindowMs", "provider.burst", "config.laneOkLookbackMs", "config.revertCooldownMs"],
+	// src/detect/orphans.mjs:44–86,125–127,173,219,257
+	"D8:dead-child": ["orphans.deadChildMs", "orphans.reviveGraceMs", "orphans.retryWaitMs", "orphans.retryWaitMaxMs"],
+	"D8:child-error-unhandled": ["sessions.recentMs", "orphans.parentIdleMs"],
+	"D8:task-host-gone": ["sessions.recentMs"],
+	"D8:task-host-gone-after-resume": ["sessions.recentMs"],
+	"D8:stopped-on-errors": ["orphans.errorStopTurns"],
+	"D8:hung-main-turn": ["orphans.hungTurnMs"],
+	// src/detect/leftovers.mjs:28–42
+	"D9:leftover-process": ["leftovers.minAgeMs"],
+	// src/detect/loops.mjs:25–30,75–77
+	"D10:same-call-loop": ["loops.sameCallCount", "loops.sameCallWindowMs"],
+	"D10:error-storm": ["loops.errorStormCount", "loops.errorStormWindowMs"],
+	// src/detect/reload.mjs:48–53,88,100; orphans.mjs:44–86
+	"D11:reload-starvation": ["reload.starvationMs", "stall.noProgressMs", "stall.quietMs", "orphans.deadChildMs", "orphans.reviveGraceMs", "orphans.retryWaitMs", "orphans.retryWaitMaxMs"],
+	// src/detect/self.mjs:154–164 (other self checks use fixed constants)
+	"D12:self-budget": ["selfBudget.rssBytes", "selfBudget.cpuFrac"],
+	// src/detect/align.mjs:103–156,199–202; src/align/steps.mjs:88–128
+	"D15:drift": [
+		"align.churnEdits", "align.churnWindowMs", "align.failRepeats", "align.reviewLoops", "align.idleGapMs",
+		"align.stuckSteps", "align.stuckActiveMs", "align.noDoneSteps", "align.repeatSteps", "align.afterCompleteMutations",
+		"align.longRun.rounds", "align.longRun.activeMs", "align.longRun.everyMs", "align.minGapMs", "align.perDay",
+	],
+	// src/detect/monitor-orphans.mjs:197
+	"D16:orphan-monitor": ["monitorOrphans.graceMs"],
+	// src/detect/respawn.mjs:25–27,62; src/collect/procs.mjs:326–349
+	"D17:respawn-storm": ["respawn.windowMs", "respawn.minSnapshots", "respawn.minBirths", "respawn.presenceFrac", "respawn.maxSurvivorFrac", "respawn.killAfterMs"],
+	// src/detect/crashes.mjs:141–142,208,316–324
+	"D18:host-crash": ["crashResume.maxAgeMs", "crashResume.loopWindowMs", "crashResume.loopCount", "crashResume.perHour"],
+	"D18:host-resume-chooser": ["crashResume.startupMs"],
+	"D18:stale-heartbeats": ["crashResume.maxAgeMs"],
+	// src/anomaly/signals.mjs:43–45; src/anomaly/watch.mjs:46,191
+	"D19:anomaly": ["anomaly.minShapeSamples", "anomaly.outlierFactor", "anomaly.outlierQuantile", "anomaly.perHour"],
+	// src/detect/goal-liveness.mjs:219–266; orphans.mjs:44–86
+	"D21:goal-wait-idle": ["stall.cpuIdleFrac", "goalLiveness.quietMs", "goalLiveness.minWakeGapMs"],
+	"D21:goal-wait-stuck": ["goalLiveness.quietMs", "goalLiveness.graceMs", "goalLiveness.foldGraceMs", "goalLiveness.livenessMs", "goalLiveness.minWakeGapMs", "orphans.deadChildMs", "orphans.reviveGraceMs", "orphans.retryWaitMs", "orphans.retryWaitMaxMs"],
+	// src/detect/reflection-orphans.mjs:146–148
+	"D22:reflection-orphan": ["reflectionOrphans.graceMs"],
+	// src/detect/boot-gap.mjs:84–110; src/collect/downtime.mjs:45
+	"D23:work-lost": ["bootGap.minGapMs", "bootGap.windowMs", "bootGap.settleMs", "sessions.recentMs"],
+	// src/detect/omo-login.mjs:46–62,72–95 (same finding kind from two rules)
+	"D25:omo-login-aging": ["omoLogin.warnBeforeMs", "omoLogin.warnAfterMs"],
+});
 
 const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 const textOf = (value) => (typeof value === "string" ? redact(value) : null);
@@ -187,11 +267,14 @@ export function auditEvidence(evidence) {
 	return { metrics, droppedEvidence };
 }
 
-function findingsOf(list, continuousSinceMs) {
+function findingsOf(list, continuousSinceMs, config) {
 	return (Array.isArray(list) ? list : []).map((finding, index) => {
 		const { metrics, droppedEvidence } = finding?.auditEvidence ?? auditEvidence(Array.isArray(finding?.evidence) ? finding.evidence : []);
 		const subject = isObject(finding?.subject) ? finding.subject : {};
 		const ts = typeof finding?.ts === "number" ? finding.ts : Date.parse(finding?.ts);
+		const thresholds = Number.isFinite(ts) && ts >= continuousSinceMs
+			? findingThresholds(config, finding?.detector, finding?.kind)
+			: undefined;
 		return {
 			ref: `F${index + 1}`,
 			ts: textOf(finding?.ts),
@@ -200,7 +283,8 @@ function findingsOf(list, continuousSinceMs) {
 			kind: textOf(finding?.kind),
 			severity: textOf(finding?.severity),
 			scope: textOf(finding?.scope),
-			thresholdsKnown: Number.isFinite(ts) && ts >= continuousSinceMs,
+			thresholdsKnown: thresholds !== undefined,
+			...(thresholds === undefined ? {} : { thresholds }),
 			subject: { sessionId: textOf(subject.sessionId), taskId: textOf(subject.taskId) },
 			metrics,
 			droppedEvidence,
@@ -372,11 +456,19 @@ function tokensOf(record, timeline) {
 	};
 }
 
-function findingThresholds(config, detector) {
-	if (detector === "D4") return config?.tokens ?? {};
-	if (detector !== "D1") return undefined;
-	const stall = config?.stall ?? {};
-	return { quietMs: numOf(stall.quietMs), unknownJudgeMs: numOf(stall.unknownJudgeMs), progressingMaxMs: numOf(stall.progressingMaxMs) };
+function findingThresholds(config, detector, kind) {
+	const keys = FINDING_CUTOFFS[`${detector}:${kind}`];
+	if (!keys?.length) return undefined;
+	const thresholds = {};
+	for (const key of keys) {
+		const path = key.split(".");
+		// The continuity hash in src/config-reload.mjs:8–14 excludes sessions.
+		if (path[0] === "sessions") return undefined;
+		const value = path.reduce((node, part) => isObject(node) && Object.hasOwn(node, part) ? node[part] : undefined, config);
+		if (!Number.isFinite(value)) return undefined;
+		thresholds[path.at(-1)] = value;
+	}
+	return thresholds;
 }
 
 function thresholdsContinuousSince(decisions, currentHash) {
@@ -426,16 +518,11 @@ export function auditBundle(record, timeline, { config, now, configDecisions = [
 		investigations: false,
 	};
 	const continuousSinceMs = thresholdsContinuousSince([...(record?.configDecisions ?? []), ...configDecisions], detectorThresholdsHash(config));
-	const allFindings = findingsOf(health.findings, continuousSinceMs);
+	const allFindings = findingsOf(health.findings, continuousSinceMs, config);
 	// Coverage is judged on every finding, before any cut: an answer cannot be
 	// required to cover more detectors than it has checks.
 	const fired = health.firedDetectors ?? firedDetectorIds(allFindings);
 	const findings = selectFindings(allFindings, fired);
-	for (const finding of findings) {
-		if (!finding.thresholdsKnown) continue;
-		const thresholds = findingThresholds(config, finding.detector);
-		if (thresholds) finding.thresholds = thresholds;
-	}
 	truncated.findings = findings.length < Math.max(health.counts?.findings ?? 0, allFindings.length);
 	// The record supplies newest-first lists and (when retained) their original counts.
 	const capped = (key) => {

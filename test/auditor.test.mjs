@@ -1713,7 +1713,7 @@ test("IS-9: audit fallback stderr rejects a valid verdict without refunding the 
 	const h = harness({ sessions: ["direct", "fallback"] });
 	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
 	const recording = createRecordingSpawn();
-	const runner = createRunner({ paths: h.paths, spawnImpl: recording.spawnImpl, clock: h.clock, env: {}, isAlive: () => true, identify: () => null });
+	const runner = createRunner({ paths: h.paths, spawnImpl: recording.spawnImpl, clock: h.clock, env: {}, isAlive: () => true, identify: () => null, findJobProcess: () => null });
 	const auditor = h.auditor({ runner });
 	const jobs = [];
 	for (const id of ["direct", "fallback"]) {
@@ -1749,7 +1749,7 @@ test("a failed first kill is retried by the real runner and the one-per-PC slot 
 	const identity = { ctimeMs: BASE - 1_000, cmdSha1: "audit-job" };
 	const processState = { alive: true };
 	const recording = createRecordingSpawn();
-	const runner = createRunner({ paths: h.paths, spawnImpl: recording.spawnImpl, clock: h.clock, env: {}, isAlive: () => processState.alive, identify: () => (processState.alive ? identity : null) });
+	const runner = createRunner({ paths: h.paths, spawnImpl: recording.spawnImpl, clock: h.clock, env: {}, isAlive: () => processState.alive, identify: () => (processState.alive ? identity : null), findJobProcess: () => null });
 	const a = createAuditor({ paths: h.paths, config: h.config, clock: h.clock, log: silent, runner, env: {} });
 	const kills = () => recording.calls.filter((call) => call.command === "taskkill").length;
 	h.request("m1");

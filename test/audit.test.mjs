@@ -327,6 +327,34 @@ test("IS-8: D4 findings straddling a config decision use only applicable thresho
 	assert.match(auditDocument(bundle), /When a finding has thresholdsKnown: false, do not judge it as exaggerated by threshold\./);
 });
 
+function findingWithContinuity(config, detector, kind) {
+	const record = emptyRecord({ health: { findings: [finding(0, 0, { detector, kind })] } });
+	const configDecisions = [{ ms: T0 - 1, thresholdsHash: detectorThresholdsHash(config) }];
+	return auditBundle(record, null, { config, now: T0, configDecisions }).omo_health_record.findings[0];
+}
+
+test("IS-8 cutoff map: D6 burst carries only the configured burst cutoffs", () => {
+	const config = structuredClone(DEFAULT_CONFIG);
+	const { burst, burstWindowMs } = config.provider;
+	config.provider.burst = burst + 2;
+	config.provider.burstWindowMs = burstWindowMs + 7_000;
+	const row = findingWithContinuity(config, "D6", "not-configured-burst");
+	assert.equal(row.thresholdsKnown, true);
+	assert.deepEqual(row.thresholds, { burst: burst + 2, burstWindowMs: burstWindowMs + 7_000 });
+});
+
+test("IS-8 cutoff map: a detector without mapped cutoffs stays unknown despite continuity", () => {
+	const row = findingWithContinuity(DEFAULT_CONFIG, "D14", "outside-workspace");
+	assert.deepEqual([row.thresholdsKnown, Object.hasOwn(row, "thresholds")], [false, false]);
+});
+
+test("IS-8 cutoff map: a missing cutoff makes the entire set unknown", () => {
+	const config = structuredClone(DEFAULT_CONFIG);
+	delete config.provider.burstWindowMs;
+	const row = findingWithContinuity(config, "D6", "not-configured-burst");
+	assert.deepEqual([row.thresholdsKnown, Object.hasOwn(row, "thresholds")], [false, false]);
+});
+
 /* ---------------------------------------------------------------- allowlist */
 
 test("IS-11: the audit bundle keeps delivered message kinds without text or other details", () => {
@@ -384,11 +412,22 @@ test("IS-8: the audit bundle keeps warning severity and structured evidence from
 		["severity", "warn", { count: "6" }],
 		["opened", "info", { count: "1" }],
 	]);
+	const { stall, memory, respawn } = DEFAULT_CONFIG;
+	const cutoffs = (group, keys) => Object.fromEntries(keys.map((key) => [key, group[key]]));
 	assert.deepEqual(findings[0], {
 		ref: "F1", ts, event: "severity", detector: "D1", kind: "stall", severity: "warn", scope: "session",
 		subject: { sessionId: "s1", taskId: null }, metrics: { count: "6" }, droppedEvidence: 1,
 		thresholdsKnown: true,
-		thresholds: { quietMs: DEFAULT_CONFIG.stall.quietMs, unknownJudgeMs: DEFAULT_CONFIG.stall.unknownJudgeMs, progressingMaxMs: DEFAULT_CONFIG.stall.progressingMaxMs },
+		thresholds: {
+			...cutoffs(stall, [
+				"quietMs", "unknownJudgeMs", "progressingMaxMs", "softMs", "restallMs", "restallWindowMs",
+				"inprocToolRelayMs", "mainNotifyMs", "boundGraceMs", "cpuSamples", "cpuBusyFrac", "cpuIdleFrac",
+				"matchWindowBeforeMs", "matchWindowAfterMs", "serverForegroundMs", "blockedInputMs",
+				"runawayReadonlyMs", "sleepUnboundedSec", "unboundedWaitMs",
+			]),
+			...cutoffs(memory, ["growthWindowMs", "growthMBPerMin", "treeMaxBytes", "commitFrac", "pressureMinBytes"]),
+			...cutoffs(respawn, ["windowMs", "minSnapshots", "minBirths", "presenceFrac", "maxSurvivorFrac", "confirmMs"]),
+		},
 	});
 	assert.doesNotMatch(JSON.stringify(bundle), /QA-PRIVATE/);
 });

@@ -1,6 +1,7 @@
 import fs from "node:fs";
-import { basename } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { addModelCounters, emptyModelBilling, MODEL_KEY_LENGTH, MODEL_KEY_LIMIT, readUsage } from "./collect/usage.mjs";
+import { pathKey } from "./paths.mjs";
 import { atomicWriteChunks, statSafe } from "./util/fsx.mjs";
 
 /**
@@ -133,6 +134,34 @@ function ownerTotals(usage) {
 	};
 }
 
+/** A task directory proves ownership only with one candidate. Stop at the second;
+ * null is a veto, undefined means this directory has no candidate. */
+export function soleChildSessionFile(dir) {
+	let entries;
+	try {
+		entries = fs.opendirSync(dir);
+		let file;
+		for (let entry; (entry = entries.readSync());) {
+			if (!entry.name.endsWith(".jsonl")) continue;
+			const candidate = join(dir, entry.name);
+			if (!entry.isFile() && !(entry.isSymbolicLink() && statSafe(candidate)?.isFile())) continue;
+			if (file) return null;
+			file = candidate;
+		}
+		return file;
+	} catch (error) {
+		return error.code === "ENOENT" || error.code === "ENOTDIR" ? undefined : null;
+	} finally {
+		entries?.closeSync();
+	}
+}
+
+export const isTaskOnlyEntry = (entry) => entry?.kind === "child" && Boolean(entry.taskId) && entry.id === entry.taskId;
+const isSoleChildSessionFile = (file) => {
+	const sole = file && soleChildSessionFile(dirname(file));
+	return Boolean(sole && pathKey(sole) === pathKey(file));
+};
+
 /**
  * The totals the board and history show, or null: only an `ok` entry whose first
  * full read finished has one, and a read failure keeps it null (IS-12).
@@ -140,6 +169,7 @@ function ownerTotals(usage) {
 export function compactUsage(entry) {
 	if (!isObject(entry) || entry.state !== "ok" || entry.complete !== true || entry.readError === true) return null;
 	if (!isObject(entry.published)) return null;
+	if (isTaskOnlyEntry(entry) && !isSoleChildSessionFile(entry.file)) return null;
 	return ownerTotals(entry.published);
 }
 
@@ -153,6 +183,7 @@ export function fresh(entry) {
 	if (!isObject(entry) || entry.state !== "ok" || entry.complete !== true) return false;
 	if (!hasNumericCursor(entry)) return false;
 	if (entry.evaluatedTo !== entry.size) return false;
+	if (isTaskOnlyEntry(entry) && !isSoleChildSessionFile(entry.file)) return false;
 	const stat = statSafe(entry.file);
 	return Boolean(
 		stat &&
@@ -424,6 +455,8 @@ export function usageEntryFor(usage, sessionId, taskId) {
 		if (match) return undefined;
 		match = entry;
 	}
+	// An exact ID can still identify its file where a task-only alias cannot.
+	if (match?.kind === "child" && match.state === "ok" && match.file && !isSoleChildSessionFile(match.file)) return undefined;
 	return match;
 }
 
@@ -573,7 +606,8 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 		/**
 		 * No session file was located for `id`. A never-found row becomes `missing`;
 		 * a row whose complete read already published a total keeps that total and
-		 * turns `gone`, exactly like the read-null path above (IS-3).
+		 * turns `gone` (IS-3), unless its claim to the file depended on being
+		 * the sole candidate. A lost claim clears the cursor and publication.
 		 */
 		markMissing(id, meta = {}) {
 			const entry = entries.get(id) ?? newEntry(id);
@@ -581,10 +615,14 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			unweigh(id);
 			applyMeta(entry, meta);
 			if (meta?.file) entry.file = meta.file;
-			if (entry.state === "ok" && entry.complete === true) {
+			if (entry.state === "ok" && entry.complete === true && !isTaskOnlyEntry(entry)) {
 				entry.gone = true;
 			} else {
 				dropCursor(entry);
+				if (isTaskOnlyEntry(entry)) {
+					entry.file = null;
+					entry.readError = false;
+				}
 			}
 			entry.checkedMs = clock.now();
 			return admit(entry, entry.gone ? previousSlots : 0);

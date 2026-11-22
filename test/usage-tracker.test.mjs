@@ -83,6 +83,41 @@ test("tracker tokens resolve by session id or by a unique task id when the sessi
 	assert.equal(s.tracker.tokensOf(null, "st_x").tokens.total, 42);
 });
 
+test("(plan 61) the next tick withdraws a task-only publication and recounts when uniqueness returns", (t) => {
+	const reads = [];
+	const s = setup(undefined, { read(file, from, options) {
+		reads.push({ file, from });
+		return readUsage(file, from, options);
+	} });
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const taskId = "st_changing";
+	const row = { sessionId: taskId, taskId, kind: "child", cwd: s.cwd, endedMs: T0, parentSessionId: "parent" };
+	const first = childFile(s.cwd, taskId, "child-first");
+	const second = childFile(s.cwd, taskId, "child-second");
+	const parent = mainFile(s.paths, "parent");
+	writeLines(parent, [bigRecord(0, usage(10))]);
+	s.index.update("parent", parent, { kind: "main" });
+	reads.length = 0;
+	writeLines(first, [bigRecord(0, usage(42))]);
+	s.tracker.queueLedger([row]);
+	const world = emptyWorld(s.clock);
+	s.tracker.tick(world);
+	assert.deepEqual([s.tracker.tokensOf(null, taskId)?.tokens?.total, s.tracker.tokensOf("parent")?.treeTokens], [42, 52]);
+
+	writeLines(second, [bigRecord(0, usage(99))]);
+	s.tracker.tick(world);
+	assert.deepEqual([
+		s.tracker.tokensOf(null, taskId),
+		s.tracker.tokensOf("parent").treeTokens,
+		s.index.fresh(s.index.get(taskId)),
+	], [null, null, false], "neither the old publication nor its contribution to the parent is safe");
+
+	fs.rmSync(second);
+	assert.ok(s.tracker.tick(world).bytesRead > 0, "restoration must read the transcript again");
+	assert.deepEqual(reads, [{ file: first, from: undefined }, { file: first, from: undefined }]);
+	assert.deepEqual([s.tracker.tokensOf(null, taskId)?.tokens?.total, s.tracker.tokensOf("parent")?.treeTokens], [42, 52]);
+});
+
 test("board uses a unique task-only token match but never an ambiguous or wrong-session match", () => {
 	const s = setup();
 	const task = { taskId: "st_shared", parentSessionId: "main" };

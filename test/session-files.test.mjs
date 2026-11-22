@@ -133,6 +133,21 @@ test("childFile with no id and two files returns undefined, never the newest fil
 	assert.equal(locator.childFile({ taskId: "t-two", sessionId: "child-two-b", cwds: [proj] }), second);
 });
 
+test("(plan 61) task-only lookup rechecks a warm candidate before the rescan interval", (t) => {
+	const { paths, locator, proj } = setup(t);
+	const taskId = "t-changing";
+	const query = { taskId, sessionId: taskId, cwds: [proj] };
+	const first = writeChild(paths, proj, taskId, `${STAMP}_child-first.jsonl`);
+	assert.equal(locator.childFile(query), first);
+
+	const second = writeChild(paths, proj, taskId, `${STAMP}_child-second.jsonl`);
+	assert.equal(locator.childFile(query), undefined, "the cached file is no longer the sole candidate");
+	assert.equal(locator.childFile({ ...query, sessionId: "child-first" }), first, "an exact ID still identifies its file");
+
+	fs.rmSync(second);
+	assert.equal(locator.childFile(query), first, "uniqueness can return without waiting for the negative rescan interval");
+});
+
 test("childFile finds a child in the agentDir projects store", (t) => {
 	const { paths, locator, proj } = setup(t);
 	const storeDir = path.join(paths.agentDir, "projects", projectStoreName(proj), "senpi-task");

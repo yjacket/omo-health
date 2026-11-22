@@ -1,11 +1,16 @@
 import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
 import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import { setImmediate } from "node:timers/promises";
+import { createAuditor, requestAudit } from "../src/auditor.mjs";
 import { runDaemon } from "../src/daemon.mjs";
 import { DEFAULT_CONFIG } from "../src/config.mjs";
+import { laneArgs } from "../src/judge/lane.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 import { queueReport } from "../src/reports/intake.mjs";
 import { RUN_KEY } from "../src/install.mjs";
@@ -573,4 +578,112 @@ test("a throwing audit tick is logged as audit_tick_failed and the daemon keeps 
 	assert.equal(f.ticks, 3);
 	const log = fs.readFileSync(path.join(f.paths.health.logsDir, "daemon.log"), "utf8");
 	assert.match(log, /audit_tick_failed/);
+});
+
+test("audit survivor lookup does not stall token publication or release the audit slot", { timeout: 10_000 }, async (t) => {
+	const { paths } = fixture();
+	const start = Date.UTC(2026, 8, 28, 12);
+	const file = path.join(paths.sessionsDir, "proj", "2026-09-28T12-00-00-000Z_m1.jsonl");
+	const line = (input) => E.assistant({ ms: start, usage: { input, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } });
+	writeJsonl(file, [line(10)]);
+	const jobId = "prior-audit";
+	const jobDir = path.join(paths.health.jobsDir, jobId);
+	const recordFile = path.join(paths.health.auditsDir, "m1.json");
+	const read = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
+	const write = (file, value) => fs.writeFileSync(file, JSON.stringify(value));
+	fs.mkdirSync(jobDir, { recursive: true });
+	fs.mkdirSync(paths.health.auditsDir, { recursive: true });
+	write(recordFile, { v: 1, sessionId: "m1", status: "running", jobId, startedMs: start, launchMs: start });
+	write(path.join(jobDir, "meta.json"), {
+		kind: "audit", pid: 70000, startedMs: start, timeoutMs: 900_000,
+		args: laneArgs({ model: "p/reviewer", bundleFile: path.join(jobDir, "bundle.md"), sessionId: "prior-lane" }),
+	});
+	write(path.join(jobDir, "exit.json"), { code: 1 });
+	const budget = { day: "2026-09-28", count: 1, jobs: [jobId] };
+	write(paths.health.auditBudgetFile, budget);
+	requestAudit(paths, "next", start);
+
+	const signal = new Int32Array(new SharedArrayBuffer(4));
+	const entered = Promise.withResolvers();
+	const release = Promise.withResolvers();
+	let syncWait;
+	let lookups = 0;
+	const lookup = (command, args) => {
+		assert.equal(command, "powershell.exe");
+		assert.match(args.at(-1), /Get-CimInstance.*CommandLine/);
+		lookups++;
+		entered.resolve();
+	};
+	t.mock.method(childProcess, "execFileSync", (command, args) => {
+		lookup(command, args);
+		// The baseline cannot get back to the code that signals this gate.
+		syncWait = Atomics.wait(signal, 0, 0, 750);
+		return "";
+	});
+	t.mock.method(childProcess, "execFile", (command, args, options, callback) => {
+		lookup(command, args);
+		assert.equal(options.timeout, 15_000);
+		void release.promise.then(() => callback(null, "", ""));
+	});
+	syncBuiltinESMExports();
+	t.after(() => {
+		t.mock.restoreAll();
+		syncBuiltinESMExports();
+	});
+
+	let ticks = 0;
+	let preparations = 0;
+	const clock = { now: () => start + ticks * 60_000 };
+	const createEngine = () => ({
+		async tick() {
+			ticks++;
+			return { findings: [], world: makeWorld({
+				now: clock.now(), procsFresh: true,
+				sessions: [sessionState({ id: "m1", file, kind: "main", cwd: "C:\\dev\\proj", startedMs: start - 1000 })],
+				sensors: [{ sessionId: "m1", pid: 4321, ts: clock.now(), idle: true }],
+			}) };
+		},
+		table: { all: () => [] }, close() {},
+	});
+	const result = await runDaemon({
+		proc: fakeProc(), paths, clock, config: { ...DEFAULT_CONFIG, audit: { ...DEFAULT_CONFIG.audit, enabled: true } },
+		overrides: {
+			procs: { kind: "fake" }, createEngine, env: {},
+			createAuditor: (options) => createAuditor({
+				...options, createWorker() {
+					preparations++;
+					return { on() {}, ref() {}, postMessage() {}, terminate() {} };
+				},
+			}),
+			sleep: async () => {
+				if (ticks <= 2) {
+					await entered.promise;
+					assert.equal(syncWait, undefined, "the daemon reached its next tick boundary before the lookup gate timed out");
+					const board = read(paths.health.sessionsSnapshotFile);
+					const row = board.groups.flatMap((g) => g.sessions).find((session) => session.sessionId === "m1");
+					assert.equal(row.tokens.total, ticks === 1 ? 10 : 30);
+					assert.equal(read(recordFile).status, "running");
+					assert.equal(read(path.join(paths.health.auditsDir, "next.json")).status, "queued");
+					assert.deepEqual(read(paths.health.auditBudgetFile), budget);
+					assert.equal(preparations, 0);
+					assert.equal(lookups, 1, "a pending lookup is not repeated even after the next poll interval");
+					if (ticks === 1) fs.appendFileSync(file, `${JSON.stringify(line(20))}\n`);
+					else {
+						Atomics.store(signal, 0, 1);
+						Atomics.notify(signal, 0);
+						release.resolve();
+						await setImmediate();
+						assert.equal(read(recordFile).status, "running", "only a tick consumes the result");
+					}
+				} else if (ticks === 3) {
+					assert.deepEqual([read(recordFile).status, read(recordFile).reason], ["failed", "exit-1"]);
+					assert.deepEqual(read(paths.health.auditBudgetFile), budget);
+				} else {
+					assert.equal(preparations, 1, "confirmed absence lets the second audit proceed");
+					fs.writeFileSync(paths.health.stoppedFile, "");
+				}
+			},
+		},
+	});
+	assert.equal(result.reason, "stopped-file");
 });

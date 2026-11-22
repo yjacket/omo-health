@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { listDirSafe, statSafe } from "../util/fsx.mjs";
-import { readUsageIndex } from "../usage-index.mjs";
+import { readUsageIndex, soleChildSessionFile } from "../usage-index.mjs";
 import { idFromFileName } from "./sessions.mjs";
 import { senpiTaskStoreDir } from "./tasks.mjs";
 
@@ -152,15 +152,14 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 		const wantId = sessionId && sessionId !== taskId ? sessionId : undefined;
 		for (const storeDir of stores) {
 			const dir = path.join(storeDir, "children", taskId, "sessions", taskId);
-			const files = listDirSafe(dir).filter((name) => name.endsWith(".jsonl"));
-			if (!files.length) continue;
-			if (wantId) {
-				const exact = files.find((name) => name.endsWith(`_${wantId}.jsonl`));
+			if (!wantId) {
+				// An ambiguous store must not fall through to an ancestor.
+				const sole = soleChildSessionFile(dir);
+				if (sole !== undefined) return sole;
+			} else {
+				const exact = listDirSafe(dir).find((name) => name.endsWith(`_${wantId}.jsonl`));
 				if (exact) return path.join(dir, exact);
-				continue;
 			}
-			// Without a real child id only an unambiguous single file is safe; never the newest-file fallback.
-			return files.length === 1 ? path.join(dir, files[0]) : undefined;
 		}
 		return undefined;
 	};
@@ -170,19 +169,21 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 		const { taskId, sessionId, cwds } = row;
 		if (!taskId) return undefined;
 		const key = childKey(taskId, sessionId, cwds);
+		const exact = sessionId && sessionId !== taskId;
 		const cached = childFiles.get(key);
-		if (cached && statSafe(cached)?.isFile()) return cached;
+		if (exact && cached && statSafe(cached)?.isFile()) return cached;
 		childFiles.delete(key);
 		const now = nowMs();
 		const missedAt = childMisses.get(key);
 		if (missedAt !== undefined && now - missedAt < rescanMs) return undefined;
 		const file = locateChild({ taskId, sessionId, cwds });
 		if (file) {
-			childFiles.set(key, file);
+			if (exact) childFiles.set(key, file);
 			childMisses.delete(key);
 			return file;
 		}
-		childMisses.set(key, now);
+		// Ambiguity can clear on the very next use, unlike a cold miss.
+		if (file !== null) childMisses.set(key, now);
 		return undefined;
 	};
 

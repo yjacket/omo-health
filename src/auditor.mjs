@@ -33,6 +33,7 @@ const TIMELINE_MAX_BYTES = 256 * 1024 * 1024;
 const MAX_CHANGED_TIMELINES = 3;
 const SAFE_ID = /^[A-Za-z0-9][\w.-]{0,127}$/;
 const ACTIVE = new Set(["queued", "launching", "running"]);
+const LOOKUP_PENDING = Symbol("lookup pending");
 
 /** The audit job's two runner functions, module-level so the runner can be built before the auditor. */
 export const AUDIT_CONTRACT = Object.freeze({ parse: (out) => parseAnalystOutput(out, "overall"), unavailableReason });
@@ -261,6 +262,9 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 	const auditsDir = paths.health.auditsDir;
 	const jobsDir = paths.health.jobsDir;
 	const investigations = createInvestigations({ paths, clock });
+	const lookupAbort = new AbortController();
+	const jobs = runner.offTick?.(lookupAbort.signal) ?? runner;
+	const lookups = new Map();
 	let worker;
 	let pending; // Memory only. The file remains queued until a tick consumes the reply.
 	const records = new Map();
@@ -273,6 +277,26 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 	const save = (record) => atomicWriteJson(recordFile(record.sessionId), record);
 	const bundleFileOf = (jobId) => path.join(jobsDir, jobId, "bundle.md");
 	const held = (record) => record.holdUntilExit === true;
+
+	// The record retains its slot and charge while a runner operation is in flight. Only a tick
+	// consumes the result; promise handlers neither transition records nor start another audit.
+	function lookup(record, kind, run) {
+		let work = lookups.get(record);
+		if (!work) {
+			const value = run();
+			if (!(value instanceof Promise)) return value;
+			work = { kind, pending: true };
+			lookups.set(record, work);
+			void value.then(
+				(result) => Object.assign(work, { pending: false, result }),
+				(error) => Object.assign(work, { pending: false, failed: true, error }),
+			);
+		}
+		if (work.pending) return LOOKUP_PENDING;
+		lookups.delete(record);
+		if (work.failed) throw work.error;
+		return work.result;
+	}
 
 	for (const name of listDirSafe(auditsDir)) {
 		if (!name.endsWith(".json") || name.startsWith("_")) continue;
@@ -316,15 +340,17 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 
 	/** The record's job has a meta.json (it was spawned), or the process is found by its own argv; a lookup error keeps it launching. */
 	function resolveLaunching(record) {
+		if (lookups.get(record)?.kind === "start") return startJob(record);
 		try {
-			if (readJsonSafe(path.join(jobsDir, record.jobId, "meta.json"))) {
-				record.status = "running";
-			} else if (runner.adoptJob(record.jobId, adoptOptions(record)) === "running") {
-				record.status = "running";
-			} else {
+			const result = lookup(record, "launch-adopt", () =>
+				readJsonSafe(path.join(jobsDir, record.jobId, "meta.json")) ? "running" :
+					jobs.adoptJob(record.jobId, adoptOptions(record)));
+			if (result === LOOKUP_PENDING) return;
+			if (result !== "running") {
 				fail(record, "launch-uncertain", null, clock.now());
 				return;
 			}
+			record.status = "running";
 			record.startedMs = record.launchMs ?? clock.now();
 			save(record);
 		} catch (error) {
@@ -404,8 +430,15 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		record.firedDetectors = firedDetectors(bundle);
 		save(record);
 		charge(jobId, now);
+		startJob(record);
+	}
+
+	function startJob(record) {
+		const { jobId, launchMs: now } = record;
 		try {
-			runner.start({ jobId, kind: "audit", command: commandOf(), args: argsOf(record), cwd: jobDir, timeoutMs: config.audit.timeoutMs, ...AUDIT_CONTRACT });
+			const result = lookup(record, "start", () =>
+				jobs.start({ jobId, kind: "audit", command: commandOf(), args: argsOf(record), cwd: path.join(jobsDir, jobId), timeoutMs: config.audit.timeoutMs, ...AUDIT_CONTRACT }));
+			if (result === LOOKUP_PENDING) return;
 		} catch (error) {
 			if (error?.spawned === false) {
 				refund(jobId, now);
@@ -514,24 +547,33 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 			refund(record.jobId, record.launchMs ?? now);
 			fail(record, "spawn-error", out.detail ? truncate(redact(String(out.detail)), 300) : null, now);
 		} else if (out.status === "failed" && out.reason === "no-job") {
-			try {
-				if (runner.adoptJob(record.jobId, adoptOptions(record)) === "absent") fail(record, "no-job", null, now);
-			} catch (error) {
-				log?.warn?.("audit_adopt_pending", { sessionId: record.sessionId, jobId: record.jobId, error: error.message });
-			}
+			adoptRunning(record, now);
 		} else if (out.status === "failed") {
 			if (out.holdUntilExit) record.holdUntilExit = true;
 			fail(record, String(out.reason ?? "failed"), out.detail ? truncate(redact(String(out.detail)), 300) : null, now);
 		}
 	}
 
+	function adoptRunning(record, now) {
+		try {
+			if (lookup(record, "running-adopt", () => jobs.adoptJob(record.jobId, adoptOptions(record))) === "absent") fail(record, "no-job", null, now);
+		} catch (error) {
+			log?.warn?.("audit_adopt_pending", { sessionId: record.sessionId, jobId: record.jobId, error: error.message });
+		}
+	}
+
 	/** A termination request is not proof of exit; only a negative liveness check releases a legacy hold. */
 	function releaseHold(record) {
 		try {
-			if (runner.alive(record.jobId)) {
-				runner.terminate(record.jobId);
-				return;
-			}
+			const remains = (alive) => {
+				if (!alive) return false;
+				const termination = jobs.terminate(record.jobId);
+				return termination instanceof Promise ? termination.then(() => true) : true;
+			};
+			if (lookup(record, "hold", () => {
+				const alive = jobs.alive(record.jobId);
+				return alive instanceof Promise ? alive.then(remains) : remains(alive);
+			}) !== false) return;
 		} catch (error) {
 			log?.warn?.("audit_hold_pending", { sessionId: record.sessionId, jobId: record.jobId, error: error.message });
 			return;
@@ -545,20 +587,27 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 			const running = record.status === "running";
 			if (!running && !(record.status === "failed" && held(record))) continue;
 			const last = lastPollMs.get(record.sessionId);
-			if (last !== undefined && now - last < ANALYST_POLL_MS) continue;
-			lastPollMs.set(record.sessionId, now);
+			const work = lookups.get(record);
+			if (!work) {
+				if (last !== undefined && now - last < ANALYST_POLL_MS) continue;
+				lastPollMs.set(record.sessionId, now);
+			}
 			if (!running) {
 				releaseHold(record);
 				continue;
 			}
+			if (work?.kind === "running-adopt") {
+				adoptRunning(record, now);
+				continue;
+			}
 			let out;
 			try {
-				out = runner.poll(record.jobId);
+				out = lookup(record, "poll", () => jobs.poll(record.jobId));
 			} catch (error) {
 				log?.warn?.("audit_poll_failed", { sessionId: record.sessionId, jobId: record.jobId, error: error.message });
 				continue;
 			}
-			finish(record, out ?? {}, now);
+			if (out !== LOOKUP_PENDING) finish(record, out ?? {}, now);
 		}
 	}
 
@@ -578,6 +627,8 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 	return {
 		preparing: () => pending?.promise,
 		close() {
+			lookupAbort.abort();
+			lookups.clear();
 			const owner = worker;
 			worker = undefined;
 			pending?.resolve();

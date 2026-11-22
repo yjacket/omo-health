@@ -4,7 +4,7 @@ import { pathKey } from "./paths.mjs";
 import { boardTaskLinks } from "./session-board.mjs";
 import { ENDED_LOCATION, endedKey, locateEndedRows, readEndedCwd } from "./session-ledger.mjs";
 import { ambiguousLedgerTaskIds, ledgerUsageSessionId, usageTreeLink } from "./session-record.mjs";
-import { USAGE_TICK_BYTES, compactUsage, fresh as isFresh, treeTotals } from "./usage-index.mjs";
+import { USAGE_TICK_BYTES, compactUsage, fresh as isFresh, isTaskOnlyEntry, treeTotals } from "./usage-index.mjs";
 import { statSafe } from "./util/fsx.mjs";
 
 /**
@@ -39,6 +39,8 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 	const ledgerRows = new Map();
 	/** Keep scoped fallback links even though the index itself has only one slot per raw ID. */
 	const fallbackRows = new Map();
+	/** Ended task-only reads whose ownership needs watching even when the byte queue is drained. */
+	const taskOnlyChecks = new Map();
 	/** Rows waiting for bytes: id -> ledger row, newest first. */
 	let queue = new Map();
 	/** Live session ids waiting for a header probe or to enter the index. Rebuilt each tick. */
@@ -157,6 +159,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 					if (row.endedMs < cutoff) {
 						ledgerRows.delete(id);
 						queue.delete(id);
+						taskOnlyChecks.delete(id);
 					}
 				}
 			}
@@ -170,6 +173,9 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 				ledgerRows.set(row.sessionId, row);
 				if (!ledgerUsageSessionId(row)) fallbackRows.set(endedKey(source), row);
 				const entry = index.get(row.sessionId);
+				if (row.kind === "child" && !ledgerUsageSessionId(row) && (entry?.state === "ok" || taskOnlyChecks.has(sessionId))) {
+					taskOnlyChecks.set(sessionId, row);
+				}
 				const checkedAgo = nowMs() - (Number.isFinite(entry?.checkedMs) ? entry.checkedMs : 0) > DAY_MS;
 				let need = false;
 				if (!entry || entry.state === "full") need = true;
@@ -191,6 +197,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 		 */
 		tick(world) {
 			let budget = USAGE_TICK_BYTES;
+			let withdrew = false;
 			const sessions = [...(world?.sessions?.values?.() ?? [])];
 			const liveSessions = new Map(sessions.filter((session) => isNonEmptyString(session?.id)).map((session) => [session.id, session]));
 			const ledgerOptions = ledgerFs ? { fs: ledgerFs } : undefined;
@@ -208,6 +215,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 						}
 					};
 					for (const row of queue.values()) if (row.kind === "child") collect(row);
+					for (const row of taskOnlyChecks.values()) collect(row);
 					for (const session of liveSessions.values()) {
 						if (session.kind === "child" && isNonEmptyString(session.file) && isNonEmptyString(session.taskId)) collect(session);
 					}
@@ -233,13 +241,36 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 				const { matches, pending, bytesRead } = verify(session, liveSessions, cwdOf, budget);
 				budget -= bytesRead;
 				if (pending || (matches && budget === 0 && !entry)) pendingLive.add(session.id);
+				if (isTaskOnlyEntry(entry) && entry.state === "ok" && (!matches || pathKey(session.file) !== pathKey(entry.file))) {
+					index.markMissing(session.id, metaOf(session));
+					withdrew = true;
+				}
 				if (!matches || budget <= 0) continue;
 				budget = Math.max(0, budget - index.update(session.id, session.file, metaOf(session), { maxBytes: budget }));
+			}
+			// Ownership checks cost no transcript bytes and must run even when live
+			// reads exhaust the budget. A restored path starts with a cleared cursor.
+			const checkedFiles = new Map();
+			for (const [id, row] of taskOnlyChecks) {
+				const { file } = locate(row, liveSessions, cwdOf, 0);
+				const entry = index.get(id);
+				if (entry?.state === "ok" && (!file || pathKey(file) !== pathKey(entry.file))) {
+					index.markMissing(id, metaOf(row));
+					withdrew = true;
+				}
+				if (file) {
+					checkedFiles.set(id, file);
+					if (!isFresh(index.get(id))) queue.set(id, row);
+				} else {
+					queue.delete(id);
+				}
 			}
 			// (c) the ended-session backlog, newest first
 			for (const [id, row] of queue) {
 				if (budget <= 0) break;
-				const { file: rowFile, pending, bytesRead } = locate(row, liveSessions, cwdOf, budget);
+				const { file: rowFile, pending, bytesRead = 0 } = checkedFiles.has(id)
+					? { file: checkedFiles.get(id) }
+					: locate(row, liveSessions, cwdOf, budget);
 				budget -= bytesRead;
 				if (pending) break;
 				if (!rowFile) {
@@ -247,6 +278,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 					queue.delete(id);
 					continue;
 				}
+				if (row.kind === "child" && !ledgerUsageSessionId(row)) taskOnlyChecks.set(id, row);
 				if (budget <= 0) break;
 				budget = Math.max(0, budget - index.update(id, rowFile, metaOf(row), { maxBytes: budget }));
 				const entry = index.get(id);
@@ -265,6 +297,9 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			];
 			trees = totals();
 			const state = counts();
+			// History reads the saved index. Persist revocation now so that removing
+			// the competing file cannot revive the old on-disk cursor before a recount.
+			if (withdrew) index.save();
 			if (index.full && !fullLogged) {
 				fullLogged = true;
 				log?.warn?.("usage_index_full");

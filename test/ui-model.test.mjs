@@ -9,11 +9,13 @@ import { SWITCH_KEYS } from "../src/config.mjs";
 import { SWITCHES } from "../src/control.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 import { appendEnded } from "../src/session-ledger.mjs";
+import { createSessionFileLocator } from "../src/collect/session-files.mjs";
 import { loadSessionRecord } from "../src/session-record.mjs";
 import { createFakeClock } from "../src/util/time.mjs";
 import { createUsageIndex, readUsageIndex, USAGE_INDEX_VERSION } from "../src/usage-index.mjs";
 import { ACTION_LABELS, EXIT_REASON_LABELS, GOAL_STATUS_LABELS, INVESTIGATION_STATUS_LABELS, OUTCOME_LABELS, SESSION_STATE_LABELS, TASK_STATUS_LABELS, TERMINAL_LABELS, TRIGGER_LABELS } from "../src/ui/labels.mjs";
 import { buildHistory } from "../src/ui/history.mjs";
+import { createDetailOperations } from "../src/ui/detail-worker.mjs";
 import { buildEnded, buildOverview, buildSessions, buildSettings, buildUiState, daemonStatus, endedRow, loadDaemonInputs, loadUiInputs, uiState } from "../src/ui/model.mjs";
 import { buildSessionView } from "../src/ui/session-view.mjs";
 import { buildSessionSnapshot } from "../src/session-board.mjs";
@@ -469,6 +471,46 @@ it("(IS-3) history renders a second line for equal and lower tree totals, but no
 		const row = history.get(id);
 		return [row.treeTokens, endedTokenCell(row).children[1]?.text];
 	}), [[10, rows[0][2]], [7, rows[1][2]], [null, rows[2][2]]]);
+});
+
+it("(plan 61) history and audit preview reject a task-only file that stops being unique", () => {
+	const { env, paths } = makeHome();
+	const clock = createFakeClock(NOW);
+	const index = createUsageIndex({ file: paths.health.usageIndexFile, clock });
+	const locator = createSessionFileLocator({ paths, clock });
+	const tracker = createUsageTracker({ paths, index, locator, clock });
+	const taskId = "st_changing";
+	const cwd = path.join(env.USERPROFILE, "proj");
+	const row = { sessionId: taskId, taskId, kind: "child", cwd, startedMs: NOW - HOUR, endedMs: NOW, outcome: "completed" };
+	appendEnded(paths, row, { nowMs: NOW });
+	const dir = path.join(cwd, ".omo", "senpi-task", "children", taskId, "sessions", taskId);
+	const transcript = '{"type":"usage","provider":"p","model":"m","usage":{"input":42}}\n';
+	write(path.join(dir, "first.jsonl"), transcript);
+	const second = path.join(dir, "second.jsonl");
+	const prepare = createDetailOperations({
+		paths, env, today: () => 0,
+		daemonInputs: () => ({ now: NOW, heartbeat: heartbeat(), pidAlive: true, loaded: { config: { mode: "auto", daemonStaleMs: 45_000 } } }),
+		resolveModel: () => ({ model: "upper" }),
+	});
+	const status = () => {
+		const history = uiState({ paths, env, now: NOW }).ended.rows.find(({ sessionId }) => sessionId === taskId);
+		const preview = prepare({ kind: "preview", id: taskId, now: NOW, record: { session: row, analystModels: [] } });
+		return [history.tokens?.total ?? null, preview.blocked, preview.planned?.model ?? null];
+	};
+	const world = makeWorld({ now: NOW, sessions: [] });
+	tracker.queueLedger([row]);
+	tracker.tick(world);
+	assert.deepEqual(status(), [42, null, "upper"]);
+
+	write(second, transcript);
+	tracker.tick(world);
+	assert.deepEqual(status(), [null, "models-unknown", null], "history and preview must not trust the old on-disk publication");
+
+	fs.rmSync(second);
+	assert.deepEqual(status(), [null, "models-unknown", null], "removal alone must not revive the publication before recount");
+	tracker.tick(world);
+	index.save();
+	assert.deepEqual(status(), [42, null, "upper"]);
 });
 
 it("history marks a partial tree with the required text and title", () => {
