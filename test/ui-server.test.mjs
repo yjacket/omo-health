@@ -615,7 +615,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 				fs.writeFileSync(file, `{"v":3}\n${JSON.stringify(row)}\n`);
 			}
 
-			function makeWorld({ daemon = "running", enabled = true, usedModels = { "anthropic/claude-used": true }, lanes = { ultrabrain: ["anthropic/claude-used"], architect: ["openai/gpt-review:high"] }, growFile = false, budgetCount = null } = {}) {
+			function makeWorld({ daemon = "running", enabled = true, usedModels = { "anthropic/claude-used": true }, lanes = { ultrabrain: ["anthropic/claude-used"], architect: ["openai/gpt-review:high"] }, providers = ["anthropic", "openai"], growFile = false, budgetCount = null, entries } = {}) {
 				const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omoh-audit-ui-"));
 				const env = { USERPROFILE: dir, OMO_HEALTH_HOME: path.join(dir, "health") };
 				const worldPaths = resolvePaths(env);
@@ -623,7 +623,8 @@ describe("ui server", { timeout: 20_000 }, () => {
 				const now = () => nowMs;
 				const sessionFile = path.join(worldPaths.sessionsDir, "slug", "2026-11-22T00-00-00-000Z_s_audit01.jsonl");
 				fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
-				fs.writeFileSync(sessionFile, `${JSON.stringify({ type: "session", id: AUDIT_ID })}\n`);
+				const sessionLines = [{ type: "session", id: AUDIT_ID }, ...(entries ?? [])];
+				fs.writeFileSync(sessionFile, `${sessionLines.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
 				const stat = fs.statSync(sessionFile);
 				fs.mkdirSync(worldPaths.health.sessionsDir, { recursive: true });
 				fs.writeFileSync(
@@ -655,7 +656,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 							published: { ...emptyUsage(), usedModels },
 				});
 				writeJson(worldPaths.omoJsonc, { "[native]": { categories: Object.fromEntries(Object.entries(lanes).map(([lane, models]) => [lane, { models }])) } });
-				writeJson(worldPaths.authFile, { anthropic: {}, openai: {} });
+				writeJson(worldPaths.authFile, Object.fromEntries(providers.map((provider) => [provider, {}])));
 				if (daemon === "running") writeJson(worldPaths.health.daemonJson, { ts: nowMs, pid: process.pid, mode: "auto", version: "test" });
 				if (daemon === "stale") writeJson(worldPaths.health.daemonJson, { ts: nowMs - 120_000, pid: process.pid, mode: "auto", version: "test" });
 				if (enabled !== true) writeJson(worldPaths.health.configFile, { audit: { enabled: false } });
@@ -931,6 +932,28 @@ describe("ui server", { timeout: 20_000 }, () => {
 					fs.rmSync(world.dir, { recursive: true, force: true });
 				}
 			});
+
+			for (const kind of ["toolResult", "compaction"]) {
+				it(`(plan 24) preview and POST exclude a model seen only in a ${kind}`, async () => {
+					const model = `grok-${kind}-carrier`;
+					const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } };
+					const entry = kind === "toolResult"
+						? { type: "message", message: { role: "toolResult", toolCallId: "c1", toolName: "bash", content: [], isError: false, provider: "xai", model, usage } }
+						: { type: "compaction", provider: "xai", model, usage };
+					const world = makeWorld({ usedModels: {}, entries: [entry], providers: ["xai", "google"], lanes: { ultrabrain: [`xai/${model}`], architect: ["google/gemini-review"] } });
+					try {
+						const planned = (await world.detail(AUDIT_ID)).audit.planned;
+						assert.equal(planned.model, "google/gemini-review");
+						assert.notEqual(planned.model, `xai/${model}`);
+						const posted = await world.startAudit(AUDIT_ID);
+						assert.equal(posted[0], 202);
+						assert.equal(posted[1].audit.planned.model, "google/gemini-review");
+					} finally {
+						await world.detail.close();
+						fs.rmSync(world.dir, { recursive: true, force: true });
+					}
+				});
+			}
 
 			it("(gate 15) preview and POST exclude an identity missing only from published.usedModels", async () => {
 				const world = makeWorld({

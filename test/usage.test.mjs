@@ -51,8 +51,10 @@ function usageEntry(usage, { ms = T0, provider = "openai", model = "gpt-5" } = {
 	return { type: "usage", timestamp: iso(ms), provider, model, usage };
 }
 
-function toolResult({ ms = T0, name = "bash", text = "ok", isError = false, usage } = {}) {
+function toolResult({ ms = T0, name = "bash", text = "ok", isError = false, provider, model, usage } = {}) {
 	const message = { role: "toolResult", toolCallId: nextId(), toolName: name, content: [{ type: "text", text }], isError, timestamp: ms };
+	if (provider !== undefined) message.provider = provider;
+	if (model !== undefined) message.model = model;
 	if (usage !== undefined) message.usage = usage;
 	return { type: "message", id: nextId(), timestamp: iso(ms), message };
 }
@@ -73,8 +75,11 @@ function compaction(usage, { ms = T0, provider, model } = {}) {
 	return entry;
 }
 
-function branchSummary(usage, ms = T0) {
-	return { type: "branch_summary", timestamp: iso(ms), usage };
+function branchSummary(usage, ms = T0, { provider, model } = {}) {
+	const entry = { type: "branch_summary", timestamp: iso(ms), usage };
+	if (provider !== undefined) entry.provider = provider;
+	if (model !== undefined) entry.model = model;
+	return entry;
 }
 
 function textRecord(text, ms = T0) {
@@ -381,6 +386,54 @@ test("usedModels lists every processing model and flags an incomplete model list
 		"moonshot/kimi-k3": true,
 	});
 	assert.equal(got.modelsIncomplete, true);
+});
+
+test("an identity-bearing toolResult, compaction and branch_summary record their model while billing under Tools/summaries", (t) => {
+	const { file } = setup(t);
+	const usage = () => use({ input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.1 });
+	writeRecords(file(), [
+		toolResult({ provider: "openai", model: "gpt-tool", usage: usage() }),
+		compaction(usage(), { provider: "anthropic-subscription", model: "claude-summary" }),
+		branchSummary(usage(), T0, { provider: "xai", model: "grok-branch" }),
+	]);
+	const got = readUsage(file()).effective;
+	assert.deepEqual(got.usedModels, {
+		"openai/gpt-tool": true,
+		"anthropic-subscription/claude-summary": true,
+		"xai/grok-branch": true,
+	});
+	assert.deepEqual(Object.keys(got.models), [USAGE_TOOLS_KEY]);
+	assert.equal(got.models[USAGE_TOOLS_KEY].tokens, 30);
+	assert.equal(got.modelsIncomplete, false);
+});
+
+test("an identity-less toolResult, compaction and branch_summary still mark the model list incomplete", (t) => {
+	const { file } = setup(t);
+	writeRecords(file(), [toolResult({ usage: use() }), compaction(use()), branchSummary(use())]);
+	const got = readUsage(file()).effective;
+	assert.deepEqual(got.usedModels, {});
+	assert.equal(got.modelsIncomplete, true);
+});
+
+test("a >16 MiB record records the identity of every usage carrier", (t) => {
+	const { file } = setup(t);
+	const huge = (entry) => `{"pad":"${"a".repeat(17 * MiB)}",${JSON.stringify(entry).slice(1)}`;
+	const usage = () => use({ input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.1 });
+	const carriers = {
+		toolResult: [{ type: "message", message: { role: "toolResult", toolCallId: "c1", toolName: "bash", content: [], isError: false, provider: "openai", model: "gpt-tool", usage: usage() } }, "openai/gpt-tool"],
+		compaction: [{ type: "compaction", provider: "anthropic-subscription", model: "claude-summary", usage: usage() }, "anthropic-subscription/claude-summary"],
+		branch_summary: [{ type: "branch_summary", provider: "xai", model: "grok-branch", usage: usage() }, "xai/grok-branch"],
+	};
+	for (const [kind, [entry, id]] of Object.entries(carriers)) {
+		const name = `large-${kind}.jsonl`;
+		fs.writeFileSync(file(name), `${huge(entry)}\n`);
+		assert.ok(fs.statSync(file(name)).size > 16 * MiB, kind);
+		const got = readUsage(file(name)).effective;
+		assert.equal(got.total, 10, kind);
+		assert.deepEqual(got.usedModels, { [id]: true }, kind);
+		assert.deepEqual(got.models, { [USAGE_TOOLS_KEY]: { tokens: 10, cost: 0.1 } }, kind);
+		assert.equal(got.modelsIncomplete, false, kind);
+	}
 });
 
 test("an incremental append with a partial last line equals a one-shot read", (t) => {

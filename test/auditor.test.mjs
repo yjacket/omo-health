@@ -632,6 +632,26 @@ test("a prewarm entry alone excludes the first candidate, a failed prewarm in an
 	assert.equal(modelOf(g.runner.starts[0]), "google/gemini-3-pro");
 });
 
+const carrierLine = (kind) => {
+	const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } };
+	const timestamp = new Date(BASE - 60_000).toISOString();
+	if (kind === "toolResult") {
+		return { type: "message", id: "tr-1", timestamp, message: { role: "toolResult", toolCallId: "c1", toolName: "bash", content: [], isError: false, provider: "openai", model: "gpt-5-5", usage } };
+	}
+	return { type: "compaction", id: "cmp-1", timestamp, provider: "openai", model: "gpt-5-5", usage };
+};
+
+for (const kind of ["toolResult", "compaction"]) {
+	test(`(plan 24) the reviewer launch excludes a model seen only in a ${kind}`, (t) => {
+		const h = harness({ entries: [E.assistant({ ms: BASE - 120_000, id: "a-m1", model: "claude-opus-5-5", provider: "anthropic-subscription" }), carrierLine(kind)] });
+		t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+		const a = h.auditor();
+		h.request("m1");
+		h.tick(a);
+		assert.equal(modelOf(h.runner.starts[0]), "google/gemini-3-pro");
+	});
+}
+
 for (const incomplete of ["timeline", "index"]) {
 	test(`(gate 14) the auditor refuses when only the ${incomplete} lost model identities`, () => {
 		const h = harness();

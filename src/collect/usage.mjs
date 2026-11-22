@@ -355,7 +355,10 @@ function addModelId(out, provider, model) {
 
 /**
  * Real model ids that processed the session (reviewer exclusion in the audit
- * plan), independent of the billing keys in `models`.
+ * plan), independent of the billing keys in `models`. Every usage carrier also
+ * supplies the identity that produced its usage: assistant/toolResult messages
+ * use `message`, compaction/branch_summary entries use the entry root, and
+ * prewarm data uses `data`.
  */
 export function modelsOfEntry(entry) {
 	const out = { ids: [], incomplete: false };
@@ -367,8 +370,9 @@ export function modelsOfEntry(entry) {
 			addModelId(out, message.provider, message.model);
 			addModelId(out, message.provider, message.responseModel);
 		}
-		if (message.role === "toolResult" && isObject(message.usage) && !message.provider && !message.model) {
-			out.incomplete = true;
+		if (message.role === "toolResult" && isObject(message.usage)) {
+			addModelId(out, message.provider, message.model);
+			if (!message.provider && !message.model) out.incomplete = true;
 		}
 	}
 	if (type === "usage") {
@@ -377,8 +381,9 @@ export function modelsOfEntry(entry) {
 	if (type === "custom" && entry.customType === "prompt-cache-prewarm" && isObject(entry.data)) {
 		addModelId(out, entry.data.provider, entry.data.model);
 	}
-	if ((type === "compaction" || type === "branch_summary") && isObject(entry.usage) && !entry.provider && !entry.model) {
-		out.incomplete = true;
+	if ((type === "compaction" || type === "branch_summary") && isObject(entry.usage)) {
+		addModelId(out, entry.provider, entry.model);
+		if (!entry.provider && !entry.model) out.incomplete = true;
 	}
 	return out;
 }
