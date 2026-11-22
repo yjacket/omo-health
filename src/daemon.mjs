@@ -333,7 +333,7 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 	// Plan todo 5: the token index and its tracker. This process is the only writer of usage.json; the
 	// tracker shares one 32 MiB budget per tick between live appends and the ended-session backlog.
 	const usageIndex = createUsageIndex({ file: paths.health.usageIndexFile, clock, log });
-	const usageTracker = createUsageTracker({ paths, index: usageIndex, locator: createSessionFileLocator({ paths, clock }), clock, log });
+	const usageTracker = createUsageTracker({ paths, index: usageIndex, locator: createSessionFileLocator({ paths, clock, indexedFile: (id) => usageIndex.get(id)?.file }), clock, log });
 	// Plan todo 12: owner-requested audits (display-only, so they run in shadow mode too); one runs at a time.
 	const auditor = (overrides.createAuditor ?? createAuditor)({ paths, config, clock, log, env, index: usageIndex, runner: createRunner({ paths, clock, contracts: { audit: AUDIT_CONTRACT } }) });
 	const savedBoard = readJsonSafe(paths.health.sessionsSnapshotFile);

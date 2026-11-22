@@ -172,7 +172,7 @@ export function readAuditTimeline(file, tokens, { maxFileBytes = TIMELINE_MAX_BY
 export function createAuditor({ paths, config, clock, log, runner, index, env = process.env, timelineMaxBytes = TIMELINE_MAX_BYTES, loadRecord = loadSessionRecord, timeline = usageTimeline, afterStart } = {}) {
 	const auditsDir = paths.health.auditsDir;
 	const jobsDir = paths.health.jobsDir;
-	const locator = createSessionFileLocator({ paths, clock });
+	const locator = createSessionFileLocator({ paths, clock, ...(index ? { indexedFile: (id) => index.get(id)?.file } : {}) });
 	const records = new Map();
 	/** Memory only: a restarted daemon polls every running record at once. */
 	const lastPollMs = new Map();

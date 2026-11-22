@@ -19,14 +19,23 @@ export function mainSessionFileMatches(file, sessionId) {
  * Nothing here writes; a negative lookup is retried after `rescanMs`, so the
  * daemon's backlog finds files that appear later without rescanning every tick.
  */
-export function createSessionFileLocator({ paths, clock, rescanMs = 60_000 } = {}) {
+/**
+ * `indexedFile(sessionId)` is an optional lookup into a token index the caller already holds (the daemon's resident
+ * index); without it the locator reads the index file, once per change of that file.
+ */
+export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, indexedFile } = {}) {
 	const nowMs = typeof clock?.now === "function" ? () => clock.now() : () => Date.now();
 	let mainFiles = new Map();
 	let mainScannedMs = -Infinity;
 	let usageStamp;
 	let customMainFiles = new Map();
 
-	const indexedMainFile = (sessionId) => {
+	const residentMainFile = (sessionId) => {
+		const file = indexedFile(sessionId);
+		return file && idFromFileName(file) !== sessionId ? file : undefined;
+	};
+
+	const readMainFile = (sessionId) => {
 		const file = paths.health?.usageIndexFile;
 		const stat = file && statSafe(file);
 		const stamp = stat?.isFile() ? `${stat.ino}:${stat.birthtimeMs}:${stat.mtimeMs}:${stat.size}` : null;
@@ -41,6 +50,8 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000 } = {
 		}
 		return customMainFiles.get(sessionId);
 	};
+
+	const indexedMainFile = typeof indexedFile === "function" ? residentMainFile : readMainFile;
 
 	const scanMain = () => {
 		const found = new Map();
