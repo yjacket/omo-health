@@ -6,16 +6,15 @@ import { Worker } from "node:worker_threads";
 import { loadConfig } from "../config.mjs";
 import { listSubjectsNow, runDiagnose } from "../diagnose.mjs";
 import { createLogger } from "../log.mjs";
-import { createDetailOperations, detailSignature } from "./detail-worker.mjs";
+import { createDetailOperations } from "./detail-worker.mjs";
 import { uiState } from "./model.mjs";
 import { createUiServer } from "./server.mjs";
-import { buildSessionView } from "./session-view.mjs";
+import { buildSessionListView, buildSessionView } from "./session-view.mjs";
 
 const DEFAULT_IDLE_MINUTES = 30;
 /** Env keys that mean "tests or staging": the launcher must not open a browser on the operator's desktop. OMO_HEALTH_CONFIG is a real user setting, so it is not one. */
 const SANDBOX_MARKERS = new Set(["OMO_HEALTH_HOME", "OMO_HEALTH_OMO_HOME", "OMO_HEALTH_CLAUDE_HOME", "NODE_TEST_CONTEXT"]);
 const DEFAULT_BIN_PATH = fileURLToPath(new URL("../../bin/omo-health.mjs", import.meta.url));
-const SESSION_CACHE_MAX = 20;
 const DETAIL_WORKER_URL = new URL("./detail-worker.mjs", import.meta.url);
 
 /** One lazy worker, shared by the two dashboard routes. Replies follow postMessage order. */
@@ -94,38 +93,15 @@ export function createStartAudit({ paths, env = process.env, now = Date.now, wor
 	}, detailWorker);
 }
 
-/**
- * The dashboard's memoized `sessionDetail` (plan todo 8): it caches the
- * historical record only, keyed by every file the reader consumes, and rebuilds
- * the labels with `buildSessionView` on every call so the audit block and daemon
- * status (todo 13) are always read fresh. The cache holds at most 20 detail lookups.
- */
-export function createSessionDetail({ paths, env = process.env, now = Date.now, load, maxEntries = SESSION_CACHE_MAX, auditDetail, worker } = {}) {
-	const local = load || auditDetail ? createDetailOperations({ paths, env, load, auditDetail }) : null;
-	const detailWorker = worker ?? (local ? null : createDetailWorker({ paths, env }));
-	const cache = new Map();
+/** The worker owns the historical cache; label only the page it returns. */
+export function createSessionDetail({ paths, env = process.env, now = Date.now, load, maxEntries, auditDetail, worker } = {}) {
+	const local = load || auditDetail ? createDetailOperations({ paths, env, load, auditDetail, maxEntries }) : null;
+	const detailWorker = worker ?? (local ? null : createDetailWorker({ paths, env, workerData: { maxEntries } }));
+	const view = ({ record, audit, page }) => page ? buildSessionListView(page) : buildSessionView(record, { audit });
 
-	function sessionDetail(id, row) {
-		const key = row === undefined ? id : `${id}:${row}`;
-		const cached = cache.get(key);
-		if (cached && detailSignature(paths, cached.files) === cached.signature) {
-			cache.delete(key);
-			cache.set(key, cached);
-			const { record } = cached;
-			if (record?.found !== true) return buildSessionView(record, { audit: null });
-			const job = { kind: "preview", id, now: now(), record: detailWorker ? { session: record.session, analystModels: record.analystModels } : record };
-			const view = (audit) => buildSessionView(record, { audit });
-			return detailWorker ? detailWorker.run(job).then(view) : view(local(job));
-		}
-		if (cached) cache.delete(key);
-		const job = { kind: "detail", id, row, now: now() };
-		const remember = ({ record, files = [], signature = detailSignature(paths, files), audit }) => {
-			cache.delete(key);
-			cache.set(key, { record, files, signature });
-			while (cache.size > maxEntries) cache.delete(cache.keys().next().value);
-			return buildSessionView(record, { audit });
-		};
-		return detailWorker ? detailWorker.run(job).then(remember) : remember(local(job));
+	function sessionDetail(id, row, pagination = { list: null, offset: 0 }) {
+		const job = { kind: "detail", id, row, now: now(), pagination };
+		return detailWorker ? detailWorker.run(job).then(view) : view(local(job));
 	}
 	return attachClose(sessionDetail, detailWorker);
 }

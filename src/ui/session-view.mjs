@@ -4,14 +4,38 @@ import { investigationRow } from "./model.mjs";
 /**
  * The dashboard's session detail (plan todo 8): the stored record from
  * `src/session-record.mjs` plus the Korean labels the page renders. Pure: every
- * call takes the record and only derives strings, so the memo in
- * `src/ui/cli.mjs` can keep the historical record without ever freezing a label
- * or the audit block.
+ * call takes a record and only derives strings. The dashboard calls this
+ * after the detail worker projects the cached historical record into a page.
  */
 
 const isRecord = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const list = (v) => (Array.isArray(v) ? v.filter(isRecord) : []);
 const overflows = (value) => typeof value === "number" && !Number.isFinite(value);
+export const SESSION_LISTS = Object.freeze(["children", "findings", "actions", "investigations", "messages"]);
+const SESSION_PAGE = 50;
+
+function sessionItems(record, name) {
+	return list(name === "children" ? record.children : record.health?.[name]);
+}
+
+/** Worker-side projection. Totals and offsets count the same valid items as the view. */
+export function sessionRecordPage(record, name, offset) {
+	if (name !== null) {
+		const items = sessionItems(record, name);
+		return { list: name, offset, total: items.length, items: items.slice(offset, offset + SESSION_PAGE) };
+	}
+	// Internal history (e.g. selected finding IDs and analyst model provenance)
+	// stays in the worker, not in the dashboard's first page.
+	const { found, id, session, tokens, coverage, health } = record;
+	const { pendingAnalystJobs, ...sessionFields } = isRecord(session) ? session : {};
+	const pages = Object.fromEntries(SESSION_LISTS.map((key) => [key, sessionRecordPage(record, key, 0)]));
+	return {
+		found, id, session: session ? sessionFields : session, tokens, coverage,
+		children: pages.children.items,
+		health: { counts: health?.counts, findings: pages.findings.items, actions: pages.actions.items, investigations: pages.investigations.items, messages: pages.messages.items },
+		counts: Object.fromEntries(SESSION_LISTS.map((key) => [key, pages[key].total])),
+	};
+}
 
 function labelledSession(session) {
 	if (!isRecord(session)) return null;
@@ -73,6 +97,18 @@ function labelledChild(child) {
 	};
 }
 
+const ITEM_LABELS = Object.freeze({
+	children: labelledChild,
+	findings: labelledFinding,
+	actions: labelledAction,
+	investigations: labelledInvestigation,
+	messages: (item) => item,
+});
+
+export function buildSessionListView(page) {
+	return { ...page, items: page.items.map(ITEM_LABELS[page.list]) };
+}
+
 function detailTokens(tokens) {
 	if (!tokens) return tokens;
 	const { treeTotal } = tokens;
@@ -124,18 +160,14 @@ export function buildSessionView(record, extras = {}) {
 	const audit = labelledAudit(auditExtra !== undefined ? auditExtra : record.audit ?? null);
 	if (record.found === false) return { ...record, audit, ...rest };
 	const health = isRecord(record.health) ? record.health : {};
-	const children = list(record.children);
 	return {
 		...record,
 		session: labelledSession(record.session),
 		...("tokens" in record ? { tokens: detailTokens(record.tokens) } : {}),
-		children: children.map(labelledChild),
+		children: sessionItems(record, "children").map(ITEM_LABELS.children),
 		health: {
 			...health,
-			findings: list(health.findings).map(labelledFinding),
-			actions: list(health.actions).map(labelledAction),
-			investigations: list(health.investigations).map(labelledInvestigation),
-			messages: list(health.messages),
+			...Object.fromEntries(SESSION_LISTS.slice(1).map((name) => [name, sessionItems(record, name).map(ITEM_LABELS[name])])),
 		},
 		audit,
 		...rest,

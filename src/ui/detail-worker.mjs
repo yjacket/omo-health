@@ -7,12 +7,14 @@ import { loadSessionRecord, recoverPendingAnalystModels, usageEntryOf } from "..
 import { fresh, readUsageIndex } from "../usage-index.mjs";
 import { AUDIT_TERMINATION_UNCONFIRMED_LABEL, auditReasonLabel, auditStatusLabel } from "./labels.mjs";
 import { daemonStatus, loadDaemonInputs, recordsStamp } from "./model.mjs";
+import { sessionRecordPage } from "./session-view.mjs";
 
+const SESSION_CACHE_MAX = 20;
 const ACTIVE_AUDIT_STATUSES = new Set(["requested", "queued", "launching", "running"]);
 const isAuditActive = (state) => Boolean(state && (ACTIVE_AUDIT_STATUSES.has(state.status) || state.holdUntilExit === true));
 const canonicalIdOf = (session, id) => typeof session?.sessionId === "string" && session.sessionId ? session.sessionId : id;
 
-export function detailSignature(paths, files) {
+function detailSignature(paths, files) {
 	return JSON.stringify([files.map(auditFileVersion), recordsStamp(paths)]);
 }
 
@@ -43,9 +45,10 @@ function blockedOf({ config, daemon, usedToday, perDay, modelBlock, planned }) {
 /** Synchronous disk operations; the dashboard runs them only inside its detail worker. */
 export function createDetailOperations({
 	paths, env = process.env, load = loadSessionRecord, resolveModel = resolveAuditModel, readState = readAuditState,
-	today = auditsToday, request = requestAudit, daemonInputs = loadDaemonInputs, auditDetail,
+	today = auditsToday, request = requestAudit, daemonInputs = loadDaemonInputs, auditDetail, maxEntries = SESSION_CACHE_MAX,
 } = {}) {
 	let at;
+	const cache = new Map();
 	const locator = createSessionFileLocator({ paths, clock: { now: () => at } });
 	const loadRecord = ({ id, row, now }) => load({ paths, id, row, now, locator });
 	const plan = (config, facts, analystModels) =>
@@ -105,13 +108,9 @@ export function createDetailOperations({
 		return [202, { ok: true, audit: { sessionId: canonicalId, status: "queued", statusKo: auditStatusLabel("queued"), planned: choice } }];
 	}
 
-	return function prepare(job) {
-		const { kind, id, now } = job;
-		at = now;
-		if (kind === "preview") return previewOf(job.record, id);
+	function readHistory(job) {
 		const loaded = loadRecord(job);
-		if (kind === "audit") return startAudit(loaded, id);
-		if (loaded?.found !== true) return { record: loaded, files: [], signature: detailSignature(paths, []), audit: null };
+		if (loaded?.found !== true) return { record: loaded, files: [], signature: detailSignature(paths, []) };
 		// Keep dependency paths out of the record sent through the client view.
 		const { transcriptFiles, ...record } = loaded;
 		const session = record.session;
@@ -120,7 +119,35 @@ export function createDetailOperations({
 			? locator.childFile({ taskId: session.taskId, sessionId: session.sessionId, cwds: session.cwd ? [session.cwd] : [] })
 			: locator.mainFile(session?.sessionId));
 		const files = transcriptFiles ?? (file ? [file] : []);
-		return { record, files, signature: detailSignature(paths, files), audit: previewOf(record, id) };
+		return { record, files, signature: detailSignature(paths, files) };
+	}
+
+	function cachedHistory(job) {
+		const key = job.row === undefined ? job.id : `${job.id}:${job.row}`;
+		let entry = cache.get(key);
+		cache.delete(key);
+		if (!entry || detailSignature(paths, entry.files) !== entry.signature) entry = readHistory(job);
+		if (maxEntries > 0) {
+			cache.set(key, entry);
+			while (cache.size > maxEntries) cache.delete(cache.keys().next().value);
+		}
+		return entry;
+	}
+
+	return function prepare(job) {
+		const { kind, id, now, pagination } = job;
+		at = now;
+		if (kind === "preview") return previewOf(job.record, id);
+		if (kind === "audit") return startAudit(loadRecord(job), id);
+		if (!pagination) {
+			const history = readHistory(job);
+			return { ...history, audit: history.record?.found === true ? previewOf(history.record, id) : null };
+		}
+		const { record } = cachedHistory(job);
+		if (record?.found !== true) return { record, audit: null };
+		const page = sessionRecordPage(record, pagination.list, pagination.offset);
+		if (pagination.list !== null) return { page };
+		return { record: page, audit: previewOf(record, id) };
 	};
 }
 
@@ -129,6 +156,7 @@ if (parentPort && workerData?.detailWorker) {
 	// Synchronous work in successive message callbacks preserves queue order.
 	parentPort.on("message", (job) => {
 		try {
+			if (job.kind === "detail") job.pagination ??= { list: null, offset: 0 };
 			parentPort.postMessage({ result: prepare(job) });
 		} catch (error) {
 			parentPort.postMessage({ error: String(error?.message ?? error) });

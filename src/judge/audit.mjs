@@ -1,6 +1,7 @@
 import { AUDIT_REASON_CODES, reasonCode } from "../audit-codes.mjs";
 import { detectorThresholdsHash } from "../config-reload.mjs";
 import { errorStormFact } from "../detect/loops.mjs";
+import { imageLevel } from "../detect/tokens.mjs";
 import { redact, truncate } from "../util/text.mjs";
 import { parseAnalystOutput } from "./analyst.mjs";
 import { laneModels, modelFamily, modelName } from "./lane.mjs";
@@ -209,6 +210,7 @@ const FINDING_CUTOFFS = Object.freeze({
 // Each aggregate suggestion cites a detector rule and the cutoffs it relies on.
 const INFERENCE_CUTOFFS = {
 	D4: { kind: "cache-storm", keys: ["tokens.cacheStormWrite", "tokens.cacheStormReadFrac"] },
+	"D4:image-load": { detector: "D4", kind: "image-load", keys: FINDING_CUTOFFS["D4:image-load"] },
 	D10: { kind: "error-storm", keys: ["loops.errorStormCount", "loops.errorStormWindowMs"] },
 };
 
@@ -464,6 +466,15 @@ function tokensOf(record, timeline, errorStorm) {
 	};
 }
 
+function imageLoadFromPeaks(images, cfg, kind) {
+	if (images.incomplete !== false) return false;
+	const count = images.peakCount ?? -Infinity;
+	const bytes = images.peakMiB === null ? -Infinity : images.peakMiB * 1024 * 1024;
+	// Child warning eligibility depends on the provider and a non-hashed policy list.
+	// For a child (or unknown kind), require a hit under both profiles.
+	return Boolean(imageLevel(count, bytes, cfg) && (kind === "main" || imageLevel(count, bytes, cfg, true)));
+}
+
 function findingThresholds(config, detector, kind) {
 	const keys = FINDING_CUTOFFS[`${detector}:${kind}`];
 	if (!keys?.length) return undefined;
@@ -535,9 +546,9 @@ export function auditBundle(record, timeline, { config, now, configDecisions = [
 	);
 	const continuousFromStart = Number.isFinite(now) && Number.isFinite(session.startedMs) &&
 		session.startedMs <= now && session.startedMs >= continuousSinceMs;
-	const inferenceThresholdsKnown = Object.fromEntries(Object.entries(INFERENCE_CUTOFFS).map(([detector, { kind, keys }]) => {
+	const inferenceThresholdsKnown = Object.fromEntries(Object.entries(INFERENCE_CUTOFFS).map(([rule, { detector = rule, kind, keys }]) => {
 		const cutoffs = FINDING_CUTOFFS[`${detector}:${kind}`];
-		return [detector, continuousFromStart && keys.every((key) => cutoffs?.includes(key)) &&
+		return [rule, continuousFromStart && keys.every((key) => cutoffs?.includes(key)) &&
 			findingThresholds(config, detector, kind) !== undefined];
 	}));
 	// Audit conditions that held during the session, even if the live finding has aged out.
@@ -598,6 +609,8 @@ export function auditBundle(record, timeline, { config, now, configDecisions = [
 		truncated,
 		question: AUDIT_QUESTION,
 	};
+	bundle.tokens.imageLoad = inferenceThresholdsKnown["D4:image-load"] &&
+		imageLoadFromPeaks(bundle.tokens.images, config.tokens, bundle.session.kind);
 	bundle.requiredDetectors = [...new Set([...fired, ...suggestedDetectors(bundle)])];
 	if (bundle.requiredDetectors.length > AUDIT_CHECK_MAX) throw new Error("evidence-too-large");
 	if (sizeOf(bundle) > BUNDLE_MAX_CHARS) {
@@ -640,7 +653,7 @@ function suggestedDetectors(bundle) {
 	const known = bundle.inferenceThresholdsKnown;
 	const out = [];
 	// usageTimeline computes stormTurns with D4's cacheStorm rule.
-	if (known?.D4 === true && (tokens.cache?.stormTurns ?? 0) > 0) out.push("D4");
+	if ((known?.D4 === true && (tokens.cache?.stormTurns ?? 0) > 0) || tokens.imageLoad === true) out.push("D4");
 	if (known?.D10 === true && tokens.errorStorm?.detected === true) out.push("D10");
 	return out;
 }
@@ -658,6 +671,7 @@ export function auditDocument(bundle) {
 		"Judge every record against its structured facts and any applicable thresholds: severity, metrics, the actions taken and the analyst's verdict with its confidence. A missing finding alone is not a miss, and a high count alone is not waste; answer `unclear` when the data cannot decide.",
 		"When a finding has thresholdsKnown: false, do not judge it as exaggerated by threshold. Do not apply current thresholds or thresholds from another finding to it.",
 		"When inferenceThresholdsKnown marks a detector false, the thresholds in effect during the session are unknown; do not infer a miss for that detector.",
+		"Only cache storm and image load were checked for D4 from aggregates; do not infer other D4 conditions from aggregates.",
 		"When coverage.infoFindings is false, info findings were not being recorded before the session started, so their absence is not a miss.",
 		"Treat incomplete statistics as unknown, not zero.",
 		`Fired detectors: ${fired.length ? fired.join(", ") : "none"}. Write at least one check per fired detector. Set item to its detector ID or one of its finding refs.`,

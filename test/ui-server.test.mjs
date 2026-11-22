@@ -46,7 +46,17 @@ const SESSION_DETAIL = {
 	},
 	audit: null,
 };
-const sessionDetail = async (id) => (id === KNOWN_ID ? SESSION_DETAIL : { found: false, id });
+const sessionDetail = async (id, _row, { list, offset }) => {
+	if (id !== KNOWN_ID) return { found: false, id };
+	const lists = { ...SESSION_DETAIL.health, children: SESSION_DETAIL.children };
+	if (list !== null) return { list, offset, total: lists[list].length, items: lists[list].slice(offset, offset + 50) };
+	return {
+		...SESSION_DETAIL,
+		children: lists.children.slice(0, 50),
+		health: { ...SESSION_DETAIL.health, findings: lists.findings.slice(0, 50), messages: lists.messages.slice(0, 50) },
+		counts: { children: lists.children.length, ...SESSION_DETAIL.health.counts },
+	};
+};
 
 let root;
 let paths;
@@ -84,9 +94,9 @@ function postAt(targetPort, target, value, extra = {}) {
 }
 
 /** One GET against an arbitrary port; resolves { status, body } with body parsed as JSON. */
-function getAt(targetPort, target) {
+function getAt(targetPort, target, signal) {
 	return new Promise((resolve, reject) => {
-		const req = http.request({ host: "127.0.0.1", port: targetPort, method: "GET", path: target, headers: { "x-omo-health-token": TOKEN }, agent: false }, (res) => {
+		const req = http.request({ host: "127.0.0.1", port: targetPort, method: "GET", path: target, headers: { "x-omo-health-token": TOKEN }, agent: false, signal }, (res) => {
 			const chunks = [];
 			res.on("data", (c) => chunks.push(c));
 			res.on("end", () => {
@@ -788,14 +798,28 @@ describe("ui server", { timeout: 20_000 }, () => {
 				return path.join(world.paths.health.auditRequestsDir, `${AUDIT_ID}.json`);
 			}
 
-			it("IS-7 refreshes cached parent detail after a child-only transcript change", async (t) => {
-				const world = makeWorld();
-				const { paths, env, now, nowMs } = world;
+			it("IS-4 keeps state responsive across bounded worker replies for a large detail and every next page", async (t) => {
+				const totals = { children: 51, findings: 5_000, actions: 5_000, investigations: 51, messages: 20_000 };
+				const timestamp = (i) => new Date(Date.UTC(2026, 10, 22) - totals.messages + i).toISOString();
+				const world = makeWorld({ entries: Array.from({ length: totals.messages }, (_, i) => ({
+					type: "custom_message", customType: "omo-health", timestamp: timestamp(i), content: `notice ${i}`,
+				})) });
+				const { paths, env, now } = world;
 				const worker = createDetailWorker({ paths, env });
-				const jobs = [];
+				let onDispatch;
+				const replies = [];
 				const detail = createSessionDetail({
 					paths, env, now,
-					worker: { run: (job) => { jobs.push(job.kind); return worker.run(job); }, close: worker.close },
+					worker: {
+						async run(job) {
+							const reply = worker.run(job);
+							const proceed = onDispatch();
+							const [result] = await Promise.all([reply, proceed]);
+							replies.push(result);
+							return result;
+						},
+						close: worker.close,
+					},
 				});
 				const ui = createUiServer({ paths, token: TOKEN, getState: () => STATE, sessionDetail: detail, now });
 				t.after(async () => {
@@ -803,6 +827,70 @@ describe("ui server", { timeout: 20_000 }, () => {
 					await world.detail.close();
 					fs.rmSync(world.dir, { recursive: true, force: true });
 				});
+				const subject = { sessionId: AUDIT_ID };
+				writeJsonl(path.join(paths.health.decisionsDir, "2026-11-21.jsonl"), Array.from({ length: totals.findings }, (_, i) => ({
+					event: "opened", fp: `finding-${i}`, detector: "D8", kind: "dead-child", severity: "warn",
+					subject, ts: timestamp(i), action: { kind: "kill" }, result: "execute",
+				})));
+				for (let i = 0; i < totals.children; i++) {
+					appendEnded(paths, { sessionId: `s_child${i}`, kind: "child", parentSessionId: AUDIT_ID, outcome: "answered", endedMs: now() }, { nowMs: now() });
+				}
+				for (let i = 0; i < totals.investigations; i++) {
+					const id = `inv-${i}`;
+					writeJson(path.join(paths.health.investigationsDir, `${id}.json`), { id, subject, openedMs: Date.parse(timestamp(i)), status: "open" });
+				}
+				const { port } = await ui.listen();
+				const url = `/api/session?id=${AUDIT_ID}`;
+				async function getWhilePollingState(query = "") {
+					const dispatched = Promise.withResolvers();
+					const stateAnswered = Promise.withResolvers();
+					onDispatch = () => {
+						dispatched.resolve();
+						return stateAnswered.promise;
+					};
+					let inFlight = true;
+					const pending = getAt(port, `${url}${query}`, AbortSignal.timeout(10_000)).finally(() => { inFlight = false; });
+					try {
+						await Promise.race([dispatched.promise, pending.then(() => assert.fail("detail completed without dispatching a worker job"))]);
+						const started = performance.now();
+						assert.equal(inFlight, true, `${query}: detail in flight before polling state`);
+						const state = await getAt(port, "/api/state", AbortSignal.timeout(1_000));
+						const elapsed = performance.now() - started;
+						assert.equal(inFlight, true, `${query}: state answered before the detail completed`);
+						assert.deepEqual(state, { status: 200, body: STATE });
+						assert.ok(elapsed < 1_000, `${query}: /api/state took ${elapsed.toFixed(1)} ms`);
+					} finally {
+						stateAnswered.resolve();
+					}
+					return pending;
+				}
+
+				const first = await getWhilePollingState();
+				assert.equal(first.status, 200);
+				assert.deepEqual(first.body.counts, totals);
+				const listOf = (record, name) => name === "children" ? record.children : record.health[name];
+				for (const [name, total] of Object.entries(totals)) {
+					assert.equal(listOf(first.body, name).length, 50);
+					const page = await getWhilePollingState(`&list=${name}&offset=50`);
+					assert.deepEqual([page.status, page.body.list, page.body.offset, page.body.total, page.body.items.length],
+						[200, name, 50, total, Math.min(total - 50, 50)]);
+					assert.notDeepEqual(page.body.items[0], listOf(first.body, name)[0], `${name}: different page`);
+					if (name === "messages") assert.equal(page.body.items[0].text, `notice ${total - 51}`);
+				}
+				const [firstReply, ...pageReplies] = replies;
+				assert.deepEqual(Object.fromEntries(Object.keys(totals).map((name) => [name, listOf(firstReply.record, name).length])),
+					Object.fromEntries(Object.keys(totals).map((name) => [name, 50])), "items that crossed the worker boundary");
+				assert.deepEqual(firstReply.record.counts, totals, "whole-list totals cross the worker boundary");
+				for (const [i, [name, total]] of Object.entries(totals).entries()) {
+					assert.deepEqual(Object.keys(pageReplies[i].page).sort(), ["items", "list", "offset", "total"]);
+					assert.equal(pageReplies[i].record, undefined, `${name}: no record accompanies the worker's list page`);
+					assert.equal(pageReplies[i].page.items.length, Math.min(total - 50, 50));
+				}
+			});
+
+			it("IS-7 refreshes cached parent detail after a child-only transcript change", async (t) => {
+				const world = makeWorld();
+				const { paths, env, now, nowMs } = world;
 				const childId = "s_cachechild";
 				const taskId = "st_cachechild";
 				const cwd = world.dir;
@@ -813,6 +901,19 @@ describe("ui server", { timeout: 20_000 }, () => {
 				const childFile = writeTask(cwd, { task_id: taskId, child_session_id: childId, status: "completed" }, [
 					{ type: "session", id: childId, cwd },
 				]);
+				const reads = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+				const worker = createDetailWorker({
+					paths, env,
+					workerUrl: new URL("./helpers/observe-detail-worker.mjs", import.meta.url),
+					workerData: { transcript: childFile, reads: reads.buffer },
+				});
+				const detail = createSessionDetail({ paths, env, now, worker });
+				const ui = createUiServer({ paths, token: TOKEN, getState: () => STATE, sessionDetail: detail, now });
+				t.after(async () => {
+					await ui.close();
+					await world.detail.close();
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				});
 				const { port } = await ui.listen();
 				const open = async () => {
 					const { status, body } = await getAt(port, `/api/session?id=${AUDIT_ID}`);
@@ -823,16 +924,20 @@ describe("ui server", { timeout: 20_000 }, () => {
 					return body.health.messages.map(({ recipient, text }) => [recipient, text]);
 				};
 				assert.deepEqual(await open(), []);
+				const initialReads = Atomics.load(reads, 0);
+				assert.ok(initialReads > 0, "instrumentation observed the child transcript load");
 				assert.deepEqual(await open(), []);
-				assert.deepEqual(jobs, ["detail", "preview"], "an unchanged reopen does not load the record");
+				assert.equal(Atomics.load(reads, 0), initialReads, "an unchanged reopen does not load the record");
 
 				const message = { type: "custom_message", customType: "omo-health", timestamp: new Date(nowMs).toISOString(), content: "delivered to child" };
 				appendJsonl(childFile, [message]);
 				const mtime = nowMs / 1000;
 				fs.utimesSync(childFile, mtime, mtime);
 				assert.deepEqual(await open(), [[childId, message.content]], "child-only append must refresh the parent's messages");
+				const refreshedReads = Atomics.load(reads, 0);
+				assert.ok(refreshedReads > initialReads, "the append invalidated the cache");
 				assert.deepEqual(await open(), [[childId, message.content]]);
-				assert.deepEqual(jobs, ["detail", "preview", "detail", "preview"]);
+				assert.equal(Atomics.load(reads, 0), refreshedReads, "the refreshed record is cached");
 
 				const original = fs.statSync(childFile);
 				const replacement = `${childFile}.tmp`;
@@ -844,7 +949,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 				assert.deepEqual([replaced.size, replaced.mtimeMs], [original.size, original.mtimeMs]);
 				assert.notDeepEqual([replaced.ino, replaced.birthtimeMs], [original.ino, original.birthtimeMs]);
 				assert.deepEqual(await open(), [[childId, text]], "same-size, same-mtime child replacement must also refresh");
-				assert.deepEqual(jobs, ["detail", "preview", "detail", "preview", "detail"]);
+				assert.ok(Atomics.load(reads, 0) > refreshedReads, "the replacement invalidated the cache");
 			});
 
 			it("isolates ended children with task id st_x in two project stores", async () => {

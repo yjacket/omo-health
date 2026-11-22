@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { clearPause, setSwitch, writePause } from "../control.mjs";
 import { writeUiPrefs } from "./prefs.mjs";
+import { SESSION_LISTS } from "./session-view.mjs";
 
 const DEFAULT_STATIC_DIR = fileURLToPath(new URL("./static", import.meta.url));
 const MAX_BODY_BYTES = 4096;
@@ -41,11 +42,8 @@ const API_ROUTES = Object.freeze({
 const SUBJECT_ID = /^[A-Za-z0-9_-]{4,80}$/;
 /** Windows device names cannot be file names under audits/ even though they look like ids. */
 const RESERVED_ID = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$/i;
-/** The session detail lists, as the record names them; `children` lives on the record, the rest under `health`. */
-const SESSION_LISTS = Object.freeze(["children", "findings", "actions", "investigations", "messages"]);
 const SESSION_QUERY_KEYS = Object.freeze(new Set(["id", "row", "list", "offset"]));
 const SESSION_ROW = /^[0-9a-f]{16}$/;
-const SESSION_PAGE = 50;
 const NON_NEGATIVE_INT = /^\d+$/;
 
 const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -179,40 +177,13 @@ export function createUiServer({ paths, token, getState, diagnose, sessionDetail
 		return { id, row, list, offset: offsetText === null ? 0 : Number(offsetText) };
 	}
 
-	/** One list of the detail, wherever the record keeps it. */
-	function sessionList(detail, name) {
-		const health = isPlainObject(detail.health) ? detail.health : {};
-		const items = name === "children" ? detail.children : health[name];
-		return Array.isArray(items) ? items : [];
-	}
-
-	/** The default response: the first page of every list plus the whole-record counts. */
-	function sessionFirstPage(detail) {
-		const health = isPlainObject(detail.health) ? detail.health : {};
-		const lists = Object.fromEntries(SESSION_LISTS.map((name) => [name, sessionList(detail, name)]));
-		return {
-			...detail,
-			children: lists.children.slice(0, SESSION_PAGE),
-			health: {
-				...health,
-				findings: lists.findings.slice(0, SESSION_PAGE),
-				actions: lists.actions.slice(0, SESSION_PAGE),
-				investigations: lists.investigations.slice(0, SESSION_PAGE),
-				messages: lists.messages.slice(0, SESSION_PAGE),
-			},
-			counts: Object.fromEntries(SESSION_LISTS.map((name) => [name, lists[name].length])),
-		};
-	}
-
 	/** GET /api/session?id=<task|session>[&row=<selector>][&list=<name>&offset=<n>]. */
 	async function serveSession(req, res) {
-		const query = parseSessionQuery(req.url);
+		const { id, row, ...pagination } = parseSessionQuery(req.url);
 		if (!sessionDetail) throw new HttpFailure(404, { error: "not-found" });
-		const detail = await sessionDetail(query.id, query.row);
+		const detail = await sessionDetail(id, row, pagination);
 		if (!isPlainObject(detail) || detail.found === false) throw new HttpFailure(404, { error: "not-found" });
-		if (query.list === null) return send(res, 200, sessionFirstPage(detail));
-		const all = sessionList(detail, query.list);
-		send(res, 200, { list: query.list, offset: query.offset, total: all.length, items: all.slice(query.offset, query.offset + SESSION_PAGE) });
+		send(res, 200, detail);
 	}
 
 	async function serveStatic(req, res, pathname) {

@@ -30,7 +30,7 @@ import { resolvePaths } from "../src/paths.mjs";
 import { appendEnded } from "../src/session-ledger.mjs";
 import { buildSessionRecord, loadSessionRecord } from "../src/session-record.mjs";
 import { compactUsage, createUsageIndex } from "../src/usage-index.mjs";
-import { tmpDir, iso, writeJsonl } from "./helpers/fixtures.mjs";
+import { E, tmpDir, iso, writeJsonl } from "./helpers/fixtures.mjs";
 import { relayDecisions } from "./helpers/relay-decisions.mjs";
 
 const T0 = Date.parse("2026-11-20T00:00:00Z");
@@ -707,6 +707,46 @@ test("plan64: fast turns with a cache storm suggest D4, not D5", () => {
 	assert.match(suggestion, /\(D4(?:,|\))/);
 	assert.doesNotMatch(suggestion, /\bD5\b/);
 	assert.deepEqual(bundle.requiredDetectors, ["D4"]);
+});
+
+test("IS-8 image load: aggregate inference agrees with the real D4 detector", (t) => {
+	const dir = tmpDir("omoh-audit-image-load-");
+	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+	const config = structuredClone(DEFAULT_CONFIG);
+	const cfg = config.tokens;
+	// Isolate the inclusive trim boundary without a lower warning cutoff.
+	cfg.imageWarnCount = cfg.imageTrimCount;
+	cfg.imageWarnBytes = 1024;
+	const now = T0 + HOUR;
+	const configDecisions = [{ ms: T0, thresholdsHash: detectorThresholdsHash(config) }];
+	const record = emptyRecord();
+	const required = {};
+	for (const [name, count, bytes, level] of [
+		["trim-count", cfg.imageTrimCount, 4, "trim"],
+		["below", cfg.imageTrimCount - 1, 4, null],
+		["warn-bytes", 1, cfg.imageWarnBytes, "warn"],
+	]) {
+		const file = path.join(dir, `${name}.jsonl`);
+		const user = E.user("", T0);
+		user.message.content = Array(count).fill({ type: "image", data: "A".repeat(bytes), mimeType: "image/png" });
+		writeJsonl(file, [user, E.assistant({ ms: T0 + 1000 })]);
+		const findings = detectTokens(detectorWorld(file, config, now));
+		assert.deepEqual(findings.map(({ kind, data }) => [kind, data.level]), level ? [["image-load", level]] : []);
+		const timeline = usageTimeline(file, cfg);
+		assert.equal(timeline.cache.stormTurns, 0);
+		assert.deepEqual(timeline.images, { peakCount: count, peakMiB: count * bytes / (1024 * 1024), incomplete: false });
+		const bundle = auditBundle(record, timeline, { config, now, configDecisions });
+		assert.deepEqual(bundle.omo_health_record.findings, []);
+		required[name] = bundle.requiredDetectors;
+		if (name === "trim-count") {
+			const incomplete = { ...timeline, images: { ...timeline.images, incomplete: true } };
+			required.incomplete = auditBundle(record, incomplete, { config, now, configDecisions }).requiredDetectors;
+			required.discontinuous = auditBundle(record, timeline, { config, now, configDecisions: [{ ...configDecisions[0], ms: T0 + 1 }] }).requiredDetectors;
+		}
+	}
+	assert.deepEqual(required, {
+		"trim-count": ["D4"], incomplete: [], discontinuous: [], below: [], "warn-bytes": ["D4"],
+	});
 });
 
 test("IS-8: sustained low hit rate without a cache storm is context only", () => {

@@ -45,7 +45,7 @@ export function providerOf(session) {
 }
 
 /** `trim`, `warn` or null: the size or the count, whichever reaches its threshold first. A Claude subagent warns at its own line. */
-function imageLevel(images, bytes, cfg, child = false) {
+export function imageLevel(images, bytes, cfg, child = false) {
 	if (bytes >= cfg.imageTrimBytes || images >= cfg.imageTrimCount) return "trim";
 	const warnBytes = child ? cfg.imageWarnChildBytes : cfg.imageWarnBytes;
 	const warnCount = child ? cfg.imageWarnChildCount : cfg.imageWarnCount;

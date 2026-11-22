@@ -391,6 +391,39 @@ for (const complete of [false, true]) {
 	});
 }
 
+test("IS-8 image load: omitting D4 fails and judging D4 finishes done", async (t) => {
+	const user = E.user("", BASE - 123_000);
+	const count = DEFAULT_CONFIG.tokens.imageTrimCount;
+	user.message.content = Array(count).fill({ type: "image", data: "AAAA", mimeType: "image/png" });
+	const h = harness({ sessions: ["m1", "m2"], entries: [user, E.assistant({ ms: BASE - 120_000 })] });
+	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+	appendDecision(h.paths, { ts: new Date(BASE - 3_600_000).toISOString(), event: "config", result: "startup", thresholdsHash: detectorThresholdsHash(h.config) });
+	const auditor = h.auditor();
+	const outcomes = [];
+	for (const [id, complete] of [["m1", false], ["m2", true]]) {
+		h.request(id);
+		await h.prepare(auditor);
+		const launched = h.record(id);
+		assert.equal(launched.status, "running");
+		assert.deepEqual(launched.firedDetectors, []);
+		const document = fs.readFileSync(path.join(h.paths.health.jobsDir, launched.jobId, "bundle.md"), "utf8");
+		assert.match(document, /"stormTurns":0/);
+		assert.match(document, new RegExp(`"images":\\{"peakCount":${count},"peakMiB":[^,]+,"incomplete":false\\}`));
+		const checks = [...TOKEN_ONLY_ANSWER.checks];
+		if (complete) checks.push({ item: "D4", judgment: "missed", explanation: "이미지 누적을 놓쳤습니다.", evidence: ["T"] });
+		h.runner.script = () => ({ ...DONE, result: { ...TOKEN_ONLY_ANSWER, checks } });
+		h.tick(auditor);
+		const state = h.record(id);
+		if (complete) assert.deepEqual(state.result?.checks, checks);
+		const suggested = /^Also write one check.*\bD4\b/m.test(document);
+		outcomes.push([launched.requiredDetectors, suggested, state.status, state.reason]);
+	}
+	assert.deepEqual(outcomes, [
+		[["D4"], true, "failed", "incomplete-checks"],
+		[["D4"], true, "done", null],
+	]);
+});
+
 test("(gate 16) audit preparation reaches reviewer launch with a resident index at 96 MiB", (t) => {
 	const h = harness({ providers: ["openai", "google"], entries: [E.assistant({ ms: BASE - 120_000, model: "gpt-5-5", provider: "openai" })] });
 	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
