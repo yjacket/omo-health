@@ -1,5 +1,5 @@
 import { parentPort, workerData } from "node:worker_threads";
-import { auditModelFacts, readAuditTimeline } from "./auditor.mjs";
+import { readAuditTimeline } from "./auditor.mjs";
 import { createSessionFileLocator } from "./collect/session-files.mjs";
 import { loadSessionRecord, usageEntryOf } from "./session-record.mjs";
 import { readUsageIndex } from "./usage-index.mjs";
@@ -16,7 +16,7 @@ export function prepareAudit({ sessionId, now, bounds }, { paths, loadRecord = l
 	const file = entry?.file ?? (session.taskId ? null : locator.mainFile(session.sessionId));
 	let warning;
 	const full = readAuditTimeline(file, tokens, { maxFileBytes: bounds.messageScanMaxBytes, timeline, log: { warn: (_event, detail) => { warning = detail; } } });
-	return { loaded, full, facts: auditModelFacts(entry, full), warning };
+	return { loaded, full, warning };
 }
 
 if (parentPort && workerData?.auditPrepareWorker) {

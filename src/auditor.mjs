@@ -6,6 +6,7 @@ import { usageTimeline } from "./collect/usage.mjs";
 import { auditBundle, auditDocument, detectorFindingRefs, firedDetectors, hasDetectorCoverage, resolveAuditModel, validateAudit } from "./judge/audit.mjs";
 import { ANALYST_POLL_MS, parseAnalystOutput, unavailableReason } from "./judge/analyst.mjs";
 import { laneArgs } from "./judge/lane.mjs";
+import { usageEntryOf } from "./session-record.mjs";
 import { auditReasonLabel } from "./ui/labels.mjs";
 import { fresh, isSpillModelKey } from "./usage-index.mjs";
 import { atomicWriteFile, atomicWriteJson, ensureDir, listDirSafe, readJsonSafe, readTextSafe, removeSafe, statSafe } from "./util/fsx.mjs";
@@ -165,7 +166,7 @@ export function readAuditTimeline(file, tokens, { maxFileBytes = TIMELINE_MAX_BY
 	}
 }
 
-export function createAuditor({ paths, config, clock, log, runner, env = process.env, timelineMaxBytes = TIMELINE_MAX_BYTES, createWorker = (url, options) => new Worker(url, options), afterStart } = {}) {
+export function createAuditor({ paths, config, clock, log, runner, index, env = process.env, timelineMaxBytes = TIMELINE_MAX_BYTES, createWorker = (url, options) => new Worker(url, options), afterStart } = {}) {
 	const auditsDir = paths.health.auditsDir;
 	const jobsDir = paths.health.jobsDir;
 	let worker;
@@ -271,11 +272,13 @@ export function createAuditor({ paths, config, clock, log, runner, env = process
 		}
 	}
 
-	function launchPrepared(record, now, { loaded, full, facts, warning }) {
+	function launchPrepared(record, now, { loaded, full, warning }) {
 		if (config.audit?.enabled !== true) return fail(record, "disabled", null, now);
 		if (!loaded?.found) return fail(record, "not-found", null, now);
 		if (readBudget(paths, now).count >= config.audit.perDay) return fail(record, "cap", null, now);
 		if (warning) log?.warn?.("audit_timeline_failed", warning);
+		// The resident index may have learned identities since the worker prepared the evidence.
+		const facts = auditModelFacts(index ? usageEntryOf(index, loaded.session ?? {}) : null, full);
 		// The record join already collected every analyst model for its selected fps, including decision-only fps.
 		const analystModels = loaded.analystModels ?? [];
 		const choice = resolveAuditModel(paths, config, { ...facts, analystModels });

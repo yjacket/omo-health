@@ -709,7 +709,7 @@ test("a same-length rewrite is no longer fresh, queueLedger requeues it, and the
 	assert.equal(fresh(index.get("m1")), false);
 	assert.ok(tracker.queueLedger(rows) > 0, "the changed file is queued again");
 
-	const a = h.auditor({ timelineMaxBytes: 1 });
+	const a = h.auditor({ index, timelineMaxBytes: 1 });
 	h.request("m1");
 	await h.prepare(a);
 	assert.equal(h.record("m1").reason, "models-unknown");
@@ -740,7 +740,7 @@ test("a same-length rewrite read by a complete timeline excludes the new model b
 	fs.utimesSync(file, new Date(before.atimeMs), new Date(before.mtimeMs + 5000));
 	assert.equal(fresh(index.get("m1")), false, "the index still holds the old read");
 
-	const a = h.auditor();
+	const a = h.auditor({ index });
 	h.request("m1");
 	await h.prepare(a);
 	assert.equal(h.runner.starts.length, 1, "a complete timeline proves coverage without the recount");
@@ -769,6 +769,36 @@ function indexed(h, id, { maxBytes } = {}) {
 	return index;
 }
 
+test("(IS-1, IS-9) reviewer launch excludes an identity learned only by the resident index after preparation", async (t) => {
+	for (const changed of [false, true]) {
+		const h = harness();
+		const index = indexed(h, "m1");
+		t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+		const auditor = h.auditor({ index });
+		const published = fs.readFileSync(index.file, "utf8");
+		assert.equal(index.get("m1").published.usedModels["openai/gpt-5-5"], undefined);
+
+		h.request("m1");
+		h.tick(auditor);
+		await auditor.preparing();
+		assert.equal(h.record("m1").status, "queued");
+		assert.equal(h.runner.starts.length, 0);
+
+		if (changed) {
+			appendJsonl(h.files.m1, [openaiLine()]);
+			index.update("m1", h.files.m1, { kind: "main" });
+			assert.ok(index.get("m1").published.usedModels["openai/gpt-5-5"]);
+			assert.equal(fresh(index.get("m1")), true);
+			assert.equal(fs.readFileSync(index.file, "utf8"), published, "the resident update was not saved");
+		}
+
+		h.tick(auditor);
+		assert.equal(h.record("m1").status, "running");
+		assert.equal(h.runner.starts.length, 1);
+		assert.equal(modelOf(h.runner.starts[0]), changed ? "google/gemini-3-pro" : "openai/gpt-5-5");
+	}
+});
+
 test("(gate 15) the auditor excludes an identity missing only from published.usedModels", async () => {
 	const h = harness({ entries: [openaiLine()] });
 	const index = indexed(h, "m1");
@@ -778,7 +808,8 @@ test("(gate 15) the auditor excludes an identity missing only from published.use
 	delete entry.published.usedModels["openai/gpt-5-5"];
 	fs.writeFileSync(file, `${header}\n${JSON.stringify(entry)}\n`);
 
-	const a = h.auditor({ timelineMaxBytes: fs.statSync(h.files.m1).size - 1 });
+	const resident = createUsageIndex({ file, clock: h.clock, log: silent });
+	const a = h.auditor({ index: resident, timelineMaxBytes: fs.statSync(h.files.m1).size - 1 });
 	h.request("m1");
 	await h.prepare(a);
 	assert.equal(modelOf(h.runner.starts[0]), "google/gemini-3-pro");
@@ -790,24 +821,24 @@ test("without a full timeline, an incomplete entry and a complete entry that is 
 	assert.equal(index.get("m1").complete, false);
 	appendJsonl(h.files.m1, [openaiLine()]);
 	const small = fs.statSync(h.files.m1).size - 1;
-	const a = h.auditor({ timelineMaxBytes: small });
+	const a = h.auditor({ index, timelineMaxBytes: small });
 	h.request("m1");
 	await h.prepare(a);
 	assert.equal(h.record("m1").reason, "models-unknown");
 
-	indexed(h, "m1");
+	const resident = indexed(h, "m1");
 	appendJsonl(h.files.m1, [E.assistant({ ms: BASE - 20_000, id: "a-later", model: "gpt-5-5", provider: "openai" })]);
-	const entry = createUsageIndex({ file: h.paths.health.usageIndexFile, clock: h.clock, log: silent }).get("m1");
+	const entry = resident.get("m1");
 	assert.equal(entry.complete, true);
 	assert.equal(fresh(entry), false, "complete but not at the end");
-	const b = h.auditor({ timelineMaxBytes: fs.statSync(h.files.m1).size - 1 });
+	const b = h.auditor({ index: resident, timelineMaxBytes: fs.statSync(h.files.m1).size - 1 });
 	h.request("m1");
 	await h.prepare(b);
 	assert.equal(h.record("m1").reason, "models-unknown");
 	assert.equal(h.runner.starts.length, 0);
 	assert.equal(h.budget(), undefined);
 
-	const c = h.auditor();
+	const c = h.auditor({ index: resident });
 	h.request("m1");
 	await h.prepare(c);
 	assert.equal(modelOf(h.runner.starts[0]), "google/gemini-3-pro", "with the timeline the unread suffix is seen and its model excluded");
@@ -821,11 +852,11 @@ test("a prewarm entry alone excludes the first candidate, a failed prewarm in an
 	assert.equal(modelOf(h.runner.starts[0]), "google/gemini-3-pro");
 
 	const g = harness();
-	indexed(g, "m1");
+	const index = indexed(g, "m1");
 	appendJsonl(g.files.m1, [prewarm("failed")]);
-	const entry = createUsageIndex({ file: g.paths.health.usageIndexFile, clock: g.clock, log: silent }).get("m1");
+	const entry = index.get("m1");
 	assert.equal(fresh(entry), false);
-	const b = g.auditor();
+	const b = g.auditor({ index });
 	g.request("m1");
 	await g.prepare(b);
 	assert.equal(modelOf(g.runner.starts[0]), "google/gemini-3-pro");
@@ -886,7 +917,7 @@ test("a fresh task-keyed entry from another store cannot certify a queued child 
 	assert.ok(index.save(), "publish the colliding entry to the preparation worker");
 
 	h.request("child-b");
-	await h.prepare(h.auditor());
+	await h.prepare(h.auditor({ index }));
 	const { status, reason } = h.record("child-b");
 	assert.deepEqual([status, reason, h.runner.starts.length, h.budget()], ["failed", "models-unknown", 0, undefined]);
 });
@@ -902,7 +933,8 @@ for (const incomplete of ["timeline", "index"]) {
 			entry.published.modelsIncomplete = true;
 			fs.writeFileSync(file, `${header}\n${JSON.stringify(entry)}\n`);
 		}
-		const a = h.auditor({ createWorker: probeWorker(incomplete) });
+		const index = createUsageIndex({ file: h.paths.health.usageIndexFile, clock: h.clock, log: silent });
+		const a = h.auditor({ index, createWorker: probeWorker(incomplete) });
 		h.request("m1");
 		await h.prepare(a);
 		assert.equal(h.record("m1").reason, "models-unknown");

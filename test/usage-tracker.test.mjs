@@ -289,6 +289,53 @@ test("a tick never reads more than the byte budget: a 40 MiB live record waits w
 	assert.equal(compactUsage(s.index.get("b1")).total, 5);
 });
 
+for (const [label, bytes] of [["40 MiB", 40 * 1024 * 1024], ["small", 512 * 1024]]) {
+	test(`(IS-2, IS-12) a small append resumes a ${label} EOF record without rereading it`, (t) => {
+		const s = setup();
+		t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+		const id = "resume";
+		const file = mainFile(s.paths, id);
+		const world = makeWorld({ now: s.clock.now(), sessions: [sessionState({ id, file, cwd: s.cwd })] });
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		const [head, tail] = bigRecord(0, usage(7)).split('""');
+		const padding = Buffer.alloc(Math.min(bytes, 1024 * 1024), "x");
+		const fd = fs.openSync(file, "w");
+		try {
+			fs.writeFileSync(fd, `${head}"`);
+			for (let rest = bytes - head.length - tail.length - 2; rest > 0; rest -= padding.length) {
+				fs.writeFileSync(fd, padding.subarray(0, rest));
+			}
+			fs.writeFileSync(fd, `"${tail}`);
+		} finally {
+			fs.closeSync(fd);
+		}
+		assert.equal(s.tracker.tick(world).bytesRead, Math.min(bytes, USAGE_TICK_BYTES));
+		if (bytes > USAGE_TICK_BYTES) assert.equal(s.tracker.tick(world).bytesRead, bytes - USAGE_TICK_BYTES);
+		assert.equal(s.tracker.tokensOf(id).tokens.total, 7);
+		assert.equal(s.index.get(id).offset, 0, "the EOF overlay has not been committed");
+		assert.equal(s.index.save(), true);
+
+		const index = createUsageIndex({ file: s.index.file, clock: s.clock });
+		const restarted = createUsageTracker({ paths: s.paths, index, clock: s.clock });
+		assert.equal(restarted.tokensOf(id).tokens.total, 7);
+		const append = `\n${bigRecord(0, usage(11))}\n`;
+		const appendedBytes = Buffer.byteLength(append);
+		fs.appendFileSync(file, append);
+
+		assert.equal(s.tracker.tick(world).bytesRead, appendedBytes, "only the append spends the live tick budget");
+		const live = s.tracker.tokensOf(id).tokens;
+		assert.deepEqual([live.total, live.turns], [18, 2]);
+		assert.equal(s.index.get(id).overlay.total, 0);
+		assert.equal(s.tracker.tick(world).bytesRead, 0);
+		assert.deepEqual(s.tracker.tokensOf(id).tokens, live);
+
+		const coldBytes = bytes + appendedBytes;
+		assert.equal(restarted.tick(world).bytesRead, Math.min(coldBytes, USAGE_TICK_BYTES), "restart reads from the persisted offset");
+		if (coldBytes > USAGE_TICK_BYTES) assert.equal(restarted.tick(world).bytesRead, coldBytes - USAGE_TICK_BYTES);
+		assert.deepEqual(restarted.tokensOf(id).tokens, live);
+	});
+}
+
 test("a verified live session waiting for its first read is pending on the board", (t) => {
 	const s = setup();
 	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));

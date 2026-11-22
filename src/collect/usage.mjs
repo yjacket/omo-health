@@ -13,7 +13,7 @@ import { classifyProviderError } from "../detect/provider.mjs";
  *
  * `readUsage` is incremental and resumable: persisted fields (`offset`, `usage`,
  * `head`, `tail`, file identity) never hold a whole file, and `scanOffset` /
- * `partial` only live in memory for a record cut by `maxBytes`.
+ * `partial` only live in memory for a record cut by `maxBytes` or EOF.
  */
 
 export const USAGE_TOOLS_KEY = "Tools/summaries";
@@ -21,6 +21,7 @@ export const MODEL_KEY_LIMIT = 1000;
 export const MODEL_KEY_LENGTH = 256;
 
 const RECORD_PARSE_LIMIT = 16 * 1024 * 1024;
+const USAGE_BUFFER_LIMIT = 1024 * 1024;
 const READ_CHUNK = 4 * 1024 * 1024;
 const HEAD_LIMIT = 4096;
 const BOM_0 = 0xef;
@@ -447,7 +448,7 @@ function truncatedIdentity(prefix) {
 
 const TRUNCATED_NONSTRING_ID = Object.freeze({ [Symbol.toPrimitive]: () => MODEL_ID_TOO_LONG });
 
-/** Validating projection for records above RECORD_PARSE_LIMIT. Only a selected
+/** Validating projection for records above the buffer limit. Only a selected
  * value can own the capture buffer. The stack below the projected objects is
  * just container-kind bits: ancestors always resume in STATE_AFTER. */
 export function createRecordScanner() {
@@ -703,11 +704,16 @@ export function createRecordScanner() {
 			}
 			return malformed ? undefined : entry;
 		},
+		// Only an object can contribute usage, and its closing brace already
+		// completes it. Do not finalize a torn object at a provisional EOF.
+		preview() {
+			return !malformed && state === STATE_END ? entry : undefined;
+		},
 		get malformed() {
 			return malformed;
 		},
 		get oversized() {
-			if (!finished || malformed || !entry) return false;
+			if (malformed || state !== STATE_END || !entry) return false;
 			const carrier = usageCarrier(entry);
 			if (!carrier) return false;
 			if (carrier[TRUNCATED_USAGE]?.size) return true;
@@ -721,25 +727,27 @@ function newAccumulator(start) {
 	return { [RECORD_ACCUMULATOR]: true, start, kind: "buffer", parts: [], len: 0 };
 }
 
-function appendBytes(accumulator, bytes) {
+function appendBytes(accumulator, bytes, bufferLimit = RECORD_PARSE_LIMIT) {
 	if (!bytes.length) return accumulator;
 	let acc = accumulator;
 	if (acc.kind === "buffer") {
-		acc.parts.push(Buffer.from(bytes));
-		acc.len += bytes.length;
-		if (acc.len > RECORD_PARSE_LIMIT) {
+		if (acc.len + bytes.length > bufferLimit) {
 			const scanner = createRecordScanner();
+			const parts = [...acc.parts, bytes];
 			let skip = 0;
 			if (acc.start === 0) {
-				const first = acc.parts[0].length < 3 ? Buffer.concat(acc.parts.slice(0, 3), 3) : acc.parts[0];
+				const first = parts[0].length < 3 ? Buffer.concat(parts.slice(0, 3), 3) : parts[0];
 				if (stripBomBuffer(first) !== first) skip = 3;
 			}
-			for (const part of acc.parts) {
+			for (const part of parts) {
 				const consumed = Math.min(skip, part.length);
 				skip -= consumed;
 				scanner.push(part.subarray(consumed));
 			}
 			acc = { [RECORD_ACCUMULATOR]: true, start: acc.start, kind: "scanner", scanner };
+		} else {
+			acc.parts.push(Buffer.from(bytes));
+			acc.len += bytes.length;
 		}
 	} else {
 		acc.scanner.push(bytes);
@@ -789,9 +797,14 @@ function finalFragment(acc) {
 }
 
 function consumeScannerRecord(totals, scanner, fragment = false) {
+	if (fragment) {
+		const entry = scanner.preview();
+		if (entry) consumeEntry(totals, entry, scanner.oversized);
+		return;
+	}
 	const entry = scanner.finish();
 	if (scanner.malformed) {
-		if (!fragment) totals.diagnostics.badLines += 1;
+		totals.diagnostics.badLines += 1;
 		return;
 	}
 	consumeEntry(totals, entry, scanner.oversized);
@@ -897,10 +910,10 @@ export function readUsage(file, from, { maxBytes = Infinity } = {}) {
 			for (;;) {
 				const newline = chunk.indexOf(NEWLINE, index);
 				if (newline === -1) {
-					acc = appendBytes(acc, chunk.subarray(index));
+					acc = appendBytes(acc, chunk.subarray(index), USAGE_BUFFER_LIMIT);
 					break;
 				}
-				acc = appendBytes(acc, chunk.subarray(index, newline));
+				acc = appendBytes(acc, chunk.subarray(index, newline), USAGE_BUFFER_LIMIT);
 				finishRecord(usage, acc);
 				offset = chunkStart + newline + 1;
 				acc = newline + 1 >= chunk.length ? undefined : newAccumulator(chunkStart + newline + 1);
@@ -910,16 +923,11 @@ export function readUsage(file, from, { maxBytes = Infinity } = {}) {
 		}
 
 		const overlay = emptyUsage();
-		if (acc) {
-			if (position === size) {
-				if (acc.kind === "scanner") consumeScannerRecord(overlay, acc.scanner, true);
-				else {
-					const entry = finalFragment(acc);
-					if (entry !== undefined) consumeEntry(overlay, entry);
-				}
-				partial = undefined;
-			} else {
-				partial = acc;
+		if (acc && position === size) {
+			if (acc.kind === "scanner") consumeScannerRecord(overlay, acc.scanner, true);
+			else {
+				const entry = finalFragment(acc);
+				if (entry !== undefined) consumeEntry(overlay, entry);
 			}
 		}
 		const evaluatedTo = position;
@@ -929,7 +937,7 @@ export function readUsage(file, from, { maxBytes = Infinity } = {}) {
 		return {
 			offset,
 			scanOffset: position,
-			partial,
+			partial: acc,
 			size,
 			mtimeMs,
 			ino,
