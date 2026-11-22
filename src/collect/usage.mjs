@@ -34,6 +34,14 @@ const BRACKET_CLOSE = 0x5d;
 const COMMA = 0x2c;
 const COLON = 0x3a;
 const LOWER_U = 0x75;
+const ZERO = 0x30;
+const NINE = 0x39;
+const MINUS = 0x2d;
+const PLUS = 0x2b;
+const DOT = 0x2e;
+const LOWER_E = 0x65;
+const UPPER_E = 0x45;
+const STRING_RETAIN_LIMIT = 4096;
 
 const isObject = (value) => typeof value === "object" && value !== null;
 const nonNegative = (value) => (Number.isFinite(value) && value >= 0 ? value : 0);
@@ -265,6 +273,8 @@ export function createRecordScanner() {
 	let stringBytes = [];
 	let stringTarget;
 	let stringIsKey = false;
+	let stringOverflow = false;
+	let literal;
 	let capture;
 	let malformed = false;
 	let done = false;
@@ -299,6 +309,7 @@ export function createRecordScanner() {
 	};
 
 	const decodeString = () => {
+		if (stringOverflow) return undefined;
 		try {
 			return JSON.parse(`"${Buffer.from(stringBytes).toString("utf8")}"`);
 		} catch {
@@ -307,11 +318,94 @@ export function createRecordScanner() {
 		}
 	};
 
+	const retainStringByte = (byte) => {
+		if (!(stringIsKey || stringTarget) || stringOverflow) return;
+		if (stringBytes.length >= STRING_RETAIN_LIMIT) {
+			stringOverflow = true;
+			return;
+		}
+		stringBytes.push(byte);
+	};
+
+	const isDigit = (byte) => byte >= ZERO && byte <= NINE;
+	const isNonZeroDigit = (byte) => byte > ZERO && byte <= NINE;
+	const isExponent = (byte) => byte === LOWER_E || byte === UPPER_E;
+
+	const beginLiteral = (byte) => {
+		if (byte === 0x74) literal = { token: "true", index: 1 };
+		else if (byte === 0x66) literal = { token: "false", index: 1 };
+		else if (byte === 0x6e) literal = { token: "null", index: 1 };
+		else if (byte === MINUS) literal = { state: "minus" };
+		else if (byte === ZERO) literal = { state: "zero" };
+		else if (isNonZeroDigit(byte)) literal = { state: "int" };
+		else {
+			literal = undefined;
+			malformed = true;
+		}
+	};
+
+	const feedLiteral = (byte) => {
+		if (!literal) return;
+		if (literal.token) {
+			if (literal.token.charCodeAt(literal.index) !== byte) malformed = true;
+			literal.index += 1;
+			return;
+		}
+		switch (literal.state) {
+			case "minus":
+				if (byte === ZERO) literal.state = "zero";
+				else if (isNonZeroDigit(byte)) literal.state = "int";
+				else malformed = true;
+				break;
+			case "zero":
+				if (byte === DOT) literal.state = "fracStart";
+				else if (isExponent(byte)) literal.state = "expStart";
+				else malformed = true;
+				break;
+			case "int":
+				if (isDigit(byte)) break;
+				if (byte === DOT) literal.state = "fracStart";
+				else if (isExponent(byte)) literal.state = "expStart";
+				else malformed = true;
+				break;
+			case "fracStart":
+				if (isDigit(byte)) literal.state = "frac";
+				else malformed = true;
+				break;
+			case "frac":
+				if (isExponent(byte)) literal.state = "expStart";
+				else if (!isDigit(byte)) malformed = true;
+				break;
+			case "expStart":
+				if (byte === PLUS || byte === MINUS) literal.state = "expSign";
+				else if (isDigit(byte)) literal.state = "exp";
+				else malformed = true;
+				break;
+			case "expSign":
+				if (isDigit(byte)) literal.state = "exp";
+				else malformed = true;
+				break;
+			case "exp":
+				if (!isDigit(byte)) malformed = true;
+				break;
+		}
+	};
+
+	const endLiteral = () => {
+		if (!literal) return false;
+		const complete = literal.token
+			? literal.index === literal.token.length
+			: literal.state === "zero" || literal.state === "int" || literal.state === "frac" || literal.state === "exp";
+		literal = undefined;
+		return complete;
+	};
+
 	const beginString = () => {
 		inString = true;
 		escaped = false;
 		unicodeLeft = 0;
 		stringBytes = [];
+		stringOverflow = false;
 		if (expect === "key") {
 			stringIsKey = true;
 			stringTarget = undefined;
@@ -319,23 +413,23 @@ export function createRecordScanner() {
 		}
 		stringIsKey = false;
 		stringTarget = expect === "value" ? stringValueTarget() : undefined;
-		if (expect === "after" || expect === "start" || expect === "literal") malformed = true;
+		if (expect !== "value") malformed = true;
 	};
 
 	const endString = () => {
 		inString = false;
+		const container = currentContainer();
 		if (stringIsKey) {
 			const key = decodeString();
-			const container = currentContainer();
 			if (container) container.key = key;
 			expect = "colon";
 			return;
 		}
 		if (stringTarget) {
 			const value = decodeString();
-			const container = currentContainer();
 			if (value !== undefined && container && container.key !== undefined) stringTarget[container.key] = value;
 		}
+		if (container) container.count += 1;
 		expect = "after";
 	};
 
@@ -344,10 +438,10 @@ export function createRecordScanner() {
 		const type = byte === BRACE_OPEN ? "object" : "array";
 		if (byte === BRACE_OPEN) {
 			const target = !capture && expect !== "start" ? usageObjectTarget() : undefined;
-			stack.push({ type, key: undefined });
+			stack.push({ type, key: undefined, count: 0 });
 			if (target) capture = { holder: target, key: "usage", depth: stack.length, bytes: [byte] };
 		} else {
-			stack.push({ type, key: undefined });
+			stack.push({ type, key: undefined, count: 0 });
 		}
 		expect = type === "object" ? "key" : "value";
 	};
@@ -359,6 +453,10 @@ export function createRecordScanner() {
 			malformed = true;
 			return;
 		}
+		const empty = container.count === 0;
+		const closesCleanly =
+			type === "object" ? expect === "after" || (empty && expect === "key") : expect === "after" || (empty && expect === "value");
+		if (!closesCleanly) malformed = true;
 		stack.pop();
 		if (capture && stack.length === capture.depth - 1) {
 			let value;
@@ -371,7 +469,11 @@ export function createRecordScanner() {
 			capture = undefined;
 		}
 		expect = "after";
-		if (!stack.length) done = true;
+		if (!stack.length) {
+			done = true;
+		} else {
+			currentContainer().count += 1;
+		}
 	};
 
 	const push = (chunk) => {
@@ -385,18 +487,18 @@ export function createRecordScanner() {
 			if (capture) capture.bytes.push(byte);
 			if (inString) {
 				if (unicodeLeft > 0) {
-					stringBytes.push(byte);
+					retainStringByte(byte);
 					unicodeLeft -= 1;
 					continue;
 				}
 				if (escaped) {
-					stringBytes.push(byte);
+					retainStringByte(byte);
 					escaped = false;
 					if (byte === LOWER_U) unicodeLeft = 4;
 					continue;
 				}
 				if (byte === BACKSLASH) {
-					stringBytes.push(byte);
+					retainStringByte(byte);
 					escaped = true;
 					continue;
 				}
@@ -404,16 +506,23 @@ export function createRecordScanner() {
 					endString();
 					continue;
 				}
-				if (stringIsKey || stringTarget) stringBytes.push(byte);
+				retainStringByte(byte);
 				continue;
 			}
 			if (expect === "literal") {
 				if (isWhitespace(byte)) {
+					if (!endLiteral()) malformed = true;
 					expect = "after";
+					if (currentContainer()) currentContainer().count += 1;
 					continue;
 				}
-				if (byte !== COMMA && byte !== BRACE_CLOSE && byte !== BRACKET_CLOSE) continue;
+				if (byte !== COMMA && byte !== BRACE_CLOSE && byte !== BRACKET_CLOSE) {
+					feedLiteral(byte);
+					continue;
+				}
+				if (!endLiteral()) malformed = true;
 				expect = "after";
+				if (currentContainer()) currentContainer().count += 1;
 			} else if (isWhitespace(byte)) {
 				continue;
 			}
@@ -430,7 +539,7 @@ export function createRecordScanner() {
 					closeContainer(byte);
 					break;
 				case COMMA:
-					if (!stack.length || (expect !== "after" && expect !== "value")) {
+					if (!stack.length || expect !== "after") {
 						malformed = true;
 					} else {
 						expect = currentContainer().type === "object" ? "key" : "value";
@@ -441,8 +550,12 @@ export function createRecordScanner() {
 					expect = "value";
 					break;
 				default:
-					if (expect === "value") expect = "literal";
-					else if (expect !== "after") malformed = true;
+					if (expect === "value") {
+						beginLiteral(byte);
+						expect = "literal";
+					} else {
+						malformed = true;
+					}
 					break;
 			}
 		}
@@ -450,7 +563,7 @@ export function createRecordScanner() {
 
 	const finish = () => {
 		if (result) return result;
-		if (inString || escaped || unicodeLeft > 0 || stack.length > 0 || !done) malformed = true;
+		if (inString || escaped || unicodeLeft > 0 || literal || stack.length > 0 || !done) malformed = true;
 		let entry;
 		if (!malformed) {
 			entry = {};
@@ -471,6 +584,9 @@ export function createRecordScanner() {
 		finish,
 		get malformed() {
 			return malformed;
+		},
+		get bufferedBytes() {
+			return stringBytes.length + (capture ? capture.bytes.length : 0);
 		},
 	};
 }

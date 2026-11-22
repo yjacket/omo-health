@@ -617,6 +617,52 @@ test("does not restart when a large record is appended to a 2 KiB file", (t) => 
 	assert.equal(second.effective.total, oracleTotals(file()).total + 1);
 });
 
+test("a large escaped ignored value is not retained by the scanner", () => {
+	const usage = use({ input: 7, output: 0, cacheRead: 0, cacheWrite: 0 });
+	const escaped = "\\n".repeat((3 * MiB) / 2);
+	const record = Buffer.from(`{"type":"message","message":{"role":"assistant","content":"${escaped}"},"usage":${JSON.stringify(usage)}}`);
+	const scanner = createRecordScanner();
+	let peak = 0;
+	for (let index = 0; index < record.length; index += 4093) {
+		scanner.push(record.subarray(index, index + 4093));
+		peak = Math.max(peak, scanner.bufferedBytes);
+	}
+	assert.equal(scanner.malformed, false);
+	assert.ok(peak <= 8192, `scanner retained ${peak} bytes`);
+	assert.deepEqual(scanner.finish().usage, usage);
+});
+
+test("the scanner validates skipped literals and containers the way JSON.parse does", () => {
+	for (const value of ["true", "false", "null", "0", "-0", "12", "-12", "1.5", "0.5", "1e3", "1E-4", "-1.25e+6"]) {
+		const record = `{"type":"message","x":${value},"usage":{"input":1}}`;
+		const scanned = scanInChunks(Buffer.from(record), 3);
+		assert.equal(scanned.malformed, false, `valid literal ${value}`);
+		assert.deepEqual(scanned.entry.usage, { input: 1 });
+	}
+	for (const value of ["broken", "True", "tru", "falsey", "nul", "01", "-", "-.5", "1.", ".5", "+1", "1e", "1e+", "NaN", "Infinity"]) {
+		const record = `{"type":"message","x":${value},"usage":{"input":13}}`;
+		assert.equal(scanInChunks(Buffer.from(record), 3).malformed, true, `invalid literal ${value}`);
+	}
+	for (const fragment of ["{}", "[]", "[1,2]", '{"x":[true,null,{"y":-1.5e+2}]}']) {
+		const record = `{"type":"message","payload":${fragment},"usage":{"input":2}}`;
+		assert.equal(scanInChunks(Buffer.from(record), 2).malformed, false, `valid container ${fragment}`);
+	}
+	for (const fragment of ['{"x":1,}', "[1,]", '{"x":1 "y":2}', "[1 2]"]) {
+		const record = `{"type":"message","payload":${fragment},"usage":{"input":5}}`;
+		assert.equal(scanInChunks(Buffer.from(record), 2).malformed, true, `invalid container ${fragment}`);
+	}
+});
+
+test("a large record with an invalid literal counts as bad and adds no usage", (t) => {
+	const { file } = setup(t);
+	const padding = "a".repeat(17 * MiB);
+	const line = `{"type":"message","message":{"role":"assistant","content":"${padding}"},"bad":broken,"usage":{"input":13,"output":0,"cacheRead":0,"cacheWrite":0,"cost":{"total":0}}}`;
+	fs.writeFileSync(file(), `${line}\n`);
+	const got = readUsage(file());
+	assert.equal(got.usage.diagnostics.badLines, 1);
+	assert.equal(got.effective.total, 0);
+});
+
 test("counts a malformed large record in badLines", (t) => {
 	const { file } = setup(t);
 	const malformed = `{"type":"message","usage":{"input":1},"x":"${"a".repeat(17 * MiB)}"`;
