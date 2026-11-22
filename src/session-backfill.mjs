@@ -116,9 +116,23 @@ function readCrashes(paths, sinceMs, errors) {
 	return out.sort((a, b) => a.atMs - b.atMs);
 }
 
-/** Executed kill-pids / release-shell decisions, keyed by the task and session ids they name. */
-function readReleases(paths, sinceMs, errors) {
-	const byId = new Map();
+/** Resolve each executed release to at most one child across the scanned stores. */
+function readReleases(paths, sinceMs, errors, tasks) {
+	const owners = { taskId: new Map(), sessionId: new Map() };
+	const remember = (index, id, projectKey, task) => {
+		if (typeof id !== "string" || !id) return;
+		for (const scope of projectKey ? [null, projectKey] : [null]) {
+			const key = subjectKey({ projectKey: scope, sessionId: id });
+			index.set(key, index.has(key) ? null : task);
+		}
+	};
+	// Even children outside the write window can make a legacy ID ambiguous.
+	for (const task of tasks) {
+		const projectKey = projectKeyOf(task.cwd);
+		remember(owners.taskId, task.taskId, projectKey, task);
+		remember(owners.sessionId, task.childSessionId, projectKey, task);
+	}
+	const byChild = new Map();
 	for (const name of listDirSafe(paths.health.decisionsDir).filter((n) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(n))) {
 		if (Date.parse(`${name.slice(0, 10)}T23:59:59.999Z`) < sinceMs) continue;
 		let text;
@@ -133,14 +147,25 @@ function readReleases(paths, sinceMs, errors) {
 			const entry = parseLine(line);
 			const kind = entry?.action?.kind;
 			if (!RELEASE_KINDS.has(kind) || (entry.result !== undefined && entry.result !== "execute")) continue;
-			const ms = toMs(entry.ts);
-			const hit = { kind, ms };
-			for (const id of [entry.subject?.taskId, entry.subject?.sessionId, entry.action?.params?.taskId, entry.action?.params?.sessionId]) {
-				if (typeof id === "string" && id && !byId.has(id)) byId.set(id, hit);
+			const subjectProject = subjectOf(entry.subject).projectKey;
+			const paramsProject = subjectOf(entry.action.params).projectKey;
+			if (subjectProject != null && paramsProject != null && subjectProject !== paramsProject) continue;
+			const projectKey = subjectProject ?? paramsProject;
+			const matches = new Set();
+			for (const source of [entry.subject, entry.action.params]) {
+				for (const field of ["taskId", "sessionId"]) {
+					const id = source?.[field];
+					if (typeof id !== "string" || !id) continue;
+					const owner = owners[field].get(subjectKey({ projectKey, sessionId: id }));
+					if (owner) matches.add(owner);
+				}
 			}
+			if (matches.size !== 1) continue;
+			const [child] = matches;
+			if (!byChild.has(child)) byChild.set(child, { kind, ms: toMs(entry.ts) });
 		}
 	}
-	return byId;
+	return byChild;
 }
 
 /** Read new traversal edges within the tick's allowance, with no open fd across ticks. */
@@ -199,7 +224,7 @@ function childOutcome(task, releases) {
 		const detail = task.errorMessage ? `: ${clean(task.errorMessage, 160)}` : ".";
 		return { outcome: "failed", reason: `작업이 오류로 끝났습니다${detail}` };
 	}
-	const release = releases.get(task.taskId) ?? (task.childSessionId ? releases.get(task.childSessionId) : undefined);
+	const release = releases.get(task);
 	if (release) return { outcome: "released", reason: `omo-health가 ${release.kind} 조치로 호출을 종료했습니다${Number.isFinite(release.ms) ? ` (${kst(release.ms)})` : ""}.` };
 	return { outcome: "unknown", reason: `작업 상태가 ${clean(task.status ?? "없음", 30)}이고 끝난 이유를 알려 줄 기록이 없습니다.` };
 }
@@ -365,7 +390,7 @@ function* readRelated(paths, { cwds, sinceMs, errors }, budget) {
 		for (const task of yield* readTasks(cwd, storeDir, errors, taskBudget)) remember(task);
 	}
 
-	return { tasks, childSubjects, childCount, crashes: readCrashes(paths, sinceMs, errors), releases: readReleases(paths, sinceMs, errors) };
+	return { tasks, childSubjects, childCount, crashes: readCrashes(paths, sinceMs, errors), releases: readReleases(paths, sinceMs, errors, tasks) };
 }
 
 function writeBatch(paths, nowMs, { sinceMs, liveCutMs, mains, related }, lastBatch) {

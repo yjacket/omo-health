@@ -1341,6 +1341,34 @@ test("(IS-1) worker prepares tokens, children and model facts after the index fi
 	assert.equal(modelOf(h.runner.starts[0]), "google/gemini-3-pro");
 });
 
+test("(IS-1, IS-7) detail and outbound fallback preserve models sharing a 120-character prefix", async (t) => {
+	const provider = "openai";
+	const prefix = "m".repeat(120 - provider.length - 1);
+	const models = [`${prefix}${"a".repeat(136)}`, `${prefix}${"b".repeat(136)}`];
+	const counts = [41, 23];
+	const h = harness({ entries: models.map((model, i) => openaiLine({
+		id: `long-model-${i}`, provider, model,
+		usage: { input: counts[i], output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+	})) });
+	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+	const index = indexed(h, "m1");
+	const expected = models.map((model, i) => ({ key: `${provider}/${model}`, tokens: counts[i], cost: 0 }));
+	const { record: detail } = createDetailOperations({ paths: h.paths, auditDetail: () => null })({
+		kind: "detail", id: "m1", now: h.clock.now(), pagination: { list: null, offset: 0 },
+	});
+
+	const timelineMaxBytes = 1;
+	assert.ok(fs.statSync(h.files.m1).size > timelineMaxBytes);
+	const auditor = h.auditor({ index, timelineMaxBytes });
+	h.request("m1");
+	await h.prepare(auditor);
+	const launched = h.record("m1");
+	assert.equal(launched.status, "running");
+	const document = fs.readFileSync(path.join(h.paths.health.jobsDir, launched.jobId, "bundle.md"), "utf8");
+	const bundle = JSON.parse(document.split("\n").find((line) => line.startsWith('{"session":')));
+	assert.deepEqual({ detail: detail.tokens.models, outbound: bundle.tokens.models }, { detail: expected, outbound: expected });
+});
+
 test("(gate 15) the auditor excludes an identity missing only from published.usedModels", async () => {
 	const h = harness({ entries: [openaiLine()] });
 	const index = indexed(h, "m1");

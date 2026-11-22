@@ -112,6 +112,33 @@ function processBackfilledRows(paths, now) {
 	return tracker;
 }
 
+test("backfill attributes releases only to a uniquely identified child", (t) => {
+	const { paths, now, startedMs, endedMs, sessionId, a, b } = setupProjectPair(t);
+	const interrupted = (cwd, id) => writeTask(cwd, {
+		task_id: `st_${id}`, parent_session_id: sessionId, child_session_id: id,
+		status: "interrupted", created_at: iso(startedMs), terminal_at: iso(endedMs),
+	});
+	for (const cwd of [a, b]) {
+		interrupted(cwd, "ambiguous");
+		interrupted(cwd, "scoped");
+	}
+	interrupted(a, "unique");
+	writeJsonl(path.join(paths.health.decisionsDir, `${iso(endedMs).slice(0, 10)}.jsonl`), [
+		{ ts: iso(endedMs), action: { kind: "release-shell" }, result: "execute", subject: { taskId: "st_ambiguous", sessionId: "ambiguous" } },
+		{ ts: iso(endedMs), action: { kind: "release-shell" }, result: "execute", subject: { taskId: "st_scoped" } },
+		{ ts: iso(endedMs), action: { kind: "release-shell" }, result: "execute", subject: { taskId: "st_scoped", projectKey: projectKeyOf(b) } },
+		{ ts: iso(endedMs), action: { kind: "release-shell", params: { sessionId: "unique" } }, result: "execute" },
+	]);
+
+	assert.deepEqual(backfillOnce(paths, now).errors, []);
+	assert.deepEqual(readEnded(paths).filter((row) => row.kind === "child")
+		.map((row) => [row.sessionId, path.basename(row.cwd), row.outcome].join("/")).sort(), [
+		"ambiguous/a/unknown", "ambiguous/b/unknown",
+		"scoped/a/unknown", "scoped/b/released",
+		"unique/a/released",
+	]);
+});
+
 test("a v2 upgrade respects the transcript byte allowance each tick and resumes after restart", (t) => {
 	const a = fs.mkdtempSync(path.join(os.tmpdir(), "backfill-resume-"));
 	t.after(() => fs.rmSync(a, { recursive: true, force: true }));
