@@ -219,6 +219,29 @@ test("a request becomes queued, then running with the marker, the guard flags an
 	assert.equal(a.busy(), false);
 });
 
+test("a request the daemon accepted is not expired while it waits behind a running audit, and starts after it", () => {
+	const h = harness({ sessions: ["m1", "m2"] });
+	const a = h.auditor();
+	h.request("m1");
+	h.request("m2");
+	h.tick(a);
+	assert.equal(h.record("m1").status, "running");
+	assert.equal(h.record("m2").status, "queued");
+	h.tick(a, REQUEST_TTL_MS + 60_000);
+	assert.equal(h.record("m1").status, "running", "still inside its 15-minute limit");
+	assert.equal(h.record("m2").status, "queued", "the expiry applies to a request file the daemon has not taken, not to the queue");
+	h.runner.script = () => DONE;
+	h.tick(a);
+	assert.equal(h.record("m1").status, "done");
+	h.tick(a);
+	assert.equal(h.record("m2").status, "running", "the waiting request starts once the slot is free");
+	h.tick(a);
+	assert.equal(h.record("m2").status, "done");
+	assert.equal(h.record("m2").reason ?? null, null);
+	assert.equal(h.runner.starts.length, 2);
+	assert.equal(h.budget().count, 2);
+});
+
 test("a running job survives a daemon restart: one runner.start and one charge", () => {
 	const h = harness();
 	const a = h.auditor();
