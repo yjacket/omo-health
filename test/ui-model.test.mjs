@@ -14,7 +14,7 @@ import { createFakeClock } from "../src/util/time.mjs";
 import { createUsageIndex, readUsageIndex, USAGE_INDEX_VERSION } from "../src/usage-index.mjs";
 import { ACTION_LABELS, EXIT_REASON_LABELS, GOAL_STATUS_LABELS, INVESTIGATION_STATUS_LABELS, OUTCOME_LABELS, SESSION_STATE_LABELS, TASK_STATUS_LABELS, TERMINAL_LABELS, TRIGGER_LABELS } from "../src/ui/labels.mjs";
 import { buildHistory } from "../src/ui/history.mjs";
-import { buildOverview, buildSessions, buildSettings, buildUiState, daemonStatus, endedRow, loadDaemonInputs, loadUiInputs, uiState } from "../src/ui/model.mjs";
+import { buildEnded, buildOverview, buildSessions, buildSettings, buildUiState, daemonStatus, endedRow, loadDaemonInputs, loadUiInputs, uiState } from "../src/ui/model.mjs";
 import { buildSessionView } from "../src/ui/session-view.mjs";
 import { buildSessionSnapshot } from "../src/session-board.mjs";
 import { createUsageTracker } from "../src/usage-tracker.mjs";
@@ -54,6 +54,60 @@ function writeDecisions(paths, lines, rawFile = "2026-09-28.jsonl") {
 const heartbeat = (extra = {}) => ({ pid: 424242, ts: NOW - 10_000, startedMs: NOW - DAY, version: "0.3.0", mode: "auto", ...extra });
 const inputsOf = (home, overrides = {}) => ({ ...loadUiInputs({ paths: home.paths, env: home.env, now: NOW }), ...overrides });
 const running = (home, hbExtra, overrides = {}) => inputsOf(home, { heartbeat: heartbeat(hbExtra), pidAlive: true, ...overrides });
+
+it("(plan 35) history adds a detail selector only to shared session IDs", () => {
+	const shared = { sessionId: "st_shared", taskId: "st_shared", kind: "child" };
+	const { rows } = buildEnded({ now: NOW, ended: [
+		{ ...shared, endedMs: NOW, parentSessionId: "b" },
+		{ sessionId: "unique", endedMs: NOW - 1 },
+		{ ...shared, endedMs: NOW - 2, parentSessionId: "a" },
+	] });
+	assert.deepEqual(rows.map((r) => [r.sessionId, r.detailEndedMs]), [
+		["st_shared", NOW], ["unique", undefined], ["st_shared", NOW - 2],
+	]);
+	assert.equal(Object.hasOwn(rows[1], "detailEndedMs"), false);
+});
+
+it("(plan 35) browser history toggles and requests each row independently", async () => {
+	const app = fs.readFileSync(new URL("../src/ui/static/app.js", import.meta.url), "utf8");
+	const openEnded = new Set();
+	const endedDetails = new Map();
+	const urls = [];
+	const el = (tag, attrs, ...children) => ({
+		tag, ...attrs, children: children.flat(), classList: { toggle() {} }, setAttribute() {},
+	});
+	const { endedItem, loadEndedPage } = runInNewContext(
+		["endedDetailId", "endedDetailUrl", "endedItem", "loadEndedDetail", "loadEndedPage"]
+			.map((name) => app.match(new RegExp(`(?:async )?function ${name}\\([^]*?\\n\\t\\}`))?.[0]).join("\n") +
+			"\n({ endedItem, loadEndedPage })",
+		{
+			el, openEnded, endedDetails, drawEndedDetail() {}, ENDED_COLUMNS: Array(6).fill("column"), cellClass() {},
+			when() {}, endedSessionCell() {}, outcomeMark() {}, endedTokenCell() {}, show() {},
+			append: (body, children) => Object.assign(body, { children }),
+			getJson: (url) => { urls.push(url); return { messages: [], counts: { messages: 1 } }; },
+			gone: false, busy: new Set(), errors: new Map(), detailList: (data, name) => data[name],
+		},
+	);
+	const rows = [
+		{ sessionId: "st_shared", endedMs: NOW, detailEndedMs: NOW },
+		{ sessionId: "st_shared", endedMs: NOW - 1, detailEndedMs: NOW - 1 },
+		{ sessionId: "unique", endedMs: NOW },
+	];
+	const items = rows.map(endedItem);
+	assert.deepEqual(items.map(({ children: [row] }) => row.children[0].children[0]["data-key"]),
+		[`ended:st_shared:${NOW}`, `ended:st_shared:${NOW - 1}`, "ended:unique"]);
+	for (const { children: [row] } of items) row.onclick();
+	await Promise.resolve();
+	await loadEndedPage(rows[1], "messages");
+	assert.deepEqual(urls, [
+		`/api/session?id=st_shared&ended=${NOW}`,
+		`/api/session?id=st_shared&ended=${NOW - 1}`,
+		"/api/session?id=unique",
+		`/api/session?id=st_shared&ended=${NOW - 1}&list=messages&offset=0`,
+	]);
+	assert.equal(openEnded.size, 3);
+	assert.equal(endedDetails.size, 3);
+});
 
 it("(gate 16) history and board show a dash with the full-index tooltip", () => {
 	const id = "full-session";
@@ -161,6 +215,29 @@ it("history overflow survives /api/state serialization and renders for own and N
 		[null, "overflow", "-", overflowTitle]);
 	assert.deepEqual([history.treeTokens, history.treeTokensState, cell.children[1]?.text, cell.children[1]?.title],
 		[null, "overflow", "자식 포함 -", overflowTitle]);
+});
+
+it("(IS-3) history renders a second line for equal and lower tree totals, but not uncounted descendants", () => {
+	const { paths, env } = makeHome();
+	const rows = [
+		["equal", "0", "자식 포함 10"],
+		["lower", "-3", "자식 포함 7"],
+		["missing", null, undefined],
+	];
+	const row = { kind: "main", startedMs: NOW - HOUR, endedMs: NOW, outcome: "completed" };
+	for (const [id] of rows) appendEnded(paths, { ...row, sessionId: id }, { nowMs: NOW });
+	const index = overflowIndex(paths, rows.flatMap(([id, input]) => [
+		[id, "10"],
+		...(input === null ? [] : [[`${id}-child`, input, id]]),
+	]));
+	index.markMissing("missing-child", { kind: "child", parentSessionId: "missing" });
+	index.save();
+	const history = new Map(JSON.parse(JSON.stringify(uiState({ paths, env, now: NOW }))).ended.rows.map((row) => [row.sessionId, row]));
+	const { endedTokenCell } = tokenFormatters("endedTokenCell");
+	assert.deepEqual(rows.map(([id]) => {
+		const row = history.get(id);
+		return [row.treeTokens, endedTokenCell(row).children[1]?.text];
+	}), [[10, rows[0][2]], [7, rows[1][2]], [null, rows[2][2]]]);
 });
 
 it("(gate 17) the disk-backed full state renders a dash in history, detail, and child rows until recount", () => {

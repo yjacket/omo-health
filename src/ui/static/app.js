@@ -359,6 +359,7 @@
 						depth ? el("span", { class: "tree__branch", "aria-hidden": "true", text: "└" }) : null,
 						el("span", { class: "tree__name", text: c.name }),
 						el("span", { class: "tree__meta", title: c.tokensState ? tokenReading(c.tokensState).title : c.tokens ? `토큰 ${fullCount(c.tokens.total)}` : undefined, text: childMeta(c) }),
+						treeTokenMark(c, "tree__meta"),
 					),
 					c.children.length ? tree(c.children, depth + 1) : null,
 				),
@@ -379,11 +380,12 @@
 		]);
 	}
 
-	/** A live session's token marks: its own total (계산 중 until its file is read to the end), then the tree total when its children add to it. */
+	/** A live session's own total, then the tree total when a descendant has been counted. */
 	function boardTokenMarks(s) {
-		if (!s.tokens && !s.tokensPending && !s.tokensState) return null;
+		const tree = treeTokenMark(s);
+		if (!s.tokens && !s.tokensPending && !s.tokensState) return tree;
 		const own = tokenReading(s.tokensState ?? (s.tokens ? "ok" : "pending"), s.tokens?.total);
-		return [el("span", { title: own.title, text: `토큰 ${own.text}` }), treeTokenMark(s)];
+		return [el("span", { title: own.title, text: `토큰 ${own.text}` }), tree];
 	}
 
 	/** One main session: the head row is the accordion toggle; the body shows details, the child tree and the health rows. */
@@ -477,14 +479,14 @@
 
 	const outcomeMark = (o) => el("span", { class: `outcome outcome--${OUTCOME_TONE[o.outcome] ?? "idle"}`, text: o.estimated ? `${o.outcomeKo} (추정)` : o.outcomeKo });
 
-	/** The 토큰 cell: the session's own total, and under it the tree total when its children add to it. */
+	/** The 토큰 cell: the session's own total, then the tree total when a descendant has been counted. */
 	function endedTokenCell(r) {
 		const own = tokenReading(r.tokensState, r.tokens?.total);
 		return el(
 			"span",
 			{ class: "ended__tokens" },
 			el("span", { class: r.tokensState === "ok" ? undefined : "ended__none", title: r.tokensGone && r.tokensState !== "overflow" ? `${own.title} (파일 삭제됨)` : own.title, text: own.text }),
-			r.tokensState === "ok" || r.tokensState === "overflow" || r.treeTokensState === "overflow" ? treeTokenMark(r, "ended__meta") : null,
+			treeTokenMark(r, "ended__meta"),
 		);
 	}
 
@@ -536,6 +538,10 @@
 			[{ label: "모델" }, { label: "토큰", num: true }, { label: "비용", num: true }],
 			models.map((m) => ({ cells: [mono(m.key), fullCount(m.tokens), costText(m.cost)] })),
 		);
+	}
+
+	function endedTokenBlock(t) {
+		return block("토큰", endedTokenFacts(t), treeTokenMark({ treeTokens: t?.treeTotal, treeTokensState: t?.treeTokensState }, "ended__meta"));
 	}
 
 	function endedChild(c) {
@@ -621,15 +627,15 @@
 	const auditTone = (judgment) => (judgment === "sound" ? "ok" : judgment === "unverifiable" ? undefined : "warn");
 
 	/** How to start an audit: the model it would use and today's count, why it cannot start now, then 조사 (다시 조사 after a result). */
-	function auditStart(id, a, label, primary = false) {
-		const group = `audit:${id}`;
+	function auditStart(r, a, label, primary = false) {
+		const group = `audit:${endedDetailId(r)}`;
 		const blocked = a.blocked ? (AUDIT_BLOCKED_TEXT[a.blocked] ?? a.blocked) : null;
 		return el(
 			"div",
 			{ class: "block" },
 			note(`조사 모델 ${show(a.planned?.model)} · 오늘 ${show(a.usedToday)}/${show(a.perDay)}`),
 			blocked ? note(`${blocked}.`, "warn") : null,
-			el("div", { class: "wrap-row" }, button(label, { group, key: group, primary, disabled: Boolean(a.blocked), onclick: () => void startAudit(id) })),
+			el("div", { class: "wrap-row" }, button(label, { group, key: group, primary, disabled: Boolean(a.blocked), onclick: () => void startAudit(r) })),
 		);
 	}
 
@@ -680,32 +686,42 @@
 	}
 
 	/** 상위 모델 조사: start an audit of the session, follow it while it is queued or running, then show the verdict or why there is none. */
-	function auditBlock(id, a) {
+	function auditBlock(r, a) {
+		const id = endedDetailId(r);
 		const status = a.state?.status;
 		let parts;
 		if (AUDIT_ACTIVE.has(status)) parts = auditProgress(a);
-		else if (status === "done") parts = [auditResult(a.state), auditStart(id, a, "다시 조사")];
-		else if (status === "failed") parts = [auditFailure(a.state), auditStart(id, a, "다시 조사")];
-		else parts = auditStart(id, a, "조사", true);
+		else if (status === "done") parts = [auditResult(a.state), auditStart(r, a, "다시 조사")];
+		else if (status === "failed") parts = [auditFailure(a.state), auditStart(r, a, "다시 조사")];
+		else parts = auditStart(r, a, "조사", true);
 		return block("상위 모델 조사", el("div", { class: "audit" }, parts, errorSlot(`audit:${id}`), errorSlot(`audit-read:${id}`)));
+	}
+
+	function endedDetailId(r) {
+		return r.detailEndedMs === undefined ? r.sessionId : `${r.sessionId}:${r.detailEndedMs}`;
+	}
+
+	function endedDetailUrl(r) {
+		const url = `/api/session?id=${encodeURIComponent(r.sessionId)}`;
+		return r.detailEndedMs === undefined ? url : `${url}&ended=${r.detailEndedMs}`;
 	}
 
 	/** Everything omo-health recorded about one ended session, as GET /api/session returns it. */
 	function endedRecord(r, d) {
-		const id = r.sessionId;
+		const id = endedDetailId(r);
 		/** One list of the record or its empty state, then 더 보기 while the server holds more of it than the page has. */
 		const paged = (name, wrap, none) => {
 			const items = detailList(d, name);
 			const group = `more:${id}:${name}`;
 			return [
 				items.length ? wrap(items) : empty(none),
-				items.length < d.counts[name] ? el("div", { class: "wrap-row" }, button(`더 보기 (${items.length}/${d.counts[name]})`, { group, key: group, onclick: () => void loadEndedPage(id, name) })) : null,
+				items.length < d.counts[name] ? el("div", { class: "wrap-row" }, button(`더 보기 (${items.length}/${d.counts[name]})`, { group, key: group, onclick: () => void loadEndedPage(r, name) })) : null,
 				errorSlot(group),
 			];
 		};
 		const samples = (row) => (items) => el("div", { class: "samples" }, items.map(row));
 		return [
-			el("div", { class: "split" }, block("상세", endedFacts(r, d.session)), block("토큰", endedTokenFacts(d.tokens))),
+			el("div", { class: "split" }, block("상세", endedFacts(r, d.session)), endedTokenBlock(d.tokens)),
 			block("모델별", endedModels(d.tokens?.models)),
 			block("자식 세션", paged("children", (items) => el("ul", { class: "tree" }, items.map(endedChild)), "자식 세션이 없습니다")),
 			block(
@@ -720,17 +736,17 @@
 					subBlock("보낸 메시지", paged("messages", samples((m) => endedMessage(m, d.session.sessionId)), "보낸 메시지가 없습니다")),
 				),
 			),
-			auditBlock(id, d.audit),
+			auditBlock(r, d.audit),
 		];
 	}
 
 	/** What an open row shows under it: the fetch in progress, its failure with a way to retry, or the session's record. */
 	function endedDetailView(r) {
-		const id = r.sessionId;
+		const id = endedDetailId(r);
 		const entry = endedDetails.get(id);
 		const body = (...children) => el("div", { class: "ended__body" }, children);
 		if (entry.state === "loading") return body(note("불러오는 중"));
-		if (entry.state === "error") return body(note(`상세를 읽지 못했습니다: ${entry.error}`, "crit"), el("div", { class: "wrap-row" }, button("다시 읽기", { key: `ended-retry:${id}`, onclick: () => void loadEndedDetail(id) })));
+		if (entry.state === "error") return body(note(`상세를 읽지 못했습니다: ${entry.error}`, "crit"), el("div", { class: "wrap-row" }, button("다시 읽기", { key: `ended-retry:${id}`, onclick: () => void loadEndedDetail(r) })));
 		// A stored record of an unexpected shape costs its own cell, not the whole table.
 		try {
 			return body(endedRecord(r, entry.data));
@@ -744,18 +760,19 @@
 		const cell = [...document.querySelectorAll("td[data-ended]")].find((n) => n.dataset.ended === id);
 		if (!cell || !openEnded.has(id)) return;
 		const held = cell.contains(document.activeElement) ? document.activeElement.dataset.key : null;
-		cell.replaceChildren(endedDetailView(lastState.ended.rows.find((r) => r.sessionId === id)));
+		cell.replaceChildren(endedDetailView(lastState.ended.rows.find((r) => endedDetailId(r) === id)));
 		// A control the redraw removed (다시 읽기, the last 더 보기) hands its focus to the row's own toggle.
 		if (held && !focusByKey(held)) focusByKey(`ended:${id}`);
 	}
 
 	/** Fetches a session's record for its open row. Once per page: a later open and every re-render read the map. */
-	async function loadEndedDetail(id) {
+	async function loadEndedDetail(r) {
+		const id = endedDetailId(r);
 		const entry = { state: "loading", data: null, error: null };
 		endedDetails.set(id, entry);
 		drawEndedDetail(id);
 		try {
-			const data = await getJson(`/api/session?id=${encodeURIComponent(id)}`);
+			const data = await getJson(endedDetailUrl(r));
 			// No data means a 401: the masthead already says the token is wrong.
 			Object.assign(entry, data ? { state: "ready", data } : { state: "error", error: "토큰이 맞지 않습니다" });
 		} catch (error) {
@@ -765,7 +782,8 @@
 	}
 
 	/** Fetches the next page of one list and appends it to the stored record, so the items survive every redraw. */
-	async function loadEndedPage(id, name) {
+	async function loadEndedPage(r, name) {
+		const id = endedDetailId(r);
 		const group = `more:${id}:${name}`;
 		if (gone || busy.has(group)) return;
 		const d = endedDetails.get(id).data;
@@ -773,7 +791,7 @@
 		busy.add(group);
 		errors.delete(group);
 		try {
-			const page = await getJson(`/api/session?id=${encodeURIComponent(id)}&list=${name}&offset=${items.length}`);
+			const page = await getJson(`${endedDetailUrl(r)}&list=${name}&offset=${items.length}`);
 			if (page) {
 				items.push(...page.items);
 				// An empty page means the list ends here, whatever the count said.
@@ -787,20 +805,21 @@
 	}
 
 	/** Asks the daemon for an audit of the session, then re-reads the row's audit block before 조사 can be pressed again. */
-	function startAudit(id) {
-		return post("/api/audit", { sessionId: id }, `audit:${id}`, () => loadAudit(id));
+	function startAudit(r) {
+		return post("/api/audit", { sessionId: r.sessionId }, `audit:${endedDetailId(r)}`, () => loadAudit(r));
 	}
 
 	/**
 	 * Re-reads one open row's audit block. The rest of the record stays as first fetched, with every page 더 보기 appended to it.
 	 * `headers` marks the 10 s re-read as automatic, so following an audit does not keep the server alive.
 	 */
-	async function loadAudit(id, headers) {
+	async function loadAudit(r, headers) {
+		const id = endedDetailId(r);
 		const entry = endedDetails.get(id);
 		if (entry?.state !== "ready") return;
 		const slot = `audit-read:${id}`;
 		try {
-			const data = await getJson(`/api/session?id=${encodeURIComponent(id)}`, headers);
+			const data = await getJson(endedDetailUrl(r), headers);
 			if (data) {
 				// A refusal shown while the audit ran (이미 조사 중입니다) is moot once it ends.
 				if (AUDIT_ACTIVE.has(entry.data.audit?.state?.status) && !AUDIT_ACTIVE.has(data.audit?.state?.status)) errors.delete(`audit:${id}`);
@@ -817,13 +836,16 @@
 	function pollAudits() {
 		for (const cell of document.querySelectorAll("td[data-ended]")) {
 			const id = cell.dataset.ended;
-			if (openEnded.has(id) && AUDIT_ACTIVE.has(endedDetails.get(id)?.data?.audit?.state?.status)) void loadAudit(id, { "x-omo-health-auto": "1" });
+			if (openEnded.has(id) && AUDIT_ACTIVE.has(endedDetails.get(id)?.data?.audit?.state?.status)) {
+				const row = lastState.ended.rows.find((r) => endedDetailId(r) === id);
+				if (row) void loadAudit(row, { "x-omo-health-auto": "1" });
+			}
 		}
 	}
 
 	/** One ended session: its six-column row, and the detail row it expands into. The row is the click target; the button is the keyboard one. */
 	function endedItem(r) {
-		const id = r.sessionId;
+		const id = endedDetailId(r);
 		const open = openEnded.has(id);
 		const toggle = el("button", { type: "button", class: "ended__toggle", "data-key": `ended:${id}`, "aria-expanded": String(open) }, el("span", { class: "row__chevron", "aria-hidden": "true" }), when(r.endedMs));
 		const detail = el("tr", { class: "ended__detail", hidden: !open }, el("td", { colspan: String(ENDED_COLUMNS.length), "data-ended": id }, open ? endedDetailView(r) : null));
@@ -849,7 +871,7 @@
 					detail.hidden = !next;
 					if (!next) return;
 					if (endedDetails.has(id)) drawEndedDetail(id);
-					else void loadEndedDetail(id);
+					else void loadEndedDetail(r);
 				},
 			},
 			cells.map((cell, i) => el(i === 0 ? "th" : "td", { scope: i === 0 ? "row" : undefined, class: cellClass(ENDED_COLUMNS[i]) }, cell)),

@@ -119,7 +119,7 @@ function newestFileMs(dir) {
  * The dashboard's memoized `sessionDetail` (plan todo 8): it caches the
  * historical record only, keyed by every file the reader consumes, and rebuilds
  * the labels with `buildSessionView` on every call so the audit block and daemon
- * status (todo 13) are always read fresh. The cache holds at most 20 ids.
+ * status (todo 13) are always read fresh. The cache holds at most 20 detail lookups.
  */
 export function createSessionDetail({ paths, env = process.env, now = Date.now, load, maxEntries = SESSION_CACHE_MAX, auditDetail, worker } = {}) {
 	const local = load || auditDetail ? createDetailOperations({ paths, env, load, auditDetail }) : null;
@@ -135,22 +135,23 @@ export function createSessionDetail({ paths, env = process.env, now = Date.now, 
 			usage: fileStamp(paths.health.usageIndexFile)?.mtimeMs ?? null,
 		});
 
-	function sessionDetail(id) {
-		const cached = cache.get(id);
+	function sessionDetail(id, endedMs) {
+		const key = endedMs === undefined ? id : `${id}:${endedMs}`;
+		const cached = cache.get(key);
 		if (cached && signatureOf(cached.file) === cached.signature) {
-			cache.delete(id);
-			cache.set(id, cached);
+			cache.delete(key);
+			cache.set(key, cached);
 			const { record } = cached;
 			if (record?.found !== true) return buildSessionView(record, { audit: null });
 			const job = { kind: "preview", id, now: now(), record: detailWorker ? { session: record.session, analystModels: record.analystModels } : record };
 			const view = (audit) => buildSessionView(record, { audit });
 			return detailWorker ? detailWorker.run(job).then(view) : view(local(job));
 		}
-		if (cached) cache.delete(id);
-		const job = { kind: "detail", id, now: now() };
+		if (cached) cache.delete(key);
+		const job = { kind: "detail", id, endedMs, now: now() };
 		const remember = ({ record, file, audit }) => {
-			cache.delete(id);
-			cache.set(id, { record, file, signature: signatureOf(file) });
+			cache.delete(key);
+			cache.set(key, { record, file, signature: signatureOf(file) });
 			while (cache.size > maxEntries) cache.delete(cache.keys().next().value);
 			return buildSessionView(record, { audit });
 		};

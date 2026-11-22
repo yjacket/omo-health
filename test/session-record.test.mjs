@@ -61,6 +61,27 @@ const ohealth = (ms, text) => ({ type: "custom_message", customType: "omo-health
 const mainRow = (extra = {}) => ({ sessionId: "s-main", kind: "main", parentSessionId: null, taskId: null, title: "main", cwd: "C:/work/a", terminal: { kind: "wt" }, omoVersion: "0.8.0", startedMs: T0, endedMs: T0 + 2 * HOUR, childCount: 2, ...extra });
 const childRow = (sessionId, taskId, parentSessionId, extra = {}) => ({ sessionId, kind: "child", parentSessionId, taskId, title: sessionId, cwd: "C:/work/a", terminal: null, omoVersion: null, startedMs: T0 + 10 * MIN, endedMs: T0 + 70 * MIN, ...extra });
 
+test("(plan 35) loadSessionRecord selects the exact ledger session ID and endedMs", () => {
+	const { paths } = setup();
+	const id = "st_shared";
+	const a = childRow(id, id, "parent-a", { title: "older" });
+	const b = childRow(id, id, "parent-b", { title: "newer", endedMs: a.endedMs + 1 });
+	const c = childRow("child-c", "st_c", "parent-c");
+	writeLedger(paths, [a, b, c]);
+	const options = { paths, id, now: T0 + 2 * HOUR };
+	const selected = (overrides) => loadSessionRecord({ ...options, ...overrides });
+	assert.deepEqual([a, b].map(({ endedMs }) => {
+		const { session, tokens } = selected({ endedMs });
+		return [session.title, session.parentSessionId, session.endedMs, tokens, session.usageTaskIdAmbiguous];
+	}), [
+		[a.title, a.parentSessionId, a.endedMs, null, true],
+		[b.title, b.parentSessionId, b.endedMs, null, true],
+	]);
+	assert.equal(selected().session.title, b.title);
+	assert.deepEqual(selected({ endedMs: b.endedMs + 1 }), { found: false, id });
+	assert.deepEqual(selected({ id: c.taskId, endedMs: c.endedMs }), { found: false, id: c.taskId });
+});
+
 function baseRows() {
 	return [
 		mainRow(),
@@ -298,6 +319,28 @@ test("the loader includes overlapping machine incidents opened 31 days before th
 	assert.deepEqual(machine.map(({ fp, ts, event }) => [fp, ts, event]), [
 		["fp-during", iso(openedMs + MIN), "opened"],
 		["fp-open", iso(openedMs), "opened"],
+	]);
+});
+
+test("the loader includes every overlapping interval of a repeated machine fingerprint", () => {
+	const { paths } = setup();
+	const row = mainRow();
+	const incident = { fp: "fp-machine", subject: { key: "machine" }, detector: "D2", kind: "machine-commit" };
+	writeLedger(paths, [row]);
+	writeDecisions(paths, [
+		{ ...incident, event: "opened", ts: iso(T0 - 2 * MIN) },
+		{ ...incident, event: "resolved", ts: iso(T0 - MIN) },
+		{ ...incident, event: "opened", ts: iso(T0 + MIN) },
+		{ ...incident, event: "resolved", ts: iso(T0 + 2 * MIN) },
+		{ ...incident, event: "reopened", ts: iso(T0 + 3 * MIN) },
+		{ ...incident, event: "resolved", ts: iso(T0 + 4 * MIN) },
+		{ ...incident, event: "reopened", ts: iso(row.endedMs + MIN) },
+	]);
+	const record = loadSessionRecord({ paths, id: row.sessionId, now: row.endedMs + HOUR });
+	const machine = record.health.findings.filter(({ scope }) => scope === "machine");
+	assert.deepEqual(machine.map(({ fp, ts, event }) => [fp, ts, event]), [
+		[incident.fp, iso(T0 + 3 * MIN), "reopened"],
+		[incident.fp, iso(T0 + MIN), "opened"],
 	]);
 });
 

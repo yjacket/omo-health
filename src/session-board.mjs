@@ -131,7 +131,7 @@ function countChildren(rows) {
  *   tokensOf is the injected token index lookup: `{tokens, treeTokens}` for an indexed session, `{state:"full"}` when the
  *   index refused the session, `{pending:true}` while its first read has not reached the end of the file, null when it is
  *   unknown. Task id is a fallback only for an unambiguous visible row without a session id. Rows carry `tokensState: "full"` for refusal
- *   or `tokensState` / `treeTokensState` of `"overflow"` for a non-finite total.
+ *   or `tokensState` / `treeTokensState` of `"overflow"` for a non-finite total. A tree total can exist without an own total.
  */
 export function buildSessionSnapshot(world, findings = [], investigations = [], nowMs = world.now, { tokensOf } = {}) {
 	const tokenFields = (entry) => {

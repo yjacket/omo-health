@@ -167,9 +167,9 @@ export function atEnd(entry) {
 }
 
 /**
- * Own plus descendants' complete totals via `parentSessionId`, one Map entry per
- * id. Cycle-safe, depth-capped at 8, each id counted once; an incomplete child
- * contributes nothing of its own.
+ * Own plus descendants' complete totals via `parentSessionId`, or null when no
+ * descendant contributes. Cycle-safe, depth-capped at 8, each id counted once;
+ * an incomplete child contributes nothing of its own.
  */
 export function treeTotals(entries) {
 	const list = entries instanceof Map ? [...entries.values()] : [...(entries ?? [])];
@@ -185,12 +185,13 @@ export function treeTotals(entries) {
 	}
 	const totals = new Map();
 	for (const id of byId.keys()) {
-		const own = compactUsage(byId.get(id));
-		let total = own ? own.total : 0;
 		if (!childrenByParent.has(id)) {
-			totals.set(id, total);
+			totals.set(id, null);
 			continue;
 		}
+		const own = compactUsage(byId.get(id));
+		let total = own ? own.total : 0;
+		let hasCountedDescendant = false;
 		const seen = new Set([id]);
 		let frontier = [id];
 		for (let depth = 0; depth < TREE_DEPTH && frontier.length; depth += 1) {
@@ -201,13 +202,16 @@ export function treeTotals(entries) {
 					seen.add(childId);
 					const child = byId.get(childId);
 					const childUsage = compactUsage(child);
-					if (childUsage) total += childUsage.total;
+					if (childUsage) {
+						total += childUsage.total;
+						hasCountedDescendant = true;
+					}
 					next.push(childId);
 				}
 			}
 			frontier = next;
 		}
-		totals.set(id, total);
+		totals.set(id, hasCountedDescendant ? total : null);
 	}
 	return totals;
 }

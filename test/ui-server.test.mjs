@@ -750,27 +750,31 @@ describe("ui server", { timeout: 20_000 }, () => {
 				}
 			});
 
+			function writeTaskOnlyCollision(world) {
+				const taskId = "st_shared";
+				const children = ["a", "b"].map((id, i) => ({
+					v: 1, kind: "child", sessionId: taskId, taskId, parentSessionId: `main-${id}`,
+					title: `task ${id}`, cwd: path.join(world.dir, id), outcome: "answered",
+					startedMs: world.nowMs - 2000, endedMs: world.nowMs + i, reason: "", source: "live",
+				}));
+				// The append-time ID dedupe would skip the second row. Exercise a ledger
+				// where both writer-shaped records are already present.
+				const ledger = path.join(world.paths.health.sessionsDir, "ended-2026-11-22.jsonl");
+				fs.appendFileSync(ledger, children.map((row) => `${JSON.stringify(row)}\n`).join(""));
+				const file = writeTask(children[0].cwd, { task_id: taskId, status: "completed" }, [
+					{ type: "session", id: "child-a" },
+					{ type: "message", message: { role: "assistant", provider: "anthropic", model: "claude-used", usage: { input: 42 }, stopReason: "stop" } },
+				]);
+				const index = createUsageIndex({ file: world.paths.health.usageIndexFile, clock: { now: world.now } });
+				index.update(taskId, file, { kind: "child", taskId });
+				index.save();
+				return children;
+			}
+
 			it("(plan 34) task-only ledger collisions leave detail and reviewer facts unknown", async () => {
 				const world = makeWorld();
 				try {
-					const taskId = "st_shared";
-					const children = ["a", "b"].map((id, i) => ({
-						v: 1, kind: "child", sessionId: taskId, taskId, parentSessionId: `main-${id}`,
-						title: `task ${id}`, cwd: path.join(world.dir, id), outcome: "answered",
-						startedMs: world.nowMs - 2000, endedMs: world.nowMs + i, reason: "", source: "live",
-					}));
-					// The append-time ID dedupe would skip the second row. Exercise a ledger
-					// where both writer-shaped records are already present.
-					const ledger = path.join(world.paths.health.sessionsDir, "ended-2026-11-22.jsonl");
-					fs.appendFileSync(ledger, children.map((row) => `${JSON.stringify(row)}\n`).join(""));
-					const file = writeTask(children[0].cwd, { task_id: taskId, status: "completed" }, [
-						{ type: "session", id: "child-a" },
-						{ type: "message", message: { role: "assistant", provider: "anthropic", model: "claude-used", usage: { input: 42 }, stopReason: "stop" } },
-					]);
-					const index = createUsageIndex({ file: world.paths.health.usageIndexFile, clock: { now: world.now } });
-					index.update(taskId, file, { kind: "child", taskId });
-					index.save();
-
+					const [{ taskId }] = writeTaskOnlyCollision(world);
 					const detail = await world.detail(taskId);
 					const cached = await world.detail(taskId);
 					const [status, body] = await world.startAudit(taskId);
@@ -781,6 +785,34 @@ describe("ui server", { timeout: 20_000 }, () => {
 						[409, "models-unknown"],
 					]);
 				} finally {
+					await world.detail.close();
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				}
+			});
+
+			it("(plan 35) HTTP ended selector isolates shared-ID details and cached audit previews", async () => {
+				const world = makeWorld();
+				const ui = createUiServer({ paths: world.paths, token: TOKEN, getState: () => STATE, sessionDetail: world.detail, now: world.now });
+				try {
+					const [a, b] = writeTaskOnlyCollision(world);
+					const { port } = await ui.listen();
+					const get = (query = "") => getAt(port, `/api/session?id=${a.sessionId}${query}`);
+					const facts = ({ status, body }) => [status, body.session?.title, body.session?.parentSessionId, body.tokens, body.audit?.blocked, body.audit?.planned];
+					const expect = (row) => [200, row.title, row.parentSessionId, null, "models-unknown", null];
+					assert.deepEqual(facts(await get()), expect(b));
+					assert.deepEqual(facts(await get(`&ended=${a.endedMs}`)), expect(a));
+					assert.deepEqual(facts(await get(`&ended=${b.endedMs}`)), expect(b));
+					assert.deepEqual(facts(await get(`&ended=${a.endedMs}`)), expect(a), "cached detail and preview");
+					assert.deepEqual(facts(await get()), expect(b), "unqualified cache entry still selects the newest");
+					assert.deepEqual(await get(`&ended=${a.endedMs}&list=children&offset=0`), {
+						status: 200, body: { list: "children", offset: 0, total: 0, items: [] },
+					});
+					assert.deepEqual(await get("&ended=0"), { status: 404, body: { error: "not-found" } });
+					for (const query of ["&ended=", "&ended=-1", "&ended=1.5", "&ended=1e3", "&ended=9007199254740993", "&Ended=1", "&ended=0&ended=-1"]) {
+						assert.deepEqual(await get(query), { status: 422, body: { error: "invalid" } }, query);
+					}
+				} finally {
+					await ui.close();
 					await world.detail.close();
 					fs.rmSync(world.dir, { recursive: true, force: true });
 				}

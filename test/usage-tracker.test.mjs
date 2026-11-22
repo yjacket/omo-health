@@ -688,7 +688,7 @@ test("a read failure keeps tokensOf null with one log, and the next success rest
 	assert.equal(s.events.filter((event) => event.event === "usage_read_failed").length, 1);
 });
 
-test("tokensOf reports treeTokens only when a descendant pushes the tree above the session's own total", () => {
+test("tokensOf reports a raised tree total for a parent and no tree total for a leaf", () => {
 	const s = setup();
 	writeLines(mainFile(s.paths, "p2"), [JSON.stringify(E.assistant({ ms: T0, usage: usage(10) }))]);
 	writeJsonl(childFile(s.cwd, "st_x", "c2"), [E.assistant({ ms: T0, usage: usage(6) })]);
@@ -702,6 +702,38 @@ test("tokensOf reports treeTokens only when a descendant pushes the tree above t
 	s.tracker.tick(emptyWorld(s.clock));
 	assert.deepEqual(s.tracker.tokensOf("p2"), { tokens: compactUsage(s.index.get("p2")), treeTokens: 16 });
 	assert.deepEqual(s.tracker.tokensOf("c2"), { tokens: compactUsage(s.index.get("c2")), treeTokens: null });
+});
+
+test("(IS-2) the board snapshot includes equal and lower tree totals, but not uncounted descendants", (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const parents = ["equal", "lower", "pending", "missing", "overflow"];
+	for (const id of parents) {
+		const file = mainFile(s.paths, id);
+		if (id === "overflow") writeLines(file, ['{"type":"usage","provider":"p","model":"m","usage":{"input":1e309}}']);
+		else writeJsonl(file, [E.assistant({ ms: T0, usage: usage(10) })]);
+		s.index.update(id, file, { kind: "main" });
+		const childId = `${id}-child`;
+		const meta = { kind: "child", parentSessionId: id, taskId: `st_${id}` };
+		if (id === "missing") {
+			s.index.markMissing(childId, meta);
+			continue;
+		}
+		const child = childFile(s.cwd, meta.taskId, childId);
+		writeJsonl(child, [E.assistant({ ms: T0, usage: usage(id === "lower" ? -3 : 0) })]);
+		s.index.update(childId, child, meta, id === "pending" ? { maxBytes: 1 } : {});
+	}
+	assert.deepEqual([s.index.get("pending-child").state, s.index.get("pending-child").complete], ["ok", false]);
+	const world = makeWorld({
+		now: T0,
+		sessions: parents.map((id) => sessionState({ id, startedMs: T0 - 5000 })),
+		sensors: parents.map((sessionId) => ({ sessionId, pid: 100, ts: T0 - 1000, idle: true, executingTools: 0 })),
+		procsFresh: true,
+	});
+	const snapshot = buildSessionSnapshot(world, [], [], T0, { tokensOf: s.tracker.tokensOf });
+	const rows = new Map(snapshot.groups.flatMap((g) => g.sessions.map((row) => [row.sessionId, row])));
+	assert.deepEqual(parents.map((id) => [rows.get(id).treeTokens, rows.get(id).treeTokensState ?? null]),
+		[[10, null], [7, null], [null, null], [null, null], [null, "overflow"]]);
 });
 
 test("sparse queued children recover ledger-only cwds in one pass per needed day", (t) => {

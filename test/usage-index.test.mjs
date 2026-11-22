@@ -1276,15 +1276,15 @@ test("treeTotals sums descendants, survives a cycle, and skips an incomplete chi
 	]);
 	assert.equal(totals.get("main"), 125);
 	assert.equal(totals.get("child"), 25);
-	assert.equal(totals.get("grandchild"), 5);
+	assert.equal(totals.get("grandchild"), null);
 	assert.equal(totals.get("x"), 16);
 	assert.equal(totals.get("y"), 16);
-	assert.equal(totals.get("main2"), 50);
-	assert.equal(totals.get("child2"), 0);
+	assert.equal(totals.get("main2"), null);
+	assert.equal(totals.get("child2"), null);
 
 	const index = createUsageIndex({ file: "unused.json", clock: createFakeClock(T0) });
 	const map = treeTotals(new Map([["main", { id: "main", state: "ok", complete: true, published: { total: 3 } }]]));
-	assert.equal(map.get("main"), 3);
+	assert.equal(map.get("main"), null);
 });
 
 test("(IS-1) a negative total and cost save and reload through the index", (t) => {

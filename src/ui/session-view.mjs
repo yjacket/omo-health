@@ -53,6 +53,7 @@ function labelledChild(child) {
 
 function detailTokens(tokens) {
 	if (!tokens) return tokens;
+	// The record's treeTotal is null when no descendant contributed, not when the sum equals the own total.
 	return {
 		...tokens,
 		...(overflows(tokens.total) ? { total: null, tokensState: "overflow" } : {}),

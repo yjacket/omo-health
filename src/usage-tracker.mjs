@@ -230,22 +230,21 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 
 		/**
 		 * The board's lookup: `{tokens, treeTokens}` for a complete entry
-		 * (`treeTokens` when descendants raise the total or produce a distinct non-finite total),
+		 * (`treeTokens` is non-null when at least one descendant has a counted total),
 		 * `{pending:true}` while a verified first read has not begun or an entry's
-		 * first full read has not finished, and
-		 * null when nothing is known.
+		 * first full read has not finished, and null when nothing is known.
+		 * A counted descendant can supply a tree total even without an own total.
 		 */
 		tokensOf(sessionId, taskId) {
 			const entry = index.get(sessionId, taskId);
 			if (!entry) return pendingLive.has(sessionId) ? { pending: true } : null;
-			if (entry.state === "full") return { state: "full" };
-			if (entry.readError === true) return null;
+			const treeTokens = (trees ?? treeTotals(index.entries())).get(entry.id) ?? null;
+			const tree = treeTokens === null ? {} : { treeTokens };
+			if (entry.state === "full") return { state: "full", ...tree };
 			const tokens = compactUsage(entry);
-			if (!tokens) return entry.state === "ok" ? { pending: true } : null;
-			const totals = trees ?? treeTotals(index.entries());
-			const tree = totals.get(entry.id) ?? tokens.total;
-			const showTree = tree > tokens.total || (!Number.isFinite(tree) && !Object.is(tree, tokens.total));
-			return { tokens, treeTokens: showTree ? tree : null };
+			if (tokens) return { tokens, treeTokens };
+			if (entry.state === "ok" && entry.readError !== true) return { pending: true, ...tree };
+			return treeTokens === null ? null : tree;
 		},
 	};
 }

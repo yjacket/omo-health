@@ -43,7 +43,7 @@ const SUBJECT_ID = /^[A-Za-z0-9_-]{4,80}$/;
 const RESERVED_ID = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$/i;
 /** The session detail lists, as the record names them; `children` lives on the record, the rest under `health`. */
 const SESSION_LISTS = Object.freeze(["children", "findings", "actions", "investigations", "messages"]);
-const SESSION_QUERY_KEYS = Object.freeze(new Set(["id", "list", "offset"]));
+const SESSION_QUERY_KEYS = Object.freeze(new Set(["id", "ended", "list", "offset"]));
 const SESSION_PAGE = 50;
 const NON_NEGATIVE_INT = /^\d+$/;
 
@@ -156,22 +156,27 @@ export function createUiServer({ paths, token, getState, diagnose, sessionDetail
 		send(res, 200, await diagnose(id ?? undefined));
 	}
 
-	/** `/api/session` params: exact id, an optional known list and a page offset. Anything else is invalid. */
+	/** `/api/session` params: exact id, optional ended timestamp, and optional list pagination. */
 	function parseSessionQuery(url) {
 		const query = url.includes("?") ? url.slice(url.indexOf("?") + 1) : "";
 		const params = new URLSearchParams(query);
 		for (const key of params.keys()) if (!SESSION_QUERY_KEYS.has(key)) throw new HttpFailure(422, { error: "invalid" });
 		const id = params.get("id");
 		if (id === null || !SUBJECT_ID.test(id)) throw new HttpFailure(422, { error: "invalid" });
+		const endedText = params.get("ended");
+		const endedMs = endedText === null ? undefined : Number(endedText);
+		if (endedText !== null && (!NON_NEGATIVE_INT.test(endedText) || !Number.isSafeInteger(endedMs) || params.getAll("ended").length !== 1)) {
+			throw new HttpFailure(422, { error: "invalid" });
+		}
 		const list = params.get("list");
 		const offsetText = params.get("offset");
 		if (list === null) {
 			if (offsetText !== null) throw new HttpFailure(422, { error: "invalid" });
-			return { id, list: null, offset: 0 };
+			return { id, endedMs, list: null, offset: 0 };
 		}
 		if (!SESSION_LISTS.includes(list)) throw new HttpFailure(422, { error: "invalid" });
 		if (offsetText !== null && !NON_NEGATIVE_INT.test(offsetText)) throw new HttpFailure(422, { error: "invalid" });
-		return { id, list, offset: offsetText === null ? 0 : Number(offsetText) };
+		return { id, endedMs, list, offset: offsetText === null ? 0 : Number(offsetText) };
 	}
 
 	/** One list of the detail, wherever the record keeps it. */
@@ -199,11 +204,11 @@ export function createUiServer({ paths, token, getState, diagnose, sessionDetail
 		};
 	}
 
-	/** GET /api/session?id=<task|session>[&list=<name>&offset=<n>]. */
+	/** GET /api/session?id=<task|session>[&ended=<ms>][&list=<name>&offset=<n>]. */
 	async function serveSession(req, res) {
 		const query = parseSessionQuery(req.url);
 		if (!sessionDetail) throw new HttpFailure(404, { error: "not-found" });
-		const detail = await sessionDetail(query.id);
+		const detail = await sessionDetail(query.id, query.endedMs);
 		if (!isPlainObject(detail) || detail.found === false) throw new HttpFailure(404, { error: "not-found" });
 		if (query.list === null) return send(res, 200, sessionFirstPage(detail));
 		const all = sessionList(detail, query.list);

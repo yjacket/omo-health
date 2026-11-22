@@ -124,7 +124,7 @@ function trackOwner(owners, taskId, identity) {
  * Machine-wide incidents (no subject session or task) whose active interval
  * overlaps the session window, and the latest info coverage marker before it.
  * Consume lifecycle rows oldest first and keep only the open intervals and
- * the first overlapping opener per fingerprint.
+ * the openers of closed intervals that overlap the session.
  */
 function scanDecisionHistory(decisions, row) {
 	const startedMs = msOf(row.startedMs);
@@ -132,7 +132,7 @@ function scanDecisionHistory(decisions, row) {
 	const startMs = Number.isFinite(startedMs) ? startedMs : -Infinity;
 	const endMs = Number.isFinite(endedMs) ? endedMs : Number.isFinite(startedMs) ? startedMs : Infinity;
 	const open = new Map();
-	const matched = new Map();
+	const matched = [];
 	const coverageEnd = Number.isFinite(startedMs) ? startedMs : Number.isFinite(endedMs) ? endedMs : Infinity;
 	let coverageMs = -Infinity;
 	for (const entry of decisions) {
@@ -141,16 +141,16 @@ function scanDecisionHistory(decisions, row) {
 		const ts = timeOf(entry);
 		if (!Number.isFinite(ts)) continue;
 		if (event === "coverage" && entry.infoFindings === true && ts < coverageEnd && ts > coverageMs) coverageMs = ts;
-		if (!FINDING_EVENTS.has(event) || !nonEmpty(fp) || matched.has(fp)) continue;
+		if (!FINDING_EVENTS.has(event) || !nonEmpty(fp)) continue;
 		if (event === "resolved") {
 			const opened = open.get(fp);
-			if (opened && ts >= startMs) matched.set(fp, opened);
+			if (opened && ts >= startMs) matched.push(opened);
 			open.delete(fp);
 		} else if (ts <= endMs && !open.has(fp) && !nonEmpty(subject?.sessionId) && !nonEmpty(subject?.taskId)) {
 			open.set(fp, machineRow(entry, fp, ts));
 		}
 	}
-	return { machine: [...matched.values(), ...open.values()], infoFindings: Number.isFinite(coverageMs) };
+	return { machine: [...matched, ...open.values()], infoFindings: Number.isFinite(coverageMs) };
 }
 
 function machineRow(entry, fp, ts) {
@@ -509,7 +509,7 @@ function cwdsOf(node, ancestors) {
 	return out;
 }
 
-function recordLedger(rows, id, usage, descendantScanMax) {
+function recordLedger(rows, id, endedMs, usage, descendantScanMax) {
 	// First pass: keep only identities, links and ordering. In particular, an
 	// unrelated row's cwd must not stay resident alongside the usage index.
 	const links = [];
@@ -524,7 +524,7 @@ function recordLedger(rows, id, usage, descendantScanMax) {
 		else if (byTask.get(link.taskId)?.sessionId !== link.sessionId) byTask.set(link.taskId, null);
 	}
 	const linkFor = (id) => byId.get(id) ?? byTask.get(id);
-	const subject = linkFor(id);
+	const subject = endedMs === undefined ? linkFor(id) : links.find((link) => link.sessionId === id && link.endedMs === endedMs);
 	if (!subject) return null;
 	const descendants = collectDescendants(subject, links, usage.values());
 	const newest = [...descendants].sort((a, b) => (b.endedMs ?? 0) - (a.endedMs ?? 0));
@@ -587,10 +587,10 @@ function recordLedger(rows, id, usage, descendantScanMax) {
  * per-file limit or the remaining total message scan budget is skipped and
  * listed in `truncated.messagesSkipped`. The dashboard defaults to no limits.
  */
-export function loadSessionRecord({ paths, id, now = Date.now(), messageScanMaxBytes = Infinity, messageScanTotalBytes = Infinity, descendantScanMax = Infinity, scanMessages = scanOmoHealthMessages, locator, index } = {}) {
+export function loadSessionRecord({ paths, id, endedMs, now = Date.now(), messageScanMaxBytes = Infinity, messageScanTotalBytes = Infinity, descendantScanMax = Infinity, scanMessages = scanOmoHealthMessages, locator, index } = {}) {
 	if (!nonEmpty(id)) return { found: false, id };
 	const usage = index ?? readUsageIndex(paths.health.usageIndexFile);
-	const joined = recordLedger(() => streamEnded(paths, { sinceMs: now - 30 * DAY_MS }), id, usage, descendantScanMax);
+	const joined = recordLedger(() => streamEnded(paths, { sinceMs: now - 30 * DAY_MS }), id, endedMs, usage, descendantScanMax);
 	if (!joined) return { found: false, id };
 	const { row, descendants, ancestors, scanned, ambiguous } = joined;
 	const startedMs = msOf(row.startedMs);

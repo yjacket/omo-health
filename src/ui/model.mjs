@@ -251,7 +251,7 @@ export function endedRow(r, childRows = 0, usage = null, trees = null, full = us
 	const tokens = compactUsage(entry);
 	const tree = entry && trees instanceof Map ? trees.get(entry.id) ?? null : null;
 	const overflow = tokens !== null && !Number.isFinite(tokens.total);
-	const treeOverflow = tree !== null && !Number.isFinite(tree) && !Object.is(tree, tokens?.total);
+	const treeOverflow = tree !== null && !Number.isFinite(tree);
 	return {
 		sessionId: text(r.sessionId, 80),
 		sessionShort: short(r.sessionId),
@@ -276,7 +276,7 @@ export function endedRow(r, childRows = 0, usage = null, trees = null, full = us
 		tokens: overflow ? { ...tokens, total: null } : tokens,
 		tokensState: overflow ? "overflow" : tokens ? "ok" : entry?.state === "missing" ? "missing" : entry?.state === "full" || (!entry && full) ? "full" : "pending",
 		tokensGone: entry?.gone === true,
-		treeTokens: !treeOverflow && tree !== null && tree > (tokens?.total ?? 0) ? tree : null,
+		treeTokens: treeOverflow ? null : tree,
 		...(treeOverflow ? { treeTokensState: "overflow" } : {}),
 	};
 }
@@ -286,9 +286,11 @@ export function buildEnded(inputs) {
 	if (isRecord(inputs.ended) && "error" in inputs.ended) throw new Error(inputs.ended.error);
 	const all = (Array.isArray(inputs.ended) ? inputs.ended : []).filter((r) => isRecord(r) && Number.isFinite(r.endedMs));
 	const tally = new Map(Object.keys(OUTCOME_LABELS).map((outcome) => [outcome, 0]));
+	const idCounts = new Map();
 	for (const r of all) {
 		const outcome = typeof r.outcome === "string" && tally.has(r.outcome) ? r.outcome : "unknown";
 		tally.set(outcome, tally.get(outcome) + 1);
+		idCounts.set(r.sessionId, (idCounts.get(r.sessionId) ?? 0) + 1);
 	}
 	const childRows = new Map();
 	for (const r of all) if (r.kind === "child" && typeof r.parentSessionId === "string") childRows.set(r.parentSessionId, (childRows.get(r.parentSessionId) ?? 0) + 1);
@@ -309,7 +311,11 @@ export function buildEnded(inputs) {
 		counts: [...tally].map(([outcome, count]) => ({ outcome, outcomeKo: outcomeLabel(outcome), count })),
 		shown: { main: shownMains.length, child: shownChildren.length },
 		totals: { main: mains.length, child: children.length },
-		rows: all.filter((r) => selected.has(r)).map((r) => endedRow(r, childRows.get(r.sessionId), usage, trees, usage.full === true, ambiguous)),
+		rows: all.filter((r) => selected.has(r)).map((r) => {
+			const row = endedRow(r, childRows.get(r.sessionId), usage, trees, usage.full === true, ambiguous);
+			if (idCounts.get(r.sessionId) > 1) row.detailEndedMs = r.endedMs;
+			return row;
+		}),
 	};
 }
 

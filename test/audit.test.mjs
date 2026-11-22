@@ -483,6 +483,24 @@ test("a fired detector whose only finding is the 60th keeps a representative row
 	assert.equal(audit.hasDetectorCoverage(covering, audit.firedDetectors(bundle), audit.detectorFindingRefs(bundle)), true);
 });
 
+test("repeated machine intervals get separate audit refs but only one fired detector", () => {
+	const row = { sessionId: "s1", kind: "main", startedMs: T0, endedMs: T0 + HOUR };
+	const incident = { fp: "fp-machine", subject: { key: "machine" }, detector: "D2", kind: "machine-commit" };
+	const decisions = [
+		{ ...incident, event: "opened", ts: iso(T0 + 1) },
+		{ ...incident, event: "resolved", ts: iso(T0 + 2) },
+		{ ...incident, event: "reopened", ts: iso(T0 + 3) },
+		{ ...incident, event: "resolved", ts: iso(T0 + 4) },
+	];
+	const record = buildSessionRecord({ row, decisions });
+	const bundle = auditBundle(record, null, { config: DEFAULT_CONFIG, now: row.endedMs });
+	assert.deepEqual(bundle.omo_health_record.findings.map(({ ref, ts, scope }) => [ref, ts, scope]), [
+		["F1", iso(T0 + 3), "machine"],
+		["F2", iso(T0 + 1), "machine"],
+	]);
+	assert.deepEqual(audit.firedDetectors(bundle), ["D2"]);
+});
+
 test("the machine cap keeps the oldest finding when it alone represents D23", () => {
 	const findings = Array.from({ length: 25 }, (_, i) => finding(i, 1, {
 		ts: iso(T0 - i), detector: i === 24 ? "D23" : "D6", scope: "machine", subject: {},

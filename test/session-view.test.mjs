@@ -88,6 +88,40 @@ function record(overrides = {}) {
 }
 
 describe("session view", () => {
+	it("(IS-3) detail renders a tree total only when a descendant has been counted", () => {
+		const root = tmpDir("session-view-tree-");
+		const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health") });
+		const cases = [["equal", 0, 10], ["lower", -3, 7], ["pending", null, null], ["missing", null, null]];
+		const row = { kind: "main", outcome: "completed", startedMs: T0 - 1000, endedMs: T0 };
+		const index = createUsageIndex({ file: paths.health.usageIndexFile, clock: { now: () => T0 } });
+		const count = (id, input, meta, options) => {
+			const file = path.join(root, `${id}.jsonl`);
+			fs.writeFileSync(file, `${JSON.stringify({ type: "usage", provider: "p", model: "m", usage: { input } })}\n`);
+			index.update(id, file, meta, options);
+		};
+		for (const [id, input] of cases) {
+			const child = `${id}-child`;
+			const meta = { kind: "child", taskId: `st_${id}`, parentSessionId: id };
+			appendEnded(paths, { ...row, sessionId: id }, { nowMs: T0 });
+			appendEnded(paths, { ...row, ...meta, sessionId: child }, { nowMs: T0 });
+			count(id, 10, { kind: "main" });
+			if (id === "missing") index.markMissing(child, meta);
+			else count(child, input ?? 0, meta, id === "pending" ? { maxBytes: 1 } : {});
+		}
+		index.save();
+		const tokens = cases.map(([id]) => buildSessionView(loadSessionRecord({ paths, id, now: T0 })).tokens);
+		assert.deepEqual(tokens.map((entry) => entry.treeTotal), cases.map(([, , total]) => total));
+
+		const app = fs.readFileSync(new URL("../src/ui/static/app.js", import.meta.url), "utf8");
+		const names = ["tokenReading", "treeTokenMark", "endedTokenBlock"];
+		const el = (tag, attrs) => ({ tag, ...attrs });
+		const endedTokenBlock = runInNewContext(
+			names.map((name) => app.match(new RegExp(`function ${name}\\([^]*?\\n\\t\\}`))[0]).join("\n") + "\nendedTokenBlock",
+			{ el, block: (_title, _own, tree) => tree, endedTokenFacts: () => null, compactCount: String, fullCount: String },
+		);
+		assert.deepEqual(tokens.map((entry) => endedTokenBlock(entry)?.text), ["자식 포함 10", "자식 포함 7", undefined, undefined]);
+	});
+
 	it("detail overflow survives index reload and JSON, and renders on the token block and child row", () => {
 		const root = tmpDir("session-view-overflow-");
 		const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health") });
