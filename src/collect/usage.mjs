@@ -4,6 +4,7 @@ import { performance } from "node:perf_hooks";
 import { StringDecoder } from "node:string_decoder";
 import { classifyProviderError } from "../detect/provider.mjs";
 import { cacheStorm } from "../detect/tokens.mjs";
+import { applyImageLoad } from "./sessions.mjs";
 
 // Match SessionTracker's retained assistant usage turns, without loading the transcript.
 const STORM_HISTORY = 200;
@@ -413,7 +414,7 @@ const COST_FIELDS = { total: "usage" };
 // instead of marking the counted usage as unusable.
 const USAGE_FIELDS = { input: "usage", output: "usage", cacheRead: "usage", cacheWrite: "usage", costUnknown: "value", cost: COST_FIELDS };
 const ROOT_FIELDS = {
-	type: "value", customType: "value", provider: "identity", model: "identity", usage: USAGE_FIELDS,
+	type: "value", timestamp: "timestamp", customType: "value", provider: "identity", model: "identity", usage: USAGE_FIELDS,
 	message: { role: "value", provider: "identity", model: "identity", responseModel: "identity", usage: USAGE_FIELDS },
 	data: { phase: "value", provider: "identity", model: "identity", usage: USAGE_FIELDS },
 };
@@ -512,6 +513,9 @@ export function createRecordScanner() {
 				frame.value[key] = JSON.parse(raw.toString("utf8", 0, length));
 			} else if (decimal) {
 				frame.value[key] = roundedDecimal(decimal);
+			} else if (plan === "timestamp") {
+				// A clipped string can parse as a different date. Never use its prefix.
+				delete frame.value[key];
 			} else {
 				const prefix = kind === QUOTE
 					? JSON.parse('"' + new StringDecoder("utf8").write(raw.subarray(1, prefixEnd)) + '"')
@@ -1001,23 +1005,10 @@ function timelineErrorClass(text) {
 	}
 }
 
-function imageBytes(item) {
-	if (Number.isFinite(item.bytes) && item.bytes >= 0) return item.bytes;
-	const base64 = typeof item.data === "string" ? item.data : typeof item.source?.data === "string" ? item.source.data : undefined;
-	return base64 === undefined ? 0 : Buffer.byteLength(base64, "base64");
-}
-
-function countImages(stats, content) {
-	if (!Array.isArray(content)) return;
-	let count = 0;
-	let bytes = 0;
-	for (const item of content) {
-		if (!isObject(item) || item.type !== "image") continue;
-		count += 1;
-		bytes += imageBytes(item);
-	}
-	if (count > stats.segmentCount) stats.segmentCount = count;
-	if (bytes > stats.segmentBytes) stats.segmentBytes = bytes;
+function consumeTimelineImages(stats, entry) {
+	applyImageLoad(stats, entry);
+	stats.peakCount = Math.max(stats.peakCount, stats.images);
+	stats.peakBytes = Math.max(stats.peakBytes, stats.imageBytes);
 }
 
 function stormCounter(value) {
@@ -1040,52 +1031,47 @@ function consumeStormTurn(stats, entry) {
 	stats.stormNext = (stats.stormNext + 1) % STORM_HISTORY;
 }
 
+function consumeTimelineTurn(stats, message, ms) {
+	const { usage } = message;
+	const input = counter(usage.input);
+	const output = counter(usage.output);
+	const cacheRead = counter(usage.cacheRead);
+	const cacheWrite = counter(usage.cacheWrite);
+	const total = input + output + cacheRead + cacheWrite;
+	if (Number.isFinite(ms)) {
+		const hourMs = Math.floor(ms / 3_600_000) * 3_600_000;
+		const hour = stats.hours.get(hourMs) ?? { hourMs, tokens: 0, turns: 0 };
+		hour.tokens += total;
+		hour.turns += 1;
+		stats.hours.set(hourMs, hour);
+	}
+	const top = stats.topTurns;
+	// Insert after equal totals, just as the stable sort did (also for Infinity).
+	if (top.length < 10 || total > top[9].total) {
+		let index = top.length;
+		while (index > 0 && total > top[index - 1].total) index -= 1;
+		top.splice(index, 0, {
+			ms,
+			key: billingKey(message.provider, message.responseModel ?? message.model),
+			input,
+			output,
+			cacheRead,
+			cacheWrite,
+			total,
+			stopReason: message.stopReason,
+		});
+		if (top.length > 10) top.pop();
+	}
+}
+
 function consumeTimelineStats(stats, entry) {
 	if (!isObject(entry)) return;
+	consumeTimelineImages(stats, entry);
 	consumeStormTurn(stats, entry);
-	if (entry.type === "compaction") {
-		stats.peakCount = Math.max(stats.peakCount, stats.segmentCount);
-		stats.peakBytes = Math.max(stats.peakBytes, stats.segmentBytes);
-		stats.segmentCount = 0;
-		stats.segmentBytes = 0;
-		return;
-	}
 	if (entry.type !== "message" || !isObject(entry.message)) return;
 	const message = entry.message;
 	if (message.role === "assistant") {
-		const usage = isObject(message.usage) ? message.usage : undefined;
-		const input = usage ? counter(usage.input) : 0;
-		const output = usage ? counter(usage.output) : 0;
-		const cacheRead = usage ? counter(usage.cacheRead) : 0;
-		const cacheWrite = usage ? counter(usage.cacheWrite) : 0;
-		const total = input + output + cacheRead + cacheWrite;
-		const ms = timestampOf(entry, message);
-		if (usage && Number.isFinite(ms)) {
-			const hourMs = Math.floor(ms / 3_600_000) * 3_600_000;
-			const hour = stats.hours.get(hourMs) ?? { hourMs, tokens: 0, turns: 0 };
-			hour.tokens += total;
-			hour.turns += 1;
-			stats.hours.set(hourMs, hour);
-		}
-		if (usage) {
-			const top = stats.topTurns;
-			// Insert after equal totals, just as the stable sort did (also for Infinity).
-			if (top.length < 10 || total > top[9].total) {
-				let index = top.length;
-				while (index > 0 && total > top[index - 1].total) index -= 1;
-				top.splice(index, 0, {
-					ms,
-					key: billingKey(message.provider, message.responseModel ?? message.model),
-					input,
-					output,
-					cacheRead,
-					cacheWrite,
-					total,
-					stopReason: message.stopReason,
-				});
-				if (top.length > 10) top.pop();
-			}
-		}
+		if (isObject(message.usage)) consumeTimelineTurn(stats, message, timestampOf(entry, message));
 		if (message.stopReason === "error") {
 			stats.errors.count += 1;
 			const cls = timelineErrorClass(message.errorMessage);
@@ -1100,20 +1086,31 @@ function consumeTimelineStats(stats, entry) {
 		}
 		return;
 	}
-	if (message.role === "toolResult") {
-		if (message.isError === true && typeof message.toolName === "string") {
-			toolsEntry(stats, message.toolName).errors += 1;
-		}
-		countImages(stats, message.content);
+	if (message.role === "toolResult" && message.isError === true && typeof message.toolName === "string") {
+		toolsEntry(stats, message.toolName).errors += 1;
+	}
+}
+
+function consumeTimelineScanner(totals, stats, scanner, fragment = false) {
+	stats.largeRecords += 1;
+	const entry = consumeScannerRecord(totals, scanner, fragment);
+	if (!entry) {
+		stats.turnStatsIncomplete = true;
 		return;
 	}
-	if (message.role === "user") countImages(stats, message.content);
+	// Content is not projected, but a compaction still resets the image load.
+	consumeTimelineImages(stats, entry);
+	consumeStormTurn(stats, entry);
+	const { message } = entry;
+	if (entry.type !== "message" || message?.role !== "assistant" || !isObject(message.usage)) return;
+	const ms = timestampOf(entry, message);
+	if (Number.isFinite(ms) && !scanner.oversized) consumeTimelineTurn(stats, message, ms);
+	else stats.turnStatsIncomplete = true;
 }
 
 function consumeTimelineRecord(totals, stats, acc) {
 	if (acc.kind === "scanner") {
-		stats.largeRecords += 1;
-		consumeStormTurn(stats, consumeScannerRecord(totals, acc.scanner));
+		consumeTimelineScanner(totals, stats, acc.scanner);
 		return;
 	}
 	const text = accumulatorText(acc);
@@ -1142,8 +1139,7 @@ function consumeTimelineRecord(totals, stats, acc) {
 
 function consumeTimelineFragment(totals, stats, acc) {
 	if (acc.kind === "scanner") {
-		stats.largeRecords += 1;
-		consumeStormTurn(stats, consumeScannerRecord(totals, acc.scanner, true));
+		consumeTimelineScanner(totals, stats, acc.scanner, true);
 		return;
 	}
 	const text = accumulatorText(acc);
@@ -1183,6 +1179,7 @@ export function usageTimeline(file, { cacheStormWrite = Infinity, cacheStormRead
 		const totals = emptyUsage();
 		const stats = {
 			largeRecords: 0,
+			turnStatsIncomplete: false,
 			hours: new Map(),
 			topTurns: [],
 			errors: { count: 0, byClass: {} },
@@ -1191,8 +1188,8 @@ export function usageTimeline(file, { cacheStormWrite = Infinity, cacheStormRead
 			stormNext: 0,
 			peakCount: 0,
 			peakBytes: 0,
-			segmentCount: 0,
-			segmentBytes: 0,
+			images: 0,
+			imageBytes: 0,
 		};
 		let position = 0;
 		let acc;
@@ -1218,21 +1215,21 @@ export function usageTimeline(file, { cacheStormWrite = Infinity, cacheStormRead
 			}
 		}
 		if (acc) consumeTimelineFragment(totals, stats, acc);
-		stats.peakCount = Math.max(stats.peakCount, stats.segmentCount);
-		stats.peakBytes = Math.max(stats.peakBytes, stats.segmentBytes);
 		const denominator = totals.input + totals.cacheRead + totals.cacheWrite;
 		const { stormHistory, stormNext } = stats;
 		const turns = stormHistory.length === STORM_HISTORY
 			? [...stormHistory.slice(stormNext), ...stormHistory.slice(0, stormNext)]
 			: stormHistory;
 		const [storm] = cacheStorm({ turns }, { cacheStormWrite, cacheStormReadFrac });
-		// The scanner preserves accounting but does not parse the full record for statistics.
+		// The scanner projects turn counters and time, but not content or error details.
 		const incomplete = stats.largeRecords > 0;
 		return {
 			totals,
 			largeRecords: stats.largeRecords,
 			hours: [...stats.hours.values()].sort((a, b) => a.hourMs - b.hourMs).slice(-240),
+			hoursIncomplete: stats.turnStatsIncomplete,
 			topTurns: stats.topTurns,
+			topTurnsIncomplete: stats.turnStatsIncomplete,
 			cache: {
 				hitRate: denominator > 0 ? totals.cacheRead / denominator : null,
 				stormTurns: storm?.data.turns ?? 0,

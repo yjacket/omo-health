@@ -1563,7 +1563,7 @@ test("(gate 8) timeline recognizes stats-only tool errors with separator whitesp
 test("(gate 8) timeline recognizes an escaped image type", (t) => {
 	const { file } = setup(t);
 	const image = '{"type":"message","message":{"role":"user","content":[{"type":"im\\u0061ge","bytes":1048576}]}}';
-	assert.deepEqual(gate8Parity(file(), image).images, { peakCount: 1, peakMiB: 1, incomplete: false });
+	assert.deepEqual(gate8Parity(file(), image).images, { peakCount: 1, peakMiB: 0, incomplete: false });
 });
 
 test("(gate 8) an error turn with non-text error detail is classified without coercion", (t) => {
@@ -1724,12 +1724,39 @@ test("usageTimeline reports buckets, turns, cache, errors, tools and images equa
 	assert.deepEqual(timeline.errors, { count: 1, byClass: { "usage-limit": 1 }, incomplete: false });
 	assert.deepEqual(timeline.tools, { rows: [{ name: "bash", calls: 1, errors: 1 }], incomplete: false });
 	assert.equal(timeline.images.peakCount, 2);
-	assert.ok(Math.abs(timeline.images.peakMiB - 6 / MiB) < 1e-12);
+	assert.equal(timeline.images.peakMiB, 8 / MiB);
 	assert.equal(typeof timeline.prepMs, "number");
 });
 
 const stormRewrite = { input: 0, cacheRead: 0, cacheWrite: 60 };
 const stormBreak = { input: 100, cacheRead: 0, cacheWrite: 0 };
+
+test("(IS-8) image peaks agree with D4 across messages and a compaction", (t) => {
+	const { file } = setup(t);
+	const transcript = file();
+	const second = userImages(20, T0 + MIN);
+	second.message.role = "toolResult";
+	writeRecords(transcript, [
+		userImages(20, T0),
+		second,
+		compaction(undefined, { ms: T0 + 2 * MIN }),
+		userImages(5, T0 + 3 * MIN),
+	]);
+	const session = new SessionTracker({ file: transcript });
+	session.read();
+	const now = T0 + MIN;
+	session.advance(now);
+	const finding = detectTokens(makeWorld({ now, sessions: [session.state] }), {}).find(({ kind }) => kind === "image-load");
+	assert.equal(finding?.data.level, "warn");
+	assert.equal(finding.data.images, 40);
+	assert.equal(finding.data.imageBytes, 160);
+	session.advance(T0 + 3 * MIN);
+	assert.equal(session.state.images, 5);
+	assert.equal(session.state.imageBytes, 20);
+	const { peakCount, peakMiB } = usageTimeline(transcript).images;
+	assert.deepEqual({ peakCount, peakMiB }, { peakCount: finding.data.images, peakMiB: finding.data.imageBytes / MiB });
+});
+
 for (const [label, usages, expected] of [
 	["latest consecutive run", [stormBreak, stormRewrite, stormRewrite, stormRewrite, stormBreak, stormRewrite, stormRewrite, stormBreak, stormRewrite], 2],
 	["single qualifying turn", [stormBreak, stormRewrite], 0],
@@ -1770,6 +1797,8 @@ test("(IS-8) an oversized tool-result image marks statistics incomplete without 
 		assert.equal(timeline.images.incomplete, true);
 		assert.equal(timeline.tools.incomplete, true);
 		assert.equal(timeline.errors.incomplete, true);
+		assert.equal(timeline.hoursIncomplete, false);
+		assert.equal(timeline.topTurnsIncomplete, false);
 	}
 });
 

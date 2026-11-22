@@ -97,6 +97,47 @@ function emptyRecord(over = {}) {
 	};
 }
 
+function oversizedTurnBundle(t, timestamp, trailingNewline) {
+	const dir = tmpDir("omoh-audit-large-turn-");
+	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+	const file = path.join(dir, "session.jsonl");
+	const turn = (output, timestamp, content) => ({
+		type: "message",
+		message: { role: "assistant", provider: "fake", model: "large-model", usage: { output }, content },
+		timestamp,
+	});
+	fs.writeFileSync(file, `${JSON.stringify(turn(7, iso(T0)))}\n`);
+	fs.appendFileSync(file, JSON.stringify(turn(500, timestamp, [{ type: "text", text: "A".repeat(40 * 1024 * 1024) }])));
+	if (trailingNewline) fs.appendFileSync(file, "\n");
+	const { tokens } = auditBundle(emptyRecord(), usageTimeline(file), { config: DEFAULT_CONFIG, now: T0 + 2 * HOUR });
+	assert.equal(tokens.total, 507);
+	assert.equal(tokens.turns, 2);
+	assert.equal(tokens.largeRecords, 1);
+	return tokens;
+}
+
+test("(IS-8) a timestamped 40 MiB assistant turn leads topTurns and fills its hour", (t) => {
+	const ms = T0 + HOUR + 123;
+	const tokens = oversizedTurnBundle(t, iso(ms), true);
+	assert.deepEqual([tokens.topTurns[0].total, tokens.topTurns[0].ms], [500, ms]);
+	assert.deepEqual(tokens.hours, [
+		{ hourMs: Math.floor(T0 / HOUR) * HOUR, tokens: 7, turns: 1 },
+		{ hourMs: Math.floor(ms / HOUR) * HOUR, tokens: 500, turns: 1 },
+	]);
+	assert.deepEqual([tokens.hoursIncomplete, tokens.topTurnsIncomplete], [false, false]);
+});
+
+test("(IS-8) a 40 MiB assistant turn with an uncapturable timestamp marks bundle statistics incomplete", (t) => {
+	// A capped prefix can look like a date; the full timestamp is not a date.
+	const tokens = oversizedTurnBundle(t, `2026-09-28${" ".repeat(64 * 1024)}not-a-date`, false);
+	assert.deepEqual(
+		{ hoursIncomplete: tokens.hoursIncomplete, topTurnsIncomplete: tokens.topTurnsIncomplete },
+		{ hoursIncomplete: true, topTurnsIncomplete: true },
+	);
+	assert.deepEqual(tokens.hours.map(({ tokens }) => tokens), [7]);
+	assert.deepEqual(tokens.topTurns.map(({ total }) => total), [7]);
+});
+
 const finding = (i, metrics = 1, over = {}) => {
 	const evidence = ["head:1"];
 	for (let j = 0; j < metrics; j += 1) evidence.push(`m${i}_${j}:6`);

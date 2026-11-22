@@ -350,6 +350,7 @@ function tokensOf(record, timeline) {
 		largeRecords: numOf(timeline?.largeRecords),
 		models: modelsOf(totals.models),
 		hours: (Array.isArray(timeline?.hours) ? timeline.hours : []).map((hour) => ({ hourMs: numOf(hour?.hourMs), tokens: numOf(hour?.tokens), turns: numOf(hour?.turns) })),
+		hoursIncomplete: boolOf(timeline?.hoursIncomplete),
 		topTurns: (Array.isArray(timeline?.topTurns) ? timeline.topTurns : []).map((turn) => ({
 			key: textOf(turn?.key),
 			ms: numOf(turn?.ms),
@@ -359,6 +360,7 @@ function tokensOf(record, timeline) {
 			cacheWrite: numOf(turn?.cacheWrite),
 			total: numOf(turn?.total),
 		})),
+		topTurnsIncomplete: boolOf(timeline?.topTurnsIncomplete),
 		cache: { hitRate: numOf(timeline?.cache?.hitRate), stormTurns: numOf(timeline?.cache?.stormTurns) },
 		errors: { count: numOf(timeline?.errors?.count), byClass: Object.fromEntries(Object.entries(isObject(timeline?.errors?.byClass) ? timeline.errors.byClass : {}).map(([key, value]) => [key, numOf(value)])), incomplete: boolOf(timeline?.errors?.incomplete) },
 		tools: {
