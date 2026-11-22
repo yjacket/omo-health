@@ -822,7 +822,10 @@ export function buildSessionRecord(inputs = {}) {
 		configDecisions,
 		analystModels,
 		selectedFps,
-		truncated: { messagesSkipped: Array.isArray(truncated.messagesSkipped) ? truncated.messagesSkipped : [] },
+		truncated: {
+			messagesSkipped: Array.isArray(truncated.messagesSkipped) ? truncated.messagesSkipped : [],
+			...(truncated.descendantsSkipped > 0 ? { descendantsSkipped: truncated.descendantsSkipped } : {}),
+		},
 		health,
 	};
 }
@@ -1067,6 +1070,7 @@ function recordLedger(rows, id, selector, usage, descendantScanMax) {
 	const descendants = recordDescendants(subject, rows, usage);
 	const newest = [...descendants].sort((a, b) => (b.endedMs ?? 0) - (a.endedMs ?? 0));
 	const scanned = Number.isFinite(descendantScanMax) ? newest.slice(0, descendantScanMax) : newest;
+	const descendantsSkipped = newest.length - scanned.length;
 	const ancestors = new Map();
 	let parents = new Set([subject, ...scanned].filter((node) => nonEmpty(node.taskId)).map((node) => node.parentSessionId).filter(nonEmpty));
 	const visited = new Set();
@@ -1085,13 +1089,14 @@ function recordLedger(rows, id, selector, usage, descendantScanMax) {
 		for (const rec of rows()) if (fallback.has(rec.taskId)) yield rec;
 	};
 	const ambiguous = ambiguousLedgerTaskIds(fallback.size ? relevantRows() : []);
-	return { row: subject, descendants, ancestors, scanned, ambiguous };
+	return { row: subject, descendants, ancestors, scanned, descendantsSkipped, ambiguous };
 }
 
 /**
  * Read everything the record needs and join it. A file that exceeds the
  * per-file limit or the remaining total message scan budget is skipped and
- * listed in `truncated.messagesSkipped`. `auditRetention` keeps only the
+ * listed in `truncated.messagesSkipped`. Descendants outside the scan cap
+ * are counted in `truncated.descendantsSkipped`. `auditRetention` keeps only the
  * daemon's audit samples; the dashboard defaults to no retention limit.
  * Non-audit records report the transcript paths scanned for detail caching.
  */
@@ -1100,7 +1105,7 @@ export function loadSessionRecord({ paths, id, row: selector, now = Date.now(), 
 	const usage = index ?? readUsageIndex(paths.health.usageIndexFile);
 	const joined = recordLedger(() => streamEnded(paths, { sinceMs: now - 30 * DAY_MS }), id, selector, usage, descendantScanMax);
 	if (!joined) return { found: false, id };
-	const { row, descendants, ancestors, scanned, ambiguous } = joined;
+	const { row, descendants, ancestors, scanned, descendantsSkipped, ambiguous } = joined;
 	const startedMs = msOf(row.startedMs);
 	const sinceMs = (Number.isFinite(startedMs) ? startedMs : now) - 30 * DAY_MS;
 	const retained = auditRetention ? {
@@ -1134,6 +1139,9 @@ export function loadSessionRecord({ paths, id, row: selector, now = Date.now(), 
 	}
 
 	const auditHealth = retained && auditRecordHealth(retained, decisionHistory.infoFindings);
-	const record = buildSessionRecord({ id, row, descendants, ambiguous, usage, decisionJoin, decisionHistory, auditHealth, messages, truncated: { messagesSkipped: skipped } });
+	const record = buildSessionRecord({
+		id, row, descendants, ambiguous, usage, decisionJoin, decisionHistory, auditHealth, messages,
+		truncated: { messagesSkipped: skipped, descendantsSkipped },
+	});
 	return auditRetention ? { ...record, auditSubjectIds: decisionJoin.auditSubjectIds } : { ...record, transcriptFiles: [...transcriptFiles] };
 }

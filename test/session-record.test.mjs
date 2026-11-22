@@ -900,18 +900,54 @@ test("two different verdicts for one fp keep their order", () => {
 	assert.deepEqual(direct.verdictHistory.map((v) => v.verdict), ["escalate", "wait"]);
 });
 
-test("with 51 descendants, a message in the 51st descendant file is in the record under the default scan", () => {
-	const { paths } = setup();
-	const rows = [mainRow({ cwd: paths.repoRoot })];
-	const cwd = paths.repoRoot;
-	for (let i = 0; i < 51; i += 1) {
-		rows.push(childRow(`s-d${i}`, `st_d${i}`, "s-main", { cwd: paths.repoRoot, startedMs: T0 + MIN, endedMs: T0 + 10 * MIN + i * 1000 }));
-		childSessionFile(cwd, `st_d${i}`, `s-d${i}`, [{ type: "session", id: `s-d${i}` }, ...(i === 50 ? [ohealth(T0 + 20 * MIN, "in the 51st")] : [])]);
+function descendantMessageFixture(count) {
+	const { root: cwd, paths } = setup();
+	const rows = [mainRow({ cwd, childCount: count })];
+	for (let i = 0; i < count; i += 1) {
+		rows.push(childRow(`s-d${i}`, `st_d${i}`, "s-main", { cwd, startedMs: T0 + MIN, endedMs: T0 + 10 * MIN - i * 1000 }));
+		childSessionFile(cwd, `st_d${i}`, `s-d${i}`, [{ type: "session", id: `s-d${i}` }, ...(i === count - 1 ? [ohealth(T0 + 20 * MIN, count === 51 ? "in the 51st" : "in the 50th")] : [])]);
 	}
 	writeLedger(paths, rows);
-	const record = loadSessionRecord({ paths, id: "s-main", now: T0 + 24 * HOUR });
+	return { paths, id: "s-main", now: T0 + 24 * HOUR };
+}
+
+test("with 51 descendants, a message in the 51st descendant file is in the record under the default scan", () => {
+	const record = loadSessionRecord(descendantMessageFixture(51));
 	assert.equal(record.children.length, 51);
 	assert.ok(record.health.messages.some((m) => m.text === "in the 51st" && m.recipient === "s-d50"));
+});
+
+const daemonMessageScanBounds = {
+	descendantScanMax: 50,
+	messageScanMaxBytes: 256 * 1024 * 1024,
+	messageScanTotalBytes: 64 * 1024 * 1024,
+	auditRetention: true,
+};
+
+test("plan64: the bounded audit bundle marks messages incomplete when a descendant is omitted", () => {
+	const options = descendantMessageFixture(51);
+	const bundleOf = (record) => auditBundle(record, null, { config: DEFAULT_CONFIG, now: options.now });
+	const bounded = bundleOf(loadSessionRecord({ ...options, ...daemonMessageScanBounds }));
+	const unbounded = bundleOf(loadSessionRecord(options));
+	assert.equal(bounded.children.length, 51);
+	assert.deepEqual(bounded.omo_health_record.messages, []);
+	assert.equal(unbounded.omo_health_record.messages.length, 1);
+	assert.equal(unbounded.truncated.messages, false);
+	assert.deepEqual(
+		{ messages: bounded.truncated.messages, descendantsSkipped: bounded.truncated.descendantsSkipped, messagesSkipped: bounded.truncated.messagesSkipped },
+		{ messages: true, descendantsSkipped: 1, messagesSkipped: 0 },
+	);
+});
+
+test("plan64: bounded and unbounded audit bundles agree at the descendant cap", () => {
+	const options = descendantMessageFixture(50);
+	const bundleOf = (record) => auditBundle(record, null, { config: DEFAULT_CONFIG, now: options.now });
+	const bounded = bundleOf(loadSessionRecord({ ...options, ...daemonMessageScanBounds }));
+	const unbounded = bundleOf(loadSessionRecord(options));
+	assert.equal(bounded.children.length, 50);
+	assert.equal(bounded.omo_health_record.messages.length, 1);
+	assert.equal(bounded.truncated.messages, false);
+	assert.deepEqual(bounded, unbounded);
 });
 
 test("with 21 overlapping machine findings, the 21st is in the record and reachable by offset", () => {

@@ -508,13 +508,16 @@ export function auditBundle(record, timeline, { config, now, configDecisions = [
 	const session = isObject(record?.session) ? record.session : {};
 	const health = isObject(record?.health) ? record.health : {};
 	const children = Array.isArray(record?.children) ? record.children : [];
+	const messagesSkipped = Array.isArray(record?.truncated?.messagesSkipped) ? record.truncated.messagesSkipped.length : 0;
+	const descendantsSkipped = numOf(record?.truncated?.descendantsSkipped) ?? 0;
 	const truncated = {
-		messagesSkipped: Array.isArray(record?.truncated?.messagesSkipped) ? record.truncated.messagesSkipped.length : 0,
+		messagesSkipped,
+		...(descendantsSkipped > 0 ? { descendantsSkipped } : {}),
 		hours: false,
 		topTurns: false,
 		findings: false,
 		actions: false,
-		messages: false,
+		messages: messagesSkipped > 0 || descendantsSkipped > 0,
 		investigations: false,
 	};
 	const continuousSinceMs = thresholdsContinuousSince([...(record?.configDecisions ?? []), ...configDecisions], detectorThresholdsHash(config));
@@ -528,7 +531,7 @@ export function auditBundle(record, timeline, { config, now, configDecisions = [
 	const capped = (key) => {
 		const list = Array.isArray(health[key]) ? health[key] : [];
 		const rows = list.slice(0, AUDIT_LIST_CAPS[key]);
-		truncated[key] = rows.length < Math.max(health.counts?.[key] ?? 0, list.length);
+		truncated[key] ||= rows.length < Math.max(health.counts?.[key] ?? 0, list.length);
 		return rows;
 	};
 	const investigations = capped("investigations");
@@ -613,7 +616,6 @@ function suggestedDetectors(bundle) {
 	const out = [];
 	if ((tokens.cache?.stormTurns ?? 0) > 0 || (tokens.cache?.hitRate !== null && tokens.cache?.hitRate < 0.25) || (tokens.errors?.count ?? 0) > 0) out.push("D4");
 	if ((tokens.tools?.rows ?? []).some((tool) => (tool.errors ?? 0) > 0)) out.push("D10");
-	if ((tokens.cache?.stormTurns ?? 0) > 0) out.push("D5");
 	return [...new Set(out)];
 }
 

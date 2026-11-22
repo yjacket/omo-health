@@ -576,6 +576,29 @@ test("verdict and action reasons reach the document only as recognized codes; fr
 
 /* ---------------------------------------------------------------- coverage */
 
+test("plan64: fast turns with a cache storm suggest D4, not D5", () => {
+	const file = path.join(tmpDir("omoh-audit-fast-storm-"), "session.jsonl");
+	const { cacheStormWrite } = DEFAULT_CONFIG.tokens;
+	writeJsonl(file, [3 * cacheStormWrite, 0, 0].map((cacheRead, i) => {
+		const startMs = T0 + i * 1000;
+		return {
+			type: "message",
+			timestamp: iso(startMs + 100),
+			message: {
+				role: "assistant", provider: "fake", model: "fast-model", stopReason: "stop", timestamp: startMs,
+				usage: { input: 10, output: 100, cacheRead, cacheWrite: i === 0 ? 0 : cacheStormWrite },
+			},
+		};
+	}));
+	const bundle = auditBundle(emptyRecord(), usageTimeline(file, DEFAULT_CONFIG.tokens), { config: DEFAULT_CONFIG, now: T0 + HOUR });
+	assert.equal(bundle.tokens.cache.stormTurns, 2);
+	assert.ok(bundle.tokens.cache.hitRate >= 0.25, "low hit rate must not independently suggest D4");
+	assert.equal(bundle.tokens.errors.count, 0);
+	const suggestion = auditDocument(bundle).split("\n").find((line) => line.startsWith("Also write one check"));
+	assert.match(suggestion, /\(D4(?:,|\))/);
+	assert.doesNotMatch(suggestion, /\bD5\b/);
+});
+
 test("(coverage) the prompt requires each fired detector in first appearance order", () => {
 	const record = emptyRecord({ health: {
 		findings: [
