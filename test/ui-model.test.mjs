@@ -490,6 +490,28 @@ it("history marks a partial tree with the required text and title", () => {
 	]);
 });
 
+it("(plan 51) history marks a pending parent tree partial until its read finishes", () => {
+	const { paths, env } = makeHome();
+	appendEnded(paths, { sessionId: "main", kind: "main", startedMs: NOW - HOUR, endedMs: NOW, outcome: "completed" }, { nowMs: NOW });
+	const index = overflowIndex(paths, [["child", "20", "main"]]);
+	const file = path.join(paths.health.sessionsDir, "main.jsonl");
+	write(file, '{"type":"usage","provider":"p","model":"m","usage":{"input":100}}\n');
+	index.update("main", file, { kind: "main" }, { maxBytes: 1 });
+	const { endedTokenCell } = tokenFormatters("endedTokenCell");
+	const display = () => {
+		index.save();
+		const [row] = uiState({ paths, env, now: NOW }).ended.rows;
+		const mark = endedTokenCell(row).children[1];
+		return [row.tokensState, row.treeTokens, row.treeTokensComplete, mark.text, mark.title];
+	};
+	const pending = display();
+	index.update("main", file, { kind: "main" });
+	assert.deepEqual([pending, display()], [
+		["pending", 20, false, "자식 포함 20+", "세지 못한 자식이 있어 일부만 더한 값입니다"],
+		["ok", 120, true, "자식 포함 120", "120"],
+	]);
+});
+
 it("a completeness-only history change refreshes the detail", () => {
 	const { endedTokenSignature } = endedDetailFunctions(["endedTokenSignature"]);
 	assert.notEqual(
@@ -1137,14 +1159,22 @@ describe("ui model", () => {
 			writeUsage(home.paths, [
 				{ id: taskId, meta: { kind: "child", taskId } },
 				{ id: "child-session", total: 75 },
+				{ id: "main-a", total: 100 },
+				{ id: "main-b", total: 100 },
+				{ id: "counted-a", total: 20, meta: { parentSessionId: "main-a" } },
+				{ id: "counted-b", total: 20, meta: { parentSessionId: "main-b" } },
 			]);
 			writeRows(home.paths, [
 				row(taskId, NOW - 1000, { kind: "child", taskId, parentSessionId: "main-a", title: "task A" }),
 				row(taskId, NOW - 2000, { kind: "child", taskId, parentSessionId: "main-b", title: "task B" }),
 				row("child-session", NOW - 3000, { kind: "child", taskId, parentSessionId: "main-c", title: "session" }),
+				row("main-a", NOW - 4000),
+				row("main-b", NOW - 5000),
 			]);
 			const { rows } = uiState({ paths: home.paths, env: home.env, now: NOW }).ended;
-			assert.deepEqual(rows.map((r) => [r.title, r.tokens?.total ?? null]), [["task A", null], ["task B", null], ["session", 75]]);
+			assert.deepEqual(rows.filter((r) => r.kind === "child").map((r) => [r.title, r.tokens?.total ?? null]), [["task A", null], ["task B", null], ["session", 75]]);
+			assert.deepEqual(rows.filter((r) => r.kind === "main").map((r) => [r.sessionId, r.treeTokens, r.treeTokensComplete]),
+				[["main-a", 120, false], ["main-b", 120, false]]);
 		});
 
 		it("keeps the last total of a complete entry whose file was then deleted, and marks a never-found row missing", () => {

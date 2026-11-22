@@ -4,8 +4,8 @@ import { getPath, pauseState, SWITCHES } from "../control.mjs";
 import { readDecisions } from "../decisions.mjs";
 import { createInvestigations, RESOLVED } from "../investigations.mjs";
 import { endedSelector, readEnded } from "../session-ledger.mjs";
-import { ambiguousLedgerTaskIds, ledgerUsageSessionId } from "../session-record.mjs";
-import { compactUsage, readUsageIndex, treeTotals, usageEntryFor } from "../usage-index.mjs";
+import { ambiguousLedgerTaskIds, usageEntryOf, usageTreeLink } from "../session-record.mjs";
+import { compactUsage, readUsageIndex, treeTotals } from "../usage-index.mjs";
 import { listDirSafe, readJsonSafe, statSafe } from "../util/fsx.mjs";
 import { redact, truncate } from "../util/text.mjs";
 import { VERSION } from "../version.mjs";
@@ -276,8 +276,7 @@ export function endedRow(r, childRows = 0, usage = null, trees = null, full = us
 	const startedMs = num(r.startedMs);
 	const endedMs = num(r.endedMs);
 	const cwd = clean(r.cwd, 300);
-	const sessionId = ledgerUsageSessionId(r);
-	const entry = !sessionId && ambiguous?.has(r.taskId) ? null : usageEntryFor(usage, sessionId, r.taskId);
+	const entry = usage && usageEntryOf(usage, r, ambiguous);
 	const tokens = compactUsage(entry);
 	const treeId = entry?.id ?? r.sessionId;
 	const tree = trees?.get(treeId) ?? null;
@@ -334,11 +333,7 @@ export function buildEnded(inputs) {
 	const selected = new Set([...shownMains, ...shownChildren]);
 	const usage = inputs.usage instanceof Map ? inputs.usage : new Map();
 	const ambiguous = ambiguousLedgerTaskIds(all);
-	const trees = treeTotals(usage, all.map((row) => {
-		const sessionId = ledgerUsageSessionId(row);
-		const id = sessionId || (!ambiguous.has(row.taskId) && usageEntryFor(usage, null, row.taskId)?.id) || row.sessionId;
-		return { id, parentSessionId: row.parentSessionId };
-	}));
+	const trees = treeTotals(usage, all.map((row) => usageTreeLink(usage, row, ambiguous)));
 	return {
 		sinceMs: inputs.now - ENDED_WINDOW_MS,
 		limit: ENDED_LIMIT,

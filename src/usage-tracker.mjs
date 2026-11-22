@@ -1,7 +1,9 @@
 import { probeSessionHeader } from "./collect/session-files.mjs";
 import { idFromFileName } from "./collect/sessions.mjs";
 import { pathKey } from "./paths.mjs";
-import { ENDED_LOCATION, locateEndedRows, readEndedCwd } from "./session-ledger.mjs";
+import { boardTaskLinks } from "./session-board.mjs";
+import { ENDED_LOCATION, endedKey, locateEndedRows, readEndedCwd } from "./session-ledger.mjs";
+import { ambiguousLedgerTaskIds, ledgerUsageSessionId, usageTreeLink } from "./session-record.mjs";
 import { USAGE_TICK_BYTES, compactUsage, fresh as isFresh, treeTotals } from "./usage-index.mjs";
 import { statSafe } from "./util/fsx.mjs";
 
@@ -35,6 +37,8 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 	const nowMs = () => (typeof clock?.now === "function" ? clock.now() : Date.now());
 	/** Compact ledger rows, for the ancestor cwd walk. */
 	const ledgerRows = new Map();
+	/** Keep scoped fallback links even though the index itself has only one slot per raw ID. */
+	const fallbackRows = new Map();
 	/** Rows waiting for bytes: id -> ledger row, newest first. */
 	let queue = new Map();
 	/** Live session ids waiting for a header probe or to enter the index. Rebuilt each tick. */
@@ -124,10 +128,14 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 		return { indexed, missing };
 	};
 
-	const totals = () => treeTotals(index.entries(), [
-		...[...ledgerRows.values()].map(({ sessionId, parentSessionId }) => ({ id: sessionId, parentSessionId })),
-		...liveTreeRows,
-	]);
+	const totals = () => {
+		const ambiguous = ambiguousLedgerTaskIds(fallbackRows.values());
+		return treeTotals(index.entries(), [
+			...[...ledgerRows.values()].filter(ledgerUsageSessionId).map((row) => usageTreeLink(index, row, ambiguous)),
+			...[...fallbackRows.values()].map((row) => usageTreeLink(index, row, ambiguous)),
+			...liveTreeRows,
+		]);
+	};
 
 	return {
 		/**
@@ -144,6 +152,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			// The daemon passes a stream for the daily window and an array
 			// for live exits. Only sweep the old window on refresh.
 			if (!Array.isArray(rows)) {
+				for (const [key, row] of fallbackRows) if (row.endedMs < cutoff) fallbackRows.delete(key);
 				for (const [id, row] of ledgerRows) {
 					if (row.endedMs < cutoff) {
 						ledgerRows.delete(id);
@@ -159,6 +168,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 				// have locations and resolve cwd from the ledger line instead.
 				if (!row[ENDED_LOCATION] && source.cwd !== undefined) row.cwd = source.cwd;
 				ledgerRows.set(row.sessionId, row);
+				if (!ledgerUsageSessionId(row)) fallbackRows.set(endedKey(source), row);
 				const entry = index.get(row.sessionId);
 				const checkedAgo = nowMs() - (Number.isFinite(entry?.checkedMs) ? entry.checkedMs : 0) > DAY_MS;
 				let need = false;
@@ -247,12 +257,11 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 					queue.delete(id);
 				}
 			}
+			const board = boardTaskLinks(world, nowMs());
 			liveTreeRows = [
 				...liveSessions.values(),
-				...(world?.tasks ?? []).map(({ childSessionId, taskId, parentSessionId }) => ({
-					id: childSessionId || index.get(null, taskId)?.id || taskId,
-					parentSessionId,
-				})),
+				...(world?.tasks ?? []).filter((task) => task.childSessionId).map(({ childSessionId, parentSessionId }) => ({ id: childSessionId, parentSessionId })),
+				...board.rows.filter((row) => !row.sessionId).map((row) => usageTreeLink(index, row, board.ambiguous)),
 			];
 			trees = totals();
 			const state = counts();
@@ -280,7 +289,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			const id = entry?.id ?? sessionId;
 			trees ??= totals();
 			const treeTokens = trees.get(id) ?? null;
-			const treeTokensComplete = trees.complete.get(id) === true;
+			const treeTokensComplete = !pendingLive.has(id) && trees.complete.get(id) === true;
 			const tree = treeTokens === null ? {} : { treeTokens, treeTokensComplete };
 			if (pendingLive.has(sessionId)) return { pending: true, ...tree };
 			if (!entry) return treeTokens === null ? null : tree;

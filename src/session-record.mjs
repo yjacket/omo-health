@@ -6,7 +6,7 @@ import { DEFAULT_CONFIG } from "./config.mjs";
 import { streamDecisions } from "./decisions.mjs";
 import { streamInvestigations } from "./investigations.mjs";
 import { endedKey, endedSelector, streamEnded } from "./session-ledger.mjs";
-import { compactUsage, readUsageIndex, treeTotals, usageEntryFor } from "./usage-index.mjs";
+import { compactUsage, readUsageIndex, usageEntryFor } from "./usage-index.mjs";
 import { reasonCode } from "./audit-codes.mjs";
 import { AUDIT_CHECK_MAX, AUDIT_DETECTOR_ID, AUDIT_LIST_CAPS, BUNDLE_MAX_CHARS, auditEvidence, auditHistoryRow, auditMessageKind } from "./judge/audit.mjs";
 import { statSafe } from "./util/fsx.mjs";
@@ -466,6 +466,9 @@ export function ledgerUsageSessionId({ sessionId, taskId }) {
 	return nonEmpty(sessionId) && sessionId !== taskId ? sessionId : null;
 }
 
+const ambiguousUsageFallback = (row, ambiguous) =>
+	!ledgerUsageSessionId(row) && (row.usageTaskIdAmbiguous === true || ambiguous?.has(row.taskId));
+
 export function ambiguousLedgerTaskIds(rows) {
 	const seen = new Set();
 	const ambiguous = new Set();
@@ -478,9 +481,14 @@ export function ambiguousLedgerTaskIds(rows) {
 }
 
 export function usageEntryOf(usage, row, ambiguous) {
-	const sessionId = ledgerUsageSessionId(row);
-	if (!sessionId && (row.usageTaskIdAmbiguous === true || ambiguous?.has(row.taskId))) return null;
-	return usageEntryFor(usage, sessionId, row.taskId) ?? (usage.full === true ? FULL_USAGE : null);
+	if (ambiguousUsageFallback(row, ambiguous)) return null;
+	return usageEntryFor(usage, ledgerUsageSessionId(row), row.taskId) ?? (usage.full === true ? FULL_USAGE : null);
+}
+
+export function usageTreeLink(usage, row, ambiguous) {
+	const { parentSessionId } = row;
+	const id = ledgerUsageSessionId(row) ?? usageEntryOf(usage, row, ambiguous)?.id;
+	return id ? { id, parentSessionId } : { id: row.taskId, parentSessionId, unresolved: true };
 }
 
 const FULL_USAGE = Object.freeze({ state: "full" });
@@ -678,22 +686,28 @@ export function buildSessionRecord(inputs = {}) {
 
 	const entry = usageEntryOf(usage, row, ambiguous);
 	const compact = compactUsage(entry);
-	const trees = treeTotals(usage.values());
-	const tokens = entry
-		? {
-				...(compact ?? { total: null, input: null, output: null, cacheRead: null, cacheWrite: null, cost: null, costUnknown: false, turns: null }),
-				models: modelRows(entry.published),
-				state: typeof entry.state === "string" ? entry.state : null,
-				complete: entry.complete === true,
-				treeTotal: trees.get(entry.id) ?? null,
-				gone: entry.gone === true,
-			}
-		: null;
-
+	// Sum the ownership-checked descendants; a separate index-only fallback
+	// could count a child whose ledger row deliberately did not resolve.
+	let subtotal = compact?.total ?? 0;
+	let counted = false;
+	let treeTokensComplete = Number.isFinite(compact?.total);
+	const seen = new Set(entry?.id ? [entry.id] : []);
+	const blocked = new Set(ambiguousUsageFallback(row, ambiguous) ? [row.sessionId] : []);
 	const children = descendants
 		.map((node) => {
 			const childEntry = usageEntryOf(usage, node, ambiguous);
 			const childCompact = compactUsage(childEntry);
+			const total = childCompact?.total;
+			// Descendants are discovered breadth first. Do not sum a branch
+			// reached through a task ID that could belong to another parent.
+			const branchBlocked = blocked.has(node.parentSessionId) || ambiguousUsageFallback(node, ambiguous);
+			if (branchBlocked) blocked.add(node.sessionId ?? node.taskId);
+			if (branchBlocked || !Number.isFinite(total)) treeTokensComplete = false;
+			if (!branchBlocked && typeof total === "number" && !seen.has(childEntry.id)) {
+				seen.add(childEntry.id);
+				counted = true;
+				subtotal += total;
+			}
 			return {
 				sessionId: node.sessionId,
 				taskId: node.taskId,
@@ -707,6 +721,18 @@ export function buildSessionRecord(inputs = {}) {
 			};
 		})
 		.sort((a, b) => (b.endedMs ?? 0) - (a.endedMs ?? 0));
+
+	const tokens = entry || counted
+		? {
+				...(compact ?? { total: null, input: null, output: null, cacheRead: null, cacheWrite: null, cost: null, costUnknown: false, turns: null }),
+				models: modelRows(entry?.published),
+				state: entry?.state ?? "pending",
+				complete: entry?.complete === true,
+				treeTotal: counted ? subtotal : null,
+				treeTokensComplete: treeTokensComplete && Number.isFinite(subtotal),
+				gone: entry?.gone === true,
+			}
+		: null;
 
 	const session = cleanValue(row);
 	// Cached previews and audit preparation re-read the index from this session alone.
@@ -981,15 +1007,10 @@ function recordLedger(rows, id, selector, usage, descendantScanMax) {
 		}
 	}
 	const fallback = new Set([subject, ...descendants].filter((node) => !ledgerUsageSessionId(node) && nonEmpty(node.taskId)).map((node) => node.taskId));
-	const seen = new Set();
-	const ambiguous = new Set();
-	if (fallback.size) {
-		for (const rec of rows()) {
-			if (!fallback.has(rec.taskId) || ledgerUsageSessionId(rec)) continue;
-			if (seen.has(rec.taskId)) ambiguous.add(rec.taskId);
-			else seen.add(rec.taskId);
-		}
-	}
+	const relevantRows = function* () {
+		for (const rec of rows()) if (fallback.has(rec.taskId)) yield rec;
+	};
+	const ambiguous = ambiguousLedgerTaskIds(fallback.size ? relevantRows() : []);
 	return { row: subject, descendants, ancestors, scanned, ambiguous };
 }
 

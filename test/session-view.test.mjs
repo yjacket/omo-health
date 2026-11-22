@@ -150,6 +150,68 @@ describe("session view", () => {
 		assert.deepEqual(total(), [120, false]);
 	});
 
+	it("(plan 51) detail marks a pending parent tree partial until its read finishes", () => {
+		const root = tmpDir("session-view-pending-parent-");
+		const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health") });
+		appendEnded(paths, { sessionId: "main", kind: "main", startedMs: T0 - 1000, endedMs: T0, outcome: "completed" }, { nowMs: T0 });
+		const index = createUsageIndex({ file: paths.health.usageIndexFile, clock: { now: () => T0 } });
+		const transcript = (id, input) => {
+			const file = path.join(root, `${id}.jsonl`);
+			fs.writeFileSync(file, `${JSON.stringify({ type: "usage", provider: "p", model: "m", usage: { input } })}\n`);
+			return file;
+		};
+		const parent = transcript("main", 100);
+		index.update("main", parent, { kind: "main" }, { maxBytes: 1 });
+		index.update("child", transcript("child", 20), { kind: "child", parentSessionId: "main" });
+		const app = fs.readFileSync(new URL("../src/ui/static/app.js", import.meta.url), "utf8");
+		const endedTokenBlock = runInNewContext(
+			["tokenReading", "treeTokenMark", "endedTokenBlock"].map((name) => app.match(new RegExp(`function ${name}\\([^]*?\\n\\t\\}`))[0]).join("\n") + "\nendedTokenBlock",
+			{ el: (_tag, attrs) => attrs, block: (_title, _own, tree) => tree, endedTokenFacts: () => null, compactCount: String, fullCount: String },
+		);
+		const display = () => {
+			index.save();
+			const { tokens } = buildSessionView(loadSessionRecord({ paths, id: "main", now: T0 }));
+			const mark = endedTokenBlock(tokens);
+			return [tokens.total, tokens.treeTotal, tokens.treeTokensComplete, mark.text, mark.title];
+		};
+		const pending = display();
+		index.update("main", parent, { kind: "main" });
+		assert.deepEqual([pending, display()], [
+			[null, 20, false, "자식 포함 20+", "세지 못한 자식이 있어 일부만 더한 값입니다"],
+			[100, 120, true, "자식 포함 120", "120"],
+		]);
+	});
+
+	it("(plan 51) detail parent trees do not fall back to an ambiguous task-only child's tokens", () => {
+		const root = tmpDir("session-view-ambiguous-tree-");
+		const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health") });
+		const row = { kind: "main", outcome: "completed", startedMs: T0 - 1000, endedMs: T0 };
+		const taskId = "st_shared";
+		const parents = ["main-a", "main-b"];
+		const index = createUsageIndex({ file: paths.health.usageIndexFile, clock: { now: () => T0 } });
+		const count = (id, input, meta) => {
+			const file = path.join(root, `${id}.jsonl`);
+			fs.writeFileSync(file, `${JSON.stringify({ type: "usage", provider: "p", model: "m", usage: { input } })}\n`);
+			index.update(id, file, meta);
+		};
+		for (const id of parents) {
+			count(id, 100, { kind: "main" });
+			appendEnded(paths, { ...row, sessionId: id }, { nowMs: T0 });
+			appendEnded(paths, { ...row, sessionId: taskId, taskId, kind: "child", cwd: path.join(root, id), parentSessionId: id }, { nowMs: T0 });
+		}
+		count(taskId, 42, { kind: "child", taskId, parentSessionId: parents[0] });
+		const totals = () => {
+			index.save();
+			return parents.map((id) => {
+				const { tokens, children } = buildSessionView(loadSessionRecord({ paths, id, now: T0 }));
+				return [tokens.treeTotal, tokens.treeTokensComplete, children.find((child) => child.taskId === taskId)?.tokens];
+			});
+		};
+		assert.deepEqual(totals(), [[null, false, null], [null, false, null]]);
+		for (const id of parents) count(`${id}-counted`, 20, { kind: "child", parentSessionId: id });
+		assert.deepEqual(totals(), [[120, false, null], [120, false, null]]);
+	});
+
 	it("detail overflow survives index reload and JSON, and renders on the token block and child row", () => {
 		const root = tmpDir("session-view-overflow-");
 		const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health") });

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
+import { runInNewContext } from "node:vm";
 import { createSessionFileLocator } from "../src/collect/session-files.mjs";
 import { SessionRegistry } from "../src/collect/sessions.mjs";
 import { readUsage } from "../src/collect/usage.mjs";
@@ -131,14 +132,33 @@ test("(plan 34) visible task-only board rows compete even when only one is index
 			sensors: parents.map((sessionId, i) => ({ sessionId, pid: 100 + i, ts: T0 - 1000 })),
 			procsFresh: true,
 		});
-		const snapshot = buildSessionSnapshot(world, [], [], T0, { tokensOf: (id, task) => s.tracker.tokensOf(id, task) });
-		return snapshot.groups.flatMap((g) => g.sessions.flatMap((r) => r.children.map((c) => [c.tokens?.total ?? null, c.tokensPending])));
+		s.tracker.tick(world);
+		const snapshot = buildSessionSnapshot(world, [], [], T0, { tokensOf: s.tracker.tokensOf });
+		return snapshot.groups.flatMap((g) => g.sessions);
+	}
+	const childTokens = (rows) => rows.flatMap((r) => r.children.map((c) => [c.tokens?.total ?? null, c.tokensPending]));
+	const trees = (rows) => rows.map((r) => [r.sessionId, r.treeTokens, r.treeTokensComplete]);
+	for (const id of ["main-a", "main-b"]) {
+		const file = mainFile(s.paths, id);
+		writeLines(file, [bigRecord(0, usage(100))]);
+		s.index.update(id, file, { kind: "main" });
+		const child = `${id}-counted`;
+		writeLines(childFile(s.cwd, `st_${child}`, child), [bigRecord(0, usage(20))]);
+		s.index.update(child, childFile(s.cwd, `st_${child}`, child), { kind: "child", parentSessionId: id });
 	}
 	indexChild(0);
-	assert.deepEqual(rowsFor(["main-a"]), [[42, false]], "a child outside the board does not compete");
-	assert.deepEqual(rowsFor(["main-a", "main-b"]), [[null, false], [null, false]], "only one candidate is indexed");
+	const oneVisible = rowsFor(["main-a"]);
+	const oneIndexed = rowsFor(["main-a", "main-b"]);
+	assert.deepEqual(childTokens(oneVisible), [[42, false]], "a child outside the board does not compete");
+	assert.deepEqual(childTokens(oneIndexed), [[null, false], [null, false]], "only one candidate is indexed");
 	indexChild(1);
-	assert.deepEqual(rowsFor(["main-a", "main-b"]), [[null, false], [null, false]], "both candidates are indexed");
+	const bothIndexed = rowsFor(["main-a", "main-b"]);
+	assert.deepEqual(childTokens(bothIndexed), [[null, false], [null, false]], "both candidates are indexed");
+	assert.deepEqual([trees(oneVisible), trees(oneIndexed), trees(bothIndexed)], [
+		[["main-a", 162, true]],
+		[["main-a", 120, false], ["main-b", 120, false]],
+		[["main-a", 120, false], ["main-b", 120, false]],
+	]);
 });
 
 test("(gate 16) saturation marks uncounted rows full, logs once, and prune lets the backlog count again", (t) => {
@@ -977,6 +997,38 @@ test("tokensOf reports a raised tree total for a parent and no tree total for a 
 	s.tracker.tick(emptyWorld(s.clock));
 	assert.deepEqual(s.tracker.tokensOf("p2"), { tokens: compactUsage(s.index.get("p2")), treeTokens: 16, treeTokensComplete: true });
 	assert.deepEqual(s.tracker.tokensOf("c2"), { tokens: compactUsage(s.index.get("c2")), treeTokens: null, treeTokensComplete: true });
+});
+
+test("(plan 51) board marks a pending parent tree partial until its read finishes", () => {
+	const s = setup();
+	const file = mainFile(s.paths, "main");
+	writeLines(file, [bigRecord(0, usage(100))]);
+	s.index.update("main", file, { kind: "main" }, { maxBytes: 1 });
+	const child = childFile(s.cwd, "st_child", "child");
+	writeLines(child, [bigRecord(0, usage(20))]);
+	s.index.update("child", child, { kind: "child", taskId: "st_child", parentSessionId: "main" });
+	const world = makeWorld({
+		now: T0,
+		sessions: [sessionState({ id: "main", file, startedMs: T0 - 5000 })],
+		sensors: [{ sessionId: "main", pid: 100, ts: T0 - 1000 }],
+		procsFresh: true,
+	});
+	const app = fs.readFileSync(new URL("../src/ui/static/app.js", import.meta.url), "utf8");
+	const treeTokenMark = runInNewContext(
+		["tokenReading", "treeTokenMark"].map((name) => app.match(new RegExp(`function ${name}\\([^]*?\\n\\t\\}`))[0]).join("\n") + "\ntreeTokenMark",
+		{ el: (_tag, attrs) => attrs, compactCount: String, fullCount: String },
+	);
+	const display = () => {
+		const [row] = buildSessionSnapshot(world, [], [], T0, { tokensOf: s.tracker.tokensOf }).groups[0].sessions;
+		const mark = treeTokenMark(row);
+		return [row.tokensPending, row.treeTokens, row.treeTokensComplete, mark.text, mark.title];
+	};
+	const pending = display();
+	s.tracker.tick(world);
+	assert.deepEqual([pending, display()], [
+		[true, 20, false, "자식 포함 20+", "세지 못한 자식이 있어 일부만 더한 값입니다"],
+		[false, 120, true, "자식 포함 120", "120"],
+	]);
 });
 
 test("tree token completeness follows pending siblings and never counts a missing sibling as complete", () => {

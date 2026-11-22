@@ -1,5 +1,6 @@
 import path from "node:path";
 import { endedKey } from "./session-ledger.mjs";
+import { ambiguousLedgerTaskIds } from "./session-record.mjs";
 import { listDirSafe, readTextSafe, statSafe } from "./util/fsx.mjs";
 import { redact, truncate } from "./util/text.mjs";
 import { toMs } from "./util/time.mjs";
@@ -155,19 +156,7 @@ export function buildSessionSnapshot(world, findings = [], investigations = [], 
 		return healthOf((findings ?? []).filter((f) => own(f.subject)), openInvestigations.filter((inv) => own(inv.subject)));
 	};
 
-	// Children by parent session id; repeated observations of the same UID count once.
-	const byParent = new Map();
-	const seen = new Set();
-	for (const task of world.tasks ?? []) {
-		const key = task.uid ?? task.taskId;
-		if (!task.parentSessionId || seen.has(key)) continue;
-		const recent = TERMINAL_STATUSES.has(task.status) && nowMs - (task.terminalAtMs ?? task.updatedAtMs ?? 0) <= RECENT_END_MS;
-		if (!ACTIVE_STATUSES.has(task.status) && !recent) continue;
-		seen.add(key);
-		if (!byParent.has(task.parentSessionId)) byParent.set(task.parentSessionId, []);
-		byParent.get(task.parentSessionId).push(task);
-	}
-	const taskOnlyRows = new Map();
+	const { byParent, ambiguous } = boardTaskLinks(world, nowMs);
 	const childrenOf = (parentId, depth, trail) => {
 		if (depth > 8 || trail.has(parentId)) return [];
 		const next = new Set(trail).add(parentId);
@@ -175,7 +164,6 @@ export function buildSessionSnapshot(world, findings = [], investigations = [], 
 			.map((task) => {
 				const sessionId = task.childSessionId || null;
 				const taskId = task.taskId ?? null;
-				const taskOnly = !sessionId && taskId;
 				const row = {
 					taskId: task.taskId,
 					sessionId,
@@ -186,10 +174,9 @@ export function buildSessionSnapshot(world, findings = [], investigations = [], 
 					startedMs: finite(task.startedAtMs ?? task.createdAtMs),
 					endedMs: finite(task.terminalAtMs),
 					health: healthFor({ sessionId, taskId }),
-					...tokenFields(taskOnly ? null : tokensOf?.(sessionId, taskId)),
+					...tokenFields(!sessionId && ambiguous.has(taskId) ? null : tokensOf?.(sessionId, taskId)),
 					children: sessionId ? childrenOf(sessionId, depth + 1, next) : [],
 				};
-				if (tokensOf && taskOnly) taskOnlyRows.set(taskId, taskOnlyRows.has(taskId) ? null : row);
 				return row;
 			})
 			.sort((a, b) => (a.startedMs ?? 0) - (b.startedMs ?? 0));
@@ -221,10 +208,6 @@ export function buildSessionSnapshot(world, findings = [], investigations = [], 
 		if (!groups.has(omoVersion)) groups.set(omoVersion, []);
 		groups.get(omoVersion).push(row);
 	}
-	// Only rows reached from live main sessions compete, including across groups.
-	for (const [taskId, row] of taskOnlyRows) {
-		if (row) Object.assign(row, tokenFields(tokensOf(null, taskId)));
-	}
 	return {
 		v: 1,
 		ts: nowMs,
@@ -232,6 +215,36 @@ export function buildSessionSnapshot(world, findings = [], investigations = [], 
 			.sort(([a], [b]) => compareVersionsDesc(a, b))
 			.map(([omoVersion, sessions]) => ({ omoVersion, sessions: sessions.sort((a, b) => (a.startedMs ?? 0) - (b.startedMs ?? 0)) })),
 	};
+}
+
+/** Only rows reached from live main sessions compete, including across groups. */
+export function boardTaskLinks(world, nowMs = world?.now) {
+	const byParent = new Map();
+	const seen = new Set();
+	for (const task of world?.tasks ?? []) {
+		const key = task.uid ?? task.taskId;
+		if (!task.parentSessionId || seen.has(key)) continue;
+		const recent = TERMINAL_STATUSES.has(task.status) && nowMs - (task.terminalAtMs ?? task.updatedAtMs ?? 0) <= RECENT_END_MS;
+		if (!ACTIVE_STATUSES.has(task.status) && !recent) continue;
+		seen.add(key);
+		if (!byParent.has(task.parentSessionId)) byParent.set(task.parentSessionId, []);
+		byParent.get(task.parentSessionId).push(task);
+	}
+	const rows = [];
+	const visit = (parentId, depth, trail) => {
+		if (depth > 8 || trail.has(parentId)) return;
+		const next = new Set(trail).add(parentId);
+		for (const task of byParent.get(parentId) ?? []) {
+			rows.push({ sessionId: task.childSessionId || null, taskId: task.taskId, parentSessionId: parentId });
+			if (task.childSessionId) visit(task.childSessionId, depth + 1, next);
+		}
+	};
+	for (const session of world?.sessions?.values?.() ?? []) {
+		if (session.kind === "main" && world.isSessionLive?.(session)) visit(session.id, 1, new Set());
+	}
+	// The board already has authoritative child session IDs, even when one equals a task ID.
+	const ambiguous = ambiguousLedgerTaskIds(rows.filter((row) => !row.sessionId));
+	return { byParent, rows, ambiguous };
 }
 
 /** Executed release decisions of the last two decision files, keyed by task and session id. */

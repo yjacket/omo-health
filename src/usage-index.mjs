@@ -170,45 +170,52 @@ export function atEnd(entry) {
 
 /**
  * Own plus descendants' complete totals via `parentSessionId`, or null when no
- * descendant contributes. `totals.complete` reports whether any known descendant
- * was left out, including rows that have not entered the usage index yet.
+ * descendant contributes. Exactness requires a published own total and every
+ * known descendant. Unresolved fallback links mark a branch partial without
+ * joining it to an unrelated index entry with the same task ID.
  */
 export function treeTotals(entries, knownRows = []) {
 	const byId = new Map();
 	const childrenByParent = new Map();
+	const unresolvedIds = new Set();
+	const unresolvedParents = new Set();
 	const link = ({ id, parentSessionId }) => {
 		if (parentSessionId == null) return;
 		const siblings = childrenByParent.get(parentSessionId) ?? new Set();
 		siblings.add(id);
 		childrenByParent.set(parentSessionId, siblings);
 	};
-	for (const entry of (entries instanceof Map ? entries.values() : entries ?? [])) {
-		if (!isObject(entry) || entry.id == null) continue;
-		byId.set(entry.id, entry);
-		link(entry);
-	}
 	for (const row of knownRows) {
 		if (!isObject(row) || row.id == null) continue;
 		if (!byId.has(row.id)) byId.set(row.id, null);
-		link(row);
+		if (row.unresolved) {
+			unresolvedIds.add(row.id);
+			if (row.parentSessionId != null) unresolvedParents.add(row.parentSessionId);
+		} else link(row);
+	}
+	for (const entry of (entries instanceof Map ? entries.values() : entries ?? [])) {
+		if (!isObject(entry) || entry.id == null) continue;
+		byId.set(entry.id, entry);
+		if (!unresolvedIds.has(entry.id)) link(entry);
 	}
 	const totals = new Map();
 	totals.complete = new Map();
 	for (const id of byId.keys()) {
+		const own = compactUsage(byId.get(id));
 		if (!childrenByParent.has(id)) {
 			totals.set(id, null);
-			totals.complete.set(id, true);
+			totals.complete.set(id, Number.isFinite(own?.total) && !unresolvedParents.has(id));
 			continue;
 		}
-		const own = compactUsage(byId.get(id));
 		let total = own ? own.total : 0;
 		let hasCountedDescendant = false;
-		let complete = true;
+		let complete = Number.isFinite(own?.total);
 		const seen = new Set([id]);
 		let frontier = [id];
 		for (let depth = 0; depth < TREE_DEPTH && frontier.length; depth += 1) {
 			const next = [];
 			for (const parentId of frontier) {
+				if (unresolvedParents.has(parentId)) complete = false;
 				for (const childId of childrenByParent.get(parentId) ?? []) {
 					if (seen.has(childId)) continue;
 					seen.add(childId);
@@ -217,7 +224,8 @@ export function treeTotals(entries, knownRows = []) {
 					if (childUsage) {
 						total += childUsage.total;
 						hasCountedDescendant = true;
-					} else complete = false;
+					}
+					if (!Number.isFinite(childUsage?.total)) complete = false;
 					next.push(childId);
 				}
 			}
@@ -225,12 +233,13 @@ export function treeTotals(entries, knownRows = []) {
 		}
 		// A depth-limited subtotal is partial if a child beyond the cap was skipped.
 		for (const parentId of frontier) {
+			if (unresolvedParents.has(parentId)) complete = false;
 			for (const childId of childrenByParent.get(parentId) ?? []) {
 				if (!seen.has(childId)) complete = false;
 			}
 		}
 		totals.set(id, hasCountedDescendant ? total : null);
-		totals.complete.set(id, complete);
+		totals.complete.set(id, complete && Number.isFinite(total));
 	}
 	return totals;
 }
