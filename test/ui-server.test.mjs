@@ -458,6 +458,27 @@ describe("ui server", { timeout: 20_000 }, () => {
 			assert.equal(calls, 2);
 		});
 
+		it("invalidates when a line is appended to an existing ledger file", () => {
+			let calls = 0;
+			const load = ({ id }) => {
+				calls += 1;
+				return fakeRecord(id);
+			};
+			fs.mkdirSync(paths.health.sessionsDir, { recursive: true });
+			const ledger = path.join(paths.health.sessionsDir, "ended-2026-11-21.jsonl");
+			fs.writeFileSync(ledger, "{}\n");
+			fs.utimesSync(ledger, clock, clock);
+			const detail = createSessionDetail({ paths, load });
+			detail("st_ledger");
+			detail("st_ledger");
+			assert.equal(calls, 1);
+			// An append changes the file's mtime but not the directory's, which is why the key reads file mtimes.
+			fs.appendFileSync(ledger, "{}\n");
+			fs.utimesSync(ledger, clock + 20_000, clock + 20_000);
+			detail("st_ledger");
+			assert.equal(calls, 2);
+		});
+
 		it("invalidates when the session file itself grows", () => {
 			let calls = 0;
 			const load = ({ id }) => {

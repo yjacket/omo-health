@@ -29,10 +29,11 @@ const dirMtime = (dir) => {
 };
 
 /** The newest decision file mtime, or null when the log is empty. */
-function newestDecisionMs(decisionsDir) {
+/** Newest mtime among a directory's files: an append to an existing file changes it, unlike the directory's own mtime. */
+function newestFileMs(dir) {
 	let newest = null;
-	for (const name of listDirSafe(decisionsDir)) {
-		const stamp = fileStamp(path.join(decisionsDir, name));
+	for (const name of listDirSafe(dir)) {
+		const stamp = fileStamp(path.join(dir, name));
 		if (stamp && (newest === null || stamp.mtimeMs > newest)) newest = stamp.mtimeMs;
 	}
 	return newest;
@@ -58,9 +59,9 @@ export function createSessionDetail({ paths, now = Date.now, load = loadSessionR
 	const signatureOf = (file) =>
 		JSON.stringify({
 			file: fileStamp(file),
-			decisions: newestDecisionMs(paths.health.decisionsDir),
+			decisions: newestFileMs(paths.health.decisionsDir),
 			investigations: dirMtime(paths.health.investigationsDir),
-			ledger: dirMtime(paths.health.sessionsDir),
+			ledger: newestFileMs(paths.health.sessionsDir),
 			usage: fileStamp(paths.health.usageIndexFile)?.mtimeMs ?? null,
 		});
 
