@@ -314,7 +314,12 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		if (record?.v === 1 && safeAuditId(record.sessionId) && typeof record.status === "string") records.set(record.sessionId, record);
 	}
 
+	const clearUnconfirmedTermination = (record) => {
+		delete record.terminationUnconfirmed;
+		delete record.deadlineMs;
+	};
 	const fail = (record, reason, detail, now) => {
+		clearUnconfirmedTermination(record);
 		record.status = "failed";
 		record.reason = reason;
 		record.detail = detail ?? null;
@@ -441,6 +446,7 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 
 		Object.assign(record, { status: "launching", jobId, laneSessionId, model: choice.model, lane: choice.lane, independence: choice.independence, launchMs: now, prepMs: Number.isFinite(full?.prepMs) ? Math.round(full.prepMs) : null });
 		record.firedDetectors = firedDetectors(bundle);
+		record.requiredDetectors = bundle.requiredDetectors;
 		save(record);
 		charge(jobId, now);
 		startJob(record);
@@ -532,15 +538,22 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 	}
 
 	function finish(record, out, now) {
-		if (out.status === "done") {
+		if (out.status === "running" && out.terminationUnconfirmed === true) {
+			if (record.terminationUnconfirmed !== true || record.deadlineMs !== out.deadlineMs) {
+				record.terminationUnconfirmed = true;
+				record.deadlineMs = out.deadlineMs;
+				save(record);
+			}
+		} else if (out.status === "done") {
 			const metadata = readJsonSafe(path.join(jobsDir, record.jobId, "refs.json"));
 			const refs = Array.isArray(metadata) ? metadata : metadata?.refs;
 			const verdict = validateAudit(out.result ?? null, { refs: Array.isArray(refs) ? refs : [] });
 			if (verdict.ok) {
-				// In-flight audits from before coverage tracking cannot prove complete review.
-				if (!Array.isArray(record.firedDetectors) || !hasDetectorCoverage(verdict.result.checks, record.firedDetectors, metadata?.findingRefs ?? {})) {
+				// Older in-flight audits without the full launch-time set cannot prove complete review.
+				if (!Array.isArray(record.requiredDetectors) || !hasDetectorCoverage(verdict.result.checks, record.requiredDetectors, metadata?.findingRefs ?? {})) {
 					return fail(record, "incomplete-checks", null, now);
 				}
+				clearUnconfirmedTermination(record);
 				record.status = "done";
 				record.result = verdict.result;
 				record.reason = null;

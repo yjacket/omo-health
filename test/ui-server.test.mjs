@@ -999,6 +999,29 @@ describe("ui server", { timeout: 20_000 }, () => {
 				}
 			});
 
+			it("IS-10 unconfirmed: HTTP detail exposes the persisted overdue flag and status label", async () => {
+				const world = makeWorld();
+				const ui = createUiServer({ paths: world.paths, token: TOKEN, getState: () => STATE, sessionDetail: world.detail, now: world.now });
+				try {
+					const deadlineMs = world.nowMs - 30_000;
+					writeJson(path.join(world.paths.health.auditsDir, `${AUDIT_ID}.json`), {
+						v: 1, sessionId: AUDIT_ID, status: "running", startedMs: deadlineMs - 900_000,
+						terminationUnconfirmed: true, deadlineMs,
+					});
+					const { port } = await ui.listen();
+					const { status, body } = await getAt(port, `/api/session?id=${AUDIT_ID}`);
+					assert.equal(status, 200);
+					assert.equal(body.audit.state.status, "running");
+					assert.equal(body.audit.state.terminationUnconfirmed, true);
+					assert.equal(body.audit.state.deadlineMs, deadlineMs);
+					assert.equal(body.audit.terminationUnconfirmedKo, "제한 시간이 지났지만 종료를 확인하지 못했습니다");
+				} finally {
+					await ui.close();
+					await world.detail.close();
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				}
+			});
+
 			it("plans around every analyst model a selected investigation used, not only the latest", async () => {
 				const world = makeWorld({ lanes: { ultrabrain: ["openai/alpha-review"], architect: ["openai/beta-review"], "deep-high": ["openai/gamma-review"] } });
 				try {

@@ -142,6 +142,20 @@ function endedDetailFunctions(names, globals) {
 	return runInNewContext(`${functions.join("\n")}\n({ ${names.map((name) => `${name}: typeof ${name} === "function" ? ${name} : undefined`).join(", ")} })`, globals);
 }
 
+it("IS-10 unconfirmed: the app audit block renders the overdue status when flagged", () => {
+	const el = (tag, attrs, ...children) => ({ tag, attrs, children });
+	const { auditBlock } = endedDetailFunctions(["auditBlock", "auditProgress"], {
+		el, block: (title, body) => ({ title, body }), note: (text, tone) => ({ text, tone }),
+		AUDIT_ACTIVE: new Set(["running"]), endedDetailId: (r) => r.sessionId,
+		show: String, when: String, chip: String, errorSlot: () => null,
+	});
+	const label = "제한 시간이 지났지만 종료를 확인하지 못했습니다";
+	const state = { status: "running", statusKo: "조사 중", startedMs: NOW - 930_000 };
+	const render = (fields) => JSON.stringify(auditBlock({ sessionId: "audit" }, { state, ...fields }));
+	assert.ok(render({ state: { ...state, terminationUnconfirmed: true, deadlineMs: NOW - 30_000 }, terminationUnconfirmedKo: label }).includes(label));
+	assert.ok(!render({ terminationUnconfirmedKo: label }).includes(label), "an ordinary running audit has no overdue note");
+});
+
 it("(plan 37) the app disclosure uses a 300-character preview and keeps the full text", () => {
 	const el = (tag, attrs, ...children) => ({ tag, attrs, children });
 	const { detailText, detailTextParts } = endedDetailFunctions(["detailTextParts", "detailText"], { el, show: String });

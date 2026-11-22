@@ -5,7 +5,7 @@ import { loadConfig } from "../config.mjs";
 import { resolveAuditModel } from "../judge/audit.mjs";
 import { loadSessionRecord, recoverPendingAnalystModels, usageEntryOf } from "../session-record.mjs";
 import { fresh, readUsageIndex } from "../usage-index.mjs";
-import { auditReasonLabel, auditStatusLabel } from "./labels.mjs";
+import { AUDIT_TERMINATION_UNCONFIRMED_LABEL, auditReasonLabel, auditStatusLabel } from "./labels.mjs";
 import { daemonStatus, loadDaemonInputs, recordsStamp } from "./model.mjs";
 
 const ACTIVE_AUDIT_STATUSES = new Set(["requested", "queued", "launching", "running"]);
@@ -71,7 +71,10 @@ export function createDetailOperations({
 		const choice = modelBlock ? null : plan(config, facts, analystModels);
 		const planned = choice && !choice.blocked ? choice : null;
 		const blocked = blockedOf({ config, daemon, usedToday, perDay, modelBlock, planned });
-		return { state, planned, blocked, stalled: isAuditActive(state) && daemon.state !== "running", usedToday, perDay };
+		return {
+			state, planned, blocked, stalled: isAuditActive(state) && daemon.state !== "running", usedToday, perDay,
+			...(state?.terminationUnconfirmed === true ? { terminationUnconfirmedKo: AUDIT_TERMINATION_UNCONFIRMED_LABEL } : {}),
+		};
 	}
 	const previewOf = auditDetail ?? ((record, id) => preview(id, record));
 

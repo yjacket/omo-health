@@ -671,6 +671,7 @@
 			"div",
 			{ class: "block" },
 			el("div", { class: "wrap-row" }, chip(s.statusKo, "info"), el("span", { class: "meta", text: line.join(" · ") })),
+			s.terminationUnconfirmed === true && a.terminationUnconfirmedKo ? note(a.terminationUnconfirmedKo, "warn") : null,
 			a.stalled ? note("감시기가 꺼져 있어 진행이 멈춰 있습니다.", "warn") : null,
 		);
 	}

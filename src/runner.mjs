@@ -216,6 +216,14 @@ function runnerOperations({ jobsDir, spawnImpl, clock, env, isAlive, identify, c
 		};
 	};
 	const running = () => ({ status: "running", result: null, exitCode: null });
+	const lookupUnconfirmed = (meta, error) => {
+		const deadlineMs = meta.startedMs + meta.timeoutMs;
+		return {
+			...running(),
+			detail: truncate(error.message, 300),
+			...(meta.kind === "audit" && clock.now() > deadlineMs ? { terminationUnconfirmed: true, deadlineMs } : {}),
+		};
+	};
 
 	function finish(f, meta, outcome, stderr) {
 		// An unverified timeout releases the slot without establishing that stderr is final.
@@ -316,7 +324,7 @@ function runnerOperations({ jobsDir, spawnImpl, clock, env, isAlive, identify, c
 			if (adoptedTerminationAttempts(meta) > 0) return finish(f, meta, { status: "timeout", result: null, exitCode: null, exitConfirmed: true });
 			return null;
 		} catch (error) {
-			return { ...running(), detail: truncate(error.message, 300) };
+			return lookupUnconfirmed(meta, error);
 		}
 	}
 
@@ -417,7 +425,7 @@ function runnerOperations({ jobsDir, spawnImpl, clock, env, isAlive, identify, c
 				} catch (error) {
 					// Audits keep retrying; other jobs release their slot at the deadline without killing an unverified pid.
 					if (timedOut && meta.kind !== "audit") return finish(f, meta, { status: "timeout", reason: "unverified", result: null, exitCode: null });
-					return { status: "running", result: null, exitCode: null, detail: truncate(error.message, 300) };
+					return lookupUnconfirmed(meta, error);
 				}
 				if (!found || !Number.isFinite(found.ctimeMs) || found.ctimeMs < meta.startedMs - ADOPT_SKEW_MS) return yield* ended(f, meta, exit);
 				meta = { ...meta, ctimeMs: found.ctimeMs, cmdSha1: found.cmdSha1 };
@@ -432,15 +440,12 @@ function runnerOperations({ jobsDir, spawnImpl, clock, env, isAlive, identify, c
 				seen = yield identityOf(meta.pid);
 			} catch (error) {
 				// Not knowing is neither "gone" nor "someone else": keep the job, never kill on a guess, retry next poll.
-				if (!timedOut) return { status: "running", result: null, exitCode: null, detail: truncate(error.message, 300) };
-				// Past the timeout a lookup that keeps failing must not hold the one-job slot and the daemon's idle exit forever:
-				// end it like an unverifiable job, without a kill. The count lives in meta (survives a restart); any successful
-				// lookup past the timeout ends the job below, so the failures counted here are always consecutive.
+				if (!timedOut) return lookupUnconfirmed(meta, error);
+				// Unlike an audit, other jobs release their slot after repeated failures without killing an unverified pid.
 				const failures = (meta.identityFailures ?? 0) + 1;
-				// An audit job is held by its own timeout and a retryable terminate(): it never finalizes on a failed lookup.
 				if (meta.kind === "audit") {
 					atomicWriteJson(f.meta, { ...meta, identityFailures: failures });
-					return { status: "running", result: null, exitCode: null, detail: truncate(error.message, 300), identityFailures: failures };
+					return { ...lookupUnconfirmed(meta, error), identityFailures: failures };
 				}
 				if (failures >= IDENTITY_FAILURE_LIMIT) return finish(f, meta, { status: "timeout", reason: "unverified", result: null, exitCode: null });
 				atomicWriteJson(f.meta, { ...meta, identityFailures: failures });

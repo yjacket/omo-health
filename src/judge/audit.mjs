@@ -48,7 +48,7 @@ export const AUDIT_METRIC_KEYS = Object.freeze([
 ]);
 const RULE_ID = /^R\d+[a-z]*$/;
 export const AUDIT_DETECTOR_ID = /^D\d+$/;
-/** The answer's check limit and the most fired detectors one answer can require. */
+/** The answer's check limit and the most detectors one answer can require. */
 export const AUDIT_CHECK_MAX = 40;
 /** The bundle's finding slots before truncation. */
 export const AUDIT_LIST_CAPS = Object.freeze({ findings: 50, machineFindings: 20, actions: 50, messages: 50, investigations: 30 });
@@ -574,6 +574,8 @@ export function auditBundle(record, timeline, { config, now, configDecisions = [
 		truncated,
 		question: AUDIT_QUESTION,
 	};
+	bundle.requiredDetectors = [...new Set([...fired, ...suggestedDetectors(bundle)])];
+	if (bundle.requiredDetectors.length > AUDIT_CHECK_MAX) throw new Error("evidence-too-large");
 	if (sizeOf(bundle) > BUNDLE_MAX_CHARS) {
 		if (bundle.tokens.hours.length > 48) {
 			bundle.tokens.hours = bundle.tokens.hours.slice(-48);
@@ -603,8 +605,8 @@ export function firedDetectors(bundle) {
 }
 
 /** A validated check covers only the detector named by its item. */
-export function hasDetectorCoverage(checks, fired, findingRefs) {
-	const remaining = new Set(fired);
+export function hasDetectorCoverage(checks, required, findingRefs) {
+	const remaining = new Set(required);
 	for (const { item } of checks) {
 		remaining.delete(Object.hasOwn(findingRefs, item) ? findingRefs[item] : item);
 	}

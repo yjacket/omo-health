@@ -599,6 +599,15 @@ test("plan64: fast turns with a cache storm suggest D4, not D5", () => {
 	assert.doesNotMatch(suggestion, /\bD5\b/);
 });
 
+test("plan65: the bundle requires both fired and aggregate-suggested detectors", () => {
+	const record = emptyRecord({ health: { findings: [finding(1, 1, { detector: "D6" })] } });
+	const timeline = timelineShell({ cache: { hitRate: 0.75, stormTurns: 2 } });
+	const bundle = auditBundle(record, timeline, { config: DEFAULT_CONFIG, now: T0 + HOUR });
+	assert.deepEqual(audit.firedDetectors(bundle), ["D6"]);
+	assert.match(auditDocument(bundle), /^Also write one check for each detector whose conditions the aggregates suggest should have fired \(D4\),/m);
+	assert.deepEqual(bundle.requiredDetectors, ["D6", "D4"]);
+});
+
 test("(coverage) the prompt requires each fired detector in first appearance order", () => {
 	const record = emptyRecord({ health: {
 		findings: [

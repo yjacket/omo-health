@@ -272,6 +272,47 @@ for (const complete of [true, false]) {
 	});
 }
 
+for (const [complete, restart] of [[false, false], [false, true], [true, true]]) {
+	test(`plan65: ${complete ? "judging" : "omitting"} the suggested D4 ${restart ? "after a restart" : "without a restart"}`, async (t) => {
+		const { cacheStormWrite } = DEFAULT_CONFIG.tokens;
+		const entries = [3 * cacheStormWrite, 0, 0].map((cacheRead, i) => E.assistant({
+			ms: BASE - 120_000 + i * 1000,
+			usage: { input: 10, output: 100, cacheRead, cacheWrite: i === 0 ? 0 : cacheStormWrite },
+		}));
+		const h = harness({ entries });
+		t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+		const auditor = h.auditor();
+		h.request("m1");
+		await h.prepare(auditor);
+		const launched = h.record("m1");
+		assert.equal(launched.status, "running");
+		assert.deepEqual(launched.firedDetectors, []);
+		const document = fs.readFileSync(path.join(h.paths.health.jobsDir, launched.jobId, "bundle.md"), "utf8");
+		assert.match(document, /"stormTurns":2/);
+		assert.match(document, /^Also write one check for each detector whose conditions the aggregates suggest should have fired \(D4\),/m);
+
+		const checks = [...TOKEN_ONLY_ANSWER.checks];
+		if (complete) checks.push({ item: "D4", judgment: "missed", explanation: "캐시 폭풍을 놓쳤습니다.", evidence: ["T"] });
+		h.runner.script = () => ({ ...DONE, result: { ...TOKEN_ONLY_ANSWER, checks } });
+		if (restart) await auditor.close();
+		h.tick(restart ? h.auditor() : auditor);
+
+		const state = readAuditState(h.paths, "m1");
+		assert.equal(state.status, complete ? "done" : "failed");
+		assert.equal(state.reason, complete ? null : "incomplete-checks");
+		if (complete) assert.deepEqual(state.result.checks, checks);
+		else {
+			assert.equal(state.result, null);
+			assert.equal(state.reasonKo, "감지를 모두 검토하지 않은 답을 받았습니다");
+		}
+		assert.deepEqual(launched.requiredDetectors, ["D4"]);
+		assert.deepEqual(state.requiredDetectors, launched.requiredDetectors);
+		assert.equal(h.runner.starts.length, 1);
+		assert.deepEqual(h.budget().jobs, [launched.jobId]);
+		assert.equal(h.budget().count, 1);
+	});
+}
+
 test("(gate 16) audit preparation reaches reviewer launch with a resident index at 96 MiB", (t) => {
 	const h = harness({ providers: ["openai", "google"], entries: [E.assistant({ ms: BASE - 120_000, model: "gpt-5-5", provider: "openai" })] });
 	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
@@ -1824,6 +1865,68 @@ test("IS-9: audit fallback stderr rejects a valid verdict without refunding the 
 	assert.equal(h.budget().count, 2);
 	assert.deepEqual(h.budget().jobs, jobs);
 	assert.equal(h.budget().refunded, undefined);
+});
+
+test("IS-10 unconfirmed: overdue identity failures are recorded while the next audit waits", async () => {
+	const h = harness({ sessions: ["m1", "m2"] });
+	h.config.audit.timeoutMs = 60_000;
+	const identity = { ctimeMs: BASE - 1_000, cmdSha1: "audit-job" };
+	let failLookup = false;
+	let alive = true;
+	let lookups = 0;
+	const recording = createRecordingSpawn();
+	const runner = createRunner({
+		paths: h.paths, clock: h.clock, env: {},
+		spawnImpl(command, args, options) {
+			if (command === "taskkill") alive = false;
+			return recording.spawnImpl(command, args, options);
+		},
+		isAlive: () => alive,
+		identify() {
+			lookups++;
+			if (failLookup) throw new Error("identity lookup failed");
+			return alive ? identity : null;
+		},
+		findJobProcess: () => null,
+	});
+	const a = h.auditor({ runner });
+	const kills = () => recording.calls.filter(({ command }) => command === "taskkill").map(({ args }) => args);
+	h.request("m1");
+	await h.prepare(a);
+	const { startedMs } = h.record("m1");
+	const deadlineMs = startedMs + h.config.audit.timeoutMs;
+	failLookup = true;
+	h.tick(a, POLL);
+	assert.equal(h.record("m1").terminationUnconfirmed, undefined, "a lookup error before the deadline is not overdue");
+	h.request("m2");
+	const beforeOverduePolls = lookups;
+	for (let i = 0; i < 5; i++) {
+		h.tick(a, POLL);
+		assert.equal(h.record("m1").status, "running");
+		assert.equal(h.record("m2").status, "queued");
+		assert.deepEqual(kills(), [], "no kill may use an unverified identity");
+	}
+	assert.equal(lookups - beforeOverduePolls, 5);
+	assert.equal(h.budget().count, 1);
+	assert.deepEqual(
+		[h.record("m1").terminationUnconfirmed, h.record("m1").deadlineMs],
+		[true, deadlineMs],
+	);
+
+	failLookup = false;
+	h.tick(a);
+	assert.deepEqual(kills(), [["/F", "/T", "/PID", "70000"]]);
+	h.tick(a);
+	const finished = h.record("m1");
+	assert.deepEqual(
+		[finished.status, finished.reason, finished.terminationUnconfirmed, finished.deadlineMs, finished.holdUntilExit],
+		["failed", "timeout", undefined, undefined, undefined],
+	);
+	assert.deepEqual(kills(), [["/F", "/T", "/PID", "70000"]]);
+	assert.equal(h.record("m2").status, "queued");
+	await h.prepare(a);
+	assert.equal(h.record("m2").status, "running");
+	assert.equal(h.budget().count, 2);
 });
 
 test("a failed first kill is retried by the real runner and the one-per-PC slot stays held until the verified pid is gone", async () => {

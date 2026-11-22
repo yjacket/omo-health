@@ -201,6 +201,7 @@ export const AUDIT_TOKEN_LABELS = Object.freeze({ normal: "정상", high: "많�
 
 /** An audit record's status (src/auditor.mjs). A request the daemon has not taken yet is `requested`, shown as queued. */
 export const AUDIT_STATUS_LABELS = Object.freeze({ queued: "대기 중", launching: "조사 중", running: "조사 중", done: "완료", failed: "실패" });
+export const AUDIT_TERMINATION_UNCONFIRMED_LABEL = "제한 시간이 지났지만 종료를 확인하지 못했습니다";
 
 /** An audit failure or refusal reason, keyed by the prefix before `:`. */
 export const AUDIT_REASON_LABELS = Object.freeze({
