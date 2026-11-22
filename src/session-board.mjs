@@ -1,4 +1,4 @@
-import { subjectKey, subjectOf, worldLiveOwners } from "./session-subject.mjs";
+import { childSubjectOf, subjectKey, subjectOf, worldLiveOwners } from "./session-subject.mjs";
 import path from "node:path";
 import { endedKey } from "./session-ledger.mjs";
 import { ambiguousLedgerTaskIds } from "./session-record.mjs";
@@ -166,7 +166,7 @@ export function buildSessionSnapshot(world, findings = [], investigations = [], 
 			.map((task) => {
 				const sessionId = task.childSessionId || null;
 				const taskId = task.taskId ?? null;
-				const subject = subjectOf({ sessionId, cwd: world.sessions?.get(sessionId)?.cwd }, parent);
+				const subject = childSubjectOf({ sessionId, task, world, parent });
 				const cwd = world.sessions?.get(sessionId)?.cwd || task.spawnCwd;
 				const row = {
 					taskId: task.taskId,
@@ -243,7 +243,7 @@ export function boardTaskLinks(world, nowMs = world?.now) {
 		const next = new Set(trail).add(parentId);
 		for (const task of byParent.get(parentId) ?? []) {
 			const sessionId = task.childSessionId || null;
-			const subject = subjectOf({ sessionId, cwd: world.sessions?.get(sessionId)?.cwd }, parent);
+			const subject = childSubjectOf({ sessionId, task, world, parent });
 			rows.push({ ...subject, taskId: task.taskId, parentSessionId: parentId, parentKey: subjectKey(parent) });
 			if (sessionId) visit(subject, depth + 1, next);
 		}

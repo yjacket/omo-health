@@ -196,6 +196,39 @@ test("project subject: a simultaneous ended row cannot replace the live board's 
 	assert.equal(buildSessionSnapshot(world, [], [], T0, { tokensOf: s.tracker.tokensOf }).groups[0].sessions[0].tokens.total, live.total);
 });
 
+test("(IS-1, IS-2) a child absent from the live registry uses its spawn project for board and tree tokens", (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const childId = "review.1";
+	const parentId = "parent";
+	const spawnCwd = path.join(s.root, "other");
+	writeLines(mainFile(s.paths, childId), [bigRecord(0, usage(17))]);
+	writeLines(mainFile(s.paths, parentId), [bigRecord(0, usage(5))]);
+	s.tracker.queueLedger([{ sessionId: childId, kind: "main", cwd: s.cwd, endedMs: T0 - 1 }]);
+	const task = taskRecord({ taskId: "st_review", parentSessionId: parentId, childSessionId: childId, spawnCwd });
+	const world = makeWorld({ now: T0, sessions: [sessionState({ id: parentId, cwd: s.cwd, file: mainFile(s.paths, parentId) })], tasks: [task] });
+	world.isSessionLive = () => true;
+	const boardTokens = () => {
+		s.tracker.tick(world);
+		const parent = buildSessionSnapshot(world, [], [], T0, { tokensOf: s.tracker.tokensOf }).groups[0].sessions[0];
+		return { child: parent.children[0].tokens?.total ?? null, parent: parent.tokens.total, tree: parent.treeTokens };
+	};
+
+	const withoutChildUsage = boardTokens();
+	assert.equal(s.tracker.tokensOf(sub(s, childId))?.tokens?.total, 17, "the colliding ended transcript was counted");
+	const file = childFile(spawnCwd, task.taskId, childId);
+	writeLines(file, [bigRecord(0, usage(7))]);
+	s.index.update(sub(s, childId, spawnCwd), file, { kind: "child", taskId: task.taskId });
+	const withChildUsage = boardTokens();
+	world.sessions.set(childId, sessionState({ id: childId, kind: "child", cwd: spawnCwd, file, task, taskId: task.taskId, parentSessionId: parentId }));
+	task.spawnCwd = s.cwd;
+	assert.deepEqual([withoutChildUsage, withChildUsage, boardTokens()], [
+		{ child: null, parent: 5, tree: null },
+		{ child: 7, parent: 5, tree: 12 },
+		{ child: 7, parent: 5, tree: 12 },
+	]);
+});
+
 test("project subject: a v4 index is discarded and rebuilt from its project's transcript", (t) => {
 	const s = projectCollision(t);
 	const [{ row, total }] = s.projects;
@@ -502,15 +535,16 @@ test("(IS-3) deleted task-only usage stays published until a new sole candidate 
 	assert.deepEqual([s.index.get(key(s, taskId)).gone, s.tracker.tokensOf(sub(s, null), taskId)?.tokens?.total], [false, 99]);
 });
 
-test("board uses a unique task-only token match but never an ambiguous or wrong-session match", () => {
+test("board uses a unique task-only token match but never an ambiguous or wrong-session match", (t) => {
 	const s = setup();
-	const task = { taskId: "st_shared", parentSessionId: "main" };
-	const first = taskRecord({ ...task, uid: "store-a/st_shared", spawnCwd: s.cwd, childSessionId: null });
-	const second = taskRecord({ ...task, uid: "store-b/st_shared", spawnCwd: path.join(s.root, "other"), childSessionId: null });
-	function indexChild({ spawnCwd, taskId }, id, total) {
-		const file = childFile(spawnCwd, taskId, id);
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const task = { taskId: "st_shared", parentSessionId: "main", spawnCwd: s.cwd, childSessionId: null };
+	const first = taskRecord({ ...task, uid: "store-a/st_shared" });
+	const second = taskRecord({ ...task, uid: "store-b/st_shared" });
+	function indexChild(store, id, total) {
+		const file = childFile(path.join(s.root, store), task.taskId, id);
 		writeLines(file, [bigRecord(0, usage(total))]);
-		s.index.update(sub(s, id), file, { kind: "child", taskId });
+		s.index.update(sub(s, id), file, { kind: "child", taskId: task.taskId });
 	}
 	function totals(tasks) {
 		const world = makeWorld({
@@ -523,9 +557,9 @@ test("board uses a unique task-only token match but never an ambiguous or wrong-
 		const snapshot = buildSessionSnapshot(world, [], [], T0, { tokensOf: (sessionId, taskId) => s.tracker.tokensOf(sessionId, taskId) });
 		return snapshot.groups[0].sessions[0].children.map((child) => child.tokens?.total ?? null);
 	}
-	indexChild(first, "indexed-a", 42);
+	indexChild("store-a", "indexed-a", 42);
 	assert.deepEqual(totals([first, { ...second, childSessionId: "not-indexed" }]), [42, null]);
-	indexChild(second, "indexed-b", 73);
+	indexChild("store-b", "indexed-b", 73);
 	assert.deepEqual(totals([first, second]), [null, null]);
 });
 
@@ -534,12 +568,12 @@ test("(plan 34) visible task-only board rows compete even when only one is index
 	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
 	const taskId = "st_shared";
 	const tasks = ["a", "b"].map((id) => taskRecord({
-		taskId, uid: `store-${id}/${taskId}`, spawnCwd: path.join(s.root, `store-${id}`),
+		taskId, uid: `store-${id}/${taskId}`, spawnCwd: s.cwd,
 		parentSessionId: `main-${id}`, childSessionId: null,
 	}));
 	function indexChild(i) {
 		const id = `indexed-${i}`;
-		const file = childFile(tasks[i].spawnCwd, taskId, id);
+		const file = childFile(path.join(s.root, `store-${i}`), taskId, id);
 		writeLines(file, [bigRecord(0, usage(42 + i))]);
 		s.index.update(sub(s, id), file, { kind: "child", taskId });
 	}

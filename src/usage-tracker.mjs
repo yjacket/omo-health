@@ -1,7 +1,7 @@
 import path from "node:path";
 import { probeSessionHeader } from "./collect/session-files.mjs";
 import { idFromFileName } from "./collect/sessions.mjs";
-import { ledgerParentSubject, PACKED_PROJECT, packScopedText, parseSubjectKey, sessionSubjects, SubjectMap, subjectKey, subjectOf, unpackScopedText } from "./session-subject.mjs";
+import { childSubjectOf, ledgerParentSubject, PACKED_PROJECT, packScopedText, parseSubjectKey, sessionSubjects, SubjectMap, subjectKey, subjectOf, unpackScopedText } from "./session-subject.mjs";
 import { isInside, pathKey } from "./paths.mjs";
 import { boardTaskLinks } from "./session-board.mjs";
 import { ENDED_LOCATION, locateEndedRows, readEndedCwd, streamEnded } from "./session-ledger.mjs";
@@ -313,8 +313,8 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			let budget = maxBytes;
 			let ownershipChanged = false;
 			const sessions = [...(world?.sessions?.values?.() ?? [])];
-			const resolve = sessionSubjects([...sessions, ...ledgerRows.values()]);
-			const liveSubject = sessionSubjects(sessions);
+			const resolve = sessionSubjects([...sessions, ...ledgerRows.values()], world);
+			const liveSubject = sessionSubjects(sessions, world);
 			resolveLiveCwdParent = (id) => {
 				const row = world?.sessions?.get(id) ?? ledgerRows.getForSubject({ sessionId: id });
 				if (!row) return null;
@@ -483,10 +483,11 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			const board = boardTaskLinks(world, nowMs());
 			liveTreeRows = [
 				...[...liveSessions.values()].map((row) => ({ key: identityOf(row), parentKey: linkedSubject(row, "parent") })),
-				...(world?.tasks ?? []).filter((task) => task.childSessionId).map(({ childSessionId, parentSessionId }) => {
+				...(world?.tasks ?? []).filter((task) => task.childSessionId).map((task) => {
+					const { childSessionId, parentSessionId } = task;
 					const parent = liveSubject(world.sessions?.get(parentSessionId));
-					const child = subjectOf(world.sessions?.get(childSessionId), parent);
-					return { key: { ...child, sessionId: childSessionId }, parentKey: parentSessionId ? { ...parent, sessionId: parentSessionId } : null };
+					const child = childSubjectOf({ sessionId: childSessionId, task, world, parent });
+					return { key: child, parentKey: parentSessionId ? { ...parent, sessionId: parentSessionId } : null };
 				}),
 				...board.rows.filter((row) => !row.sessionId).map((row) => usageTreeLink(index, row, board.ambiguous)),
 			];

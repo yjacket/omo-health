@@ -34,6 +34,15 @@ export function subjectOf(row, parent) {
 	};
 }
 
+/** A task can identify its child's project before the transcript reaches the live registry. */
+export function childSubjectOf({ sessionId, task, world, parent }) {
+	const live = sessionId ? world?.sessions?.get(sessionId) : undefined;
+	return {
+		projectKey: projectKeyOf(live?.cwd) ?? projectKeyOf((task ?? live?.task)?.spawnCwd) ?? parent?.projectKey ?? null,
+		sessionId: sessionId ?? null,
+	};
+}
+
 /** Read exact identities, not the dashboard's redacted display paths. */
 export function boardLiveOwners(paths) {
 	const snapshot = readJsonSafe(paths.health.sessionsSnapshotFile);
@@ -69,7 +78,7 @@ function sortedOwners(owners) {
 
 export function worldLiveOwners(world) {
 	const rows = [...(world?.sessions?.values?.() ?? [])];
-	return rows.map(sessionSubjects(rows));
+	return rows.map(sessionSubjects(rows, world));
 }
 
 /** Track only the requested IDs. Repeated rows of one scoped subject are one owner. */
@@ -240,7 +249,7 @@ export function auditFileKey(subject) {
 }
 
 /** Inherit only from an unambiguous parent when a child has no cwd. */
-export function sessionSubjects(rows) {
+export function sessionSubjects(rows, world) {
 	const byId = new Map();
 	for (const row of rows) {
 		const sessionId = row?.sessionId ?? row?.id;
@@ -250,12 +259,14 @@ export function sessionSubjects(rows) {
 		byId.set(sessionId, peers);
 	}
 	const resolve = (row, remaining = 8) => {
-		const own = subjectOf(row);
+		const sessionId = row?.sessionId ?? row?.id;
+		const liveChild = row?.kind === "child" && sessionId && world?.sessions?.get(sessionId) === row;
+		const own = liveChild ? childSubjectOf({ sessionId, world }) : subjectOf(row);
 		if (own.projectKey || !remaining || !row?.parentSessionId) return own;
-		if (row.parentProjectKey != null) return subjectOf(row, { projectKey: row.parentProjectKey });
+		if (row.parentProjectKey != null) return { ...own, projectKey: row.parentProjectKey };
 		const parents = byId.get(row.parentSessionId) ?? [];
 		const keys = new Set(parents.map((parent) => resolve(parent, remaining - 1).projectKey).filter(Boolean));
-		return keys.size === 1 ? subjectOf(row, { projectKey: keys.values().next().value }) : own;
+		return keys.size === 1 ? { ...own, projectKey: keys.values().next().value } : own;
 	};
 	return resolve;
 }
