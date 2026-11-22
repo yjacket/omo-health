@@ -1,9 +1,11 @@
+import { createHash } from "node:crypto";
 import { AUDIT_REASON_CODES, reasonCode } from "../audit-codes.mjs";
 import { MODEL_KEY_LENGTH } from "../collect/usage.mjs";
 import { detectorThresholdsHash } from "../config-reload.mjs";
 import { errorStormFact } from "../detect/loops.mjs";
 import { imageLevel } from "../detect/tokens.mjs";
 import { safeSubjectId } from "../session-id.mjs";
+import { isRedactedLedgerId } from "../session-record.mjs";
 import { redact, truncate } from "../util/text.mjs";
 import { parseAnalystOutput } from "./analyst.mjs";
 import { laneModels, modelFamily, modelName } from "./lane.mjs";
@@ -218,8 +220,11 @@ const INFERENCE_CUTOFFS = {
 
 const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 const textOf = (value) => (typeof value === "string" ? redact(value) : null);
-// Missing, malformed or redacted IDs don't identify a subject in reviewer data.
-const subjectIdOf = (value) => safeSubjectId(textOf(value));
+const outboundId = (id) => isRedactedLedgerId(id)
+	? `redacted-id-${createHash("sha256").update(id).digest("hex").slice(0, 12)}`
+	: id;
+// Validate first: a display placeholder is not an exact subject ID and must never be hashed.
+const subjectIdOf = (value) => outboundId(safeSubjectId(value));
 const numOf = (value) => (typeof value === "number" && Number.isFinite(value) ? value : null);
 const boolOf = (value) => (typeof value === "boolean" ? value : null);
 const safeRule = (value) => {
@@ -397,7 +402,7 @@ function investigationsOf(list) {
 		const rule = isObject(investigation?.rule) ? investigation.rule : {};
 		return {
 			ref: `I${index + 1}`,
-			id: textOf(investigation?.id),
+			id: outboundId(typeof investigation?.id === "string" ? investigation.id : null),
 			openedMs: numOf(investigation?.openedMs),
 			trigger: textOf(investigation?.trigger),
 			status: textOf(investigation?.status),
@@ -511,6 +516,7 @@ const BUNDLE_SUBJECT_ID_PATHS = new Set([
 	"session.parentSessionId",
 	"children[].sessionId",
 	"children[].taskId",
+	"children[].parentSessionId",
 	"omo_health_record.findings[].subject.sessionId",
 	"omo_health_record.findings[].subject.taskId",
 ]);
@@ -555,6 +561,8 @@ const sizeOf = (bundle) => JSON.stringify(bundle).length;
  */
 export function auditBundle(record, timeline, { config, now, configDecisions = [] } = {}) {
 	const session = isObject(record?.session) ? record.session : {};
+	// ledgerIds are local-only exact keys; the corresponding display fields may already be masked.
+	const sessionIds = session.ledgerIds ?? session;
 	const health = isObject(record?.health) ? record.health : {};
 	const children = Array.isArray(record?.children) ? record.children : [];
 	const messagesSkipped = Array.isArray(record?.truncated?.messagesSkipped) ? record.truncated.messagesSkipped.length : 0;
@@ -605,10 +613,10 @@ export function auditBundle(record, timeline, { config, now, configDecisions = [
 	if (investigations.some((row) => row?.verdictHistoryTooLarge)) throw new Error("evidence-too-large");
 	const bundle = {
 		session: {
-			sessionId: subjectIdOf(session.sessionId),
-			taskId: subjectIdOf(session.taskId),
+			sessionId: subjectIdOf(sessionIds.sessionId),
+			taskId: subjectIdOf(sessionIds.taskId),
 			kind: textOf(session.kind),
-			parentSessionId: subjectIdOf(session.parentSessionId),
+			parentSessionId: subjectIdOf(sessionIds.parentSessionId),
 			outcome: textOf(session.outcome),
 			estimated: boolOf(session.estimated),
 			source: textOf(session.source),
@@ -623,6 +631,7 @@ export function auditBundle(record, timeline, { config, now, configDecisions = [
 		children: children.map((child) => ({
 			sessionId: subjectIdOf(child?.sessionId),
 			taskId: subjectIdOf(child?.taskId),
+			parentSessionId: subjectIdOf(child?.parentSessionId),
 			depth: numOf(child?.depth),
 			outcome: textOf(child?.outcome),
 			endedMs: numOf(child?.endedMs),

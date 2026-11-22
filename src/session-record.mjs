@@ -60,6 +60,7 @@ const nonEmpty = (v) => typeof v === "string" && v.length > 0;
 
 /** `redact` plus the GitHub token shape it does not mask yet. */
 const scrub = (value) => redact(String(value ?? "")).replace(/ghp_[A-Za-z0-9]{8,}/g, "ghp_[REDACTED]");
+export const isRedactedLedgerId = (id) => typeof id === "string" && scrub(id) !== id;
 const clean = (value, max = LINE_MAX) => (typeof value === "string" && value ? truncate(scrub(value), max) : null);
 export const displayLedgerId = (id) => typeof id === "string" ? truncate(scrub(id), TEXT_MAX) : id;
 const msOf = (value) => (typeof value === "number" && Number.isFinite(value) ? value : typeof value === "string" ? Date.parse(value) : Number.NaN);

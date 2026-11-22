@@ -1,4 +1,5 @@
 import "./helpers/tmp-root.mjs";
+import { createHash } from "node:crypto";
 import { subjectOf, subjectKey } from "../src/session-subject.mjs";
 const sub = (sessionId, cwd) => subjectOf({ sessionId, cwd });
 const key = (sessionId, cwd) => subjectKey(sub(sessionId, cwd));
@@ -667,7 +668,7 @@ test("plan79: credential-shaped subject IDs are still redacted from reviewer dat
 	const credentialShapedId = `sk-ant-${"x".repeat(300)}`;
 	const record = emptyRecord({ session: { sessionId: credentialShapedId } });
 	const bundle = auditBundle(record, null, { config: DEFAULT_CONFIG, now: T0 });
-	assert.equal(bundle.session.sessionId, null);
+	assert.equal(bundle.session.sessionId, `redacted-id-${createHash("sha256").update(credentialShapedId).digest("hex").slice(0, 12)}`);
 	assert.ok(!JSON.stringify(bundle).includes(credentialShapedId));
 });
 

@@ -4,21 +4,26 @@ const sub = (sessionId, cwd) => subjectOf({ sessionId, cwd });
 const key = (sessionId, cwd) => subjectKey(sub(sessionId, cwd));
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
 import { prepareAudit } from "../src/audit-prepare-worker.mjs";
+import { createAuditor, readAuditState } from "../src/auditor.mjs";
 import { DEFAULT_CONFIG } from "../src/config.mjs";
 import { appendDecision } from "../src/decisions.mjs";
 import { createInvestigations } from "../src/investigations.mjs";
+import { ANALYST_POLL_MS } from "../src/judge/analyst.mjs";
 import { AUDIT_LIST_CAPS, auditBundle, resolveAuditModel } from "../src/judge/audit.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 import { appendEnded } from "../src/session-ledger.mjs";
 import { buildSessionRecord, loadSessionRecord, scanOmoHealthMessages } from "../src/session-record.mjs";
 import * as sessionRecord from "../src/session-record.mjs";
+import { createDetailWorker, createSessionDetail, createStartAudit } from "../src/ui/cli.mjs";
 import { createDetailOperations } from "../src/ui/detail-worker.mjs";
+import { createUiServer } from "../src/ui/server.mjs";
 import { buildSessionView } from "../src/ui/session-view.mjs";
-import { fresh } from "../src/usage-index.mjs";
+import { createUsageIndex, fresh } from "../src/usage-index.mjs";
 import { expectedSelector } from "./helpers/ended-selector.mjs";
 import { tmpDir, writeJsonl, writeTask } from "./helpers/fixtures.mjs";
 import { indexLiveParentTranscript } from "./helpers/live-parent-transcript.mjs";
@@ -1150,16 +1155,24 @@ test("a ghp_ token in stored text is redacted", () => {
 	assert.ok(text.includes("ghp_[REDACTED]"));
 });
 
-test("plan86: record identity is separate from redacted ledger display IDs", () => {
+test("plan86: record identity is separate from redacted ledger display IDs", async (t) => {
+	const { root, paths } = setup();
 	const sessionId = "ghp_review1234";
 	const taskId = "ghp_workitem1234";
 	const parentSessionId = "ghp_upstream1234";
 	const childId = "ghp_descendant1234";
 	const childTaskId = "ghp_childtask1234";
-	const row = { sessionId, taskId, parentSessionId, kind: "child", startedMs: T0, endedMs: T0 + HOUR };
-	const child = { sessionId: childId, taskId: childTaskId, parentSessionId: sessionId, kind: "child", startedMs: T0 + MIN, endedMs: T0 + HOUR };
-	const entry = { id: sessionId, taskId };
-	const index = new Map([[subjectKey(subjectOf(row)), entry]]);
+	const row = { sessionId, taskId, parentSessionId, kind: "child", cwd: root, startedMs: T0, endedMs: T0 + HOUR };
+	const child = { ...row, sessionId: childId, taskId: childTaskId, parentSessionId: sessionId, startedMs: T0 + MIN };
+	const grandchild = { ...child, sessionId: "plain-grandchild", taskId: "plain-task", parentSessionId: childId, startedMs: T0 + 2 * MIN };
+	const file = childSessionFile(root, taskId, sessionId);
+	let tickMs = row.endedMs;
+	const now = () => tickMs;
+	const subject = subjectOf(row);
+	const index = createUsageIndex({ file: paths.health.usageIndexFile, clock: { now } });
+	index.update(subject, file, { kind: "child", taskId, parentSessionId });
+	index.save();
+	const entry = index.get(subjectKey(subject));
 	const record = buildSessionRecord({ row, ledger: [row, child], usage: index });
 	assert.equal(sessionRecord.usageEntryOf(index, record.session), entry);
 	assert.deepEqual(record.session.ledgerIds, { sessionId, taskId, parentSessionId });
@@ -1170,9 +1183,83 @@ test("plan86: record identity is separate from redacted ledger display IDs", () 
 	for (const item of [view.session, view.children[0]]) {
 		assert.deepEqual([item.sessionId, item.taskId, item.parentSessionId], Array(3).fill("ghp_[REDACTED]"));
 	}
-	const bundle = auditBundle(record, null, { config: DEFAULT_CONFIG, now: row.endedMs });
-	assert.deepEqual([bundle.session.sessionId, bundle.session.taskId, bundle.session.parentSessionId], [null, null, null]);
-	assert.deepEqual([bundle.children[0].sessionId, bundle.children[0].taskId], [childId, childTaskId], "reviewer bundle retains its own child ID policy");
+
+	writeLedger(paths, [row, child, grandchild]);
+	appendDecision(paths, { fp: "joined-finding", subject: { sessionId, taskId }, event: "opened",
+		detector: "D1", kind: "stalled", severity: "warn", ts: iso(T0 + MIN) });
+	const writeJson = (file, value) => {
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, JSON.stringify(value));
+	};
+	const env = { USERPROFILE: root, OMO_HEALTH_HOME: paths.healthHome, OMO_HEALTH_OMO_HOME: paths.omoHome };
+	writeJson(paths.health.daemonJson, { ts: now(), pid: process.pid, mode: "auto", version: "test" });
+	writeJson(paths.omoJsonc, { "[native]": { categories: { ultrabrain: { models: ["openai/gpt-review"] } } } });
+	writeJson(paths.authFile, { openai: {} });
+	const launches = [];
+	const runner = {
+		start(job) {
+			launches.push(job);
+			return { jobId: job.jobId, pid: 5000 };
+		},
+		poll: () => ({ status: "done", exitCode: 0, result: {
+			overall: "sound",
+			summary: "토큰 사용과 점검이 모두 적절했습니다.",
+			tokens: { judgment: "normal", explanation: "정상 범위입니다." },
+			checks: [{ item: "D1", judgment: "unverifiable", explanation: "자료가 부족합니다.", evidence: [] }],
+			recommendations: [],
+			confidence: 0.8,
+		} }),
+	};
+	const auditor = createAuditor({ paths, env, config: DEFAULT_CONFIG, clock: { now }, runner });
+	const worker = createDetailWorker({ paths, env });
+	const token = "test-token";
+	const ui = createUiServer({ paths, token, now, getState: () => ({}),
+		sessionDetail: createSessionDetail({ paths, env, now, worker }), startAudit: createStartAudit({ paths, env, now, worker }) });
+	t.after(async () => {
+		await Promise.all([ui.close(), worker.close(), auditor.close()]);
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+	const { port } = await ui.listen();
+	const selector = expectedSelector(row);
+	const headers = { "x-omo-health-token": token, "content-type": "application/json" };
+	const base = `http://127.0.0.1:${port}/api`;
+	const detail = await fetch(`${base}/session?id=${sessionId}&row=${selector}`, { headers });
+	const opened = await detail.json();
+	assert.equal(detail.status, 200, JSON.stringify(opened));
+	assert.deepEqual(opened.health.findings.map(({ subject }) => [subject.sessionId, subject.taskId]),
+		[["ghp_[REDACTED]", "ghp_[REDACTED]"]]);
+	const post = await fetch(`${base}/audit`, { method: "POST", headers, body: JSON.stringify({ sessionId, row: selector }) });
+	const accepted = await post.json();
+	assert.deepEqual([post.status, accepted.audit?.sessionId, accepted.audit?.status], [202, sessionId, "queued"], JSON.stringify(accepted));
+	const [requestFile] = fs.readdirSync(paths.health.auditRequestsDir);
+	assert.equal(JSON.parse(fs.readFileSync(path.join(paths.health.auditRequestsDir, requestFile), "utf8")).sessionId, sessionId);
+
+	auditor.tick(now());
+	await auditor.preparing();
+	auditor.tick(now());
+	assert.equal(launches.length, 1, JSON.stringify(readAuditState(paths, subject)));
+	tickMs += ANALYST_POLL_MS;
+	auditor.tick(now());
+	const completed = readAuditState(paths, subject);
+	assert.deepEqual([completed.status, completed.sessionId], ["done", sessionId], JSON.stringify(completed));
+
+	const [{ cwd, args }] = launches;
+	const document = fs.readFileSync(path.join(cwd, "bundle.md"), "utf8");
+	assert.ok(args.includes(`@${path.join(cwd, "bundle.md")}`));
+	const ids = [sessionId, taskId, parentSessionId, childId, childTaskId];
+	for (const [label, text] of [["bundle.md", document], ["runner prompt argv", args.join("\n")]]) {
+		assert.equal(ids.some((id) => text.includes(id)), false, `dummy credential-shaped ID leaked in ${label}`);
+	}
+	const bundle = JSON.parse(document.split("\n").find((line) => line.startsWith('{"session":')));
+	const ref = (id) => `redacted-id-${createHash("sha256").update(id).digest("hex").slice(0, 12)}`;
+	assert.deepEqual([bundle.session.sessionId, bundle.session.taskId, bundle.session.parentSessionId], ids.slice(0, 3).map(ref));
+	const bundledChild = bundle.children.find(({ depth }) => depth === 1);
+	assert.deepEqual([bundledChild.sessionId, bundledChild.taskId, bundledChild.parentSessionId],
+		[ref(childId), ref(childTaskId), bundle.session.sessionId]);
+	const bundledGrandchild = bundle.children.find(({ depth }) => depth === 2);
+	assert.deepEqual([bundledGrandchild.sessionId, bundledGrandchild.taskId, bundledGrandchild.parentSessionId],
+		["plain-grandchild", "plain-task", bundledChild.sessionId]);
+	assert.deepEqual(bundle.omo_health_record.findings.map(({ subject }) => subject), [{ sessionId: null, taskId: null }]);
 });
 
 test("an unknown id returns {found:false}", () => {
