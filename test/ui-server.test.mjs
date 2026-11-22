@@ -1062,6 +1062,8 @@ describe("ui server", { timeout: 20_000 }, () => {
 				const { config } = loadConfig({ paths, env });
 				const auditor = createAuditor({ paths, env, config, clock: { now }, runner: { start: (job) => starts.push(job) } });
 				auditor.tick(nowMs);
+				await auditor.preparing();
+				auditor.tick(nowMs);
 				assert.equal(starts.length, 1);
 				assert.equal(readAuditState(paths, AUDIT_ID).status, "running");
 				assert.equal(fs.existsSync(requestFileOf(world)), false);
@@ -1084,7 +1086,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 						assert.equal(claim.created, true);
 						claimed = claim.request;
 						auditor.tick(now());
-						assert.equal(readAuditState(paths, AUDIT_ID).status, "running");
+						assert.equal(readAuditState(paths, AUDIT_ID).status, "queued");
 						assert.equal(fs.existsSync(requestFileOf(world)), false);
 						return claim;
 					},
@@ -1103,7 +1105,9 @@ describe("ui server", { timeout: 20_000 }, () => {
 				assert.equal(readAuditState(paths, AUDIT_ID).claimId, claimed.claimId);
 				const refused = await postAt(bPort, "/api/audit", { sessionId: AUDIT_ID });
 				assert.deepEqual([refused.status, refused.body], [409, { error: "running", reasonKo: "이미 조사 중입니다" }]);
+				await auditor.preparing();
 				auditor.tick(now());
+				assert.equal(readAuditState(paths, AUDIT_ID).status, "running");
 				assert.equal(fs.existsSync(requestFileOf(world)), false);
 				assert.equal(starts.length, 1);
 				assert.deepEqual(JSON.parse(fs.readFileSync(paths.health.auditBudgetFile, "utf8")), {
@@ -1129,7 +1133,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 					const a = dashboard(world.startAudit);
 					const intake = () => {
 						auditor.tick(now());
-						assert.equal(readAuditState(paths, AUDIT_ID).status, "launching");
+						assert.equal(readAuditState(paths, AUDIT_ID).status, "queued");
 						assert.equal(fs.existsSync(requestFileOf(world)), false);
 					};
 					let firstRead = interleave;
@@ -1159,6 +1163,9 @@ describe("ui server", { timeout: 20_000 }, () => {
 						const refused = await postAt(bPort, "/api/audit", { sessionId: AUDIT_ID });
 						assert.deepEqual([refused.status, refused.body], [409, { error: "running", reasonKo: "이미 조사 중입니다" }]);
 						assert.equal(fs.existsSync(requestFileOf(world)), false);
+						await auditor.preparing();
+						auditor.tick(now());
+						assert.equal(readAuditState(paths, AUDIT_ID).status, "launching");
 						auditor.tick(now() + 30_000);
 						auditor.tick(now() + 60_000);
 						assert.equal(starts.length, 1);

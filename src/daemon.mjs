@@ -526,6 +526,7 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 		} catch (error) {
 			log.error("usage_save_failed", { error: error.message });
 		}
+		await auditor.close?.();
 		engine.close();
 		closeDb(db);
 		releaseLock(paths);

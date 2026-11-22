@@ -114,9 +114,12 @@ if (operation === "all-sources") {
 	console.log(`DECISIONS matching bytes=${bytes}`);
 	requestAudit(paths, sessionId, now);
 	let starts = 0;
-	createAuditor({ paths, config: DEFAULT_CONFIG, clock, env: {}, runner: {
+	const auditor = createAuditor({ paths, config: DEFAULT_CONFIG, clock, env: {}, runner: {
 		start() { starts++; return { pid: 1 }; },
-	} }).tick(now);
+	} });
+	auditor.tick(now);
+	await auditor.preparing();
+	auditor.tick(now);
 	const state = readAuditState(paths, sessionId);
 	if (state?.status === "running") {
 		assert.equal(starts, 1);
@@ -275,9 +278,12 @@ if (operation === "all-sources") {
 			put(paths.authFile, '{"other":{}}');
 			requestAudit(paths, "seed", now);
 			let starts = 0;
-			createAuditor({ paths, index, config: DEFAULT_CONFIG, clock, env: {}, runner: {
+			const auditor = createAuditor({ paths, index, config: DEFAULT_CONFIG, clock, env: {}, runner: {
 				start() { starts++; return { pid: 1 }; },
-			} }).tick(now + 1);
+			} });
+			auditor.tick(now + 1);
+			await auditor.preparing();
+			auditor.tick(now + 1);
 			const state = readAuditState(paths, "seed");
 			if (shape === "family") {
 				assert.equal(starts, 0);

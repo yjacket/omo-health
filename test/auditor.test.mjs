@@ -5,7 +5,8 @@ import { once } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { test } from "node:test";
+import { Worker } from "node:worker_threads";
+import { afterEach, test } from "node:test";
 import { AUDIT_CONTRACT, REQUEST_TTL_MS, auditsToday, createAuditor, readAuditState, requestAudit, safeAuditId } from "../src/auditor.mjs";
 import { createSessionFileLocator } from "../src/collect/session-files.mjs";
 import { usageTimeline } from "../src/collect/usage.mjs";
@@ -13,7 +14,6 @@ import { DEFAULT_CONFIG } from "../src/config.mjs";
 import { GUARD_FLAGS } from "../src/judge/lane.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 import { appendEnded, readEnded } from "../src/session-ledger.mjs";
-import { loadSessionRecord } from "../src/session-record.mjs";
 import { createRunner } from "../src/runner.mjs";
 import { createUsageIndex, fresh } from "../src/usage-index.mjs";
 import { createUsageTracker } from "../src/usage-tracker.mjs";
@@ -82,6 +82,22 @@ function fakeRunner(paths, state) {
 	return r;
 }
 
+const auditors = new Set();
+afterEach(async () => {
+	await Promise.all([...auditors].map((auditor) => auditor.close?.()));
+	auditors.clear();
+});
+
+function probeWorker(mode, observed) {
+	return (_url, options) => {
+		const worker = new Worker(new URL("./helpers/audit-prepare-probe.mjs", import.meta.url), {
+			...options, workerData: { paths: options.workerData.paths, mode },
+		});
+		worker.on("message", (reply) => observed?.(reply.observed));
+		return worker;
+	};
+}
+
 function harness({ providers = ["anthropic-subscription", "openai", "google", "xai"], sessions = ["m1"], entries } = {}) {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "auditor-"));
 	const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health") });
@@ -102,9 +118,18 @@ function harness({ providers = ["anthropic-subscription", "openai", "google", "x
 		return file;
 	};
 	for (const id of sessions) h.addSession(id);
-	h.auditor = (extra = {}) => createAuditor({ paths, config, clock, log: silent, runner: h.runner, env: {}, ...extra });
+	h.auditor = (extra = {}) => {
+		const auditor = createAuditor({ paths, config, clock, log: silent, runner: h.runner, env: {}, ...extra });
+		auditors.add(auditor);
+		return auditor;
+	};
 	h.tick = (auditor, ms = POLL) => {
 		state.now += ms;
+		auditor.tick(state.now);
+	};
+	h.prepare = async (auditor, ms) => {
+		h.tick(auditor, ms);
+		await auditor.preparing();
 		auditor.tick(state.now);
 	};
 	h.request = (id) => {
@@ -119,21 +144,98 @@ function harness({ providers = ["anthropic-subscription", "openai", "google", "x
 }
 
 /** Start the oldest queued audit, then die right after the runner spawned it (before `running` is persisted). */
-function crashAfterStart(h, { writeMeta = true } = {}) {
+async function crashAfterStart(h, { writeMeta = true } = {}) {
 	h.runner.writeMeta = writeMeta;
 	const first = h.auditor({
 		afterStart: () => {
 			throw new Error("crash");
 		},
 	});
-	assert.throws(() => h.tick(first), /crash/);
+	await assert.rejects(h.prepare(first), /crash/);
 	return first;
 }
 
 const modelOf = (start) => start.args[start.args.indexOf("--model") + 1];
 
+test("(IS-2 worker) board callbacks keep running while audit preparation is blocked", async () => {
+	const h = harness({ sessions: ["m1", "m2"] });
+	const signal = new Int32Array(new SharedArrayBuffer(8));
+	let posts = 0;
+	const auditor = h.auditor({ createWorker(_url, options) {
+		assert.equal(options.resourceLimits.maxOldGenerationSizeMb, 64);
+		const worker = new Worker(new URL("./helpers/audit-prepare-probe.mjs", import.meta.url), {
+			...options, workerData: { paths: options.workerData.paths, mode: "block", signal },
+		});
+		const post = worker.postMessage.bind(worker);
+		worker.postMessage = (message) => { posts++; post(message); };
+		return worker;
+	} });
+	const boards = [];
+	const updateBoard = () => boards.push(h.state.now);
+	h.request("m1");
+	h.request("m2");
+	h.tick(auditor);
+	assert.equal(h.record("m1").status, "queued");
+	try {
+		await Atomics.waitAsync(signal, 0, 0, 30_000).value;
+		assert.equal(Atomics.load(signal, 0), 1, "worker entered loadRecord");
+		for (let i = 0; i < 4; i++) {
+			h.tick(auditor);
+			updateBoard();
+			assert.equal(boards.length, i + 1);
+			assert.equal(auditor.busy(), true);
+			assert.equal(h.record("m1").status, "queued");
+			assert.equal(h.record("m2").status, "queued");
+		}
+		assert.equal(posts, 1);
+		assert.equal(h.runner.starts.length, 0);
+		assert.equal(h.budget(), undefined);
+	} finally {
+		Atomics.store(signal, 1, 1);
+		Atomics.notify(signal, 1);
+	}
+	await auditor.preparing();
+	assert.equal(h.record("m1").status, "queued", "reply alone must not launch");
+	h.tick(auditor);
+	h.tick(auditor);
+	assert.equal(h.record("m1").status, "running");
+	assert.equal(h.record("m2").status, "queued");
+	assert.equal(h.runner.starts.length, 1);
+	assert.deepEqual(h.budget().jobs, [h.record("m1").jobId]);
+	assert.equal(h.budget().count, 1);
+});
+
+for (const mode of ["crash", "exit"]) {
+	test(`(IS-2 worker) worker ${mode} fails one audit uncharged and the next worker launches`, async () => {
+		const h = harness({ sessions: ["m1", "m2"] });
+		let workers = 0;
+		const auditor = h.auditor({ createWorker(url, options) {
+			if (++workers === 1) return probeWorker(mode)(url, options);
+			return new Worker(url, options);
+		} });
+		h.request("m1");
+		h.tick(auditor);
+		await auditor.preparing?.();
+		h.tick(auditor);
+		const first = h.record("m1");
+		assert.equal(first.status, "failed");
+		assert.equal(first.reason, "prepare-error");
+		assert.match(first.detail, mode === "crash" ? /failed preparation/ : /exited \(7\)/);
+		assert.ok(first.detail.length <= 300);
+		assert.equal(h.runner.starts.length, 0);
+		assert.equal(h.budget(), undefined);
+		h.request("m2");
+		await h.prepare(auditor);
+		assert.equal(workers, 2);
+		assert.equal(h.record("m2").status, "running");
+		assert.equal(h.runner.starts.length, 1);
+		assert.deepEqual(h.budget().jobs, [h.record("m2").jobId]);
+		assert.equal(h.budget().count, 1);
+	});
+}
+
 for (const complete of [true, false]) {
-	test(`(coverage) an audit ${complete ? "reviewing every fired detector finishes done" : "citing both findings without judging both detectors fails without a refund"}`, (t) => {
+	test(`(coverage) an audit ${complete ? "reviewing every fired detector finishes done" : "citing both findings without judging both detectors fails without a refund"}`, async (t) => {
 		const h = harness();
 		t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
 		fs.mkdirSync(h.paths.health.decisionsDir, { recursive: true });
@@ -142,7 +244,7 @@ for (const complete of [true, false]) {
 			{ ts: new Date(BASE - 110_000).toISOString(), fp: "d8", event: "opened", detector: "D8" },
 		]);
 		h.request("m1");
-		h.tick(h.auditor());
+		await h.prepare(h.auditor());
 		const launched = readAuditState(h.paths, "m1");
 		assert.equal(launched.status, "running");
 		const checks = [{ item: "D6", judgment: "sound", explanation: "적절했습니다.", evidence: ["근거: F1, F2"] }];
@@ -205,6 +307,9 @@ if (mode === "fixture") {
 		start() { launches++; return { pid: 5001 }; },
 	} });
 	auditor.tick(now + 1);
+	assert.equal(indexOpens, 0, "the submitting daemon tick never reopens the index");
+	await auditor.preparing();
+	auditor.tick(now + 1);
 	assert.equal(launches, 1);
 	const record = readAuditState(paths, "m1");
 	assert.deepEqual([record.status, record.model], ["running", "google/gemini-3-pro"]);
@@ -218,12 +323,12 @@ if (mode === "fixture") {
 	}
 });
 
-test("a request becomes queued, then running with the marker, the guard flags and one charge, then done", () => {
+test("a request becomes queued, then running with the marker, the guard flags and one charge, then done", async () => {
 	const h = harness();
 	const a = h.auditor();
 	h.request("m1");
 	assert.equal(a.busy(), false, "a request file alone is not read until a tick");
-	h.tick(a);
+	await h.prepare(a);
 	const record = h.record("m1");
 	assert.equal(record.status, "running");
 	assert.deepEqual([record.model, record.lane, record.independence], ["openai/gpt-5-5", "ultrabrain", "family"]);
@@ -254,12 +359,12 @@ test("a request becomes queued, then running with the marker, the guard flags an
 	assert.equal(a.busy(), false);
 });
 
-test("a request the daemon accepted is not expired while it waits behind a running audit, and starts after it", () => {
+test("a request the daemon accepted is not expired while it waits behind a running audit, and starts after it", async () => {
 	const h = harness({ sessions: ["m1", "m2"] });
 	const a = h.auditor();
 	h.request("m1");
 	h.request("m2");
-	h.tick(a);
+	await h.prepare(a);
 	assert.equal(h.record("m1").status, "running");
 	assert.equal(h.record("m2").status, "queued");
 	h.tick(a, REQUEST_TTL_MS + 60_000);
@@ -268,7 +373,7 @@ test("a request the daemon accepted is not expired while it waits behind a runni
 	h.runner.script = () => DONE;
 	h.tick(a);
 	assert.equal(h.record("m1").status, "done");
-	h.tick(a);
+	await h.prepare(a);
 	assert.equal(h.record("m2").status, "running", "the waiting request starts once the slot is free");
 	h.tick(a);
 	assert.equal(h.record("m2").status, "done");
@@ -277,12 +382,12 @@ test("a request the daemon accepted is not expired while it waits behind a runni
 	assert.equal(h.budget().count, 2);
 });
 
-test("a running job survives a daemon restart: one runner.start and one charge", () => {
+test("a running job survives a daemon restart: one runner.start and one charge", async () => {
 	const h = harness();
 	const a = h.auditor();
 	h.request("m1");
 	h.runner.script = queue(RUNNING, RUNNING, DONE);
-	h.tick(a);
+	await h.prepare(a);
 	h.tick(a);
 	h.tick(a);
 	assert.equal(h.record("m1").status, "running");
@@ -294,25 +399,25 @@ test("a running job survives a daemon restart: one runner.start and one charge",
 	assert.equal(h.budget().count, 1);
 });
 
-test("a rerun charges again", () => {
+test("a rerun charges again", async () => {
 	const h = harness();
 	const a = h.auditor();
 	h.request("m1");
 	h.runner.script = () => DONE;
-	h.tick(a);
+	await h.prepare(a);
 	h.tick(a);
 	assert.equal(h.record("m1").status, "done");
 	h.request("m1");
-	h.tick(a);
+	await h.prepare(a);
 	assert.equal(h.runner.starts.length, 2);
 	assert.equal(h.budget().count, 2);
 	assert.notEqual(h.runner.starts[0].jobId, h.runner.starts[1].jobId);
 });
 
-test("dying right after the spawn leaves a launching record that the next auditor polls to done without a second start", () => {
+test("dying right after the spawn leaves a launching record that the next auditor polls to done without a second start", async () => {
 	const h = harness();
 	h.request("m1");
-	crashAfterStart(h);
+	await crashAfterStart(h);
 	assert.equal(h.record("m1").status, "launching");
 	h.runner.script = () => DONE;
 	const b = h.auditor();
@@ -322,10 +427,10 @@ test("dying right after the spawn leaves a launching record that the next audito
 	assert.equal(h.budget().count, 1);
 });
 
-test("dying inside the spawn (no meta.json) ends launch-uncertain without a second start", () => {
+test("dying inside the spawn (no meta.json) ends launch-uncertain without a second start", async () => {
 	const h = harness();
 	h.request("m1");
-	crashAfterStart(h, { writeMeta: false });
+	await crashAfterStart(h, { writeMeta: false });
 	const b = h.auditor();
 	h.tick(b);
 	const record = h.record("m1");
@@ -337,16 +442,16 @@ test("dying inside the spawn (no meta.json) ends launch-uncertain without a seco
 	assert.equal(b.busy(), false);
 });
 
-function twoSessionsCrashed() {
+async function twoSessionsCrashed() {
 	const h = harness({ sessions: ["m1", "m2"] });
 	h.request("m1");
 	h.request("m2");
-	crashAfterStart(h, { writeMeta: false });
+	await crashAfterStart(h, { writeMeta: false });
 	return h;
 }
 
-test("after that crash with a second audit queued: adoptJob running keeps the second waiting until the first ends", () => {
-	const h = twoSessionsCrashed();
+test("after that crash with a second audit queued: adoptJob running keeps the second waiting until the first ends", async () => {
+	const h = await twoSessionsCrashed();
 	h.runner.adopt = () => "running";
 	h.runner.script = (jobId, n) => (jobId.endsWith("-m1") && n >= 1 ? DONE : RUNNING);
 	const b = h.auditor();
@@ -356,25 +461,25 @@ test("after that crash with a second audit queued: adoptJob running keeps the se
 	h.tick(b);
 	assert.equal(h.record("m1").status, "done");
 	assert.equal(h.runner.starts.length, 1, "the slot was freed by the poll of this tick");
-	h.tick(b);
+	await h.prepare(b);
 	assert.equal(h.runner.starts.length, 2);
 	assert.ok(h.runner.starts[1].jobId.endsWith("-m2"));
 });
 
-test("after that crash: adoptJob absent frees the slot and the second starts on the next tick", () => {
-	const h = twoSessionsCrashed();
+test("after that crash: adoptJob absent frees the slot and the second starts on the next tick", async () => {
+	const h = await twoSessionsCrashed();
 	h.runner.adopt = () => "absent";
 	const b = h.auditor();
 	assert.equal(h.record("m1").reason, "launch-uncertain");
 	assert.equal(h.runner.starts.length, 1);
-	h.tick(b);
+	await h.prepare(b);
 	assert.equal(h.runner.starts.length, 2);
 	assert.ok(h.runner.starts[1].jobId.endsWith("-m2"));
 	assert.equal(h.runner.starts.filter((start) => start.jobId.endsWith("-m1")).length, 1, "the uncertain job is never restarted");
 });
 
-test("after that crash: a throwing adoptJob keeps the second waiting across ticks", () => {
-	const h = twoSessionsCrashed();
+test("after that crash: a throwing adoptJob keeps the second waiting across ticks", async () => {
+	const h = await twoSessionsCrashed();
 	h.runner.adopt = () => {
 		throw new Error("cim down");
 	};
@@ -388,7 +493,7 @@ test("after that crash: a throwing adoptJob keeps the second waiting across tick
 	h.runner.adopt = () => "absent";
 	h.tick(b);
 	assert.equal(h.record("m1").reason, "launch-uncertain");
-	h.tick(b);
+	await h.prepare(b);
 	assert.equal(h.runner.starts.length, 2);
 });
 
@@ -401,7 +506,7 @@ function aliveFlag(h) {
 	return flag;
 }
 
-test("five failed lookups past the deadline, then timeout: the second audit starts only after alive turns false", () => {
+test("five failed lookups past the deadline, then timeout: the second audit starts only after alive turns false", async () => {
 	const h = harness({ sessions: ["m1", "m2"] });
 	const alive = aliveFlag(h);
 	const failedLookup = { status: "running", result: null, exitCode: null, detail: "job process lookup failed" };
@@ -409,7 +514,7 @@ test("five failed lookups past the deadline, then timeout: the second audit star
 	const a = h.auditor();
 	h.request("m1");
 	h.request("m2");
-	h.tick(a);
+	await h.prepare(a);
 	for (let i = 0; i < 5; i++) {
 		h.tick(a);
 		assert.equal(h.record("m1").status, "running");
@@ -426,18 +531,18 @@ test("five failed lookups past the deadline, then timeout: the second audit star
 	h.tick(a);
 	assert.equal(h.record("m1").holdUntilExit, undefined);
 	assert.equal(h.runner.starts.length, 1, "alive turned false on this tick; the next one starts");
-	h.tick(a);
+	await h.prepare(a);
 	assert.equal(h.runner.starts.length, 2);
 });
 
-test("a timeout holds the slot while alive is true, retries terminate on every poll, and survives a failed lookup", () => {
+test("a timeout holds the slot while alive is true, retries terminate on every poll, and survives a failed lookup", async () => {
 	const h = harness({ sessions: ["m1", "m2"] });
 	const alive = aliveFlag(h);
 	h.runner.script = (jobId) => (jobId.endsWith("-m1") ? { status: "timeout", result: null, exitCode: null } : RUNNING);
 	const a = h.auditor();
 	h.request("m1");
 	h.request("m2");
-	h.tick(a);
+	await h.prepare(a);
 	h.tick(a);
 	assert.equal(h.record("m1").reason, "timeout");
 	assert.equal(a.busy(), true);
@@ -454,15 +559,15 @@ test("a timeout holds the slot while alive is true, retries terminate on every p
 	alive.value = false;
 	h.tick(a);
 	assert.equal(h.runner.starts.length, 1);
-	h.tick(a);
+	await h.prepare(a);
 	assert.equal(h.runner.starts.length, 2);
 });
 
-test("a launching record whose meta.json has ctimeMs null is polled through the runner, and a second audit waits for its end", () => {
+test("a launching record whose meta.json has ctimeMs null is polled through the runner, and a second audit waits for its end", async () => {
 	const h = harness({ sessions: ["m1", "m2"] });
 	h.request("m1");
 	h.request("m2");
-	crashAfterStart(h);
+	await crashAfterStart(h);
 	const meta = readJsonSafe(path.join(h.paths.health.jobsDir, h.record("m1").jobId, "meta.json"));
 	assert.equal(meta.ctimeMs, null);
 	h.runner.script = (jobId, n) => (jobId.endsWith("-m1") && n >= 1 ? DONE : RUNNING);
@@ -473,16 +578,16 @@ test("a launching record whose meta.json has ctimeMs null is polled through the 
 	h.tick(b);
 	assert.equal(h.record("m1").status, "done");
 	assert.equal(h.runner.adopts.length, 0, "meta.json exists, so no process lookup is needed");
-	h.tick(b);
+	await h.prepare(b);
 	assert.equal(h.runner.starts.length, 2);
 });
 
-test("a pre-spawn throw (spawned:false) refunds the charge and ends spawn-error", () => {
+test("a pre-spawn throw (spawned:false) refunds the charge and ends spawn-error", async () => {
 	const h = harness();
 	h.runner.startError = Object.assign(new Error("EACCES"), { spawned: false });
 	const a = h.auditor();
 	h.request("m1");
-	h.tick(a);
+	await h.prepare(a);
 	const record = h.record("m1");
 	assert.equal(record.status, "failed");
 	assert.equal(record.reason, "spawn-error");
@@ -491,7 +596,7 @@ test("a pre-spawn throw (spawned:false) refunds the charge and ends spawn-error"
 	assert.equal(a.busy(), false);
 });
 
-test("(IS-10) only a confirmed non-launch refunds, even when its poll result is replayed after restart", (t) => {
+test("(IS-10) only a confirmed non-launch refunds, even when its poll result is replayed after restart", async (t) => {
 	const h = harness({ sessions: ["m1", "m2"] });
 	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
 	h.runner.writeMeta = false;
@@ -506,13 +611,13 @@ test("(IS-10) only a confirmed non-launch refunds, even when its poll result is 
 	});
 	const a = h.auditor();
 	h.request("m1");
-	h.tick(a);
+	await h.prepare(a);
 	h.tick(a);
 	const { jobId: uncertainId, status, reason } = h.record("m1");
 	assert.deepEqual([status, reason, h.budget().count], ["failed", "spawn-error:ENOENT", 1]);
 
 	h.request("m2");
-	h.tick(a);
+	await h.prepare(a);
 	const running = h.record("m2");
 	assert.equal(running.status, "running");
 	assert.equal(h.budget().count, 2);
@@ -545,7 +650,7 @@ test("(IS-10) a nonexistent OMO_HEALTH_OMO executable ends spawn-error without s
 	const a = h.auditor({ runner, env });
 	assert.equal(auditsToday(h.paths, h.state.now), 0);
 	h.request("m1");
-	h.tick(a);
+	await h.prepare(a);
 	assert.equal(h.record("m1").status, "running");
 	assert.equal(auditsToday(h.paths, h.state.now), 1);
 	const [error] = await spawnError;
@@ -555,14 +660,14 @@ test("(IS-10) a nonexistent OMO_HEALTH_OMO executable ends spawn-error without s
 	assert.equal(a.busy(), false);
 });
 
-test("a post-spawn meta write failure keeps the charge and the launching record; the second waits for adoptJob", () => {
+test("a post-spawn meta write failure keeps the charge and the launching record; the second waits for adoptJob", async () => {
 	for (const adopted of ["running", "absent"]) {
 		const h = harness({ sessions: ["m1", "m2"] });
 		h.runner.startError = Object.assign(new Error("EPERM meta"), { spawned: true, pid: 77 });
 		const a = h.auditor();
 		h.request("m1");
 		h.request("m2");
-		h.tick(a);
+		await h.prepare(a);
 		assert.equal(h.record("m1").status, "launching");
 		assert.equal(h.budget().count, 1, "the charge stays");
 		h.runner.startError = undefined;
@@ -578,13 +683,13 @@ test("a post-spawn meta write failure keeps the charge and the launching record;
 		} else {
 			assert.equal(h.record("m1").reason, "launch-uncertain");
 		}
-		h.tick(a);
+		await h.prepare(a);
 		assert.equal(h.runner.starts.length, 2);
 		assert.equal(h.budget().count, 2);
 	}
 });
 
-test("a same-length rewrite is no longer fresh, queueLedger requeues it, and the audit refuses with models-unknown until the recount", () => {
+test("a same-length rewrite is no longer fresh, queueLedger requeues it, and the audit refuses with models-unknown until the recount", async () => {
 	const mk = (model, input) => E.assistant({ ms: BASE - 120_000, id: "a-m1", model, provider: "openai", usage: { input, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } });
 	const h = harness({ entries: [mk("gpt-5-4", 10)] });
 	const file = h.files.m1;
@@ -606,7 +711,7 @@ test("a same-length rewrite is no longer fresh, queueLedger requeues it, and the
 
 	const a = h.auditor({ timelineMaxBytes: 1 });
 	h.request("m1");
-	h.tick(a);
+	await h.prepare(a);
 	assert.equal(h.record("m1").reason, "models-unknown");
 	assert.equal(h.runner.starts.length, 0);
 	assert.equal(h.budget(), undefined, "nothing is charged");
@@ -617,11 +722,11 @@ test("a same-length rewrite is no longer fresh, queueLedger requeues it, and the
 	assert.equal(index.get("m1").published.total, usageTimeline(file).totals.total, "the recount equals the oracle");
 	assert.equal(index.get("m1").published.total, 25);
 	h.request("m1");
-	h.tick(a);
+	await h.prepare(a);
 	assert.equal(modelOf(h.runner.starts[0]), "google/gemini-3-pro", "gpt-5-5 is excluded after the recount");
 });
 
-test("a same-length rewrite read by a complete timeline excludes the new model before the recount", () => {
+test("a same-length rewrite read by a complete timeline excludes the new model before the recount", async () => {
 	const mk = (model, input) => E.assistant({ ms: BASE - 120_000, id: "a-m1", model, provider: "openai", usage: { input, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } });
 	const h = harness({ entries: [mk("gpt-5-4", 10)] });
 	const file = h.files.m1;
@@ -637,21 +742,16 @@ test("a same-length rewrite read by a complete timeline excludes the new model b
 
 	const a = h.auditor();
 	h.request("m1");
-	h.tick(a);
+	await h.prepare(a);
 	assert.equal(h.runner.starts.length, 1, "a complete timeline proves coverage without the recount");
 	assert.equal(modelOf(h.runner.starts[0]), "google/gemini-3-pro", "the rewritten model gpt-5-5 is excluded");
 });
 
-test("evidence-too-large charges nothing and never starts", () => {
+test("evidence-too-large charges nothing and never starts", async () => {
 	const h = harness();
-	const a = h.auditor({
-		loadRecord: (options) => {
-			const record = loadSessionRecord(options);
-			return { ...record, tokens: { models: Array.from({ length: 3000 }, (_, i) => ({ key: `${"m".repeat(60)}${i}`, tokens: 1, cost: 0 })) } };
-		},
-	});
+	const a = h.auditor({ createWorker: probeWorker("oversized") });
 	h.request("m1");
-	h.tick(a);
+	await h.prepare(a);
 	assert.equal(h.record("m1").reason, "evidence-too-large");
 	assert.equal(h.runner.starts.length, 0);
 	assert.equal(h.budget(), undefined);
@@ -669,7 +769,7 @@ function indexed(h, id, { maxBytes } = {}) {
 	return index;
 }
 
-test("(gate 15) the auditor excludes an identity missing only from published.usedModels", () => {
+test("(gate 15) the auditor excludes an identity missing only from published.usedModels", async () => {
 	const h = harness({ entries: [openaiLine()] });
 	const index = indexed(h, "m1");
 	const file = index.file;
@@ -680,11 +780,11 @@ test("(gate 15) the auditor excludes an identity missing only from published.use
 
 	const a = h.auditor({ timelineMaxBytes: fs.statSync(h.files.m1).size - 1 });
 	h.request("m1");
-	h.tick(a);
+	await h.prepare(a);
 	assert.equal(modelOf(h.runner.starts[0]), "google/gemini-3-pro");
 });
 
-test("without a full timeline, an incomplete entry and a complete entry that is not at the end both end models-unknown without a charge", () => {
+test("without a full timeline, an incomplete entry and a complete entry that is not at the end both end models-unknown without a charge", async () => {
 	const h = harness();
 	const index = indexed(h, "m1", { maxBytes: 10 });
 	assert.equal(index.get("m1").complete, false);
@@ -692,7 +792,7 @@ test("without a full timeline, an incomplete entry and a complete entry that is 
 	const small = fs.statSync(h.files.m1).size - 1;
 	const a = h.auditor({ timelineMaxBytes: small });
 	h.request("m1");
-	h.tick(a);
+	await h.prepare(a);
 	assert.equal(h.record("m1").reason, "models-unknown");
 
 	indexed(h, "m1");
@@ -702,22 +802,22 @@ test("without a full timeline, an incomplete entry and a complete entry that is 
 	assert.equal(fresh(entry), false, "complete but not at the end");
 	const b = h.auditor({ timelineMaxBytes: fs.statSync(h.files.m1).size - 1 });
 	h.request("m1");
-	h.tick(b);
+	await h.prepare(b);
 	assert.equal(h.record("m1").reason, "models-unknown");
 	assert.equal(h.runner.starts.length, 0);
 	assert.equal(h.budget(), undefined);
 
 	const c = h.auditor();
 	h.request("m1");
-	h.tick(c);
+	await h.prepare(c);
 	assert.equal(modelOf(h.runner.starts[0]), "google/gemini-3-pro", "with the timeline the unread suffix is seen and its model excluded");
 });
 
-test("a prewarm entry alone excludes the first candidate, a failed prewarm in an unread suffix too", () => {
+test("a prewarm entry alone excludes the first candidate, a failed prewarm in an unread suffix too", async () => {
 	const h = harness({ entries: [E.assistant({ ms: BASE - 120_000, id: "a-1", model: "claude-opus-5-5", provider: "anthropic-subscription" }), prewarm("warmed")] });
 	const a = h.auditor();
 	h.request("m1");
-	h.tick(a);
+	await h.prepare(a);
 	assert.equal(modelOf(h.runner.starts[0]), "google/gemini-3-pro");
 
 	const g = harness();
@@ -727,7 +827,7 @@ test("a prewarm entry alone excludes the first candidate, a failed prewarm in an
 	assert.equal(fresh(entry), false);
 	const b = g.auditor();
 	g.request("m1");
-	g.tick(b);
+	await g.prepare(b);
 	assert.equal(modelOf(g.runner.starts[0]), "google/gemini-3-pro");
 });
 
@@ -741,17 +841,17 @@ const carrierLine = (kind) => {
 };
 
 for (const kind of ["toolResult", "compaction"]) {
-	test(`(plan 24) the reviewer launch excludes a model seen only in a ${kind}`, (t) => {
+	test(`(plan 24) the reviewer launch excludes a model seen only in a ${kind}`, async (t) => {
 		const h = harness({ entries: [E.assistant({ ms: BASE - 120_000, id: "a-m1", model: "claude-opus-5-5", provider: "anthropic-subscription" }), carrierLine(kind)] });
 		t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
 		const a = h.auditor();
 		h.request("m1");
-		h.tick(a);
+		await h.prepare(a);
 		assert.equal(modelOf(h.runner.starts[0]), "google/gemini-3-pro");
 	});
 }
 
-test("(plan 25) a compaction carrying usage without a model fails the queued audit as models-unknown without starting the runner or charging", (t) => {
+test("(plan 25) a compaction carrying usage without a model fails the queued audit as models-unknown without starting the runner or charging", async (t) => {
 	const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } };
 	const h = harness({
 		entries: [
@@ -762,13 +862,13 @@ test("(plan 25) a compaction carrying usage without a model fails the queued aud
 	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
 	const a = h.auditor();
 	h.request("m1");
-	h.tick(a);
+	await h.prepare(a);
 	assert.equal(h.record("m1").reason, "models-unknown");
 	assert.equal(h.runner.starts.length, 0);
 	assert.equal(h.budget(), undefined);
 });
 
-test("a fresh task-keyed entry from another store cannot certify a queued child audit", (t) => {
+test("a fresh task-keyed entry from another store cannot certify a queued child audit", async (t) => {
 	const h = harness({ sessions: [] });
 	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
 	const taskId = "st_shared";
@@ -783,15 +883,16 @@ test("a fresh task-keyed entry from another store cannot certify a queued child 
 	}
 	assert.equal(fresh(index.get(taskId)), true);
 	assert.equal(index.has("child-b"), false);
+	assert.ok(index.save(), "publish the colliding entry to the preparation worker");
 
 	h.request("child-b");
-	h.tick(h.auditor({ index }));
+	await h.prepare(h.auditor());
 	const { status, reason } = h.record("child-b");
 	assert.deepEqual([status, reason, h.runner.starts.length, h.budget()], ["failed", "models-unknown", 0, undefined]);
 });
 
 for (const incomplete of ["timeline", "index"]) {
-	test(`(gate 14) the auditor refuses when only the ${incomplete} lost model identities`, () => {
+	test(`(gate 14) the auditor refuses when only the ${incomplete} lost model identities`, async () => {
 		const h = harness();
 		indexed(h, "m1");
 		if (incomplete === "index") {
@@ -801,47 +902,41 @@ for (const incomplete of ["timeline", "index"]) {
 			entry.published.modelsIncomplete = true;
 			fs.writeFileSync(file, `${header}\n${JSON.stringify(entry)}\n`);
 		}
-		const a = h.auditor({
-			timeline: (...args) => {
-				const full = usageTimeline(...args);
-				if (incomplete === "timeline") full.totals.modelsIncomplete = true;
-				return full;
-			},
-		});
+		const a = h.auditor({ createWorker: probeWorker(incomplete) });
 		h.request("m1");
-		h.tick(a);
+		await h.prepare(a);
 		assert.equal(h.record("m1").reason, "models-unknown");
 		assert.equal(h.runner.starts.length, 0);
 		assert.equal(h.budget(), undefined);
 	});
 }
 
-test("the auditor passes a 64 MiB total message scan budget", (t) => {
+test("the auditor passes a 64 MiB total message scan budget", async (t) => {
 	const h = harness();
 	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
 	const calls = [];
-	const a = h.auditor({ loadRecord: (options) => calls.push(options) && { found: false } });
+	const a = h.auditor({ createWorker: probeWorker("bounds", ({ options }) => calls.push(options)) });
 	h.request("m1");
-	h.tick(a);
+	await h.prepare(a);
 	assert.deepEqual(calls.map((options) => options.messageScanTotalBytes), [64 * 1024 * 1024]);
 });
 
-test("preparing a file above timelineMaxBytes neither scans messages nor reads it through usageTimeline", () => {
+test("preparing a file above timelineMaxBytes neither scans messages nor reads it through usageTimeline", async () => {
 	const h = harness();
 	const scans = [];
 	const timelines = [];
 	const seen = [];
 	const deps = (limit) => ({
 		timelineMaxBytes: limit,
-		loadRecord: (options) => {
-			seen.push(options);
-			return loadSessionRecord({ ...options, scanMessages: (file) => (scans.push(file), []) });
-		},
-		timeline: (...args) => (timelines.push(args), usageTimeline(...args)),
+		createWorker: probeWorker("scans", (reply) => {
+			seen.push(reply.options);
+			scans.push(...reply.scans);
+			timelines.push(...reply.timelines);
+		}),
 	});
 	const a = h.auditor(deps(10));
 	h.request("m1");
-	h.tick(a);
+	await h.prepare(a);
 	assert.equal(h.record("m1").reason, "models-unknown");
 	assert.deepEqual(scans, []);
 	assert.deepEqual(timelines, []);
@@ -850,20 +945,20 @@ test("preparing a file above timelineMaxBytes neither scans messages nor reads i
 
 	const b = h.auditor(deps(256 * 1024 * 1024));
 	h.request("m1");
-	h.tick(b);
+	await h.prepare(b);
 	assert.equal(scans.length, 1, "under the limit the same spies are called");
 	assert.equal(timelines.length, 1);
 	assert.equal(timelines[0][1].maxFileBytes, 256 * 1024 * 1024);
 });
 
-test("a job the runner no longer knows is adopted before it ends no-job; the second waits meanwhile", () => {
+test("a job the runner no longer knows is adopted before it ends no-job; the second waits meanwhile", async () => {
 	const h = harness({ sessions: ["m1", "m2"] });
 	h.runner.script = (jobId) => (jobId.endsWith("-m1") ? { status: "failed", reason: "no-job", result: null, exitCode: null } : RUNNING);
 	h.runner.adopt = () => "running";
 	const a = h.auditor();
 	h.request("m1");
 	h.request("m2");
-	h.tick(a);
+	await h.prepare(a);
 	h.tick(a);
 	assert.equal(h.record("m1").status, "running");
 	assert.equal(h.runner.adopts.length, 1);
@@ -874,11 +969,11 @@ test("a job the runner no longer knows is adopted before it ends no-job; the sec
 	assert.equal(h.record("m1").reason, "no-job");
 	assert.ok(Number.isFinite(h.record("m1").finishedMs));
 	assert.equal(h.runner.starts.length, 1);
-	h.tick(a);
+	await h.prepare(a);
 	assert.equal(h.runner.starts.length, 2);
 });
 
-test("a no-job answer with a throwing lookup keeps the record running", () => {
+test("a no-job answer with a throwing lookup keeps the record running", async () => {
 	const h = harness();
 	h.runner.script = () => ({ status: "failed", reason: "no-job", result: null, exitCode: null });
 	h.runner.adopt = () => {
@@ -886,7 +981,7 @@ test("a no-job answer with a throwing lookup keeps the record running", () => {
 	};
 	const a = h.auditor();
 	h.request("m1");
-	h.tick(a);
+	await h.prepare(a);
 	h.tick(a);
 	assert.equal(h.record("m1").status, "running");
 	assert.equal(a.busy(), true);
@@ -919,11 +1014,11 @@ test("an invalid request file is deleted", () => {
 	assert.equal(a.busy(), false);
 });
 
-test("a duplicate request while running is deleted and keeps the original job", () => {
+test("a duplicate request while running is deleted and keeps the original job", async () => {
 	const h = harness();
 	const a = h.auditor();
 	h.request("m1");
-	h.tick(a);
+	await h.prepare(a);
 	const jobId = h.record("m1").jobId;
 	h.request("m1");
 	h.tick(a);
@@ -934,14 +1029,14 @@ test("a duplicate request while running is deleted and keeps the original job", 
 	assert.equal(h.budget().count, 1);
 });
 
-test("a failed first kill is retried by the restarted daemon, and the second audit waits until alive turns false", () => {
+test("a failed first kill is retried by the restarted daemon, and the second audit waits until alive turns false", async () => {
 	const h = harness({ sessions: ["m1", "m2"] });
 	const alive = aliveFlag(h);
 	h.runner.script = (jobId) => (jobId.endsWith("-m1") ? { status: "timeout", result: null, exitCode: null } : RUNNING);
 	const a = h.auditor();
 	h.request("m1");
 	h.request("m2");
-	h.tick(a);
+	await h.prepare(a);
 	h.tick(a);
 	h.tick(a);
 	assert.equal(h.runner.terminates.length, 1, "the first taskkill was sent and failed; alive stays true");
@@ -954,17 +1049,17 @@ test("a failed first kill is retried by the restarted daemon, and the second aud
 	alive.value = false;
 	h.tick(b);
 	assert.equal(h.runner.starts.length, 1);
-	h.tick(b);
+	await h.prepare(b);
 	assert.equal(h.runner.starts.length, 2);
 });
 
-test("a retry request during a timeout hold is deleted across a restart, and is accepted only once alive is false", () => {
+test("a retry request during a timeout hold is deleted across a restart, and is accepted only once alive is false", async () => {
 	const h = harness();
 	const alive = aliveFlag(h);
 	h.runner.script = () => ({ status: "timeout", result: null, exitCode: null });
 	const a = h.auditor();
 	h.request("m1");
-	h.tick(a);
+	await h.prepare(a);
 	h.tick(a);
 	const jobId = h.record("m1").jobId;
 	h.request("m1");
@@ -979,14 +1074,14 @@ test("a retry request during a timeout hold is deleted across a restart, and is 
 	assert.equal(h.record("m1").holdUntilExit, undefined);
 	h.runner.script = () => DONE;
 	h.request("m1");
-	h.tick(b);
+	await h.prepare(b);
 	assert.equal(h.runner.starts.length, 2, "a new request is accepted after the exit");
 });
 
-test("a duplicate request while launching with adoptJob throwing is deleted: same jobId, no second start, no second charge", () => {
+test("a duplicate request while launching with adoptJob throwing is deleted: same jobId, no second start, no second charge", async () => {
 	const h = harness();
 	h.request("m1");
-	crashAfterStart(h, { writeMeta: false });
+	await crashAfterStart(h, { writeMeta: false });
 	h.runner.adopt = () => {
 		throw new Error("cim down");
 	};
@@ -1001,26 +1096,26 @@ test("a duplicate request while launching with adoptJob throwing is deleted: sam
 	assert.equal(h.budget().count, 1);
 });
 
-test("two sessions run one after the other", () => {
+test("two sessions run one after the other", async () => {
 	const h = harness({ sessions: ["m1", "m2"] });
 	h.runner.script = () => DONE;
 	const a = h.auditor();
 	h.request("m1");
 	h.request("m2");
-	h.tick(a);
+	await h.prepare(a);
 	assert.equal(h.runner.starts.length, 1);
 	assert.equal(h.record("m2").status, "queued");
 	h.tick(a);
 	assert.equal(h.record("m1").status, "done");
 	assert.equal(h.runner.starts.length, 1);
-	h.tick(a);
+	await h.prepare(a);
 	assert.ok(h.runner.starts[1].jobId.endsWith("-m2"));
 	h.tick(a);
 	assert.equal(h.record("m2").status, "done");
 	assert.equal(h.budget().count, 2);
 });
 
-test("disabled, not-found and no-model end failed without a charge", () => {
+test("disabled, not-found and no-model end failed without a charge", async () => {
 	const off = harness();
 	off.config.audit.enabled = false;
 	const a = off.auditor();
@@ -1031,13 +1126,13 @@ test("disabled, not-found and no-model end failed without a charge", () => {
 	const none = harness();
 	const b = none.auditor();
 	none.request("ghost");
-	none.tick(b);
+	await none.prepare(b);
 	assert.equal(none.record("ghost").reason, "not-found");
 
 	const solo = harness({ providers: ["anthropic-subscription"] });
 	const c = solo.auditor();
 	solo.request("m1");
-	solo.tick(c);
+	await solo.prepare(c);
 	assert.equal(solo.record("m1").reason, "no-model");
 	for (const x of [off, none, solo]) {
 		assert.equal(x.runner.starts.length, 0);
@@ -1045,25 +1140,25 @@ test("disabled, not-found and no-model end failed without a charge", () => {
 	}
 });
 
-test("a spent daily budget ends cap", () => {
+test("a spent daily budget ends cap", async () => {
 	const h = harness();
 	h.config.audit.perDay = 1;
 	h.runner.script = () => DONE;
 	const a = h.auditor();
 	h.request("m1");
-	h.tick(a);
+	await h.prepare(a);
 	h.tick(a);
 	h.request("m1");
-	h.tick(a);
+	await h.prepare(a);
 	assert.equal(h.record("m1").reason, "cap");
 	assert.equal(h.runner.starts.length, 1);
 });
 
-test("bad output ends bad-output with the head of out.txt in the detail", () => {
+test("bad output ends bad-output with the head of out.txt in the detail", async () => {
 	const h = harness();
 	const a = h.auditor();
 	h.request("m1");
-	h.tick(a);
+	await h.prepare(a);
 	const jobId = h.record("m1").jobId;
 	fs.writeFileSync(path.join(h.paths.health.jobsDir, jobId, "out.txt"), "not json at all");
 	h.runner.script = () => ({ status: "done", result: null, exitCode: 0 });
@@ -1074,25 +1169,25 @@ test("bad output ends bad-output with the head of out.txt in the detail", () => 
 	assert.equal(a.busy(), false);
 });
 
-test("an unavailable provider and another runner failure end failed with their reason", () => {
+test("an unavailable provider and another runner failure end failed with their reason", async () => {
 	const h = harness({ sessions: ["m1", "m2"] });
 	h.runner.script = (jobId) => (jobId.endsWith("-m1") ? { status: "unavailable", reason: "usage-limit", detail: "limit", result: null, exitCode: 1 } : { status: "failed", reason: "exit-3", detail: "boom", result: null, exitCode: 3 });
 	const a = h.auditor();
 	h.request("m1");
 	h.request("m2");
+	await h.prepare(a);
 	h.tick(a);
-	h.tick(a);
-	h.tick(a);
+	await h.prepare(a);
 	h.tick(a);
 	assert.equal(h.record("m1").reason, "unavailable:usage-limit");
 	assert.equal(h.record("m2").reason, "exit-3");
 });
 
-test("ticks 10 s apart poll a running job once per 30 s", () => {
+test("ticks 10 s apart poll a running job once per 30 s", async () => {
 	const h = harness();
 	const a = h.auditor();
 	h.request("m1");
-	h.tick(a, 10_000);
+	await h.prepare(a, 10_000);
 	assert.equal(h.runner.polls.length, 0);
 	h.tick(a, 10_000);
 	h.tick(a, 10_000);
@@ -1106,12 +1201,12 @@ test("ticks 10 s apart poll a running job once per 30 s", () => {
 	assert.equal(h.runner.polls.length, 2);
 });
 
-test("busy is true while queued, launching or running, and false after the end", () => {
+test("busy is true while queued, launching or running, and false after the end", async () => {
 	const h = harness();
 	const a = h.auditor();
 	assert.equal(a.busy(), false);
 	h.request("m1");
-	h.tick(a);
+	await h.prepare(a);
 	assert.equal(a.busy(), true);
 	h.runner.script = () => DONE;
 	h.tick(a);
@@ -1129,12 +1224,12 @@ test("auditsToday counts today's budget plus pending requests and ignores yester
 	assert.equal(auditsToday(h.paths, BASE), 3);
 });
 
-test("finished records older than history.retentionDays are pruned once a day", () => {
+test("finished records older than history.retentionDays are pruned once a day", async () => {
 	const h = harness();
 	h.runner.script = () => DONE;
 	const a = h.auditor();
 	h.request("m1");
-	h.tick(a);
+	await h.prepare(a);
 	h.tick(a);
 	assert.equal(h.record("m1").status, "done");
 	h.tick(a, 60 * DAY);
@@ -1158,7 +1253,7 @@ test("a duplicate audit request cannot replace the first claim", (t) => {
 	assert.deepEqual(fs.readdirSync(dir), ["m1.json"]);
 });
 
-test("request helpers: safeAuditId, the atomic request file and the state a request, a running record and a finished record show", () => {
+test("request helpers: safeAuditId, the atomic request file and the state a request, a running record and a finished record show", async () => {
 	const h = harness();
 	assert.equal(safeAuditId("abc-1.2_x"), "abc-1.2_x");
 	for (const bad of ["", "../x", "a/b", "a b", "_budget", 5, null, "x".repeat(200)]) assert.equal(safeAuditId(bad), null, String(bad));
@@ -1168,7 +1263,7 @@ test("request helpers: safeAuditId, the atomic request file and the state a requ
 	assert.deepEqual(readJsonSafe(path.join(h.paths.health.auditRequestsDir, "m1.json")), { v: 1, sessionId: "m1", requestedMs: BASE, claimId });
 	assert.equal(readAuditState(h.paths, "m1").status, "requested");
 	const a = h.auditor();
-	h.tick(a);
+	await h.prepare(a);
 	assert.equal(readAuditState(h.paths, "m1").status, "running");
 	h.runner.script = () => DONE;
 	h.tick(a);
@@ -1177,7 +1272,7 @@ test("request helpers: safeAuditId, the atomic request file and the state a requ
 	assert.equal(readAuditState(h.paths, "m1").status, "requested", "a rerun request shows before the daemon takes it");
 });
 
-test("two looks at one investigation exclude every analyst model through the production join and model choice", () => {
+test("two looks at one investigation exclude every analyst model through the production join and model choice", async () => {
 	const h = harness();
 	fs.mkdirSync(h.paths.health.investigationsDir, { recursive: true });
 	fs.writeFileSync(
@@ -1191,11 +1286,11 @@ test("two looks at one investigation exclude every analyst model through the pro
 	]);
 	const a = h.auditor();
 	h.request("m1");
-	h.tick(a);
+	await h.prepare(a);
 	assert.deepEqual([h.record("m1").model, h.record("m1").independence], ["xai/grok-5", "family"], "the first look's model is excluded too");
 });
 
-test("a decision-only fp's analyzing model is excluded from the daemon's model choice", () => {
+test("a decision-only fp's analyzing model is excluded from the daemon's model choice", async () => {
 	const h = harness();
 	assert.equal([...LANES.ultrabrain][0], "openai/gpt-5-5", "the analyst model is the first lane candidate");
 	fs.mkdirSync(h.paths.health.decisionsDir, { recursive: true });
@@ -1206,13 +1301,13 @@ test("a decision-only fp's analyzing model is excluded from the daemon's model c
 	assert.equal(fs.existsSync(path.join(h.paths.health.investigationsDir, "F9.json")), false, "no investigation file exists for the fp");
 	const a = h.auditor();
 	h.request("m1");
-	h.tick(a);
+	await h.prepare(a);
 	assert.equal(h.runner.starts.length, 1);
 	assert.equal(h.record("m1").model, "google/gemini-3-pro", "the next lane candidate is chosen");
 	assert.notEqual(modelOf(h.runner.starts[0]), "openai/gpt-5-5");
 });
 
-test("a failed first kill is retried by the real runner and the one-per-PC slot stays held until the verified pid is gone", () => {
+test("a failed first kill is retried by the real runner and the one-per-PC slot stays held until the verified pid is gone", async () => {
 	const h = harness();
 	h.config.audit.timeoutMs = 60_000;
 	const identity = { ctimeMs: BASE - 1_000, cmdSha1: "audit-job" };
@@ -1222,7 +1317,7 @@ test("a failed first kill is retried by the real runner and the one-per-PC slot 
 	const a = createAuditor({ paths: h.paths, config: h.config, clock: h.clock, log: silent, runner, env: {} });
 	const kills = () => recording.calls.filter((call) => call.command === "taskkill").length;
 	h.request("m1");
-	h.tick(a);
+	await h.prepare(a);
 	h.state.now += 61_000;
 	a.tick(h.state.now);
 	assert.deepEqual([h.record("m1").reason, h.record("m1").holdUntilExit], ["timeout", true]);

@@ -140,6 +140,8 @@ if (stage === "write") {
 		start() { starts++; sample(); return { pid: 1 }; },
 	} });
 	auditor.tick(now + 1);
+	await auditor.preparing();
+	auditor.tick(now + 1);
 	assert.equal(starts, 1);
 	assert.equal(readAuditState(paths, "reviewed").status, "running");
 }
@@ -289,9 +291,12 @@ if (stage === "fixture") {
 		assert.deepEqual(record.health.findings.map(({ fp, scope }) => [fp, scope]), [["grand-finding", "session"], ["machine-finding", "machine"]]);
 		requestAudit(paths, "seed", now);
 		let starts = 0;
-		createAuditor({ paths, index, config: DEFAULT_CONFIG, clock, env: {}, timelineMaxBytes: 0, runner: {
+		const auditor = createAuditor({ paths, index, config: DEFAULT_CONFIG, clock, env: {}, timelineMaxBytes: 0, runner: {
 			start() { starts++; return { pid: 1 }; },
-		} }).tick(now + 1);
+		} });
+		auditor.tick(now + 1);
+		await auditor.preparing();
+		auditor.tick(now + 1);
 		assert.equal(starts, 1);
 		assert.equal(readAuditState(paths, "seed").status, "running");
 	}
