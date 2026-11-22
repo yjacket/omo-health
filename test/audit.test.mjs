@@ -301,7 +301,6 @@ test("(coverage) the prompt requires each fired detector in first appearance ord
 for (const [name, fired, findingRefs, item, evidence, covered] of [
 	["detector ID item", ["D1"], { F1: "D1" }, "D1", ["T"], true],
 	["finding ref item", ["D1"], { F1: "D1" }, "F1", ["T"], true],
-	["finding ref evidence", ["D1", "D6"], { F1: "D1", F2: "D6" }, "D1", ["검토 근거: (F2)."], true],
 	["missing detector", ["D1", "D6"], { F1: "D1", F2: "D6", F20: "D1" }, "D1", ["F20", "D6", "I2"], false],
 	["no findings", [], {}, "T", ["T"], true],
 ]) {
@@ -309,6 +308,15 @@ for (const [name, fired, findingRefs, item, evidence, covered] of [
 		assert.equal(audit.hasDetectorCoverage([{ item, evidence }], fired, findingRefs), covered);
 	});
 }
+
+test("(coverage) D6 and D8 need separate items even when the D6 check cites both findings", () => {
+	const fired = ["D6", "D8"];
+	const findingRefs = { F1: "D6", F2: "D8" };
+	const checks = [{ item: "D6", evidence: ["검토 근거: F1, (F2)."] }];
+	assert.equal(audit.hasDetectorCoverage(checks, fired, findingRefs), false);
+	checks.push({ item: "F2", evidence: ["F2"] });
+	assert.equal(audit.hasDetectorCoverage(checks, fired, findingRefs), true);
+});
 
 test("a record whose coverage.infoFindings is true sends coverage.infoFindings true", () => {
 	const row = { sessionId: "s1", taskId: "st_s1", kind: "main", startedMs: T0, endedMs: T0 + HOUR, outcome: "answered" };

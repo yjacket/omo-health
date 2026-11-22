@@ -70,6 +70,15 @@ export function requestAudit(paths, sessionId, nowMs) {
 	}
 }
 
+/** Withdraw a claim only if the pending request still has its timestamp. */
+export function withdrawAuditRequest(paths, sessionId, requestedMs) {
+	const id = safeAuditId(sessionId);
+	if (!id) return;
+	const file = path.join(paths.health.auditRequestsDir, `${id}.json`);
+	const pending = readJsonSafe(file);
+	if (pending?.v === 1 && pending.sessionId === id && pending.requestedMs === requestedMs) removeSafe(file);
+}
+
 /** The session's audit record; an active one wins, else a waiting request, else the last finished record, else null. */
 export function readAuditState(paths, sessionId) {
 	const id = safeAuditId(sessionId);
@@ -237,8 +246,9 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 				record.reason = "expired";
 				record.finishedMs = now;
 			}
-			records.set(id, record);
+			// Publish the record before releasing the claim so dashboards can recheck it.
 			save(record);
+			records.set(id, record);
 			removeSafe(file);
 		}
 	}

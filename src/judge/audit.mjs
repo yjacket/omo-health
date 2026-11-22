@@ -470,17 +470,11 @@ export function firedDetectors(bundle) {
 	return [...new Set(Object.values(detectorFindingRefs(bundle)))];
 }
 
-/** Check coverage on validated checks, using only surviving evidence citations. */
+/** A validated check covers only the detector named by its item. */
 export function hasDetectorCoverage(checks, fired, findingRefs) {
 	const remaining = new Set(fired);
-	for (const { item, evidence } of checks) {
-		remaining.delete(item);
-		if (Object.hasOwn(findingRefs, item)) remaining.delete(findingRefs[item]);
-		for (const line of evidence) {
-			for (const [ref] of line.matchAll(REF_TOKEN)) {
-				if (Object.hasOwn(findingRefs, ref)) remaining.delete(findingRefs[ref]);
-			}
-		}
+	for (const { item } of checks) {
+		remaining.delete(Object.hasOwn(findingRefs, item) ? findingRefs[item] : item);
 	}
 	return remaining.size === 0;
 }

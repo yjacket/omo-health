@@ -132,26 +132,26 @@ function crashAfterStart(h, { writeMeta = true } = {}) {
 const modelOf = (start) => start.args[start.args.indexOf("--model") + 1];
 
 for (const complete of [true, false]) {
-	test(`(coverage) an audit ${complete ? "reviewing every fired detector finishes done" : "omitting a fired detector fails without a refund"}`, (t) => {
+	test(`(coverage) an audit ${complete ? "reviewing every fired detector finishes done" : "citing both findings without judging both detectors fails without a refund"}`, (t) => {
 		const h = harness();
 		t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
 		fs.mkdirSync(h.paths.health.decisionsDir, { recursive: true });
 		appendJsonl(path.join(h.paths.health.decisionsDir, "2026-11-20.jsonl"), [
-			{ ts: new Date(BASE - 100_000).toISOString(), fp: "d8", event: "opened", detector: "D8", subject: { sessionId: "m1" } },
-			{ ts: new Date(BASE - 110_000).toISOString(), fp: "d1", event: "opened", detector: "D1" },
+			{ ts: new Date(BASE - 100_000).toISOString(), fp: "d6", event: "opened", detector: "D6", subject: { sessionId: "m1" } },
+			{ ts: new Date(BASE - 110_000).toISOString(), fp: "d8", event: "opened", detector: "D8" },
 		]);
 		h.request("m1");
 		h.tick(h.auditor());
 		const launched = readAuditState(h.paths, "m1");
 		assert.equal(launched.status, "running");
-		const checks = [{ item: "D8", judgment: "sound", explanation: "적절했습니다.", evidence: ["F1"] }];
-		if (complete) checks.push({ item: "머신 감지", judgment: "sound", explanation: "적절했습니다.", evidence: ["근거: F2"] });
+		const checks = [{ item: "D6", judgment: "sound", explanation: "적절했습니다.", evidence: ["근거: F1, F2"] }];
+		if (complete) checks.push({ item: "F2", judgment: "sound", explanation: "적절했습니다.", evidence: ["근거: F2"] });
 		h.runner.script = () => ({ ...DONE, result: { ...TOKEN_ONLY_ANSWER, checks } });
 		h.tick(h.auditor()); // Finish on a fresh auditor, using the launch-time evidence.
 
 		const state = readAuditState(h.paths, "m1");
 		assert.equal(state.status, complete ? "done" : "failed");
-		assert.deepEqual(launched.firedDetectors, ["D8", "D1"]);
+		assert.deepEqual(launched.firedDetectors, ["D6", "D8"]);
 		assert.deepEqual(h.budget().jobs, [launched.jobId]);
 		assert.equal(h.budget().count, 1);
 		if (complete) {

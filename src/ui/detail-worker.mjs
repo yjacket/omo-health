@@ -1,5 +1,5 @@
 import { parentPort, workerData } from "node:worker_threads";
-import { auditModelFacts, auditsToday, readAuditState, readAuditTimeline, requestAudit } from "../auditor.mjs";
+import { auditModelFacts, auditsToday, readAuditState, readAuditTimeline, requestAudit, withdrawAuditRequest } from "../auditor.mjs";
 import { createSessionFileLocator } from "../collect/session-files.mjs";
 import { loadConfig } from "../config.mjs";
 import { resolveAuditModel } from "../judge/audit.mjs";
@@ -71,8 +71,14 @@ export function createDetailOperations({
 		if (!facts.sessionModelsKnown) return refuse(409, "models-unknown");
 		const choice = plan(config, facts, record.analystModels);
 		if (!choice || choice.blocked) return refuse(409, "no-model");
-		// Other dashboards can pass the active-state check before this claim.
-		if (!request(paths, canonicalId, at).created) return refuse(409, "running");
+		const claim = request(paths, canonicalId, at);
+		if (!claim.created) return refuse(409, "running");
+		// Intake may have published another dashboard's record and freed its claim since the first read.
+		const state = readState(paths, canonicalId);
+		if (isAuditActive(state) && state.status !== "requested") {
+			withdrawAuditRequest(paths, canonicalId, claim.request.requestedMs);
+			return refuse(409, "running");
+		}
 		return [202, { ok: true, audit: { sessionId: canonicalId, status: "queued", statusKo: auditStatusLabel("queued"), planned: choice } }];
 	}
 

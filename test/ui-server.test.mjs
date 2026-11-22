@@ -6,7 +6,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { after, before, beforeEach, describe, it } from "node:test";
-import { createAuditor, readAuditState } from "../src/auditor.mjs";
+import { createAuditor, readAuditState, requestAudit } from "../src/auditor.mjs";
 import { loadConfig } from "../src/config.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 import { emptyUsage } from "../src/collect/usage.mjs";
@@ -929,6 +929,70 @@ describe("ui server", { timeout: 20_000 }, () => {
 				assert.deepEqual(JSON.parse(fs.readFileSync(paths.health.auditBudgetFile, "utf8")), {
 					day: "2026-11-22", count: 1, jobs: [starts[0].jobId],
 				});
+			});
+
+			it("two dashboards refuse a duplicate after intake, even when B checked before A posted", async () => {
+				for (const interleave of [false, true]) {
+					const world = makeWorld();
+					const { paths, env, now } = world;
+					const { config } = loadConfig({ paths, env });
+					const starts = [];
+					const auditor = createAuditor({ paths, env, config, clock: { now }, runner: {
+						start(job) {
+							starts.push(job);
+							throw new Error("spawn result uncertain");
+						},
+						adoptJob: () => "running",
+						poll: () => ({ status: "failed", reason: "test-finish" }),
+					} });
+					const dashboard = (startAudit) => createUiServer({ paths, token: TOKEN, getState: () => STATE, now, startAudit });
+					const a = dashboard(world.startAudit);
+					const intake = () => {
+						auditor.tick(now());
+						assert.equal(readAuditState(paths, AUDIT_ID).status, "launching");
+						assert.equal(fs.existsSync(requestFileOf(world)), false);
+					};
+					let firstRead = interleave;
+					// For the interleaving, capture B's initial read before A posts.
+					const observed = readAuditState(paths, AUDIT_ID);
+					const b = dashboard(createStartAudit({
+						paths, env, now: () => now() + 1,
+						readState: (...args) => {
+							if (!firstRead) return readAuditState(...args);
+							firstRead = false;
+							return observed;
+						},
+						request: (...args) => {
+							assert.equal(interleave, true, "B must not claim when it reads A's active record");
+							assert.equal(readAuditState(paths, AUDIT_ID).status, "requested");
+							intake();
+							const claim = requestAudit(...args);
+							assert.equal(claim.created, true, "B claims the slot released by intake");
+							return claim;
+						},
+					}));
+					try {
+						const [{ port: aPort }, { port: bPort }] = await Promise.all([a.listen(), b.listen()]);
+						assert.equal(observed, null);
+						assert.equal((await postAt(aPort, "/api/audit", { sessionId: AUDIT_ID })).status, 202);
+						if (!interleave) intake();
+						const refused = await postAt(bPort, "/api/audit", { sessionId: AUDIT_ID });
+						assert.deepEqual([refused.status, refused.body], [409, { error: "running", reasonKo: "이미 조사 중입니다" }]);
+						assert.equal(fs.existsSync(requestFileOf(world)), false);
+						auditor.tick(now() + 30_000);
+						auditor.tick(now() + 60_000);
+						assert.equal(starts.length, 1);
+						assert.deepEqual(fs.readdirSync(paths.health.auditsDir).filter((name) => !name.startsWith("_") && name.endsWith(".json")), [`${AUDIT_ID}.json`]);
+						assert.equal(readAuditState(paths, AUDIT_ID).requestedMs, now());
+						assert.equal(readAuditState(paths, AUDIT_ID).status, "failed");
+						assert.deepEqual(JSON.parse(fs.readFileSync(paths.health.auditBudgetFile, "utf8")), {
+							day: "2026-11-22", count: 1, jobs: [starts[0].jobId],
+						});
+					} finally {
+						await Promise.all([a.close(), b.close(), world.detail.close()]);
+						fs.rmSync(world.dir, { recursive: true, force: true });
+					}
+				}
 			});
 
 			it("treats a file that grew after the index read as models-unknown for a POST and never plans a model", async () => {
