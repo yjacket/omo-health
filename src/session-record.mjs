@@ -282,6 +282,13 @@ export function buildSessionRecord(inputs = {}) {
 	const ambiguous = inputs.ambiguous ?? ambiguousLedgerTaskIds(ledger);
 	const nodes = [row, ...descendants];
 	const sessionAllowed = new Set(nodes.map((node) => node.sessionId).filter(nonEmpty));
+	// D8 addresses the parent session but names the affected child by its task id.
+	const childTasksByParent = new Map();
+	for (const { parentSessionId, taskId } of nodes) {
+		if (!nonEmpty(parentSessionId) || !nonEmpty(taskId)) continue;
+		if (!childTasksByParent.has(parentSessionId)) childTasksByParent.set(parentSessionId, new Set());
+		childTasksByParent.get(parentSessionId).add(taskId);
+	}
 	const taskOnly = new Set(nodes.filter((node) => !nonEmpty(node.sessionId)).map((node) => node.taskId).filter(nonEmpty));
 	const taskSubjects = new Map();
 	if (taskOnly.size) {
@@ -294,6 +301,7 @@ export function buildSessionRecord(inputs = {}) {
 		for (const record of investigations) if (isRecord(record)) countSubject(record);
 	}
 	const subjectMatches = (subject) => isRecord(subject) && (sessionAllowed.has(subject.sessionId) ||
+		childTasksByParent.get(subject.sessionId)?.has(subject.taskId) ||
 		(typeof taskSubjects.get(subject.taskId) === "string") ||
 		sessionAllowed.has(subject.parentSessionId) || sessionAllowed.has(subject.rootSessionId));
 

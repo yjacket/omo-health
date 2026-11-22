@@ -390,6 +390,43 @@ test("an audit sends info finding coverage from a retained marker 31 days before
 		[{ infoFindings: true }, { infoFindings: true }]);
 });
 
+test("IS-7: the child audit bundle includes D8 findings and wake-parent decisions addressed to its parent", () => {
+	const root = tmpDir("omoh-audit-child-subject-");
+	const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health"), OMO_HEALTH_OMO_HOME: path.join(root, "omo") });
+	const now = T0 + HOUR;
+	const row = { startedMs: T0, endedMs: now, outcome: "answered" };
+	const parent = { ...row, sessionId: "s-parent", kind: "main" };
+	const child = { ...row, sessionId: "s-child", kind: "child", taskId: "st_shared", parentSessionId: parent.sessionId };
+	const otherChild = { ...child, sessionId: "s-other-child", parentSessionId: "s-other-parent" };
+	for (const entry of [parent, child, otherChild]) appendEnded(paths, entry, { nowMs: now });
+	const subject = { sessionId: parent.sessionId, taskId: child.taskId, parentSessionId: parent.sessionId };
+	const incident = { fp: "fp-dead", detector: "D8", kind: "dead-child", subject, ts: iso(T0) };
+	appendDecision(paths, { ...incident, event: "opened", severity: "warn" });
+	appendDecision(paths, {
+		...incident,
+		action: { key: "wake-parent:fp-dead", kind: "wake-parent" },
+		result: "execute",
+		outcome: { delivered: true, sessionId: parent.sessionId },
+	});
+
+	const bundled = (id) => {
+		const record = loadSessionRecord({ paths, id, now });
+		assert.equal(record.found, true);
+		const { findings, actions } = auditBundle(record, null, { config: DEFAULT_CONFIG, now }).omo_health_record;
+		return [
+			findings.map(({ detector, kind, subject }) => [detector, kind, subject.sessionId, subject.taskId]),
+			actions.map(({ detector, kind, result, delivered }) => [detector, kind, result, delivered]),
+		];
+	};
+	const expected = [
+		[["D8", "dead-child", parent.sessionId, child.taskId]],
+		[["D8", "wake-parent", "execute", true]],
+	];
+	assert.deepEqual(bundled(child.sessionId), expected);
+	assert.deepEqual(bundled(parent.sessionId), expected);
+	assert.deepEqual(bundled(otherChild.sessionId), [[], []]);
+});
+
 test("a session predating coverage sends coverage.infoFindings false, whether false or absent", () => {
 	const row = { sessionId: "s1", taskId: "st_s1", kind: "main", startedMs: T0, endedMs: T0 + HOUR, outcome: "answered" };
 	const record = buildSessionRecord({ id: "s1", row, ledger: [row], decisions: [], investigations: [], messages: [] });

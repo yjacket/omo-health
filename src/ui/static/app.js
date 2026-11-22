@@ -38,7 +38,7 @@
 	const openInvestigations = new Set();
 	// Ids of the session cards the user expanded: they stay open across the 10 s re-render too.
 	const openSessions = new Set();
-	// Ids of the history rows the user expanded, and each one's detail as fetched ({state, data, error}): both outlive the 10 s re-render.
+	// Ids of the expanded history rows, and the details tagged with the row's token signature at fetch time.
 	const openEnded = new Set();
 	const endedDetails = new Map();
 	// The last rendered state: the history filter redraws from it at once, before the server has stored the choice.
@@ -706,6 +706,10 @@
 		return r.detailEndedMs === undefined ? url : `${url}&ended=${r.detailEndedMs}`;
 	}
 
+	function endedTokenSignature(r) {
+		return JSON.stringify([r.tokensState, r.tokens?.total, r.treeTokens, r.treeTokensState]);
+	}
+
 	/** Everything omo-health recorded about one ended session, as GET /api/session returns it. */
 	function endedRecord(r, d) {
 		const id = endedDetailId(r);
@@ -760,24 +764,42 @@
 		const cell = [...document.querySelectorAll("td[data-ended]")].find((n) => n.dataset.ended === id);
 		if (!cell || !openEnded.has(id)) return;
 		const held = cell.contains(document.activeElement) ? document.activeElement.dataset.key : null;
+		const { scrollX, scrollY } = window;
 		cell.replaceChildren(endedDetailView(lastState.ended.rows.find((r) => endedDetailId(r) === id)));
 		// A control the redraw removed (다시 읽기, the last 더 보기) hands its focus to the row's own toggle.
 		if (held && !focusByKey(held)) focusByKey(`ended:${id}`);
+		if (window.scrollX !== scrollX || window.scrollY !== scrollY) window.scrollTo({ left: scrollX, top: scrollY, behavior: "instant" });
 	}
 
-	/** Fetches a session's record for its open row. Once per page: a later open and every re-render read the map. */
-	async function loadEndedDetail(r) {
+	/** Fetches the record, leaving any old panel in place during a token refresh. Only the latest request can update the cache. */
+	async function loadEndedDetail(r, headers, preserve = false) {
 		const id = endedDetailId(r);
-		const entry = { state: "loading", data: null, error: null };
+		const signature = endedTokenSignature(r);
+		const entry = endedDetails.get(id) ?? { state: "loading", data: null, error: null, signature };
+		if (entry.request?.signature === signature) return;
+		const request = { signature };
+		entry.request = request;
 		endedDetails.set(id, entry);
-		drawEndedDetail(id);
-		try {
-			const data = await getJson(endedDetailUrl(r));
-			// No data means a 401: the masthead already says the token is wrong.
-			Object.assign(entry, data ? { state: "ready", data } : { state: "error", error: "토큰이 맞지 않습니다" });
-		} catch (error) {
-			Object.assign(entry, { state: "error", error: String(error?.message ?? error) });
+		if (!preserve) {
+			entry.state = "loading";
+			drawEndedDetail(id);
 		}
+		let data;
+		let error = "토큰이 맞지 않습니다"; // No data means a 401; the masthead already explains it.
+		try {
+			data = await getJson(endedDetailUrl(r), headers);
+		} catch (cause) {
+			error = String(cause?.message ?? cause);
+		}
+		if (endedDetails.get(id) !== entry || entry.request !== request) return;
+		entry.request = null;
+		// Do not validate the stale data after a failed refresh: the next state update will retry.
+		if (!data && preserve) return;
+		if (data && preserve) {
+			if (AUDIT_ACTIVE.has(entry.data?.audit?.state?.status) && !AUDIT_ACTIVE.has(data.audit?.state?.status)) errors.delete(`audit:${id}`);
+			errors.delete(`audit-read:${id}`);
+		}
+		Object.assign(entry, data ? { state: "ready", data, signature } : { state: "error", error, signature });
 		drawEndedDetail(id);
 	}
 
@@ -815,30 +837,40 @@
 	 */
 	async function loadAudit(r, headers) {
 		const id = endedDetailId(r);
-		const entry = endedDetails.get(id);
-		if (entry?.state !== "ready") return;
+		const record = endedDetails.get(id)?.data;
+		if (!record) return;
 		const slot = `audit-read:${id}`;
 		try {
 			const data = await getJson(endedDetailUrl(r), headers);
+			if (endedDetails.get(id)?.data !== record) return;
 			if (data) {
 				// A refusal shown while the audit ran (이미 조사 중입니다) is moot once it ends.
-				if (AUDIT_ACTIVE.has(entry.data.audit?.state?.status) && !AUDIT_ACTIVE.has(data.audit?.state?.status)) errors.delete(`audit:${id}`);
-				entry.data.audit = data.audit;
+				if (AUDIT_ACTIVE.has(record.audit?.state?.status) && !AUDIT_ACTIVE.has(data.audit?.state?.status)) errors.delete(`audit:${id}`);
+				record.audit = data.audit;
 				errors.delete(slot);
 			}
 		} catch (error) {
+			if (endedDetails.get(id)?.data !== record) return;
 			errors.set(slot, `조사 상태를 읽지 못했습니다: ${error?.message ?? error}`);
 		}
 		drawEndedDetail(id);
 	}
 
-	/** On the 10 s refresh, re-reads the audit of every open row whose audit is queued or running. A closed row or a finished audit is never polled. */
-	function pollAudits() {
-		for (const cell of document.querySelectorAll("td[data-ended]")) {
-			const id = cell.dataset.ended;
-			if (openEnded.has(id) && AUDIT_ACTIVE.has(endedDetails.get(id)?.data?.audit?.state?.status)) {
-				const row = lastState.ended.rows.find((r) => endedDetailId(r) === id);
-				if (row) void loadAudit(row, { "x-omo-health-auto": "1" });
+	/** A state refresh invalidates changed details and otherwise follows active audits on automatic ticks. */
+	function refreshEndedDetails(rows, auto) {
+		const headers = auto ? { "x-omo-health-auto": "1" } : undefined;
+		for (const r of rows) {
+			const id = endedDetailId(r);
+			const entry = endedDetails.get(id);
+			if (!entry) continue;
+			const signature = endedTokenSignature(r);
+			const changed = entry.signature !== signature || (entry.request && entry.request.signature !== signature);
+			if (!openEnded.has(id)) {
+				if (changed) endedDetails.delete(id);
+			} else if (changed || (!entry.request && entry.state === "loading")) {
+				void loadEndedDetail(r, headers, true);
+			} else if (auto && !entry.request && !(hideChildren && r.kind === "child") && AUDIT_ACTIVE.has(entry.data?.audit?.state?.status)) {
+				void loadAudit(r, headers);
 			}
 		}
 	}
@@ -870,8 +902,11 @@
 					toggle.setAttribute("aria-expanded", String(next));
 					detail.hidden = !next;
 					if (!next) return;
-					if (endedDetails.has(id)) drawEndedDetail(id);
-					else void loadEndedDetail(r);
+					const entry = endedDetails.get(id);
+					if (entry) {
+						drawEndedDetail(id);
+						if (entry.signature !== endedTokenSignature(r)) void loadEndedDetail(r, undefined, true);
+					} else void loadEndedDetail(r);
 				},
 			},
 			cells.map((cell, i) => el(i === 0 ? "th" : "td", { scope: i === 0 ? "row" : undefined, class: cellClass(ENDED_COLUMNS[i]) }, cell)),
@@ -1375,6 +1410,8 @@
 	function render(state) {
 		const openKeys = new Set([...document.querySelectorAll("details[data-open]")].filter((d) => d.open).map((d) => d.dataset.open));
 		const focusKey = document.activeElement?.dataset?.key;
+		const { scrollX, scrollY } = window;
+		const endedScroll = document.querySelector("#ended-body .tablewrap")?.scrollLeft;
 		nowMs = Number.isFinite(state.generatedMs) ? state.generatedMs : Date.now();
 		lastState = state;
 		if (hideChildren === null && typeof state.prefs?.hideChildren === "boolean") hideChildren = state.prefs.hideChildren;
@@ -1388,6 +1425,9 @@
 		section("settings", state.settings, renderSettings);
 		for (const d of document.querySelectorAll("details[data-open]")) if (openKeys.has(d.dataset.open)) d.open = true;
 		if (focusKey) focusByKey(focusKey);
+		const endedTable = document.querySelector("#ended-body .tablewrap");
+		if (endedTable && endedScroll !== undefined) endedTable.scrollLeft = endedScroll;
+		if (window.scrollX !== scrollX || window.scrollY !== scrollY) window.scrollTo({ left: scrollX, top: scrollY, behavior: "instant" });
 	}
 
 	function showServerGone() {
@@ -1437,7 +1477,7 @@
 		gone = false;
 		render(state);
 		schedule();
-		if (auto) pollAudits();
+		refreshEndedDetails(state.ended?.rows ?? [], auto);
 	}
 
 	function failureText(status, data) {

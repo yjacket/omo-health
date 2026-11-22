@@ -77,7 +77,7 @@ it("(plan 35) browser history toggles and requests each row independently", asyn
 		tag, ...attrs, children: children.flat(), classList: { toggle() {} }, setAttribute() {},
 	});
 	const { endedItem, loadEndedPage } = runInNewContext(
-		["endedDetailId", "endedDetailUrl", "endedItem", "loadEndedDetail", "loadEndedPage"]
+		["endedDetailId", "endedDetailUrl", "endedTokenSignature", "endedItem", "loadEndedDetail", "loadEndedPage"]
 			.map((name) => app.match(new RegExp(`(?:async )?function ${name}\\([^]*?\\n\\t\\}`))?.[0]).join("\n") +
 			"\n({ endedItem, loadEndedPage })",
 		{
@@ -107,6 +107,119 @@ it("(plan 35) browser history toggles and requests each row independently", asyn
 	]);
 	assert.equal(openEnded.size, 3);
 	assert.equal(endedDetails.size, 3);
+});
+
+function endedDetailFunctions(names, globals) {
+	const app = fs.readFileSync(new URL("../src/ui/static/app.js", import.meta.url), "utf8");
+	const functions = names.map((name) => app.match(new RegExp(`(?:async )?function ${name}\\([^]*?\\n\\t\\}`))?.[0]);
+	return runInNewContext(`${functions.join("\n")}\n({ ${names.map((name) => `${name}: typeof ${name} === "function" ? ${name} : undefined`).join(", ")} })`, globals);
+}
+
+const pendingTokens = { tokensState: "pending", tokens: null, treeTokens: null };
+const readyTokens = { tokensState: "ok", tokens: { total: 30 }, treeTokens: 40 };
+
+for (const [label, previous, next, changed] of [
+	["same signature keeps the detail", readyTokens, { ...readyTokens, tokens: { total: 30, input: 20 } }, false],
+	["pending to ok refreshes the detail", pendingTokens, readyTokens, true],
+	["changed ok total refreshes the detail", readyTokens, { ...readyTokens, tokens: { total: 31 } }, true],
+	["missing stays missing and keeps the detail", { ...pendingTokens, tokensState: "missing" }, { ...pendingTokens, tokensState: "missing" }, false],
+	["changed tree total refreshes the detail", readyTokens, { ...readyTokens, treeTokens: 41 }, true],
+	["changed tree state refreshes the detail", pendingTokens, { ...pendingTokens, treeTokensState: "overflow" }, true],
+]) {
+	it(`(plan 36) token signature: ${label}`, () => {
+		const { endedTokenSignature } = endedDetailFunctions(["endedTokenSignature"]);
+		assert.equal(typeof endedTokenSignature, "function", "the detail cache needs a row token signature");
+		assert.equal(endedTokenSignature(previous) !== endedTokenSignature(next), changed);
+	});
+}
+
+function endedRefreshHarness() {
+	const openEnded = new Set();
+	const endedDetails = new Map();
+	const requests = [];
+	const redraws = [];
+	const globals = {
+		openEnded, endedDetails, hideChildren: false, AUDIT_ACTIVE: new Set(["running"]), errors: new Map(),
+		seq: 0, timer: null, gone: false, token: "test", clearTimeout() {}, schedule() {}, render() {},
+		document: { querySelectorAll: () => [] }, // The old audit poll has no active audit to read.
+		fetch: async () => ({ ok: true, json: async () => ({ ended: { rows: globals.rows } }) }),
+		drawEndedDetail: (id) => redraws.push(id),
+		getJson: (url, headers) => {
+			const result = BrowserPromise.withResolvers();
+			requests.push({ url, headers, ...result });
+			return result.promise;
+		},
+	};
+	// A promise from the extracted functions' realm resumes their await on the next microtask.
+	const { refresh, loadEndedDetail, Promise: BrowserPromise } = endedDetailFunctions([
+		"refresh", "pollAudits", "refreshEndedDetails", "endedDetailId", "endedDetailUrl", "endedTokenSignature", "loadEndedDetail", "Promise",
+	], globals);
+	return {
+		openEnded, endedDetails, requests, redraws,
+		async seed(row, data) {
+			const loaded = loadEndedDetail(row);
+			requests.pop().resolve(data);
+			await loaded;
+			redraws.length = 0;
+		},
+		tick(...rows) {
+			globals.rows = rows;
+			return refresh(true);
+		},
+	};
+}
+
+it("(plan 36) state refresh re-reads a changed open detail and only drops a changed closed detail", async () => {
+	const h = endedRefreshHarness();
+	const openRow = { sessionId: "shared", detailEndedMs: NOW, ...pendingTokens };
+	const closedRow = { ...openRow, detailEndedMs: NOW - 1 };
+	const openId = `shared:${NOW}`;
+	const closedId = `shared:${NOW - 1}`;
+	const old = { audit: { blocked: "models-unknown" } };
+	h.openEnded.add(openId);
+	await h.seed(openRow, old);
+	await h.seed(closedRow, old);
+
+	await h.tick({ ...openRow, ...readyTokens }, { ...closedRow, ...readyTokens });
+	assert.deepEqual(h.requests.map(({ url }) => url), [`/api/session?id=shared&ended=${NOW}`]);
+	assert.equal(h.requests[0].headers["x-omo-health-auto"], "1");
+	assert.equal(h.endedDetails.has(closedId), false);
+	assert.equal(h.endedDetails.get(openId).data, old);
+	assert.deepEqual(h.redraws, [], "no loading redraw replaces the old panel");
+
+	const updated = { tokens: readyTokens.tokens, audit: { blocked: null } };
+	h.requests[0].resolve(updated);
+	await Promise.resolve();
+	assert.equal(h.endedDetails.get(openId).data, updated);
+	assert.equal(h.openEnded.has(openId), true);
+	assert.deepEqual(h.redraws, [openId]);
+	await h.tick({ ...openRow, ...readyTokens });
+	assert.equal(h.requests.length, 1, "a successful refresh caches the new signature");
+});
+
+it("(plan 36) a failed token refetch keeps the open panel and retries on the next state refresh", async () => {
+	const h = endedRefreshHarness();
+	const row = { sessionId: "open", ...pendingTokens };
+	const updatedRow = { ...row, ...readyTokens };
+	const old = { audit: { blocked: "models-unknown" } };
+	h.openEnded.add(row.sessionId);
+	await h.seed(row, old);
+	await h.tick(updatedRow);
+	assert.equal(h.requests.length, 1, "a changed signature starts a detail refetch");
+	await h.tick(updatedRow);
+	assert.equal(h.requests.length, 1, "a matching in-flight request is not duplicated");
+
+	h.requests[0].reject(new Error("temporary failure"));
+	await Promise.resolve();
+	assert.equal(h.endedDetails.get(row.sessionId).data, old);
+	assert.deepEqual(h.redraws, []);
+	await h.tick(updatedRow);
+	assert.equal(h.requests.length, 2);
+	const updated = { tokens: readyTokens.tokens };
+	h.requests[1].resolve(updated);
+	await Promise.resolve();
+	assert.equal(h.endedDetails.get(row.sessionId).data, updated);
+	assert.deepEqual(h.redraws, [row.sessionId]);
 });
 
 it("(gate 16) history and board show a dash with the full-index tooltip", () => {

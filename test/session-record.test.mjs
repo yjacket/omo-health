@@ -155,6 +155,44 @@ test("a wake-parent action with no investigation joins through its finding's ope
 	assert.ok(record.health.findings.some((item) => item.fp === "fp-wake" && item.event === "opened"));
 });
 
+test("IS-7: the child record includes D8 findings and wake-parent decisions addressed to its parent", () => {
+	const { paths } = setup();
+	const parent = mainRow();
+	const child = childRow("s-child", "st_shared", parent.sessionId);
+	const otherParent = mainRow({ sessionId: "s-other-parent" });
+	const otherChild = childRow("s-other-child", child.taskId, otherParent.sessionId);
+	const sibling = childRow("s-sibling", "st_sibling", parent.sessionId);
+	writeLedger(paths, [parent, child, otherParent, otherChild, sibling]);
+	const subject = { sessionId: parent.sessionId, taskId: child.taskId, parentSessionId: parent.sessionId };
+	const incident = { fp: "fp-dead", detector: "D8", kind: "dead-child", subject, ts: iso(T0 + 20 * MIN) };
+	const wake = { ...incident, action: { key: "wake-parent:fp-dead", kind: "wake-parent" }, result: "execute", outcome: { delivered: true, sessionId: parent.sessionId } };
+	// An action with no retained lifecycle or investigation entry must also join by subject.
+	writeDecisions(paths, [
+		{ ...incident, event: "opened", severity: "warn" },
+		wake,
+		{ ...wake, fp: "fp-action-only", action: { ...wake.action, key: "wake-parent:fp-action-only" }, result: "would-execute", outcome: undefined },
+	]);
+	writeInvestigation(paths, { id: "fp-investigation-only", detector: "D8", kind: "child-error-unhandled", subject });
+
+	const joined = (row) => {
+		const { health } = loadSessionRecord({ paths, id: row.sessionId, now: parent.endedMs });
+		return [
+			health.findings.map(({ fp, detector, kind }) => [fp, detector, kind]),
+			health.actions.map(({ kind, recipient, result }) => [kind, recipient, result]),
+			health.investigations.map(({ id }) => id),
+		];
+	};
+	const expected = [
+		[["fp-dead", "D8", "dead-child"]],
+		[["wake-parent", parent.sessionId, "execute"], ["wake-parent", parent.sessionId, "would-execute"]],
+		["fp-investigation-only"],
+	];
+	assert.deepEqual(joined(child), expected);
+	assert.deepEqual(joined(parent), expected);
+	assert.deepEqual(joined(otherChild), [[], [], []]);
+	assert.deepEqual(joined(sibling), [[], [], []]);
+});
+
 test("an engine action decision is listed by its action kind, not the finding kind", () => {
 	const { paths } = setup();
 	writeLedger(paths, [{ sessionId: "s-kind", kind: "main", startedMs: T0, endedMs: T0 + HOUR }]);
