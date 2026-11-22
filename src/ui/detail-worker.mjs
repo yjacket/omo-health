@@ -8,11 +8,13 @@ import { fresh, readUsageIndex } from "../usage-index.mjs";
 import { AUDIT_TERMINATION_UNCONFIRMED_LABEL, auditReasonLabel, auditStatusLabel } from "./labels.mjs";
 import { daemonStatus, loadDaemonInputs, recordsStamp } from "./model.mjs";
 import { sessionRecordPage } from "./session-view.mjs";
+import { subjectOf } from "../session-subject.mjs";
 
 const SESSION_CACHE_MAX = 20;
 const ACTIVE_AUDIT_STATUSES = new Set(["requested", "queued", "launching", "running"]);
 const isAuditActive = (state) => Boolean(state && (ACTIVE_AUDIT_STATUSES.has(state.status) || state.holdUntilExit === true));
-const canonicalIdOf = (session, id) => (session?.ledgerIds ?? session)?.sessionId || id;
+const subjectOfRecord = ({ subject, session }, id) =>
+	subject ?? subjectOf({ ...session, sessionId: (session?.ledgerIds ?? session)?.sessionId || id });
 
 function detailSignature(paths, files) {
 	return JSON.stringify([files.map(auditFileVersion), recordsStamp(paths)]);
@@ -54,7 +56,8 @@ export function createDetailOperations({
 	const plan = (config, facts, analystModels) =>
 		resolveModel(paths, config, { ...facts, analystModels: Array.isArray(analystModels) ? analystModels : [] });
 
-	function preview(id, { session, analystModels }) {
+	function preview(id, record) {
+		let { session, analystModels } = record;
 		// A cached record may predate an exit that didn't generate a decision.
 		if (session?.pendingAnalystJobs?.length) {
 			const models = new Set(analystModels);
@@ -66,7 +69,7 @@ export function createDetailOperations({
 		const { config } = loadConfig({ env, paths });
 		const daemon = daemonStatus(daemonInputs({ paths, env, now: at }));
 		// A task id and its canonical session id share the same audit files.
-		const state = readState(paths, canonicalIdOf(session, id));
+		const state = readState(paths, subjectOfRecord(record, id));
 		const perDay = Number.isFinite(config.audit?.perDay) ? config.audit.perDay : null;
 		const usedToday = today(paths, at);
 		const facts = auditFactsFor(paths, session, config.tokens);
@@ -83,13 +86,14 @@ export function createDetailOperations({
 
 	const refuse = (status, reason) => [status, { error: reason, reasonKo: auditReasonLabel(reason) }];
 	function startAudit(record, id) {
+		if (record?.error === "ambiguous-session") return refuse(409, record.error);
 		if (!record?.found) return refuse(404, "not-found");
-		const canonicalId = canonicalIdOf(record.session, id);
+		const subject = subjectOfRecord(record, id);
 		const { config } = loadConfig({ env, paths });
 		if (config.audit?.enabled !== true) return refuse(409, "disabled");
 		const daemon = daemonStatus(daemonInputs({ paths, env, now: at }));
 		if (daemon.state !== "running") return refuse(409, "daemon-off");
-		if (isAuditActive(readState(paths, canonicalId))) return refuse(409, "running");
+		if (isAuditActive(readState(paths, subject))) return refuse(409, "running");
 		const perDay = config.audit.perDay;
 		if (Number.isFinite(perDay) && today(paths, at) >= perDay) return refuse(429, "cap");
 		const facts = auditFactsFor(paths, record.session, config.tokens);
@@ -97,15 +101,15 @@ export function createDetailOperations({
 		if (modelBlock) return refuse(409, modelBlock);
 		const choice = plan(config, facts, record.analystModels);
 		if (!choice || choice.blocked) return refuse(409, "no-model");
-		const claim = request(paths, canonicalId, at);
+		const claim = request(paths, subject, at);
 		if (!claim.created) return refuse(409, "running");
 		// Intake may have published this claim, or another dashboard's, since the first read.
-		const state = readState(paths, canonicalId);
+		const state = readState(paths, subject);
 		if (isAuditActive(state) && state.claimId !== claim.request.claimId) {
-			withdrawAuditRequest(paths, canonicalId, claim.request.claimId);
+			withdrawAuditRequest(paths, subject, claim.request.claimId);
 			return refuse(409, "running");
 		}
-		return [202, { ok: true, audit: { sessionId: canonicalId, status: "queued", statusKo: auditStatusLabel("queued"), planned: choice } }];
+		return [202, { ok: true, audit: { sessionId: subject.sessionId, status: "queued", statusKo: auditStatusLabel("queued"), planned: choice } }];
 	}
 
 	function readHistory(job) {
@@ -118,13 +122,13 @@ export function createDetailOperations({
 		// Injected loaders may not report dependencies; retain the selected-file lookup for them.
 		const file = transcriptFiles === undefined && (taskId
 			? locator.childFile({ taskId, sessionId, cwds: session.cwd ? [session.cwd] : [] })
-			: locator.mainFile(sessionId));
+			: locator.mainFile(subjectOfRecord(record, job.id)));
 		const files = transcriptFiles ?? (file ? [file] : []);
 		return { record, files, signature: detailSignature(paths, files) };
 	}
 
 	function cachedHistory(job) {
-		const key = job.row === undefined ? job.id : `${job.id}:${job.row}`;
+		const key = JSON.stringify([job.id, job.row ?? null]);
 		let entry = cache.get(key);
 		cache.delete(key);
 		if (!entry || detailSignature(paths, entry.files) !== entry.signature) entry = readHistory(job);

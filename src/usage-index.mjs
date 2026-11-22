@@ -2,6 +2,7 @@ import fs from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { addModelCounters, emptyModelBilling, MODEL_KEY_LENGTH, MODEL_KEY_LIMIT, readUsage } from "./collect/usage.mjs";
 import { pathKey } from "./paths.mjs";
+import { subjectKey, subjectOf } from "./session-subject.mjs";
 import { atomicWriteChunks, statSafe } from "./util/fsx.mjs";
 
 /**
@@ -16,7 +17,7 @@ import { atomicWriteChunks, statSafe } from "./util/fsx.mjs";
  * advances record by record, while `published` only moves when a read ends
  * `done`, so a partial append never shows an intermediate sum (IS-1, IS-3, IS-12).
  */
-export const USAGE_INDEX_VERSION = 4;
+export const USAGE_INDEX_VERSION = 5;
 const INDEX_HEADER = JSON.stringify({ v: USAGE_INDEX_VERSION });
 const FULL_HEADER = JSON.stringify({ v: USAGE_INDEX_VERSION, full: true });
 const FULL_ENTRY = Object.freeze({ state: "full" });
@@ -39,10 +40,10 @@ const TREE_DEPTH = 8;
 
 const isObject = (value) => typeof value === "object" && value !== null;
 
-const META_KEYS = ["kind", "taskId", "parentSessionId", "rootSessionId"];
+const META_KEYS = ["kind", "taskId", "parentSessionId", "rootSessionId", "parentKey", "rootKey"];
 const MEMORY_ONLY_KEYS = ["scanOffset", "partial", "readError", "pending"];
 const USAGE_KEYS = ["usage", "overlay", "published"];
-const ENTRY_STRING_KEYS = ["id", "file", ...META_KEYS, "state", "head", "tail"];
+const ENTRY_STRING_KEYS = ["id", "projectKey", "file", ...META_KEYS, "state", "head", "tail"];
 const OTHER_MODELS = "(other models)";
 const SPILL_KEYS = new Set([OTHER_MODELS, "(model id too long)", "(model id unreadable)"]);
 export const isSpillModelKey = (key) => SPILL_KEYS.has(key);
@@ -50,11 +51,14 @@ const COUNTER_KEYS = ["input", "output", "cacheRead", "cacheWrite", "total", "co
 const CURSOR_NUMBERS = ["size", "offset", "evaluatedTo", "mtimeMs", "ino", "birthtimeMs", "headLen"];
 const PERSISTED_KEYS = [
 	"id",
+	"projectKey",
 	"file",
 	"kind",
 	"taskId",
 	"parentSessionId",
 	"rootSessionId",
+	"parentKey",
+	"rootKey",
 	"state",
 	"complete",
 	"gone",
@@ -73,14 +77,17 @@ const PERSISTED_KEYS = [
 	"checkedMs",
 ];
 
-function newEntry(id) {
+function newEntry({ sessionId: id, projectKey = null }) {
 	return {
 		id,
+		projectKey,
 		file: null,
 		kind: null,
 		taskId: null,
 		parentSessionId: null,
 		rootSessionId: null,
+		parentKey: null,
+		rootKey: null,
 		state: "missing",
 		complete: false,
 		gone: false,
@@ -103,6 +110,9 @@ function newEntry(id) {
 function applyMeta(entry, meta) {
 	if (!isObject(meta)) return;
 	for (const key of META_KEYS) if (key in meta) entry[key] = meta[key];
+	for (const [key, id] of [["parentKey", "parentSessionId"], ["rootKey", "rootSessionId"]]) {
+		if (id in meta && !(key in meta)) entry[key] = subjectKey({ ...subjectOf(entry), sessionId: meta[id] });
+	}
 }
 
 function hasNumericCursor(entry) {
@@ -207,7 +217,7 @@ export function atEnd(entry) {
 }
 
 /**
- * Own plus descendants' complete totals via `parentSessionId`, or null when no
+ * Own plus descendants' complete totals via `parentKey`, or null when no
  * descendant contributes. Exactness requires a published own total and every
  * known descendant. Unresolved fallback links mark a branch partial without
  * joining it to an unrelated index entry with the same task ID.
@@ -217,24 +227,26 @@ export function treeTotals(entries, knownRows = []) {
 	const childrenByParent = new Map();
 	const unresolvedIds = new Set();
 	const unresolvedParents = new Set();
-	const link = ({ id, parentSessionId }) => {
-		if (parentSessionId == null) return;
-		const siblings = childrenByParent.get(parentSessionId) ?? new Set();
+	const link = (id, parentKey) => {
+		if (parentKey == null) return;
+		const siblings = childrenByParent.get(parentKey) ?? new Set();
 		siblings.add(id);
-		childrenByParent.set(parentSessionId, siblings);
+		childrenByParent.set(parentKey, siblings);
 	};
 	for (const row of knownRows) {
-		if (!isObject(row) || row.id == null) continue;
-		if (!byId.has(row.id)) byId.set(row.id, null);
+		const key = row?.key;
+		if (key == null) continue;
+		if (!byId.has(key)) byId.set(key, null);
 		if (row.unresolved) {
-			unresolvedIds.add(row.id);
-			if (row.parentSessionId != null) unresolvedParents.add(row.parentSessionId);
-		} else link(row);
+			unresolvedIds.add(key);
+			if (row.parentKey != null) unresolvedParents.add(row.parentKey);
+		} else link(key, row.parentKey);
 	}
 	for (const entry of (entries instanceof Map ? entries.values() : entries ?? [])) {
-		if (!isObject(entry) || entry.id == null) continue;
-		byId.set(entry.id, entry);
-		if (!unresolvedIds.has(entry.id)) link(entry);
+		const key = subjectKey(subjectOf(entry));
+		if (key == null) continue;
+		byId.set(key, entry);
+		if (!unresolvedIds.has(key)) link(key, entry.parentKey);
 	}
 	const totals = new Map();
 	totals.complete = new Map();
@@ -382,7 +394,7 @@ function validateEntry(entry, remaining) {
 	if (hasOwnership && typeof entry.ownershipUnique !== "boolean") return -1;
 	if (Object.keys(entry).length !== PERSISTED_KEYS.length + Number(hasOwnership) ||
 		!PERSISTED_KEYS.every((key) => Object.hasOwn(entry, key))) return -1;
-	if (typeof entry.id !== "string" || !META_KEYS.every((key) => nullableString(entry[key]))) return -1;
+	if (typeof entry.id !== "string" || !nullableString(entry.projectKey) || !META_KEYS.every((key) => nullableString(entry[key]))) return -1;
 	if (!Number.isFinite(entry.checkedMs) || typeof entry.complete !== "boolean" || typeof entry.gone !== "boolean") return -1;
 	if (entry.state === "missing") {
 		return nullableString(entry.file) && !entry.complete && !entry.gone &&
@@ -450,7 +462,7 @@ function fitsIndexLine(text) {
 function* indexChunks(entries, weights, full) {
 	yield `${full ? FULL_HEADER : INDEX_HEADER}\n`;
 	for (const entry of [...entries.values()].sort((a, b) => b.checkedMs - a.checkedMs)) {
-		if (entry.state === "ok" && weights.get(entry.id).slots === null) continue; // Recount still pending.
+		if (entry.state === "ok" && weights.get(subjectKey(subjectOf(entry))).slots === null) continue; // Recount still pending.
 		yield `${serializeEntry(entry)}\n`;
 	}
 }
@@ -463,12 +475,13 @@ export function publishedUsageView(usage) {
 }
 
 /** Session ids are authoritative; a task id is only a lookup for a sessionless row. */
-export function usageEntryFor(usage, sessionId, taskId) {
-	if (isId(sessionId)) return usage?.get(sessionId);
+export function usageEntryFor(usage, subject, taskId) {
+	const key = subjectKey(subject);
+	if (key) return usage?.get(key);
 	if (!isId(taskId)) return undefined;
 	let match;
 	for (const entry of usage?.values() ?? []) {
-		if (entry?.taskId !== taskId) continue;
+		if (entry?.taskId !== taskId || subjectOf(entry).projectKey !== subject?.projectKey) continue;
 		if (match) return undefined;
 		match = entry;
 	}
@@ -486,10 +499,11 @@ export function relatedUsageEntries(index, sessionId) {
 	const related = [];
 	for (const entry of index?.values() ?? []) {
 		let matches = entry.id === sessionId || entry.rootSessionId === sessionId;
-		let parent = entry.parentSessionId;
+		let parent = entry.parentKey;
 		for (let depth = 0; !matches && parent && depth < TREE_DEPTH; depth += 1) {
-			matches = parent === sessionId;
-			if (!matches) parent = index.get(parent)?.parentSessionId;
+			const ancestor = index.get(parent);
+			matches = ancestor?.id === sessionId;
+			parent = ancestor?.parentKey;
 		}
 		if (matches) {
 			// A partial record may contain a large buffer or scanner functions.
@@ -522,23 +536,24 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 	};
 
 	const admit = (entry, slots) => {
+		const key = subjectKey(subjectOf(entry));
 		const line = serializeEntry(entry);
 		const size = entryBytes(entry, line);
 		if (bytes + size > INDEX_BYTE_BUDGET || !fitsIndexLine(line)) {
-			if (entries.delete(entry.id) || !full) dirty = true;
+			if (entries.delete(key) || !full) dirty = true;
 			full = true;
 			return FULL_ENTRY;
 		}
 		dirty = true;
-		entries.set(entry.id, entry);
-		weights.set(entry.id, { slots, bytes: size });
+		entries.set(key, entry);
+		weights.set(key, { slots, bytes: size });
 		bytes += size;
 		named += slots ?? 0;
 		return entry;
 	};
 
 	const dropCursor = (entry) => {
-		Object.assign(entry, newEntry(entry.id), persistedMeta(entry), { checkedMs: entry.checkedMs });
+		Object.assign(entry, newEntry(subjectOf(entry)), persistedMeta(entry), { checkedMs: entry.checkedMs });
 		delete entry.ownershipUnique;
 		entry.partial = undefined;
 		entry.scanOffset = undefined;
@@ -548,13 +563,15 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 	return {
 		file,
 		get full() { return full; },
-		get(sessionId, taskId) {
+		get(key, taskId) {
+			if (typeof key === "object" && key !== null) return usageEntryFor(entries, key, taskId) ?? (full && taskId ? FULL_ENTRY : undefined);
 			// No rejected path or id is retained. While saturated, an absent row
 			// cannot be distinguished from one skipped at the capacity boundary.
-			return usageEntryFor(entries, sessionId, taskId) ?? (full && (isId(sessionId) || isId(taskId)) ? FULL_ENTRY : undefined);
+			return entries.get(key) ?? (full && key ? FULL_ENTRY : undefined);
 		},
-		has(sessionId, taskId) {
-			return usageEntryFor(entries, sessionId, taskId) !== undefined;
+		has(key, taskId) {
+			if (typeof key === "object" && key !== null) return usageEntryFor(entries, key, taskId) !== undefined;
+			return entries.has(key);
 		},
 		values: () => entries.values(),
 		recordOwnership(id, unique) {
@@ -575,9 +592,10 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 		 * file marks the entry missing (or, after a complete read, gone) and a read
 		 * error keeps the saved totals while `readError` hides them from the board.
 		 */
-		update(id, path, meta = {}, { maxBytes = Infinity, ownershipUnique } = {}) {
+		update(subject, path, meta = {}, { maxBytes = Infinity, ownershipUnique } = {}) {
+			const id = subjectKey(subject);
 			const stored = entries.get(id);
-			const entry = stored && Object.hasOwn(stored, "file") ? stored : newEntry(id);
+			const entry = stored && Object.hasOwn(stored, "file") ? stored : newEntry(subject);
 			if (stored && entry !== stored) {
 				entry.state = "ok";
 				entry.offset = 0;
@@ -651,8 +669,9 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 		 * turns `gone` (IS-3). For a task-only row this requires zero candidates;
 		 * a conflicting lookup (including one in another store) clears the claim.
 		 */
-		markMissing(id, meta = {}, { withdraw = false } = {}) {
-			const entry = entries.get(id) ?? newEntry(id);
+		markMissing(subject, meta = {}, { withdraw = false } = {}) {
+			const id = subjectKey(subject);
+			const entry = entries.get(id) ?? newEntry(subject);
 			const previousSlots = weights.get(id)?.slots ?? null;
 			unweigh(id);
 			applyMeta(entry, meta);
@@ -772,12 +791,12 @@ function loadUsageIndex(file, trackWeights = true) {
 				} catch {
 					continue;
 				}
-				if (record(row) && typeof row.id === "string" && !entries.has(row.id)) yield { row, text };
+				const key = record(row) && typeof row.id === "string" && subjectKey(subjectOf(row));
+				if (key && !entries.has(key)) yield { row, text, key };
 			}
 		}
 		let sawInvalid = false;
-		for (const { row, text } of rows()) {
-			const { id } = row;
+		for (const { row, text, key } of rows()) {
 			const slots = validateEntry(row, USAGE_INDEX_MODEL_BUDGET - named);
 			if (slots < 0) {
 				sawInvalid = true;
@@ -788,22 +807,21 @@ function loadUsageIndex(file, trackWeights = true) {
 				full = truncated = true;
 				break;
 			}
-			entries.set(id, row);
+			entries.set(key, row);
 			bytes += size;
 			named += slots;
-			if (trackWeights) weights.set(id, { slots, bytes: size });
+			if (trackWeights) weights.set(key, { slots, bytes: size });
 		}
 		// The writer orders intact rows newest first. Only spend leftover space
 		// on recounts; a second pass avoids buffering damaged rows or their IDs.
 		const markerOverhead = 128; // Map/weight bookkeeping and the fixed marker shape.
 		if (sawInvalid && bytes + markerOverhead < INDEX_BYTE_BUDGET) {
-			for (const { row } of rows()) {
-				const { id } = row;
-				const size = markerOverhead + stringBytes(id);
+			for (const { row, key } of rows()) {
+				const size = markerOverhead + stringBytes(key);
 				if (bytes + size > INDEX_BYTE_BUDGET || validateEntry(row, USAGE_INDEX_MODEL_BUDGET - named) >= 0) continue;
-				entries.set(id, { id, state: "ok", complete: false, offset: 0 });
+				entries.set(key, { id: row.id, projectKey: subjectOf(row).projectKey, state: "ok", complete: false, offset: 0 });
 				bytes += size;
-				if (trackWeights) weights.set(id, { slots: null, bytes: size });
+				if (trackWeights) weights.set(key, { slots: null, bytes: size });
 			}
 		}
 		return { entries, weights, named, bytes, full, truncated };

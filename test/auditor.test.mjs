@@ -1,3 +1,6 @@
+import { auditFileKey, projectKeyOf, subjectOf, subjectKey } from "../src/session-subject.mjs";
+const sub = (sessionId, cwd = sessionId === "Review.1" ? "C:/dev/other" : "C:/dev/proj") => subjectOf({ sessionId, cwd });
+const key = (sessionId, cwd) => subjectKey(sub(sessionId, cwd));
 import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
@@ -8,7 +11,7 @@ import path from "node:path";
 import { Worker } from "node:worker_threads";
 import { afterEach, test } from "node:test";
 import { AUDIT_CONTRACT, REQUEST_TTL_MS, auditsToday, createAuditor, readAuditState, requestAudit } from "../src/auditor.mjs";
-import { auditFileKey, safeSubjectId } from "../src/session-id.mjs";
+import { safeSubjectId } from "../src/session-id.mjs";
 import { createSessionFileLocator } from "../src/collect/session-files.mjs";
 import { usageTimeline } from "../src/collect/usage.mjs";
 import { DEFAULT_CONFIG } from "../src/config.mjs";
@@ -118,10 +121,10 @@ function harness({ providers = ["anthropic-subscription", "openai", "google", "x
 	const config = structuredClone(DEFAULT_CONFIG);
 	const h = { root, paths, state, clock, config, runner: undefined, files: {} };
 	h.runner = fakeRunner(paths, state);
-	h.addSession = (id, list = entries ?? [E.assistant({ ms: BASE - 120_000, id: `a-${id}`, model: "claude-opus-5-5", provider: "anthropic-subscription" })]) => {
-		const file = path.join(paths.sessionsDir, "proj", `2026-11-20T11-00-00-000Z_${id}.jsonl`);
+	h.addSession = (id, list = entries ?? [E.assistant({ ms: BASE - 120_000, id: `a-${id}`, model: "claude-opus-5-5", provider: "anthropic-subscription" })], cwd = "C:/dev/proj") => {
+		const file = path.join(paths.sessionsDir, projectKeyOf(cwd), `2026-11-20T11-00-00-000Z_${id}.jsonl`);
 		writeJsonl(file, list);
-		appendEnded(paths, { sessionId: id, kind: "main", startedMs: BASE - 3_600_000, endedMs: BASE - 60_000, outcome: "completed", reason: "done", cwd: "C:\\dev\\proj" });
+		appendEnded(paths, { sessionId: id, kind: "main", startedMs: BASE - 3_600_000, endedMs: BASE - 60_000, outcome: "completed", reason: "done", cwd });
 		h.files[id] = file;
 		return file;
 	};
@@ -140,12 +143,12 @@ function harness({ providers = ["anthropic-subscription", "openai", "google", "x
 		await auditor.preparing();
 		auditor.tick(state.now);
 	};
-	h.request = (id) => {
-		const claim = requestAudit(paths, id, state.now);
+	h.request = (id, cwd) => {
+		const claim = requestAudit(paths, sub(id, cwd), state.now);
 		state.now += 1;
 		return claim;
 	};
-	h.record = (id) => readJsonSafe(path.join(paths.health.auditsDir, `${auditFileKey(id)}.json`));
+	h.record = (id, cwd) => readJsonSafe(path.join(paths.health.auditsDir, `${auditFileKey(sub(id, cwd))}.json`));
 	h.budget = () => readJsonSafe(paths.health.auditBudgetFile);
 	h.jobsOf = (id) => h.runner.starts.filter((start) => start.jobId.endsWith(`-${id}`));
 	return h;
@@ -189,7 +192,7 @@ test("IS-8: one ordinary cold turn does not require a D4 check", async (t) => {
 
 	h.runner.script = queue(DONE);
 	h.tick(auditor);
-	const { status, reason } = readAuditState(h.paths, "m1");
+	const { status, reason } = readAuditState(h.paths, sub("m1"));
 	assert.deepEqual(
 		{ suggestedD4: /\bD4\b/.test(suggestion), required: launched.requiredDetectors, status, reason },
 		{ suggestedD4: false, required: [], status: "done", reason: null },
@@ -199,12 +202,12 @@ test("IS-8: one ordinary cold turn does not require a D4 check", async (t) => {
 test("IS-7 indexed transcript: audit includes the message ref for a child located through a live parent", async () => {
 	const h = harness({ sessions: [] });
 	const { index, child } = indexLiveParentTranscript(h.paths, h.root, BASE);
-	assert.equal(index.get(child.id)?.file, child.file);
-	assert.equal(fresh(index.get(child.id)), true);
+	assert.equal(index.get(key(child.id, h.root))?.file, child.file);
+	assert.equal(fresh(index.get(key(child.id, h.root))), true);
 	const auditor = h.auditor({ index });
-	h.request(child.id);
+	h.request(child.id, h.root);
 	await h.prepare(auditor);
-	assert.equal(h.record(child.id).status, "running");
+	assert.equal(h.record(child.id, h.root).status, "running");
 	const document = fs.readFileSync(path.join(h.runner.starts[0].cwd, "bundle.md"), "utf8");
 	const bundle = JSON.parse(document.split("\n").find((line) => line.startsWith('{"session":')));
 	assert.equal(bundle.tokens.total, 51_302);
@@ -299,14 +302,14 @@ for (const complete of [true, false]) {
 		]);
 		h.request("m1");
 		await h.prepare(h.auditor());
-		const launched = readAuditState(h.paths, "m1");
+		const launched = readAuditState(h.paths, sub("m1"));
 		assert.equal(launched.status, "running");
 		const checks = [{ item: "D6", judgment: "sound", explanation: "적절했습니다.", evidence: ["근거: F1, F2"] }];
 		if (complete) checks.push({ item: "F2", judgment: "sound", explanation: "적절했습니다.", evidence: ["근거: F2"] });
 		h.runner.script = () => ({ ...DONE, result: { ...TOKEN_ONLY_ANSWER, checks } });
 		h.tick(h.auditor()); // Finish on a fresh auditor, using the launch-time evidence.
 
-		const state = readAuditState(h.paths, "m1");
+		const state = readAuditState(h.paths, sub("m1"));
 		assert.equal(state.status, complete ? "done" : "failed");
 		assert.deepEqual(launched.firedDetectors, ["D6", "D8"]);
 		assert.deepEqual(h.budget().jobs, [launched.jobId]);
@@ -348,7 +351,7 @@ for (const [complete, restart] of [[false, false], [false, true], [true, true]])
 		if (restart) await auditor.close();
 		h.tick(restart ? h.auditor() : auditor);
 
-		const state = readAuditState(h.paths, "m1");
+		const state = readAuditState(h.paths, sub("m1"));
 		assert.equal(state.status, complete ? "done" : "failed");
 		assert.equal(state.reason, complete ? null : "incomplete-checks");
 		if (complete) assert.deepEqual(state.result.checks, checks);
@@ -434,7 +437,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import { createUsageIndex } from ${source("usage-index")};
 import { createAuditor, requestAudit, readAuditState } from ${source("auditor")};
-import { DEFAULT_CONFIG } from ${source("config")};
+import { DEFAULT_CONFIG } from ${source("config")}; import { subjectOf, subjectKey } from ${source("session-subject")}; const sub = (sessionId, cwd = "C:/dev/proj") => subjectOf({ sessionId, cwd }); const key = (...args) => subjectKey(sub(...args));
 const [mode, pathsJSON, transcript] = process.argv.slice(1);
 const paths = JSON.parse(pathsJSON);
 const now = ${BASE};
@@ -442,8 +445,8 @@ const clock = { now: () => now };
 const file = paths.health.usageIndexFile;
 const index = createUsageIndex({ file, clock });
 if (mode === "fixture") {
-	index.update("m1", transcript, { kind: "main" });
-	const seed = index.get("m1");
+	index.update(sub("m1", "C:/dev/proj"), transcript, { kind: "main" });
+	const seed = index.get(key("m1", "C:/dev/proj"));
 	index.save();
 	const fd = fs.openSync(file, "a");
 	try {
@@ -451,7 +454,7 @@ if (mode === "fixture") {
 		for (let i = 0; i < 12000; i++) fs.writeSync(fd, JSON.stringify({ ...seed, id: "s" + i, file: prefix + i }) + "\\n");
 	} finally { fs.closeSync(fd); }
 } else {
-	assert.ok(index.get("m1").published.total > 0);
+	assert.ok(index.get(key("m1", "C:/dev/proj")).published.total > 0);
 	const open = fs.openSync;
 	let indexOpens = 0;
 	fs.openSync = (name, ...args) => {
@@ -459,7 +462,7 @@ if (mode === "fixture") {
 		return open(name, ...args);
 	};
 	let launches = 0;
-	requestAudit(paths, "m1", now);
+	requestAudit(paths, sub("m1"), now);
 	const auditor = createAuditor({ paths, index, clock, config: DEFAULT_CONFIG, env: {}, timelineMaxBytes: 0, runner: {
 		start() { launches++; return { pid: 5001 }; },
 	} });
@@ -468,9 +471,9 @@ if (mode === "fixture") {
 	await auditor.preparing();
 	auditor.tick(now + 1);
 	assert.equal(launches, 1);
-	const record = readAuditState(paths, "m1");
+	const record = readAuditState(paths, sub("m1"));
 	assert.deepEqual([record.status, record.model], ["running", "google/gemini-3-pro"]);
-	assert.ok(fs.readFileSync(paths.health.jobsDir + "/" + record.jobId + "/bundle.md", "utf8").includes('"total":' + index.get("m1").published.total));
+	assert.ok(fs.readFileSync(paths.health.jobsDir + "/" + record.jobId + "/bundle.md", "utf8").includes('"total":' + index.get(key("m1", "C:/dev/proj")).published.total));
 	assert.equal(indexOpens, 0);
 }
 `;
@@ -505,7 +508,7 @@ test("a request becomes queued, then running with the marker, the guard flags an
 	assert.deepEqual([marker.kind, marker.sessionId, marker.model, marker.jobId], ["audit", record.laneSessionId, record.model, record.jobId]);
 	assert.deepEqual(h.budget().jobs, [record.jobId]);
 	assert.equal(h.budget().count, 1);
-	assert.equal(fs.existsSync(path.join(h.paths.health.auditRequestsDir, `${auditFileKey("m1")}.json`)), false, "the request is consumed");
+	assert.equal(fs.existsSync(path.join(h.paths.health.auditRequestsDir, `${auditFileKey(sub("m1"))}.json`)), false, "the request is consumed");
 
 	h.runner.script = () => DONE;
 	h.tick(a);
@@ -835,7 +838,7 @@ test("(IS-10) only a confirmed non-launch refunds, even when its poll result is 
 	assert.deepEqual(h.budget(), refundedBudget);
 
 	// Replay the running record left by a crash after the budget write but before the failure record write.
-	fs.writeFileSync(path.join(h.paths.health.auditsDir, `${auditFileKey("m2")}.json`), JSON.stringify(running));
+	fs.writeFileSync(path.join(h.paths.health.auditsDir, `${auditFileKey(sub("m2"))}.json`), JSON.stringify(running));
 	h.tick(h.auditor());
 	assert.deepEqual([h.record("m2").status, h.record("m2").reason], ["failed", "spawn-error"]);
 	assert.deepEqual(h.budget(), refundedBudget);
@@ -905,14 +908,14 @@ test("a same-length rewrite is no longer fresh, queueLedger requeues it, and the
 	tracker.queueLedger(rows);
 	tracker.tick({});
 	index.save();
-	assert.equal(fresh(index.get("m1")), true);
-	assert.equal(index.get("m1").published.total, 15);
+	assert.equal(fresh(index.get(key("m1", "C:/dev/proj"))), true);
+	assert.equal(index.get(key("m1", "C:/dev/proj")).published.total, 15);
 
 	const before = fs.statSync(file);
 	writeJsonl(file, [mk("gpt-5-5", 20)]);
 	assert.equal(fs.statSync(file).size, before.size, "the rewrite keeps the length");
 	fs.utimesSync(file, new Date(before.atimeMs), new Date(before.mtimeMs + 5000));
-	assert.equal(fresh(index.get("m1")), false);
+	assert.equal(fresh(index.get(key("m1", "C:/dev/proj"))), false);
 	assert.ok(tracker.queueLedger(rows) > 0, "the changed file is queued again");
 
 	const a = h.auditor({ index, timelineMaxBytes: 1 });
@@ -924,9 +927,9 @@ test("a same-length rewrite is no longer fresh, queueLedger requeues it, and the
 
 	tracker.tick({});
 	index.save();
-	assert.equal(fresh(index.get("m1")), true);
-	assert.equal(index.get("m1").published.total, usageTimeline(file).totals.total, "the recount equals the oracle");
-	assert.equal(index.get("m1").published.total, 25);
+	assert.equal(fresh(index.get(key("m1", "C:/dev/proj"))), true);
+	assert.equal(index.get(key("m1", "C:/dev/proj")).published.total, usageTimeline(file).totals.total, "the recount equals the oracle");
+	assert.equal(index.get(key("m1", "C:/dev/proj")).published.total, 25);
 	h.request("m1");
 	await h.prepare(a);
 	assert.equal(modelOf(h.runner.starts[0]), "google/gemini-3-pro", "gpt-5-5 is excluded after the recount");
@@ -941,12 +944,12 @@ test("a same-length rewrite read by a complete timeline excludes the new model b
 	tracker.queueLedger(readEnded(h.paths));
 	tracker.tick({});
 	index.save();
-	assert.deepEqual(Object.keys(index.get("m1").published.models), ["openai/gpt-5-4"]);
+	assert.deepEqual(Object.keys(index.get(key("m1", "C:/dev/proj")).published.models), ["openai/gpt-5-4"]);
 	const before = fs.statSync(file);
 	writeJsonl(file, [mk("gpt-5-5", 20)]);
 	assert.equal(fs.statSync(file).size, before.size, "the rewrite keeps the length");
 	fs.utimesSync(file, new Date(before.atimeMs), new Date(before.mtimeMs + 5000));
-	assert.equal(fresh(index.get("m1")), false, "the index still holds the old read");
+	assert.equal(fresh(index.get(key("m1", "C:/dev/proj"))), false, "the index still holds the old read");
 
 	const a = h.auditor({ index });
 	h.request("m1");
@@ -980,7 +983,7 @@ const prewarm = (phase) => ({ type: "custom", customType: "prompt-cache-prewarm"
 
 function indexed(h, id, { maxBytes } = {}) {
 	const index = createUsageIndex({ file: h.paths.health.usageIndexFile, clock: h.clock, log: silent });
-	index.update(id, h.files[id], { kind: "main" }, maxBytes ? { maxBytes } : {});
+	index.update(sub(id, "C:/dev/proj"), h.files[id], { kind: "main" }, maxBytes ? { maxBytes } : {});
 	index.save();
 	return index;
 }
@@ -992,7 +995,7 @@ test("(IS-1, IS-9) reviewer launch excludes an identity learned only by the resi
 		t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
 		const auditor = h.auditor({ index });
 		const published = fs.readFileSync(index.file, "utf8");
-		assert.equal(index.get("m1").published.usedModels["openai/gpt-5-5"], undefined);
+		assert.equal(index.get(key("m1", "C:/dev/proj")).published.usedModels["openai/gpt-5-5"], undefined);
 
 		h.request("m1");
 		h.tick(auditor);
@@ -1002,9 +1005,9 @@ test("(IS-1, IS-9) reviewer launch excludes an identity learned only by the resi
 
 		if (changed) {
 			appendJsonl(h.files.m1, [openaiLine()]);
-			index.update("m1", h.files.m1, { kind: "main" });
-			assert.ok(index.get("m1").published.usedModels["openai/gpt-5-5"]);
-			assert.equal(fresh(index.get("m1")), true);
+			index.update(sub("m1", "C:/dev/proj"), h.files.m1, { kind: "main" });
+			assert.ok(index.get(key("m1", "C:/dev/proj")).published.usedModels["openai/gpt-5-5"]);
+			assert.equal(fresh(index.get(key("m1", "C:/dev/proj"))), true);
 			assert.equal(fs.readFileSync(index.file, "utf8"), published, "the resident update was not saved");
 		}
 
@@ -1023,7 +1026,7 @@ test("(IS-1, IS-8) an indexed append without a timeline sends current tokens to 
 	const h = harness();
 	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
 	const index = indexed(h, "m1");
-	const previousTotal = index.get("m1").published.total;
+	const previousTotal = index.get(key("m1", "C:/dev/proj")).published.total;
 	let prepared;
 	let sentTokens;
 	const start = h.runner.start;
@@ -1051,8 +1054,8 @@ test("(IS-1, IS-8) an indexed append without a timeline sends current tokens to 
 	assert.equal(h.budget(), undefined);
 
 	appendJsonl(h.files.m1, [openaiLine()]);
-	index.update("m1", h.files.m1, { kind: "main" });
-	const current = index.get("m1");
+	index.update(sub("m1", "C:/dev/proj"), h.files.m1, { kind: "main" });
+	const current = index.get(key("m1", "C:/dev/proj"));
 	assert.equal(fresh(current), true);
 	assert.ok(current.published.total > previousTotal);
 	assert.ok(current.published.models["openai/gpt-5-5"]);
@@ -1091,8 +1094,8 @@ test("(IS-1, IS-8) three consecutive index version changes without a timeline fa
 		assert.ok(preparation);
 		await preparation;
 		appendJsonl(h.files.m1, [openaiLine({ id: `a-index-change-${i}` })]);
-		index.update("m1", h.files.m1, { kind: "main" });
-		assert.equal(fresh(index.get("m1")), true);
+		index.update(sub("m1", "C:/dev/proj"), h.files.m1, { kind: "main" });
+		assert.equal(fresh(index.get(key("m1", "C:/dev/proj"))), true);
 		h.tick(auditor);
 		assert.equal(h.runner.starts.length, 0, `index version change ${i} must not launch`);
 		assert.equal(h.budget(), undefined);
@@ -1210,7 +1213,7 @@ test("(IS-9) an unindexed append after preparation retries before selecting a re
 	const first = auditor.preparing();
 	await first;
 	appendJsonl(h.files.m1, [openaiLine()]);
-	assert.equal(index.get("m1").published.usedModels["openai/gpt-5-5"], undefined);
+	assert.equal(index.get(key("m1", "C:/dev/proj")).published.usedModels["openai/gpt-5-5"], undefined);
 	h.tick(auditor);
 	assert.equal(h.runner.starts.length, 0, "the stale timeline must not launch a reviewer");
 	assert.equal(h.budget(), undefined);
@@ -1250,12 +1253,12 @@ test("(IS-1) a saturated index sends only related entries to the worker", async 
 	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
 	const index = indexed(h, "m1");
 	for (let depth = 1; depth <= 9; depth++) {
-		index.markMissing(`child-${depth}`, { parentSessionId: depth === 1 ? "m1" : `child-${depth - 1}` });
+		index.markMissing(sub(`child-${depth}`, "C:/dev/proj"), { parentSessionId: depth === 1 ? "m1" : `child-${depth - 1}` });
 	}
-	index.markMissing("root-only", { parentSessionId: "absent", rootSessionId: "m1" });
+	index.markMissing(sub("root-only", "C:/dev/proj"), { parentSessionId: "absent", rootSessionId: "m1" });
 	const longPath = "C:/" + ("unrelated/".repeat(800));
 	for (let i = 0; !index.full && i < 3000; i++) {
-		index.markMissing(`unrelated-${i}`, { file: longPath, parentSessionId: `unrelated-${i}` });
+		index.markMissing(sub(`unrelated-${i}`), { file: longPath, parentSessionId: `unrelated-${i}` });
 	}
 	assert.equal(index.full, true);
 	assert.ok([...index.values()].length > 1000);
@@ -1280,7 +1283,7 @@ test("(IS-1) worker prepares tokens, children and model facts after the index fi
 	const index = indexed(h, "m1");
 	const childFile = path.join(h.root, "child.jsonl");
 	writeJsonl(childFile, [openaiLine()]);
-	index.update("c1", childFile, { parentSessionId: "m1" });
+	index.update(sub("c1", "C:/dev/proj"), childFile, { parentSessionId: "m1" });
 	index.save();
 	const resident = createUsageIndex({ file: index.file, clock: h.clock, log: silent });
 	fs.unlinkSync(index.file);
@@ -1292,8 +1295,8 @@ test("(IS-1) worker prepares tokens, children and model facts after the index fi
 	} });
 	h.request("m1");
 	await h.prepare(auditor);
-	const ownTotal = resident.get("m1").published.total;
-	const childTotal = resident.get("c1").published.total;
+	const ownTotal = resident.get(key("m1", "C:/dev/proj")).published.total;
+	const childTotal = resident.get(key("c1", "C:/dev/proj")).published.total;
 	assert.equal(reply.loaded.tokens?.total, ownTotal, "the worker uses the resident publication");
 	assert.equal(reply.loaded.tokens.treeTotal, ownTotal + childTotal);
 	assert.ok(reply.loaded.tokens.models.some(({ key }) => key === "openai/gpt-5-5"));
@@ -1321,7 +1324,7 @@ test("(gate 15) the auditor excludes an identity missing only from published.use
 test("without a full timeline, an incomplete entry and a complete entry that is not at the end both end models-unknown without a charge", async () => {
 	const h = harness();
 	const index = indexed(h, "m1", { maxBytes: 10 });
-	assert.equal(index.get("m1").complete, false);
+	assert.equal(index.get(key("m1", "C:/dev/proj")).complete, false);
 	appendJsonl(h.files.m1, [openaiLine()]);
 	const small = fs.statSync(h.files.m1).size - 1;
 	const a = h.auditor({ index, timelineMaxBytes: small });
@@ -1331,7 +1334,7 @@ test("without a full timeline, an incomplete entry and a complete entry that is 
 
 	const resident = indexed(h, "m1");
 	appendJsonl(h.files.m1, [E.assistant({ ms: BASE - 20_000, id: "a-later", model: "gpt-5-5", provider: "openai" })]);
-	const entry = resident.get("m1");
+	const entry = resident.get(key("m1", "C:/dev/proj"));
 	assert.equal(entry.complete, true);
 	assert.equal(fresh(entry), false, "complete but not at the end");
 	const b = h.auditor({ index: resident, timelineMaxBytes: fs.statSync(h.files.m1).size - 1 });
@@ -1357,7 +1360,7 @@ test("a prewarm entry alone excludes the first candidate, a failed prewarm in an
 	const g = harness();
 	const index = indexed(g, "m1");
 	appendJsonl(g.files.m1, [prewarm("failed")]);
-	const entry = index.get("m1");
+	const entry = index.get(key("m1", "C:/dev/proj"));
 	assert.equal(fresh(entry), false);
 	const b = g.auditor({ index });
 	g.request("m1");
@@ -1413,15 +1416,15 @@ test("a fresh task-keyed entry from another store cannot certify a queued child 
 			E.assistant({ ms: BASE - 120_000, id: `a-${sessionId}`, model: "claude-opus-5-5", provider: "anthropic-subscription" }),
 		]);
 		appendEnded(h.paths, { sessionId, taskId, kind: "child", startedMs: BASE - 180_000, endedMs: BASE - 60_000, outcome: "completed", cwd });
-		if (sessionId === "child-a") index.update(taskId, file, { kind: "child", taskId });
+		if (sessionId === "child-a") index.update(sub(taskId, cwd), file, { kind: "child", taskId });
 	}
-	assert.equal(fresh(index.get(taskId)), true);
-	assert.equal(index.has("child-b"), false);
+	assert.equal(fresh(index.get(key(taskId, path.join(h.root, "child-a")))), true);
+	assert.equal(index.has(key("child-b", path.join(h.root, "child-b"))), false);
 	assert.ok(index.save(), "publish the colliding entry to the preparation worker");
 
-	h.request("child-b");
+	h.request("child-b", path.join(h.root, "child-b"));
 	await h.prepare(h.auditor({ index }));
-	const { status, reason } = h.record("child-b");
+	const { status, reason } = h.record("child-b", path.join(h.root, "child-b"));
 	assert.deepEqual([status, reason, h.runner.starts.length, h.budget()], ["failed", "models-unknown", 0, undefined]);
 });
 
@@ -1563,12 +1566,12 @@ test("IS-10 missing meta: a throwing adoption lookup keeps the record running an
 test("an expired request ends failed expired and starts nothing", () => {
 	const h = harness();
 	const a = h.auditor();
-	requestAudit(h.paths, "m1", BASE - REQUEST_TTL_MS - 1);
+	requestAudit(h.paths, sub("m1"), BASE - REQUEST_TTL_MS - 1);
 	h.tick(a);
 	assert.equal(h.record("m1").reason, "expired");
 	assert.equal(h.record("m1").status, "failed");
 	assert.equal(h.runner.starts.length, 0);
-	assert.equal(fs.existsSync(path.join(h.paths.health.auditRequestsDir, `${auditFileKey("m1")}.json`)), false);
+	assert.equal(fs.existsSync(path.join(h.paths.health.auditRequestsDir, `${auditFileKey(sub("m1"))}.json`)), false);
 });
 
 test("an invalid request file is deleted", () => {
@@ -1577,9 +1580,9 @@ test("an invalid request file is deleted", () => {
 	fs.mkdirSync(h.paths.health.auditRequestsDir, { recursive: true });
 	const bad = [
 		["x.json", "not json"],
-		[`${auditFileKey("m1")}.json`, JSON.stringify({ v: 1, sessionId: "m2", requestedMs: BASE })],
+		[`${auditFileKey(sub("m1"))}.json`, JSON.stringify({ v: 1, ...sub("m2"), requestedMs: BASE })],
 		["..%2f.json", JSON.stringify({ v: 1, sessionId: "../x", requestedMs: BASE })],
-		[`${auditFileKey("m3")}.json`, JSON.stringify({ v: 2, sessionId: "m3", requestedMs: BASE })],
+		[`${auditFileKey(sub("m3"))}.json`, JSON.stringify({ v: 2, sessionId: "m3", requestedMs: BASE })],
 	];
 	for (const [name, text] of bad) fs.writeFileSync(path.join(h.paths.health.auditRequestsDir, name), text);
 	h.tick(a);
@@ -1595,7 +1598,7 @@ test("a duplicate request while running is deleted and keeps the original job", 
 	const jobId = h.record("m1").jobId;
 	h.request("m1");
 	h.tick(a);
-	assert.equal(fs.existsSync(path.join(h.paths.health.auditRequestsDir, `${auditFileKey("m1")}.json`)), false);
+	assert.equal(fs.existsSync(path.join(h.paths.health.auditRequestsDir, `${auditFileKey(sub("m1"))}.json`)), false);
 	assert.equal(h.record("m1").jobId, jobId);
 	assert.equal(h.record("m1").status, "running");
 	assert.equal(h.runner.starts.length, 1);
@@ -1613,7 +1616,7 @@ test("a failed first kill is retried by the restarted daemon, and the second aud
 	h.tick(a);
 	h.tick(a);
 	assert.equal(h.runner.terminates.length, 1, "the first taskkill was sent and failed; alive stays true");
-	const recordFile = path.join(h.paths.health.auditsDir, `${auditFileKey("m1")}.json`);
+	const recordFile = path.join(h.paths.health.auditsDir, `${auditFileKey(sub("m1"))}.json`);
 	const { terminationUnconfirmed, deadlineMs, ...record } = h.record("m1");
 	fs.writeFileSync(recordFile, JSON.stringify({ ...record, status: "failed", reason: "timeout", finishedMs: h.state.now }));
 	await a.close();
@@ -1642,7 +1645,7 @@ test("a retry request during a timeout hold is deleted across a restart, and is 
 	const jobId = h.record("m1").jobId;
 	h.request("m1");
 	h.tick(a);
-	assert.equal(fs.existsSync(path.join(h.paths.health.auditRequestsDir, `${auditFileKey("m1")}.json`)), false);
+	assert.equal(fs.existsSync(path.join(h.paths.health.auditRequestsDir, `${auditFileKey(sub("m1"))}.json`)), false);
 	const b = h.auditor();
 	h.tick(b);
 	assert.deepEqual([h.record("m1").jobId, h.record("m1").holdUntilExit], [jobId, true]);
@@ -1667,7 +1670,7 @@ test("a duplicate request while launching with adoptJob throwing is deleted: sam
 	const jobId = h.record("m1").jobId;
 	h.request("m1");
 	h.tick(b);
-	assert.equal(fs.existsSync(path.join(h.paths.health.auditRequestsDir, `${auditFileKey("m1")}.json`)), false);
+	assert.equal(fs.existsSync(path.join(h.paths.health.auditRequestsDir, `${auditFileKey(sub("m1"))}.json`)), false);
 	assert.equal(h.record("m1").jobId, jobId);
 	assert.equal(h.record("m1").status, "launching");
 	assert.equal(h.runner.starts.length, 1);
@@ -1798,7 +1801,7 @@ test("auditsToday counts today's budget plus pending requests and ignores yester
 	assert.equal(auditsToday(h.paths, BASE), 0);
 	fs.writeFileSync(h.paths.health.auditBudgetFile, JSON.stringify({ day: "2026-11-20", count: 2, jobs: ["a", "b"] }));
 	assert.equal(auditsToday(h.paths, BASE), 2);
-	requestAudit(h.paths, "m1", BASE);
+	requestAudit(h.paths, sub("m1"), BASE);
 	assert.equal(auditsToday(h.paths, BASE), 3);
 });
 
@@ -1820,13 +1823,13 @@ test("a duplicate audit request cannot replace the first claim", (t) => {
 	const h = harness();
 	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
 	const dir = h.paths.health.auditRequestsDir;
-	const name = `${auditFileKey("m1")}.json`;
+	const name = `${auditFileKey(sub("m1"))}.json`;
 	const file = path.join(dir, name);
-	const first = requestAudit(h.paths, "m1", BASE);
+	const first = requestAudit(h.paths, sub("m1"), BASE);
 	const before = fs.readFileSync(file);
-	const second = requestAudit(h.paths, "m1", BASE + 1);
+	const second = requestAudit(h.paths, sub("m1"), BASE + 1);
 	assert.deepEqual(fs.readFileSync(file), before, "the second call must leave the first claim unchanged");
-	assert.deepEqual(first, { created: true, request: { v: 1, sessionId: "m1", requestedMs: BASE, claimId: first.request.claimId } });
+	assert.deepEqual(first, { created: true, request: { v: 1, ...sub("m1"), requestedMs: BASE, claimId: first.request.claimId } });
 	assert.match(first.request.claimId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 	assert.deepEqual(second, { created: false });
 	assert.deepEqual(fs.readdirSync(dir), [name]);
@@ -1839,7 +1842,7 @@ test("plan77: direct audit requests and daemon intake reject invalid session IDs
 	const directAccepted = [];
 	for (const id of [".", "..", "../x", "a/b", "a\\b", "%2e%2e", "x.", "a\0b", "a\n", "x".repeat(1025)]) {
 		try {
-			requestAudit(paths, id, BASE);
+			requestAudit(paths, sub(id), BASE);
 			directAccepted.push(id);
 		} catch (error) {
 			if (error.message !== "invalid session id") directAccepted.push(`${id}: ${error.code ?? error.message}`);
@@ -1861,27 +1864,25 @@ test("request helpers: safeSubjectId, the atomic request file and the state a re
 	const h = harness();
 	assert.equal(safeSubjectId("abc-1.2_x"), "abc-1.2_x");
 	for (const bad of ["", "../x", "a/b", "a b", "_budget", 5, null, "x".repeat(1025)]) assert.equal(safeSubjectId(bad), null, String(bad));
-	assert.throws(() => requestAudit(h.paths, "../x", BASE));
-	assert.equal(readAuditState(h.paths, "m1"), null);
-	const { request: { claimId } } = requestAudit(h.paths, "m1", BASE);
-	assert.deepEqual(readJsonSafe(path.join(h.paths.health.auditRequestsDir, `${auditFileKey("m1")}.json`)), { v: 1, sessionId: "m1", requestedMs: BASE, claimId });
-	assert.equal(readAuditState(h.paths, "m1").status, "requested");
+	assert.throws(() => requestAudit(h.paths, sub("../x"), BASE));
+	assert.equal(readAuditState(h.paths, sub("m1")), null);
+	const { request: { claimId } } = requestAudit(h.paths, sub("m1"), BASE);
+	assert.deepEqual(readJsonSafe(path.join(h.paths.health.auditRequestsDir, `${auditFileKey(sub("m1"))}.json`)), { v: 1, ...sub("m1"), requestedMs: BASE, claimId });
+	assert.equal(readAuditState(h.paths, sub("m1")).status, "requested");
 	const a = h.auditor();
 	await h.prepare(a);
-	assert.equal(readAuditState(h.paths, "m1").status, "running");
+	assert.equal(readAuditState(h.paths, sub("m1")).status, "running");
 	h.runner.script = () => DONE;
 	h.tick(a);
-	assert.equal(readAuditState(h.paths, "m1").status, "done");
-	requestAudit(h.paths, "m1", h.state.now);
-	assert.equal(readAuditState(h.paths, "m1").status, "requested", "a rerun request shows before the daemon takes it");
+	assert.equal(readAuditState(h.paths, sub("m1")).status, "done");
+	requestAudit(h.paths, sub("m1"), h.state.now);
+	assert.equal(readAuditState(h.paths, sub("m1")).status, "requested", "a rerun request shows before the daemon takes it");
 });
 
 test("plan78: case-distinct audits keep separate verdicts across an auditor restart", async () => {
 	const ids = ["Review.1", "review.1"];
-	const h = harness({ sessions: [ids[0]] });
-	const otherDir = path.join(h.paths.sessionsDir, "other");
-	fs.mkdirSync(otherDir);
-	fs.renameSync(h.files[ids[0]], path.join(otherDir, path.basename(h.files[ids[0]])));
+	const h = harness({ sessions: [] });
+	h.addSession(ids[0], undefined, "C:/dev/other");
 	h.addSession(ids[1]);
 	const summaries = ["대문자 세션의 사용량은 적절했습니다.", "소문자 세션의 점검 결과는 정상이었습니다."];
 	const first = h.auditor();
@@ -1895,7 +1896,7 @@ test("plan78: case-distinct audits keep separate verdicts across an auditor rest
 	}
 	assert.equal(h.runner.starts.length, 2);
 	assert.deepEqual(ids.map((id) => {
-		const record = readAuditState(h.paths, id);
+		const record = readAuditState(h.paths, sub(id));
 		return [record?.sessionId, record?.status, record?.result?.summary];
 	}), ids.map((id, i) => [id, "done", summaries[i]]));
 });
@@ -1903,18 +1904,18 @@ test("plan78: case-distinct audits keep separate verdicts across an auditor rest
 test("plan78: mismatched on-disk audit identities are ignored by readers and restart", () => {
 	const h = harness({ sessions: [] });
 	const { auditsDir, auditRequestsDir } = h.paths.health;
-	assert.equal(requestAudit(h.paths, "m1", BASE - REQUEST_TTL_MS - 1).created, true);
+	assert.equal(requestAudit(h.paths, sub("m1"), BASE - REQUEST_TTL_MS - 1).created, true);
 	const [name] = fs.readdirSync(auditRequestsDir);
 	const first = h.auditor();
 	first.tick(BASE);
-	assert.equal(readAuditState(h.paths, "m1").reason, "expired");
+	assert.equal(readAuditState(h.paths, sub("m1")).reason, "expired");
 	fs.writeFileSync(path.join(auditsDir, name), JSON.stringify({
-		v: 1, sessionId: "m2", status: "launching", jobId: "wrong-audit", laneSessionId: "wrong-lane", launchMs: BASE,
+		v: 1, ...sub("m2"), status: "launching", jobId: "wrong-audit", laneSessionId: "wrong-lane", launchMs: BASE,
 	}));
-	fs.writeFileSync(path.join(auditRequestsDir, name), JSON.stringify({ v: 1, sessionId: "m2", requestedMs: BASE }));
+	fs.writeFileSync(path.join(auditRequestsDir, name), JSON.stringify({ v: 1, ...sub("m2"), requestedMs: BASE }));
 	const restarted = h.auditor();
 	restarted.tick(BASE);
-	assert.deepEqual([readAuditState(h.paths, "m1"), readAuditState(h.paths, "m2"), restarted.busy(), h.runner.adopts, fs.readdirSync(auditRequestsDir)],
+	assert.deepEqual([readAuditState(h.paths, sub("m1")), readAuditState(h.paths, sub("m2")), restarted.busy(), h.runner.adopts, fs.readdirSync(auditRequestsDir)],
 		[null, null, false, [], []]);
 });
 
@@ -2082,7 +2083,7 @@ test("IS-9: audit fallback stderr rejects a valid verdict without refunding the 
 	const direct = h.record("direct");
 	assert.equal(direct.status, "done");
 	assert.deepEqual(direct.result, TOKEN_ONLY_ANSWER);
-	const rejected = readAuditState(h.paths, "fallback");
+	const rejected = readAuditState(h.paths, sub("fallback"));
 	assert.deepEqual([rejected.status, rejected.reason, rejected.result], ["failed", "model-fallback", null]);
 	assert.equal(rejected.reasonKo, "선택한 검토 모델이 다른 모델로 전환되어 답을 사용하지 않았습니다");
 	assert.deepEqual(readJsonSafe(path.join(runner.jobDir(jobs[1]), "meta.json")).final,
@@ -2261,7 +2262,7 @@ test("IS-10 transition: a restarted daemon rejects POST until the overdue audit 
 	const during = h.record(id);
 	fs.writeFileSync(h.paths.health.daemonJson, JSON.stringify({ ts: h.clock.now(), pid: process.pid }));
 	const prepare = createDetailOperations({
-		paths: h.paths, env: {}, load: () => ({ found: true, session: { sessionId: id } }),
+		paths: h.paths, env: {}, load: () => ({ found: true, session: sub(id) }),
 	});
 	const token = "audit-test-token";
 	const ui = createUiServer({

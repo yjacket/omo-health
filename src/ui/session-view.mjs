@@ -161,6 +161,7 @@ function labelledAudit(audit) {
  */
 export function buildSessionView(record, extras = {}) {
 	if (!isRecord(record)) return record;
+	if (record.error === "ambiguous-session") return { found: false, error: record.error };
 	const { audit: auditExtra, ...rest } = extras;
 	const audit = labelledAudit(auditExtra !== undefined ? auditExtra : record.audit ?? null);
 	if (record.found === false) return { ...record, audit, ...rest };

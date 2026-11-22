@@ -1,3 +1,5 @@
+import { projectKeyOf, subjectOf } from "../src/session-subject.mjs";
+const sub = (sessionId, cwd) => subjectOf({ sessionId, cwd });
 import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -25,8 +27,8 @@ function setup(t) {
 	return { root, paths, clock, locator, proj };
 }
 
-function writeMain(paths, id) {
-	const file = path.join(paths.sessionsDir, "--proj--", `${STAMP}_${id}.jsonl`);
+function writeMain(paths, proj, id) {
+	const file = path.join(paths.sessionsDir, projectKeyOf(proj), `${STAMP}_${id}.jsonl`);
 	fs.mkdirSync(path.dirname(file), { recursive: true });
 	fs.writeFileSync(file, '{"type":"session"}\n');
 	return file;
@@ -41,11 +43,15 @@ function writeChild(paths, cwd, taskId, name, storeDir) {
 	return file;
 }
 
+test("projectKeyOf matches a real senpi Windows project directory", () => {
+	assert.equal(projectKeyOf("C:/dev/omo/omo-health"), "--C--dev-omo-omo-health--");
+});
+
 test("mainFile finds a main session file by the id in its file name", (t) => {
-	const { paths, locator } = setup(t);
-	const file = writeMain(paths, "sess-main");
-	assert.equal(locator.mainFile("sess-main"), file);
-	assert.equal(locator.mainFile("sess-unknown"), undefined);
+	const { paths, locator, proj } = setup(t);
+	const file = writeMain(paths, proj, "sess-main");
+	assert.equal(locator.mainFile(sub("sess-main", proj)), file);
+	assert.equal(locator.mainFile(sub("sess-unknown", proj)), undefined);
 });
 
 test("(IS-1, IS-4, IS-7) filename IDs strip only the senpi timestamp", () => {
@@ -59,79 +65,79 @@ test("(IS-1, IS-4, IS-7) filename IDs strip only the senpi timestamp", () => {
 test("date-only session filenames resolve the whole ID without a header or suffix match", (t) => {
 	const { paths, locator, proj } = setup(t);
 	const child = writeChild(paths, proj, "st_review", "2026-11-22_run_review.1.jsonl");
-	const main = path.join(paths.sessionsDir, "--proj--", "2026-11-22_a_b.jsonl");
+	const main = path.join(paths.sessionsDir, projectKeyOf(proj), "2026-11-22_a_b.jsonl");
 	fs.mkdirSync(path.dirname(main), { recursive: true });
 	fs.writeFileSync(main, '{"type":"message"}\n');
 	assert.equal(idFromFileName(main), "a_b");
 	assert.equal(idFromFileName("2026-11-22_a?.jsonl"), undefined);
-	assert.equal(locator.mainFile("a_b"), main);
-	assert.equal(locator.mainFile("b"), undefined);
+	assert.equal(locator.mainFile(sub("a_b", proj)), main);
+	assert.equal(locator.mainFile(sub("b", proj)), undefined);
 	assert.equal(locator.childFile({ taskId: "st_review", sessionId: "run_review.1", cwds: [proj] }), child);
 	assert.equal(locator.childFile({ taskId: "st_review", sessionId: "review.1", cwds: [proj] }), undefined);
 });
 
 test("(IS-3) mainFile maps cold files by their headers, not a conflicting name", (t) => {
-	const { paths, clock, locator } = setup(t);
-	const file = writeMain(paths, "wrong-id");
+	const { paths, clock, locator, proj } = setup(t);
+	const file = writeMain(paths, proj, "wrong-id");
 	fs.writeFileSync(file, '{"type":"session","id":"header-id"}\n');
 	const unnamed = path.join(path.dirname(file), `${STAMP}_.jsonl`);
 	fs.writeFileSync(unnamed, '{"type":"session","id":"unnamed-id"}\n');
 
-	assert.equal(locator.mainFile("wrong-id"), undefined, "a header for another session disproves the filename");
-	assert.equal(locator.mainFile("header-id"), file);
-	assert.equal(locator.mainFile("unnamed-id"), unnamed);
+	assert.equal(locator.mainFile(sub("wrong-id", proj)), undefined, "a header for another session disproves the filename");
+	assert.equal(locator.mainFile(sub("header-id", proj)), file);
+	assert.equal(locator.mainFile(sub("unnamed-id", proj)), unnamed);
 	fs.writeFileSync(unnamed, '{"type":"session","id":"new-id"}\n');
-	assert.equal(locator.mainFile("new-id"), undefined, "a new header ID is not picked up inside the rescan interval");
+	assert.equal(locator.mainFile(sub("new-id", proj)), undefined, "a new header ID is not picked up inside the rescan interval");
 	clock.advance(RESCAN);
-	assert.equal(locator.mainFile("new-id"), unnamed);
-	assert.equal(locator.mainFile("unnamed-id"), undefined);
+	assert.equal(locator.mainFile(sub("new-id", proj)), unnamed);
+	assert.equal(locator.mainFile(sub("unnamed-id", proj)), undefined);
 });
 
 test("(IS-4) a main header scan resumes from its cursor without rereading candidates", (t) => {
-	const { paths, clock, locator } = setup(t);
+	const { paths, clock, locator, proj } = setup(t);
 	const cap = 64 * 1024;
-	const first = writeMain(paths, "first");
+	const first = writeMain(paths, proj, "first");
 	fs.writeFileSync(first, `${'{"type":"session","id":"other"}'.padEnd(cap - 1)}\n`);
 	const review = path.join(path.dirname(first), "review.jsonl");
 	fs.writeFileSync(review, `${'{"type":"session","id":"review"}'.padEnd(cap - 1)}\n`);
 
-	assert.deepEqual(locator.findMainFile("review", null, { maxBytes: cap - 1 }),
+	assert.deepEqual(locator.findMainFile(sub("review", proj), null, { maxBytes: cap - 1 }),
 		{ file: undefined, pending: true, bytesRead: 0 });
-	assert.deepEqual(locator.findMainFile("review", null, { maxBytes: cap }),
+	assert.deepEqual(locator.findMainFile(sub("review", proj), null, { maxBytes: cap }),
 		{ file: undefined, pending: true, bytesRead: cap });
 	clock.advance(RESCAN + 1);
-	assert.deepEqual(locator.findMainFile("review", null, { maxBytes: cap }),
+	assert.deepEqual(locator.findMainFile(sub("review", proj), null, { maxBytes: cap }),
 		{ file: review, pending: false, bytesRead: cap });
-	assert.deepEqual(locator.findMainFile("other", null, { maxBytes: 0 }),
+	assert.deepEqual(locator.findMainFile(sub("other", proj), null, { maxBytes: 0 }),
 		{ file: first, pending: false, bytesRead: 0 }, "results from the earlier call were retained");
-	assert.deepEqual(locator.findMainFile("first", null, { maxBytes: 0 }),
+	assert.deepEqual(locator.findMainFile(sub("first", proj), null, { maxBytes: 0 }),
 		{ file: undefined, pending: false, bytesRead: 0 }, "a finished scan can conclusively rule out an id");
 });
 
 test("(plan 41) mainFile uses a saved custom path only while its first line matches", (t) => {
-	const { paths, root, clock, locator } = setup(t);
+	const { paths, root, clock, locator, proj } = setup(t);
 	const id = "sess-review";
 	const file = path.join(root, "review.jsonl");
-	assert.equal(locator.mainFile(id), undefined, "no index yet");
+	assert.equal(locator.mainFile(sub(id, proj)), undefined, "no index yet");
 	fs.writeFileSync(file, `{"type":"session","id":"${id}"}\n`);
 	const index = createUsageIndex({ file: paths.health.usageIndexFile, clock });
-	index.update(id, file, { kind: "main" });
+	index.update(sub(id, proj), file, { kind: "main" });
 	assert.equal(index.save(), true);
-	assert.equal(locator.mainFile(id), file, "a saved custom path supersedes the cached filename miss");
+	assert.equal(locator.mainFile(sub(id, proj)), file, "a saved custom path supersedes the cached filename miss");
 
 	fs.writeFileSync(file, '{"type":"session","id":"replacement"}\n');
-	assert.equal(locator.mainFile(id), undefined, "a stale persisted path must not open a different session");
+	assert.equal(locator.mainFile(sub(id, proj)), undefined, "a stale persisted path must not open a different session");
 });
 
 test("mainFile finds a file created after a miss only once the fake clock passes rescanMs", (t) => {
-	const { paths, clock, locator } = setup(t);
-	assert.equal(locator.mainFile("sess-late"), undefined);
-	const file = writeMain(paths, "sess-late");
-	assert.equal(locator.mainFile("sess-late"), undefined, "no rescan inside the interval");
+	const { paths, clock, locator, proj } = setup(t);
+	assert.equal(locator.mainFile(sub("sess-late", proj)), undefined);
+	const file = writeMain(paths, proj, "sess-late");
+	assert.equal(locator.mainFile(sub("sess-late", proj)), undefined, "no rescan inside the interval");
 	clock.advance(RESCAN - 1);
-	assert.equal(locator.mainFile("sess-late"), undefined);
+	assert.equal(locator.mainFile(sub("sess-late", proj)), undefined);
 	clock.advance(1);
-	assert.equal(locator.mainFile("sess-late"), file);
+	assert.equal(locator.mainFile(sub("sess-late", proj)), file);
 });
 
 test("childFile finds a child by its exact session id", (t) => {

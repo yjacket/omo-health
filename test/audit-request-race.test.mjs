@@ -6,7 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
-import { auditFileKey } from "../src/session-id.mjs";
+import { auditFileKey } from "../src/session-subject.mjs";
 
 const contender = `
 	import fs from "node:fs";
@@ -19,7 +19,7 @@ const contender = `
 		if (performance.now() >= deadline) throw new Error("claim signal not received");
 		await setImmediate();
 	}
-	process.send(requestAudit({ health: { auditRequestsDir: dir } }, "same-id", Number(now)));
+	process.send(requestAudit({ health: { auditRequestsDir: dir } }, { sessionId: "same-id", projectKey: "--race--" }, Number(now)));
 	process.disconnect();
 `;
 
@@ -47,7 +47,7 @@ test("only one of two processes released by the same signal claims the audit", a
 	}));
 	// The baseline returns the request itself for every successful write.
 	assert.deepEqual(results.map((result) => result.created ?? Boolean(result)).sort(), [false, true]);
-	const name = `${auditFileKey("same-id")}.json`;
+	const name = `${auditFileKey({ sessionId: "same-id", projectKey: "--race--" })}.json`;
 	assert.deepEqual(fs.readdirSync(dir), [name]);
 	assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, name), "utf8")), results.find((result) => result.created).request);
 });

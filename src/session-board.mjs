@@ -1,3 +1,4 @@
+import { subjectKey, subjectOf } from "./session-subject.mjs";
 import path from "node:path";
 import { endedKey } from "./session-ledger.mjs";
 import { ambiguousLedgerTaskIds } from "./session-record.mjs";
@@ -129,7 +130,7 @@ function countChildren(rows) {
  * @param {object[]} findings open findings of this tick
  * @param {object[]} investigations investigation records (createInvestigations().list())
  * @param {number} nowMs
- * @param {{tokensOf?: (sessionId: string | null, taskId: string | null) => ({tokens?: object, treeTokens?: number | null, treeTokensComplete?: boolean, pending?: boolean, state?: "full"} | null | undefined)}} [options]
+ * @param {{tokensOf?: (subject: { projectKey: string | null, sessionId: string | null }, taskId: string | null) => ({tokens?: object, treeTokens?: number | null, treeTokensComplete?: boolean, pending?: boolean, state?: "full"} | null | undefined)}} [options]
  *   tokensOf is the injected token index lookup: `{tokens, treeTokens, treeTokensComplete}` for an indexed session, `{state:"full"}` when the
  *   index refused the session, `{pending:true}` while its first read has not reached the end of the file, null when it is
  *   unknown. Task id is a fallback only for an unambiguous visible row without a session id. Rows carry `tokensState: "full"` for refusal
@@ -157,13 +158,15 @@ export function buildSessionSnapshot(world, findings = [], investigations = [], 
 	};
 
 	const { byParent, ambiguous } = boardTaskLinks(world, nowMs);
-	const childrenOf = (parentId, depth, trail) => {
+	const childrenOf = (parent, depth, trail) => {
+		const parentId = parent.sessionId;
 		if (depth > 8 || trail.has(parentId)) return [];
 		const next = new Set(trail).add(parentId);
 		return (byParent.get(parentId) ?? [])
 			.map((task) => {
 				const sessionId = task.childSessionId || null;
 				const taskId = task.taskId ?? null;
+				const subject = subjectOf({ sessionId, cwd: world.sessions?.get(sessionId)?.cwd }, parent);
 				const row = {
 					taskId: task.taskId,
 					sessionId,
@@ -174,8 +177,8 @@ export function buildSessionSnapshot(world, findings = [], investigations = [], 
 					startedMs: finite(task.startedAtMs ?? task.createdAtMs),
 					endedMs: finite(task.terminalAtMs),
 					health: healthFor({ sessionId, taskId }),
-					...tokenFields(!sessionId && ambiguous.has(taskId) ? null : tokensOf?.(sessionId, taskId)),
-					children: sessionId ? childrenOf(sessionId, depth + 1, next) : [],
+					...tokenFields(!sessionId && ambiguous.has(subjectKey({ ...subject, sessionId: taskId })) ? null : tokensOf?.(subject, taskId)),
+					children: sessionId ? childrenOf(subject, depth + 1, next) : [],
 				};
 				return row;
 			})
@@ -202,8 +205,8 @@ export function buildSessionSnapshot(world, findings = [], investigations = [], 
 			todo,
 			lastInputMs: finite(toMs(hb?.lastInputAt)),
 			health: healthFor({ sessionId: session.id }),
-			...tokenFields(tokensOf?.(session.id, null)),
-			children: childrenOf(session.id, 1, new Set()),
+			...tokenFields(tokensOf?.(subjectOf(session), null)),
+			children: childrenOf(subjectOf(session), 1, new Set()),
 		};
 		if (!groups.has(omoVersion)) groups.set(omoVersion, []);
 		groups.get(omoVersion).push(row);
@@ -231,19 +234,22 @@ export function boardTaskLinks(world, nowMs = world?.now) {
 		byParent.get(task.parentSessionId).push(task);
 	}
 	const rows = [];
-	const visit = (parentId, depth, trail) => {
+	const visit = (parent, depth, trail) => {
+		const parentId = parent.sessionId;
 		if (depth > 8 || trail.has(parentId)) return;
 		const next = new Set(trail).add(parentId);
 		for (const task of byParent.get(parentId) ?? []) {
-			rows.push({ sessionId: task.childSessionId || null, taskId: task.taskId, parentSessionId: parentId });
-			if (task.childSessionId) visit(task.childSessionId, depth + 1, next);
+			const sessionId = task.childSessionId || null;
+			const subject = subjectOf({ sessionId, cwd: world.sessions?.get(sessionId)?.cwd }, parent);
+			rows.push({ ...subject, taskId: task.taskId, parentSessionId: parentId, parentKey: subjectKey(parent) });
+			if (sessionId) visit(subject, depth + 1, next);
 		}
 	};
 	for (const session of world?.sessions?.values?.() ?? []) {
-		if (session.kind === "main" && world.isSessionLive?.(session)) visit(session.id, 1, new Set());
+		if (session.kind === "main" && world.isSessionLive?.(session)) visit(subjectOf(session), 1, new Set());
 	}
 	// The board already has authoritative child session IDs, even when one equals a task ID.
-	const ambiguous = ambiguousLedgerTaskIds(rows.filter((row) => !row.sessionId));
+	const ambiguous = ambiguousLedgerTaskIds(rows.filter((row) => !row.sessionId), { scoped: true });
 	return { byParent, rows, ambiguous };
 }
 
@@ -286,7 +292,7 @@ function crashFor(world, host, sinceMs, nowMs) {
 
 function mainsOf(snapshot) {
 	const out = new Map();
-	for (const group of snapshot?.groups ?? []) for (const row of group.sessions ?? []) out.set(row.sessionId, { row, omoVersion: group.omoVersion ?? null });
+	for (const group of snapshot?.groups ?? []) for (const row of group.sessions ?? []) out.set(endedKey(row), { row, omoVersion: group.omoVersion ?? null });
 	return out;
 }
 
@@ -305,9 +311,9 @@ export function detectEnded(prevSnapshot, snapshot, world, nowMs = world.now) {
 		const visit = (rows, parentSessionId, root) => {
 			for (const row of rows ?? []) {
 				const sessionId = row.sessionId || row.taskId;
-				const key = endedKey({ sessionId, parentSessionId, cwd: root.cwd });
+				const key = JSON.stringify([endedKey(root), endedKey({ sessionId, parentSessionId })]);
 				children.set(key, { row, sessionId, parentSessionId, root });
-				if (byTask && row.sessionId) byTask.set(endedKey({ sessionId: row.taskId, parentSessionId, cwd: root.cwd }), row);
+				if (byTask && row.sessionId) byTask.set(JSON.stringify([endedKey(root), endedKey({ sessionId: row.taskId, parentSessionId })]), row);
 				visit(row.children, row.sessionId, root);
 			}
 		};
@@ -323,9 +329,11 @@ export function detectEnded(prevSnapshot, snapshot, world, nowMs = world.now) {
 	};
 	const mainOutcome = new Map();
 
-	for (const [sessionId, { row, omoVersion }] of prevMains) {
-		if (curMains.has(sessionId)) continue;
-		const session = world.sessions?.get?.(sessionId);
+	for (const [key, { row, omoVersion }] of prevMains) {
+		if (curMains.has(key)) continue;
+		const { sessionId } = row;
+		const live = world.sessions?.get?.(sessionId);
+		const session = live && subjectKey(subjectOf(live)) === subjectKey(subjectOf(row)) ? live : undefined;
 		const goal = session?.anchor?.source === "goal" ? session.anchor : row.goal;
 		const crash = crashFor(world, row.host, prevSnapshot.ts ?? nowMs, nowMs);
 		let outcome;
@@ -343,7 +351,7 @@ export function detectEnded(prevSnapshot, snapshot, world, nowMs = world.now) {
 			outcome = "unknown";
 			reason = "세션이 보드에서 사라졌지만 끝난 이유를 알려 줄 기록이 없습니다.";
 		}
-		mainOutcome.set(sessionId, outcome);
+		mainOutcome.set(key, outcome);
 		out.push({
 			v: 1,
 			sessionId,
@@ -387,10 +395,10 @@ export function detectEnded(prevSnapshot, snapshot, world, nowMs = world.now) {
 		} else if (FAILED_STATUSES.has(status)) {
 			outcome = "failed";
 			reason = `작업이 오류로 끝났습니다${task?.errorMessage ? `: ${clean(task.errorMessage, 160)}` : "."}`;
-		} else if (mainOutcome.get(root.sessionId) === "crash") {
+		} else if (mainOutcome.get(endedKey(root)) === "crash") {
 			outcome = "crash";
 			reason = "부모 세션의 omo 호스트가 비정상 종료되었습니다.";
-		} else if (mainOutcome.has(root.sessionId) && !TERMINAL_STATUSES.has(status)) {
+		} else if (mainOutcome.has(endedKey(root)) && !TERMINAL_STATUSES.has(status)) {
 			outcome = "closed";
 			reason = "부모 세션이 끝나면서 작업도 함께 끝났습니다.";
 		} else {

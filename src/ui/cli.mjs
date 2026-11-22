@@ -87,8 +87,8 @@ const attachClose = (handler, worker) => Object.assign(handler, { close: worker?
 export function createStartAudit({ paths, env = process.env, now = Date.now, worker, ...options } = {}) {
 	const local = Object.keys(options).length ? createDetailOperations({ paths, env, ...options }) : null;
 	const detailWorker = worker ?? (local ? null : createDetailWorker({ paths, env }));
-	return attachClose((id) => {
-		const job = { kind: "audit", id, now: now() };
+	return attachClose((id, row) => {
+		const job = { kind: "audit", id, row, now: now() };
 		return detailWorker ? detailWorker.run(job) : local(job);
 	}, detailWorker);
 }

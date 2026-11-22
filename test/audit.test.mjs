@@ -1,3 +1,6 @@
+import { subjectOf, subjectKey } from "../src/session-subject.mjs";
+const sub = (sessionId, cwd) => subjectOf({ sessionId, cwd });
+const key = (sessionId, cwd) => subjectKey(sub(sessionId, cwd));
 import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -249,8 +252,8 @@ test("10 committed tokens plus a 7-token final fragment is 17 in compactUsage an
 	const b = assistant({ input: 2, output: 2, cacheRead: 2, cacheWrite: 1, cost: { total: 0.01 } });
 	fs.writeFileSync(file, `${JSON.stringify(a)}\n${JSON.stringify(b)}`);
 	const index = createUsageIndex({ file: path.join(root, "usage.json"), clock: { now: () => T0 } });
-	index.update("s1", file);
-	assert.equal(compactUsage(index.get("s1")).total, 17);
+	index.update(sub("s1"), file);
+	assert.equal(compactUsage(index.get(key("s1"))).total, 17);
 });
 
 test("the bundle built from the timeline carries tokens.total 17", () => {

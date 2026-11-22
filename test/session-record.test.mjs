@@ -1,3 +1,6 @@
+import { subjectOf, subjectKey } from "../src/session-subject.mjs";
+const sub = (sessionId, cwd) => subjectOf({ sessionId, cwd });
+const key = (sessionId, cwd) => subjectKey(sub(sessionId, cwd));
 import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -126,8 +129,8 @@ function writeInvestigation(paths, record) {
 	fs.writeFileSync(path.join(paths.health.investigationsDir, `${record.id}.json`), JSON.stringify({ openedMs: T0, updatedMs: T0, status: "open", evidence: [], signals: [], ...record }));
 }
 
-function mainSessionFile(paths, id, entries = []) {
-	const file = path.join(paths.sessionsDir, "slug", `2026-10-10T00-00-00-000Z_${id}.jsonl`);
+function mainSessionFile(paths, id, entries = [], cwd = "C:/work/a") {
+	const file = path.join(paths.sessionsDir, subjectOf({ cwd }).projectKey, `2026-10-10T00-00-00-000Z_${id}.jsonl`);
 	writeJsonl(file, entries.length ? entries : [{ type: "session", id }]);
 	return file;
 }
@@ -146,8 +149,8 @@ test("IS-7 indexed transcript: detail shows messages for a child and descendant 
 	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
 	const { index, child, grandchild } = indexLiveParentTranscript(paths, root, T0, { descendant: true });
 	for (const { id, file } of [child, grandchild]) {
-		assert.equal(index.get(id)?.file, file);
-		assert.equal(fresh(index.get(id)), true);
+		assert.equal(index.get(key(id, root))?.file, file);
+		assert.equal(fresh(index.get(key(id, root))), true);
 	}
 	const detail = createDetailOperations({ paths, auditDetail: () => null });
 	const job = { kind: "detail", id: child.id, now: T0 };
@@ -157,7 +160,7 @@ test("IS-7 indexed transcript: detail shows messages for a child and descendant 
 	assert.deepEqual(result.files, [child.file, grandchild.file]);
 
 	fs.appendFileSync(child.file, "\n");
-	assert.equal(fresh(index.get(child.id)), false);
+	assert.equal(fresh(index.get(key(child.id, root))), false);
 	const afterAppend = detail(job);
 	assert.deepEqual(afterAppend.record.health.messages.map(({ recipient }) => recipient), [grandchild.id]);
 	assert.deepEqual(afterAppend.files, [grandchild.file]);
@@ -167,7 +170,7 @@ test("IS-7 indexed transcript: an ambiguous task-only path is not used by detail
 	const { root, paths } = setup();
 	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
 	const { index, child } = indexLiveParentTranscript(paths, root, T0, { taskOnly: true });
-	assert.equal(fresh(index.get(child.id)), true);
+	assert.equal(fresh(index.get(key(child.id, root))), true);
 	writeJsonl(path.join(path.dirname(child.file), "second-session.jsonl"), [ohealth(child.ms, "Another owner")]);
 	const detail = createDetailOperations({ paths, auditDetail: () => null });
 	const result = detail({ kind: "detail", id: child.id, now: T0 });
@@ -232,10 +235,10 @@ test("IS-7: ancestor detail retains both task-only descendants with the same tas
 		return message;
 	});
 	writeLedger(paths, [main, ...parents, ...children]);
-	const fallback = { id: "s-transcript-1", taskId, state: "ok", published: { total: 42 } };
+	const fallback = { projectKey: subjectOf(children[0]).projectKey, id: "s-transcript-1", taskId, state: "ok", published: { total: 42 } };
 	const index = new Map([
-		...parents.map(({ sessionId, taskId, parentSessionId }) => [sessionId, { id: sessionId, taskId, parentSessionId }]),
-		[fallback.id, fallback],
+		...parents.map((row) => [subjectKey(subjectOf(row)), { ...row, id: row.sessionId }]),
+		[subjectKey(subjectOf(fallback)), fallback],
 	]);
 	assert.equal(sessionRecord.usageEntryOf(index, children[0])?.published.total, 42);
 	const options = { paths, id: main.sessionId, now: main.endedMs, index };
@@ -336,7 +339,7 @@ test("IS-8/IS-10: QA-3's 56 messages yield the same 50 audit refs and flags on b
 	writeLedger(paths, rows);
 	const mainMessages = Array.from({ length: 55 }, (_, i) => ohealth(T0 + (i + 1) * 2 * MIN, `QA-MSG-${i + 1}`));
 	const grandchildMessage = ohealth(T0 + 51 * MIN, "QA-MSG-grandchild");
-	mainSessionFile(paths, main.sessionId, mainMessages);
+	mainSessionFile(paths, main.sessionId, mainMessages, main.cwd);
 	childSessionFile(child.cwd, child.taskId, child.sessionId);
 	childSessionFile(grandchild.cwd, grandchild.taskId, grandchild.sessionId, [grandchildMessage]);
 	const options = { paths, id: main.sessionId, now: main.endedMs };
@@ -616,7 +619,7 @@ test("an unindexed main session does not inherit another main's tokens through a
 	const unindexed = fixture.rows[1];
 	const usage = new Map([
 		[
-			indexed.sessionId,
+			subjectKey(subjectOf(indexed)),
 			{
 				id: indexed.sessionId,
 				taskId: null,
@@ -637,7 +640,7 @@ test("a non-finite per-model value stays non-finite instead of becoming 0", () =
 	const row = fixture.rows[0];
 	const models = { "a/finite": { tokens: 10, cost: 0.5 }, "b/huge": { tokens: Infinity, cost: Infinity }, "c/nan": { tokens: NaN, cost: 1 } };
 	const published = { total: Infinity, input: Infinity, output: 0, cacheRead: 0, cacheWrite: 0, cost: Infinity, costUnknown: false, turns: 2, models };
-	const usage = new Map([[row.sessionId, { id: row.sessionId, taskId: null, state: "ok", complete: true, published }]]);
+	const usage = new Map([[subjectKey(subjectOf(row)), { id: row.sessionId, taskId: null, state: "ok", complete: true, published }]]);
 	const record = buildSessionRecord({ id: row.sessionId, row, ledger: fixture.rows, decisions: [], investigations: [], usage });
 	const rows = record.tokens.models;
 	assert.deepEqual(rows.map((m) => m.key), ["b/huge", "c/nan", "a/finite"], "non-finite rows sort first, then by key");
@@ -721,7 +724,7 @@ test("IS-7: a live child extends its parent's machine overlap window through now
 	const startedMs = parent.endedMs - MIN;
 	const now = T0 + 4 * HOUR;
 	const file = childSessionFile(root, taskId, childId, [{ type: "session", id: childId, timestamp: iso(startedMs) }]);
-	const index = new Map([[childId, { id: childId, taskId, parentSessionId: parent.sessionId, file, checkedMs: startedMs + MIN, complete: false }]]);
+	const index = new Map([[key(childId, root), { id: childId, projectKey: subjectOf(parent).projectKey, taskId, parentSessionId: parent.sessionId, file, checkedMs: startedMs + MIN, complete: false }]]);
 	writeLedger(paths, [parent]);
 	const incident = { subject: { key: "machine" }, detector: "D6", kind: "provider-down", severity: "warn" };
 	writeDecisions(paths, [
@@ -747,7 +750,7 @@ test("IS-10: bounded preparation stays within the session-file allowance with 55
 		const startedMs = T0 + (i + 1) * MIN;
 		const file = mainSessionFile(paths, id, [{ type: "session", id, timestamp: iso(startedMs), padding: "x".repeat(63 * 1024) }]);
 		sessionFiles.add(file);
-		index.set(id, { id, parentSessionId: parent.sessionId, file, checkedMs: startedMs + MIN, complete: false });
+		index.set(key(id, parent.cwd), { id, projectKey: subjectOf(parent).projectKey, parentSessionId: parent.sessionId, file, checkedMs: startedMs + MIN, complete: false });
 	}
 	writeDecisions(paths, [
 		{ fp: "during-latest", subject: { key: "machine" }, detector: "D6", kind: "provider-down", severity: "warn", event: "opened", ts: iso(parent.endedMs + MIN) },
@@ -1034,7 +1037,7 @@ test("plan86: record identity is separate from redacted ledger display IDs", () 
 	const row = { sessionId, taskId, parentSessionId, kind: "child", startedMs: T0, endedMs: T0 + HOUR };
 	const child = { sessionId: childId, taskId: childTaskId, parentSessionId: sessionId, kind: "child", startedMs: T0 + MIN, endedMs: T0 + HOUR };
 	const entry = { id: sessionId, taskId };
-	const index = new Map([[sessionId, entry]]);
+	const index = new Map([[subjectKey(subjectOf(row)), entry]]);
 	const record = buildSessionRecord({ row, ledger: [row, child], usage: index });
 	assert.equal(sessionRecord.usageEntryOf(index, record.session), entry);
 	assert.deepEqual(record.session.ledgerIds, { sessionId, taskId, parentSessionId });
@@ -1072,7 +1075,7 @@ test("the total message scan budget admits the own file and only the newest desc
 	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
 	const mib = 1024 * 1024;
 	const budget = 64 * mib;
-	const own = mainSessionFile(paths, "s-main", [ohealth(T0, "own")]);
+	const own = mainSessionFile(paths, "s-main", [ohealth(T0, "own")], root);
 	fs.truncateSync(own, 40 * mib);
 	const children = [1, 2, 3].map((n) => childRow(`s-${n}`, `st_${n}`, "s-main", { cwd: root, endedMs: T0 + n * MIN }));
 	const files = children.map(({ sessionId, taskId }) => {

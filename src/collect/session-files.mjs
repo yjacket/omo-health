@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { listDirSafe, statSafe } from "../util/fsx.mjs";
+import { isInside, pathKey } from "../paths.mjs";
+import { subjectKey } from "../session-subject.mjs";
 import { fresh, readUsageIndex, soleChildSessionFile } from "../usage-index.mjs";
 import { idFromFileName } from "./sessions.mjs";
 import { senpiTaskStoreDir } from "./tasks.mjs";
@@ -41,24 +43,22 @@ export function probeSessionHeader(file, size, maxBytes) {
  * daemon's backlog finds files that appear later without rescanning every tick.
  */
 /**
- * `indexedFile(sessionId)` is an optional lookup into a token index the caller already holds (the daemon's resident
+ * `indexedFile(subject)` is an optional lookup into a token index the caller already holds (the daemon's resident
  * index); without it the locator reads the index file, once per change of that file.
  * With `probeHeaders: false`, use fresh on-disk index entries instead of probing, and discover by filename only.
  */
 export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, indexedFile, probeHeaders = true } = {}) {
 	const nowMs = typeof clock?.now === "function" ? () => clock.now() : () => Date.now();
-	let mainFiles = new Map();
-	let mainScannedMs = -Infinity;
-	let mainScan;
+	const projects = new Map();
 	let usageStamp;
 	let indexedMainEntries = new Map();
 
-	const residentMainFile = (sessionId) => {
-		const file = indexedFile(sessionId);
-		return file && idFromFileName(file) !== sessionId ? file : undefined;
+	const residentMainFile = (subject) => {
+		const file = indexedFile(subject);
+		return file && idFromFileName(file) !== subject.sessionId ? file : undefined;
 	};
 
-	const readMainFile = (sessionId) => {
+	const readMainFile = (subject) => {
 		const file = paths.health?.usageIndexFile;
 		const stat = file && statSafe(file);
 		const stamp = stat?.isFile() ? `${stat.ino}:${stat.birthtimeMs}:${stat.mtimeMs}:${stat.size}` : null;
@@ -67,28 +67,25 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 			indexedMainEntries = new Map();
 			if (stamp !== null) {
 				for (const [id, entry] of readUsageIndex(file)) {
-					if (entry.kind === "main" && entry.file && (!probeHeaders || idFromFileName(entry.file) !== id)) indexedMainEntries.set(id, entry);
+					if (entry.kind === "main" && entry.file && (!probeHeaders || idFromFileName(entry.file) !== entry.id)) indexedMainEntries.set(id, entry);
 				}
 			}
 		}
-		const entry = indexedMainEntries.get(sessionId);
+		const entry = indexedMainEntries.get(subjectKey(subject));
 		if (!probeHeaders && (entry?.readError === true || !fresh(entry))) return undefined;
 		return entry?.file;
 	};
 
 	const indexedMainFile = typeof indexedFile === "function" ? residentMainFile : readMainFile;
 
-	function* mainCandidates() {
-		for (const slug of listDirSafe(paths.sessionsDir)) {
-			const dir = path.join(paths.sessionsDir, slug);
-			for (const name of listDirSafe(dir)) {
-				if (name.endsWith(".jsonl")) yield path.join(dir, name);
-			}
+	function* mainCandidates(dir) {
+		for (const name of listDirSafe(dir)) {
+			if (name.endsWith(".jsonl")) yield path.join(dir, name);
 		}
 	}
 
 	/** A header probe is atomic; leave the candidate at the cursor if its prefix won't fit. */
-	const findMainFile = (sessionId, indexedFile, { maxBytes = Infinity } = {}) => {
+	const findMainFile = (subject, indexedFile, { maxBytes = Infinity } = {}) => {
 		let bytesRead = 0;
 		const result = (file, pending = false) => ({ file, pending, bytesRead });
 		const header = (file, size) => {
@@ -96,14 +93,19 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 			bytesRead += probe.bytesRead;
 			return probe;
 		};
-		if (!sessionId) return result();
+		const { sessionId, projectKey } = subject ?? {};
+		if (!sessionId || !projectKey || !/^--[^/\\:]*--$/.test(projectKey)) return result();
+		const dir = path.join(paths.sessionsDir, projectKey);
+		const owns = (file) => file && pathKey(path.dirname(file)) === pathKey(dir);
+		// An already verified custom transcript can live outside senpi’s sessions tree.
+		const custom = (file) => file && !isInside(file, paths.sessionsDir);
 		if (!probeHeaders) {
-			const verified = readMainFile(sessionId);
-			if (verified) return result(verified);
+			const verified = readMainFile(subject);
+			if (owns(verified) || custom(verified)) return result(verified);
 		} else if (indexedFile === undefined) {
-			indexedFile = indexedMainFile(sessionId);
+			indexedFile = indexedMainFile(subject);
 		}
-		if (probeHeaders && indexedFile && idFromFileName(indexedFile) !== sessionId) {
+		if (probeHeaders && (owns(indexedFile) || custom(indexedFile)) && idFromFileName(indexedFile) !== sessionId) {
 			const stat = statSafe(indexedFile);
 			if (stat?.isFile()) {
 				const probe = header(indexedFile, stat.size);
@@ -111,15 +113,17 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 				if (probe.id === sessionId) return result(indexedFile);
 			}
 		}
-		let file = mainFiles.get(sessionId);
+		let project = projects.get(projectKey);
+		if (!project) projects.set(projectKey, project = { files: new Map(), scannedMs: -Infinity });
+		let file = project.files.get(sessionId);
 		if (file && statSafe(file)?.isFile()) return result(file);
-		if (file) mainFiles.delete(sessionId);
-		if (!mainScan) {
-			if (nowMs() - mainScannedMs < rescanMs) return result();
-			const candidates = mainCandidates();
-			mainScan = { candidates, next: candidates.next(), found: new Map() };
+		if (file) project.files.delete(sessionId);
+		if (!project.scan) {
+			if (nowMs() - project.scannedMs < rescanMs) return result();
+			const candidates = mainCandidates(dir);
+			project.scan = { candidates, next: candidates.next(), found: new Map() };
 		}
-		const scan = mainScan;
+		const scan = project.scan;
 		for (; !scan.next.done; scan.next = scan.candidates.next()) {
 			const candidate = scan.next.value;
 			const stat = statSafe(candidate);
@@ -136,14 +140,14 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 			}
 		}
 		// Publish only the finished map: unseen files can still change which path wins.
-		mainFiles = scan.found;
-		mainScan = undefined;
-		mainScannedMs = nowMs();
-		file = mainFiles.get(sessionId);
+		project.files = scan.found;
+		project.scan = undefined;
+		project.scannedMs = nowMs();
+		file = project.files.get(sessionId);
 		return result(file && statSafe(file)?.isFile() ? file : undefined);
 	};
 
-	const mainFile = (sessionId, indexedFile) => findMainFile(sessionId, indexedFile).file;
+	const mainFile = (subject, indexedFile) => findMainFile(subject, indexedFile).file;
 
 	const childFiles = new Map();
 	const childMisses = new Map();

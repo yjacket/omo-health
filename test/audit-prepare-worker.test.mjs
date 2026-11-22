@@ -1,3 +1,5 @@
+import { projectKeyOf, subjectOf } from "../src/session-subject.mjs";
+const sub = (sessionId, cwd) => subjectOf({ sessionId, cwd });
 import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -8,7 +10,7 @@ import { Worker } from "node:worker_threads";
 import { createAuditor, requestAudit } from "../src/auditor.mjs";
 import { DEFAULT_CONFIG } from "../src/config.mjs";
 import { resolvePaths } from "../src/paths.mjs";
-import { auditFileKey } from "../src/session-id.mjs";
+import { auditFileKey } from "../src/session-subject.mjs";
 import { appendEnded } from "../src/session-ledger.mjs";
 import { createUsageIndex } from "../src/usage-index.mjs";
 import { E, writeJsonl } from "./helpers/fixtures.mjs";
@@ -22,7 +24,7 @@ function fixture(t, { bystanders = 0, indexed = false, bounds } = {}) {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "prepare-bound-"));
 	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
 	const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health") });
-	const dir = path.join(paths.sessionsDir, "project");
+	const dir = path.join(paths.sessionsDir, projectKeyOf(root));
 	const file = path.join(dir, TARGET);
 	writeJsonl(file, [
 		E.header("owner", root, NOW - 2000),
@@ -42,7 +44,7 @@ function fixture(t, { bystanders = 0, indexed = false, bounds } = {}) {
 	appendEnded(paths, { sessionId: "owner", kind: "main", startedMs: NOW - 2000, endedMs: NOW - 1000, cwd: root });
 	const clock = { now: () => NOW };
 	const index = createUsageIndex({ file: paths.health.usageIndexFile, clock });
-	if (indexed) index.update("owner", file, { kind: "main" });
+	if (indexed) index.update(sub("owner", root), file, { kind: "main" });
 	fs.writeFileSync(paths.omoJsonc, JSON.stringify({ "[native]": { categories: { ultrabrain: { models: ["openai/gpt-5-5"] } } } }));
 	fs.writeFileSync(paths.authFile, JSON.stringify({ openai: {} }));
 	const starts = [];
@@ -63,11 +65,11 @@ function fixture(t, { bystanders = 0, indexed = false, bounds } = {}) {
 		file, starts,
 		async prepare() {
 			try {
-				requestAudit(paths, "owner", NOW);
+				requestAudit(paths, sub("owner", root), NOW);
 				auditor.tick(NOW);
 				await auditor.preparing();
 				auditor.tick(NOW);
-				return { observed, record: JSON.parse(fs.readFileSync(path.join(paths.health.auditsDir, `${auditFileKey("owner")}.json`), "utf8")),
+				return { observed, record: JSON.parse(fs.readFileSync(path.join(paths.health.auditsDir, `${auditFileKey(sub("owner", root))}.json`), "utf8")),
 					charged: fs.existsSync(paths.health.auditBudgetFile) };
 			} finally {
 				await auditor.close();

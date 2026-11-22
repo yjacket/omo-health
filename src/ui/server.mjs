@@ -5,8 +5,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { clearPause, setSwitch, writePause } from "../control.mjs";
 import { safeSubjectId } from "../session-id.mjs";
+import { resolveLedgerSubject } from "../session-record.mjs";
 import { writeUiPrefs } from "./prefs.mjs";
 import { SESSION_LISTS } from "./session-view.mjs";
+import { auditReasonLabel } from "./labels.mjs";
 
 const DEFAULT_STATIC_DIR = fileURLToPath(new URL("./static", import.meta.url));
 const MAX_BODY_BYTES = 4096;
@@ -66,9 +68,12 @@ function runAction(paths, route, body, nowMs, startAudit) {
 	switch (route) {
 		case "/api/audit": {
 			const id = safeSubjectId(body.sessionId);
-			if (!hasExactKeys(body, ["sessionId"]) || id === null) throw invalid;
+			const { row } = body;
+			const selected = Object.hasOwn(body, "row");
+			if (!hasExactKeys(body, selected ? ["sessionId", "row"] : ["sessionId"]) || id === null ||
+				(selected && (typeof row !== "string" || !SESSION_ROW.test(row)))) throw invalid;
 			if (!startAudit) throw new HttpFailure(404, { error: "not-found" });
-			return startAudit(id);
+			return startAudit(id, row);
 		}
 		case "/api/pause": {
 			if (!hasExactKeys(body, ["minutes"]) || ![15, 60, null].includes(body.minutes)) throw invalid;
@@ -150,7 +155,11 @@ export function createUiServer({ paths, token, getState, diagnose, sessionDetail
 		const id = new URLSearchParams(query).get("id");
 		if (id !== null && safeSubjectId(id) === null) throw new HttpFailure(422, { error: "invalid" });
 		if (!diagnose) throw new HttpFailure(404, { error: "not-found" });
-		send(res, 200, await diagnose(id ?? undefined));
+		if (id !== null && paths?.health?.sessionsDir &&
+			resolveLedgerSubject(paths, id, { now: now() }).error === "ambiguous-session") throw ambiguousSession();
+		const result = await diagnose(id ?? undefined);
+		if (result?.error === "ambiguous-session") throw ambiguousSession();
+		send(res, 200, result);
 	}
 
 	/** `/api/session` params: exact id, optional ended row selector, and optional list pagination. */
@@ -180,8 +189,13 @@ export function createUiServer({ paths, token, getState, diagnose, sessionDetail
 		const { id, row, ...pagination } = parseSessionQuery(req.url);
 		if (!sessionDetail) throw new HttpFailure(404, { error: "not-found" });
 		const detail = await sessionDetail(id, row, pagination);
+		if (detail?.error === "ambiguous-session") throw ambiguousSession();
 		if (!isPlainObject(detail) || detail.found === false) throw new HttpFailure(404, { error: "not-found" });
 		send(res, 200, detail);
+	}
+
+	function ambiguousSession() {
+		return new HttpFailure(409, { error: "ambiguous-session", reasonKo: auditReasonLabel("ambiguous-session") });
 	}
 
 	async function serveStatic(req, res, pathname) {

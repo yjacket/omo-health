@@ -9,6 +9,9 @@ const src = process.env.OMOH_MEMORY_BASELINE
 	: new URL("../../src/", import.meta.url);
 const load = (name) => import(new URL(`${name}.mjs`, src));
 const { createUsageIndex, INDEX_BYTE_BUDGET, USAGE_TICK_BYTES } = await load("usage-index");
+const subjectModule = process.env.OMOH_MEMORY_BASELINE ? null : await load("session-subject");
+const sub = (sessionId, cwd) => subjectModule ? subjectModule.subjectOf({ sessionId, cwd }) : sessionId;
+const key = (sessionId, cwd) => subjectModule ? subjectModule.subjectKey(sub(sessionId, cwd)) : sessionId;
 const { resolvePaths } = await load("paths");
 const { appendEnded, hasEnded, streamEnded } = await load("session-ledger");
 const { backfillOnce } = await load("session-backfill");
@@ -73,8 +76,8 @@ if (operation === "all-sources") {
 	const ownFile = path.join(paths.sessionsDir, "probe", `2026-11-22_${sessionId}.jsonl`);
 	put(ownFile, usageLine);
 	const index = open();
-	index.markMissing("other", { kind: "main", file: padding });
-	index.update(sessionId, ownFile, { kind: "main" });
+	index.markMissing(sub("other"), { kind: "main", file: padding });
+	index.update(sub(sessionId), ownFile, { kind: "main" });
 	assert.ok(index.save());
 	const [header, ...rows] = fs.readFileSync(indexFile, "utf8").trimEnd().split("\n");
 	const entry = (id) => rows.find((line) => JSON.parse(line).id === id) + "\n";
@@ -95,8 +98,8 @@ if (operation === "all-sources") {
 } else if (operation === "audit-own-decisions") {
 	const sessionId = "seed";
 	const ts = new Date(now - 1000).toISOString();
-	assert.equal(appendEnded(paths, { sessionId, kind: "main", startedMs: now - 30_000, endedMs: now }, { nowMs: now }), true);
-	put(path.join(paths.sessionsDir, "probe", `2026-11-22_${sessionId}.jsonl`), usageLine);
+	assert.equal(appendEnded(paths, { sessionId, cwd: dir, kind: "main", startedMs: now - 30_000, endedMs: now }, { nowMs: now }), true);
+	put(path.join(paths.sessionsDir, subjectModule?.projectKeyOf(dir) ?? "probe", `2026-11-22_${sessionId}.jsonl`), usageLine);
 	put(paths.omoJsonc, JSON.stringify({ "[native]": { categories: { ultrabrain: { models: ["other/reviewer"] } } } }));
 	put(paths.authFile, '{"other":{}}');
 	const file = path.join(paths.health.decisionsDir, `${ts.slice(0, 10)}.jsonl`);
@@ -112,7 +115,7 @@ if (operation === "all-sources") {
 	const bytes = fs.statSync(file).size;
 	assert.ok(bytes > 96 * 1024 * 1024);
 	console.log(`DECISIONS matching bytes=${bytes}`);
-	requestAudit(paths, sessionId, now);
+	requestAudit(paths, sub(sessionId, dir), now);
 	let starts = 0;
 	const auditor = createAuditor({ paths, config: DEFAULT_CONFIG, clock, env: {}, runner: {
 		start() { starts++; return { pid: 1 }; },
@@ -120,7 +123,7 @@ if (operation === "all-sources") {
 	auditor.tick(now);
 	await auditor.preparing();
 	auditor.tick(now);
-	const state = readAuditState(paths, sessionId);
+	const state = readAuditState(paths, sub(sessionId, dir));
 	if (state?.status === "running") {
 		assert.equal(starts, 1);
 		const refs = JSON.parse(fs.readFileSync(path.join(paths.health.jobsDir, state.jobId, "refs.json"), "utf8"));
@@ -178,9 +181,9 @@ if (operation === "all-sources") {
 		fs.closeSync(fd);
 	}
 	const index = open();
-	assert.equal(index.update("seed", target, { kind: "child", taskId: "st_seed" }), USAGE_TICK_BYTES);
+	assert.equal(index.update(sub("seed", cwd), target, { kind: "child", taskId: "st_seed" }), USAGE_TICK_BYTES);
 	const prefix = "C:/작업/" + ("a".repeat(194) + "/").repeat(100);
-	for (let i = 0; !index.full; i++) index.markMissing(`existing-${i}`, { kind: "main", file: `${prefix}${i}` });
+	for (let i = 0; !index.full; i++) index.markMissing(sub(`existing-${i}`), { kind: "main", file: `${prefix}${i}` });
 	assert.ok(index.save());
 	const ledger = path.join(paths.health.sessionsDir, "ended-2026-11-22.jsonl");
 	const out = fs.openSync(ledger, "w");
@@ -198,16 +201,16 @@ if (operation === "all-sources") {
 	const index = open();
 	const seed = path.join(dir, "seed.jsonl");
 	put(seed, usageLine);
-	index.update("seed", seed, { kind: "main" });
+	index.update(sub("seed"), seed, { kind: "main" });
 	const prefix = "C:/작업/" + ("a".repeat(194) + "/").repeat(100);
-	for (let i = 0; !index.full; i++) index.markMissing(`index-${i}`, { kind: "main", file: `${prefix}${i}` });
+	for (let i = 0; !index.full; i++) index.markMissing(sub(`index-${i}`), { kind: "main", file: `${prefix}${i}` });
 	assert.ok(index.save());
 	console.log(`INDEX budget=${INDEX_BYTE_BUDGET} entries=${index.entries().length} disk=${fs.statSync(indexFile).size}`);
 } else {
 	const full = mode === "full";
 	const index = open();
 	assert.equal(index.full, full);
-	assert.equal(index.get("seed")?.published?.total, full ? 42 : undefined);
+	assert.equal(index.get(key("seed", sparseTick ? path.join(dir, "prj") : undefined))?.published?.total, full ? 42 : undefined);
 	const locator = createSessionFileLocator({ paths, clock });
 	const tracker = createUsageTracker({ paths, index, locator, clock });
 	const queue = () => tracker.queueLedger(streamEnded(paths, { sinceMs: now - 30 * day, withLocation: true }));
@@ -223,7 +226,7 @@ if (operation === "all-sources") {
 			assert.equal(operation === "positioned-tick" ? queue() : tracker.queueLedger(sparse()), full ? 1030 : 1031);
 			const tick = tracker.tick({ sessions: new Map() });
 			assert.equal(tick.bytesRead, full ? 0 : USAGE_TICK_BYTES);
-			assert.equal(tracker.tokensOf("seed")?.tokens?.total, 42);
+			assert.equal(tracker.tokensOf(sub("seed", sparseTick ? path.join(dir, "prj") : undefined))?.tokens?.total, 42);
 			break;
 		}
 		case "append":
@@ -261,11 +264,11 @@ if (operation === "all-sources") {
 			if (full) fs.renameSync(file, target);
 			const world = { sessions: new Map([[liveId, { id: liveId, kind: "main", file: target }]]) };
 			assert.ok(tracker.tick(world).bytesRead > 12 * 1024 * 1024);
-			assert.equal(tracker.tokensOf(liveId)?.tokens?.total, 42);
+			assert.equal(tracker.tokensOf(sub(liveId))?.tokens?.total, 42);
 			break;
 		}
 		case "save":
-			index.update("seed", path.join(fixture, "seed.jsonl"), { kind: "main" });
+			index.update(sub("seed"), path.join(fixture, "seed.jsonl"), { kind: "main" });
 			assert.equal(index.save(), true);
 			assert.ok(fs.statSync(indexFile).size > 0);
 			break;
@@ -276,7 +279,7 @@ if (operation === "all-sources") {
 			put(path.join(paths.sessionsDir, "probe", "2026-11-22_seed.jsonl"), usageLine);
 			put(paths.omoJsonc, JSON.stringify({ "[native]": { categories: { ultrabrain: { models: ["other/reviewer"] } } } }));
 			put(paths.authFile, '{"other":{}}');
-			requestAudit(paths, "seed", now);
+			requestAudit(paths, sub("seed"), now);
 			let starts = 0;
 			const auditor = createAuditor({ paths, index, config: DEFAULT_CONFIG, clock, env: {}, runner: {
 				start() { starts++; return { pid: 1 }; },
@@ -284,7 +287,7 @@ if (operation === "all-sources") {
 			auditor.tick(now + 1);
 			await auditor.preparing();
 			auditor.tick(now + 1);
-			const state = readAuditState(paths, "seed");
+			const state = readAuditState(paths, sub("seed"));
 			if (shape === "family") {
 				assert.equal(starts, 0);
 				assert.equal(state?.reason, "evidence-too-large");
@@ -297,5 +300,5 @@ if (operation === "all-sources") {
 		default:
 			assert.fail(`unknown operation: ${operation}`);
 	}
-	if (full) assert.equal(index.get("seed")?.published?.total, 42);
+	if (full) assert.equal(index.get(key("seed"))?.published?.total, 42);
 }

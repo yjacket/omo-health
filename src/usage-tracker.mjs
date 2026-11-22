@@ -1,10 +1,12 @@
+import path from "node:path";
 import { probeSessionHeader } from "./collect/session-files.mjs";
 import { idFromFileName } from "./collect/sessions.mjs";
-import { pathKey } from "./paths.mjs";
+import { sessionSubjects, subjectKey, subjectOf } from "./session-subject.mjs";
+import { isInside, pathKey } from "./paths.mjs";
 import { boardTaskLinks } from "./session-board.mjs";
 import { ENDED_LOCATION, endedKey, locateEndedRows, readEndedCwd } from "./session-ledger.mjs";
 import { ambiguousLedgerTaskIds, ledgerUsageSessionId, retainedTreeRows, usageTreeLink } from "./session-record.mjs";
-import { USAGE_TICK_BYTES, compactUsage, fresh as isFresh, isTaskOnlyEntry, treeTotals } from "./usage-index.mjs";
+import { USAGE_TICK_BYTES, compactUsage, fresh as isFresh, isTaskOnlyEntry, treeTotals, usageEntryFor } from "./usage-index.mjs";
 import { statSafe } from "./util/fsx.mjs";
 
 /**
@@ -37,7 +39,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 	const nowMs = () => (typeof clock?.now === "function" ? clock.now() : Date.now());
 	/** Compact ledger rows, for the ancestor cwd walk. */
 	const ledgerRows = new Map();
-	/** Keep scoped fallback links even though the index itself has only one slot per raw ID. */
+	/** Keep distinct fallback ledger rows for ownership ambiguity. */
 	const fallbackRows = new Map();
 	/** Ended task-only reads whose ownership needs watching even when the byte queue is drained. */
 	const taskOnlyChecks = new Map();
@@ -53,6 +55,8 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 	let fullLogged = false;
 	let sawBacklog = false;
 
+	const keyOf = (row) => subjectKey(subjectOf(row));
+	const linkKey = (row, sessionId) => subjectKey({ ...subjectOf(row), sessionId });
 	const cwdChain = function* (row, liveSessions) {
 		yield row;
 		const seen = new Set();
@@ -62,7 +66,8 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			const parentId = current?.parentSessionId;
 			if (!isNonEmptyString(parentId) || seen.has(parentId)) break;
 			seen.add(parentId);
-			const parent = ledgerRows.get(parentId) ?? index.get(parentId) ?? liveSessions?.get?.(parentId);
+			const key = current.parentKey ?? linkKey(current, parentId);
+			const parent = ledgerRows.get(key) ?? liveSessions?.get(key) ?? index.get(key);
 			if (!parent) break;
 			yield parent;
 			current = parent;
@@ -83,6 +88,8 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 		taskId: source?.taskId ?? null,
 		parentSessionId: source?.parentSessionId ?? null,
 		rootSessionId: source?.rootSessionId ?? null,
+		parentKey: source?.parentKey ?? linkKey(source, source?.parentSessionId),
+		rootKey: source?.rootKey ?? linkKey(source, source?.rootSessionId),
 	});
 
 	const childCandidate = (query) => (locator?.childCandidate ?? locator?.childFile)?.(query);
@@ -95,18 +102,18 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 		if (session.kind === "main") {
 			if (idFromFileName(file) === session.id) return result(true);
 			const stat = statSafe(file);
-			const cached = liveHeaders.get(session.id);
+			const cached = liveHeaders.get(keyOf(session));
 			if (!stat?.isFile()) {
-				liveHeaders.delete(session.id);
+				liveHeaders.delete(keyOf(session));
 				return result(false);
 			}
 			const { size, mtimeMs, ino } = stat;
 			if (cached?.file === file && cached.size === size && cached.mtimeMs === mtimeMs && cached.ino === ino) return result(cached.matches);
-			liveHeaders.delete(session.id);
+			liveHeaders.delete(keyOf(session));
 			const probe = probeSessionHeader(file, size, maxBytes);
 			const matches = probe.id === session.id;
 			// Don't cache an I/O failure on a nonempty file; retry it next tick.
-			if (!probe.pending && (probe.bytesRead > 0 || size === 0)) liveHeaders.set(session.id, { file, size, mtimeMs, ino, matches });
+			if (!probe.pending && (probe.bytesRead > 0 || size === 0)) liveHeaders.set(keyOf(session), { file, size, mtimeMs, ino, matches });
 			return { matches, pending: probe.pending, bytesRead: probe.bytesRead };
 		}
 		if (session.kind !== "child" || !isNonEmptyString(session.taskId)) return result(false);
@@ -121,7 +128,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			const file = ledgerUsageSessionId(row) ? locator?.childFile?.(query) : childCandidate(query);
 			return { file, bytesRead: 0 };
 		}
-		return locator?.findMainFile?.(row.sessionId, index.get(row.sessionId)?.file ?? null, { maxBytes }) ?? { bytesRead: 0 };
+		return locator?.findMainFile?.(subjectOf(row), index.get(keyOf(row))?.file ?? null, { maxBytes }) ?? { bytesRead: 0 };
 	};
 
 	const counts = () => {
@@ -135,7 +142,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 	};
 
 	const totals = () => {
-		const ambiguous = ambiguousLedgerTaskIds(fallbackRows.values());
+		const ambiguous = ambiguousLedgerTaskIds(fallbackRows.values(), { scoped: true });
 		return treeTotals(index.entries(), [
 			...[...ledgerRows.values()].filter(ledgerUsageSessionId).map((row) => usageTreeLink(index, row, ambiguous)),
 			...[...fallbackRows.values()].map((row) => usageTreeLink(index, row, ambiguous)),
@@ -168,18 +175,26 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 				}
 				rows = retainedTreeRows(paths, rows, { beforeMs: cutoff, withLocation: true });
 			}
+			const incoming = [];
 			for (const source of rows ?? []) {
 				if (!isNonEmptyString(source?.sessionId)) continue;
 				const { sessionId, taskId, kind, endedMs, parentSessionId, rootSessionId } = source;
-				const row = { sessionId, taskId, kind, endedMs, parentSessionId, rootSessionId, [ENDED_LOCATION]: source[ENDED_LOCATION] };
+				const { projectKey } = subjectOf(source);
+				const row = { sessionId, taskId, kind, endedMs, parentSessionId, rootSessionId, projectKey, [ENDED_LOCATION]: source[ENDED_LOCATION] };
 				// Unpositioned callers keep any supplied cwd. Daemon rows always
 				// have locations and resolve cwd from the ledger line instead.
 				if (!row[ENDED_LOCATION] && source.cwd !== undefined) row.cwd = source.cwd;
-				ledgerRows.set(row.sessionId, row);
-				if (!ledgerUsageSessionId(row)) fallbackRows.set(endedKey(source), row);
-				const entry = index.get(row.sessionId);
-				if (row.kind === "child" && !ledgerUsageSessionId(row) && (entry?.state === "ok" || taskOnlyChecks.has(sessionId))) {
-					taskOnlyChecks.set(sessionId, row);
+				incoming.push(row);
+				if (!ledgerUsageSessionId(row)) fallbackRows.set(JSON.stringify([subjectKey(subjectOf(source)), endedKey(source)]), row);
+			}
+			const resolve = sessionSubjects([...ledgerRows.values(), ...incoming]);
+			for (const row of incoming) {
+				row.projectKey = resolve(row).projectKey;
+				const key = keyOf(row);
+				ledgerRows.set(key, row);
+				const entry = index.get(key);
+				if (row.kind === "child" && !ledgerUsageSessionId(row) && (entry?.state === "ok" || taskOnlyChecks.has(key))) {
+					taskOnlyChecks.set(key, row);
 				}
 				const checkedAgo = nowMs() - (Number.isFinite(entry?.checkedMs) ? entry.checkedMs : 0) > DAY_MS;
 				let need = false;
@@ -188,7 +203,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 				else if (entry.gone === true) need = checkedAgo;
 				else if (entry.complete === true && (entry.readError === true || !isFresh(entry))) need = true;
 				else if (entry.state === "missing" && checkedAgo) need = true;
-				if (need) queue.set(row.sessionId, row);
+				if (need) queue.set(key, row);
 			}
 			queue = new Map([...queue.entries()].sort((a, b) => (Number(b[1]?.endedMs) || 0) - (Number(a[1]?.endedMs) || 0)));
 			if (queue.size) sawBacklog = true;
@@ -204,9 +219,22 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			let budget = USAGE_TICK_BYTES;
 			let ownershipChanged = false;
 			const sessions = [...(world?.sessions?.values?.() ?? [])];
-			const liveSessions = new Map(sessions.filter((session) => isNonEmptyString(session?.id)).map((session) => [session.id, session]));
+			const resolve = sessionSubjects([...sessions, ...ledgerRows.values()]);
+			const liveSubject = sessionSubjects(sessions);
+			const liveSessions = new Map();
+			for (const session of sessions) {
+				if (!isNonEmptyString(session?.id)) continue;
+				const subject = liveSubject(session);
+				const parent = world?.sessions?.get?.(session.parentSessionId);
+				const root = world?.sessions?.get?.(session.rootSessionId);
+				liveSessions.set(subjectKey(subject), { ...session, ...subject,
+					parentKey: parent ? subjectKey(liveSubject(parent)) : linkKey(subject, session.parentSessionId),
+					rootKey: root ? subjectKey(liveSubject(root)) : linkKey(subject, session.rootSessionId) });
+			}
 			const ledgerOptions = ledgerFs ? { fs: ledgerFs } : undefined;
+			const resolvedCwds = new WeakMap();
 			const cwdOf = (node) => {
+				if (resolvedCwds.has(node)) return resolvedCwds.get(node);
 				if (!paths) return undefined;
 				if (needsLedgerCwd(node) && !searched.has(node)) {
 					// Share one scan across pending child lookups, including their
@@ -236,24 +264,35 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 				if (session?.kind !== "main" || session.file !== file) liveHeaders.delete(id);
 			}
 			for (const session of liveSessions.values()) {
-				const entry = index.get(session.id);
+				const entry = index.get(keyOf(session));
 				const reads = entry?.state === "ok" && entry.complete === true ? liveAppends : liveFirstReads;
 				reads.push({ session, entry });
 			}
 			// (a) live appends, then (b) first/incomplete live reads. A previous
 			// publication sets priority, not whether a file has unread bytes.
-			for (const { session, entry } of [...liveAppends, ...liveFirstReads]) {
+			for (const { session: observed, entry } of [...liveAppends, ...liveFirstReads]) {
+				let session = observed;
+				// The raw-ID registry can attach a different project’s default-store file.
+				if (session.kind === "main" && session.projectKey && session.file && paths?.sessionsDir &&
+					isInside(session.file, paths.sessionsDir) &&
+					pathKey(path.dirname(session.file)) !== pathKey(path.join(paths.sessionsDir, session.projectKey))) {
+					const { file, pending, bytesRead } = locate(session, liveSessions, cwdOf, budget);
+					budget -= bytesRead;
+					if (pending || (file && budget === 0 && !entry)) pendingLive.add(keyOf(session));
+					if (!file) continue;
+					session = { ...session, file };
+				}
 				const { matches, pending, bytesRead, candidate } = verify(session, liveSessions, cwdOf, budget);
 				budget -= bytesRead;
-				if (pending || (matches && budget === 0 && !entry)) pendingLive.add(session.id);
+				if (pending || (matches && budget === 0 && !entry)) pendingLive.add(keyOf(session));
 				if (isTaskOnlyEntry(entry) && entry.state === "ok" && (!matches || pathKey(session.file) !== pathKey(entry.file))) {
 					if (!entry.gone || candidate !== undefined) {
-						index.markMissing(session.id, metaOf(session), { withdraw: candidate !== undefined });
+						index.markMissing(subjectOf(session), metaOf(session), { withdraw: candidate !== undefined });
 						ownershipChanged = true;
 					}
 				}
 				if (!matches || budget <= 0) continue;
-				budget = Math.max(0, budget - index.update(session.id, session.file, metaOf(session), {
+				budget = Math.max(0, budget - index.update(subjectOf(session), session.file, metaOf(session), {
 					maxBytes: budget, ownershipUnique: session.id === session.taskId ? true : null,
 				}));
 			}
@@ -265,7 +304,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 				const entry = index.get(id);
 				const withdraw = file === null || (file !== undefined && pathKey(file) !== pathKey(entry?.file));
 				if (entry?.state === "ok" && (withdraw || (file === undefined && (!entry.gone || entry.ownershipUnique !== true)))) {
-					index.markMissing(id, metaOf(row), { withdraw });
+					index.markMissing(subjectOf(row), metaOf(row), { withdraw });
 					ownershipChanged = true;
 				}
 				if (file) {
@@ -277,22 +316,35 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 				}
 			}
 			// (c) the ended-session backlog, newest first
-			for (const [id, row] of queue) {
+			for (const [queuedKey, row] of queue) {
 				if (budget <= 0) break;
+				if (!row.projectKey) {
+					const cwd = cwdOf(row);
+					row.projectKey = resolve({ ...row, cwd }).projectKey;
+					if (cwd !== undefined) {
+						// This tick already read the position to establish the subject.
+						resolvedCwds.set(row, cwd);
+					}
+				}
+				const id = keyOf(row);
+				if (queuedKey !== id) {
+					ledgerRows.delete(queuedKey);
+					ledgerRows.set(id, row);
+				}
 				const { file: rowFile, pending, bytesRead = 0 } = checkedFiles.has(id)
 					? { file: checkedFiles.get(id) }
 					: locate(row, liveSessions, cwdOf, budget);
 				budget -= bytesRead;
 				if (pending) break;
 				if (!rowFile) {
-					index.markMissing(id, metaOf(row), { withdraw: rowFile === null });
-					queue.delete(id);
+					index.markMissing(subjectOf(row), metaOf(row), { withdraw: rowFile === null });
+					queue.delete(queuedKey);
 					continue;
 				}
 				const taskOnly = row.kind === "child" && !ledgerUsageSessionId(row);
 				if (taskOnly) taskOnlyChecks.set(id, row);
 				if (budget <= 0) break;
-				budget = Math.max(0, budget - index.update(id, rowFile, metaOf(row), {
+				budget = Math.max(0, budget - index.update(subjectOf(row), rowFile, metaOf(row), {
 					maxBytes: budget, ownershipUnique: taskOnly ? true : null,
 				}));
 				const entry = index.get(id);
@@ -300,23 +352,27 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 				if (entry.readError === true) continue;
 				if (entry.state === "missing" || entry.state === "full" || entry.gone === true ||
 					(entry.state === "ok" && entry.complete === true && entry.evaluatedTo === entry.size)) {
-					queue.delete(id);
+					queue.delete(queuedKey);
 				}
 			}
 			// An exact-session child can also be the alias of a task-only history row.
 			// Refresh only aliases history can use; exact-ID rows need no directory check.
 			if (fallbackRows.size > 0) {
-				const taskIds = new Set([...fallbackRows.values()].map((row) => row.taskId));
+				const taskIds = new Set([...fallbackRows.values()].map((row) => linkKey(row, row.taskId)));
 				for (const entry of index.values()) {
-					if (entry.kind === "child" && entry.state === "ok" && !isTaskOnlyEntry(entry) && taskIds.has(entry.taskId)) {
-						if (index.checkAliasOwnership(entry.id)) ownershipChanged = true;
+					if (entry.kind === "child" && entry.state === "ok" && !isTaskOnlyEntry(entry) && taskIds.has(linkKey(entry, entry.taskId))) {
+						if (index.checkAliasOwnership(keyOf(entry))) ownershipChanged = true;
 					}
 				}
 			}
 			const board = boardTaskLinks(world, nowMs());
 			liveTreeRows = [
-				...liveSessions.values(),
-				...(world?.tasks ?? []).filter((task) => task.childSessionId).map(({ childSessionId, parentSessionId }) => ({ id: childSessionId, parentSessionId })),
+				...[...liveSessions.values()].map((row) => ({ key: keyOf(row), parentKey: row.parentKey })),
+				...(world?.tasks ?? []).filter((task) => task.childSessionId).map(({ childSessionId, parentSessionId }) => {
+					const parent = liveSubject(world.sessions?.get(parentSessionId));
+					const child = subjectOf(world.sessions?.get(childSessionId), parent);
+					return { key: subjectKey({ ...child, sessionId: childSessionId }), parentKey: subjectKey({ ...parent, sessionId: parentSessionId }) };
+				}),
 				...board.rows.filter((row) => !row.sessionId).map((row) => usageTreeLink(index, row, board.ambiguous)),
 			];
 			trees = totals();
@@ -344,15 +400,16 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 		 * A deferred exact reread can return both the last `tokens` and `pending:true`.
 		 * A counted descendant can supply a tree total even without an own total.
 		 */
-		tokensOf(sessionId, taskId) {
-			const entry = index.get(sessionId, taskId);
-			const id = entry?.id ?? sessionId;
+		tokensOf(subject, taskId) {
+			const entry = usageEntryFor(index, subject, taskId);
+			const key = subjectKey(subject);
+			const id = entry?.id ? keyOf(entry) : key;
 			trees ??= totals();
 			const treeTokens = trees.get(id) ?? null;
 			const treeTokensComplete = !pendingLive.has(id) && trees.complete.get(id) === true;
 			const tree = treeTokens === null ? {} : { treeTokens, treeTokensComplete };
-			if (pendingLive.has(sessionId)) return { pending: true, ...tree };
-			if (!entry) return treeTokens === null ? null : tree;
+			if (pendingLive.has(key)) return { pending: true, ...tree };
+			if (!entry) return index.full && taskId ? { state: "full", ...tree } : treeTokens === null ? null : tree;
 			if (entry.state === "full") return { state: "full", ...tree };
 			const tokens = compactUsage(entry);
 			if (tokens) return { tokens, treeTokens, treeTokensComplete, ...(entry.pending && !entry.gone ? { pending: true } : {}) };

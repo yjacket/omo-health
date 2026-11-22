@@ -1,3 +1,5 @@
+import { projectKeyOf, subjectKey, subjectOf } from "../src/session-subject.mjs";
+const sub = (sessionId, cwd) => subjectOf({ sessionId, cwd });
 import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
@@ -20,7 +22,7 @@ import { emptyUsage } from "../src/collect/usage.mjs";
 import { appendDecision } from "../src/decisions.mjs";
 import { BACKFILL_MARKER, backfillOnce } from "../src/session-backfill.mjs";
 import { ANALYST_POLL_MS } from "../src/judge/analyst.mjs";
-import { auditFileKey } from "../src/session-id.mjs";
+import { auditFileKey } from "../src/session-subject.mjs";
 import { appendEnded, readEnded } from "../src/session-ledger.mjs";
 import { createDetailWorker, createSessionDetail, createStartAudit } from "../src/ui/cli.mjs";
 import { buildEnded, daemonStatus, loadDaemonInputs, uiState } from "../src/ui/model.mjs";
@@ -253,12 +255,12 @@ describe("ui server", { timeout: 20_000 }, () => {
 			t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
 
 			for (const [id, total] of [[liveId, 11], ["s_state_done1", 22], ["s_state_done2", 33], ["s_state_done3", 44]]) {
-				const file = path.join(paths.sessionsDir, "slug", `2026-11-22T11-59-59-000Z_${id}.jsonl`);
+				const file = path.join(paths.sessionsDir, projectKeyOf(dir), `2026-11-22T11-59-59-000Z_${id}.jsonl`);
 				writeJsonl(file, [
 					{ type: "session", id, cwd: dir },
 					{ type: "message", message: { role: "assistant", provider: "anthropic", model: "claude-used", usage: { input: total }, stopReason: "stop" } },
 				]);
-				index.update(id, file, { kind: "main" });
+				index.update(sub(id, dir), file, { kind: "main" });
 				if (id === liveId) continue;
 				appendEnded(paths, { sessionId: id, kind: "main", cwd: dir, startedMs: nowMs - 1_000, endedMs: nowMs, outcome: "answered" }, { nowMs });
 				ended.set(id, total);
@@ -719,9 +721,9 @@ describe("ui server", { timeout: 20_000 }, () => {
 			let calls = 0;
 			const load = ({ id }) => {
 				calls += 1;
-				return fakeRecord(id);
+				return { ...fakeRecord(id), session: { ...fakeRecord(id).session, cwd: paths.sessionsDir } };
 			};
-			const slug = path.join(paths.sessionsDir, "slug");
+			const slug = path.join(paths.sessionsDir, projectKeyOf(paths.sessionsDir));
 			fs.mkdirSync(slug, { recursive: true });
 			const file = path.join(slug, "2026-11-21T00-00-00-000Z_grow01.jsonl");
 			fs.writeFileSync(file, "{}\n");
@@ -796,7 +798,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 				const nowMs = Date.parse("2026-11-22T00:00:00.000Z");
 				const now = () => nowMs;
 				// Seed the usage index with a short transcript path when the ID cannot fit in a Windows path component.
-				const sessionFile = path.join(worldPaths.sessionsDir, "slug", `2026-11-22T00-00-00-000Z_${sessionId.length > 200 ? "indexed" : sessionId}.jsonl`);
+				const sessionFile = path.join(worldPaths.sessionsDir, projectKeyOf(dir), `2026-11-22T00-00-00-000Z_${sessionId.length > 200 ? "indexed" : sessionId}.jsonl`);
 				fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
 				const sessionLines = [{ type: "session", id: sessionId }, ...(entries ?? [])];
 				fs.writeFileSync(sessionFile, `${sessionLines.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
@@ -804,10 +806,13 @@ describe("ui server", { timeout: 20_000 }, () => {
 				fs.mkdirSync(worldPaths.health.sessionsDir, { recursive: true });
 				fs.writeFileSync(
 					path.join(worldPaths.health.sessionsDir, "ended-2026-11-22.jsonl"),
-					`${JSON.stringify({ v: 1, sessionId, taskId: null, kind: "main", outcome: "answered", startedMs: nowMs - 1_000, endedMs: nowMs })}\n`,
+					`${JSON.stringify({ v: 1, sessionId, taskId: null, cwd: dir, kind: "main", outcome: "answered", startedMs: nowMs - 1_000, endedMs: nowMs })}\n`,
 				);
 				writeIndexRow(worldPaths.health.usageIndexFile, {
 							id: sessionId,
+							projectKey: projectKeyOf(dir),
+							parentKey: null,
+							rootKey: null,
 							file: sessionFile,
 							kind: "main",
 							taskId: null,
@@ -851,8 +856,88 @@ describe("ui server", { timeout: 20_000 }, () => {
 			}
 
 			function requestFileOf(world) {
-				return path.join(world.paths.health.auditRequestsDir, `${auditFileKey(AUDIT_ID)}.json`);
+				return path.join(world.paths.health.auditRequestsDir, `${auditFileKey(sub(AUDIT_ID, world.dir))}.json`);
 			}
+
+			it("plan87: same-ID projects keep their detail, review bundle, reviewer and saved result separate", async (t) => {
+				const sessionId = "review.1";
+				const models = ["openai/gpt-review", "google/gemini-review"];
+				const world = makeWorld({
+					sessionId, lanes: { ultrabrain: [models[0]], architect: [models[1]] },
+					providers: ["openai", "google"],
+				});
+				const { paths, env, now, nowMs, dir } = world;
+				const rows = [dir, path.join(dir, "other")].map((cwd) => ({
+					sessionId, cwd, kind: "main", startedMs: nowMs - 1000, endedMs: nowMs, outcome: "answered",
+				}));
+				const index = createUsageIndex({ file: path.join(dir, "fresh-index"), clock: { now } });
+				for (const [i, row] of rows.entries()) {
+					appendEnded(paths, row, { nowMs });
+					const file = i === 0 ? world.sessionFile : path.join(paths.sessionsDir, projectKeyOf(row.cwd), `2026-11-22T00-00-00-000Z_${sessionId}.jsonl`);
+					writeJsonl(file, [
+						E.header(sessionId, row.cwd, nowMs - 1000),
+						E.assistant({ ms: nowMs - 500, provider: models[i].split("/")[0], model: models[i].split("/")[1], usage: { input: (i + 1) * 17, output: 0 } }),
+						{ type: "custom_message", customType: "omo-health", timestamp: new Date(nowMs - 100 + i).toISOString(), content: `project ${i}`, details: { kind: "self-notice" } },
+					]);
+					index.update(subjectOf(row), file, { kind: "main" });
+				}
+				index.save();
+				fs.copyFileSync(path.join(dir, "fresh-index"), paths.health.usageIndexFile);
+				const ui = createUiServer({ paths, token: TOKEN, getState: () => STATE, sessionDetail: world.detail, startAudit: world.startAudit, diagnose: () => ({}), now });
+				let tickMs = nowMs;
+				const starts = [];
+				const summaries = ["첫 번째 프로젝트 조사 결과입니다", "두 번째 프로젝트 조사 결과입니다"];
+				const runner = {
+					start(job) { starts.push(job); return { jobId: job.jobId, pid: 5000 }; },
+					poll(jobId) {
+						return { status: "done", exitCode: 0, result: {
+							overall: "sound", summary: summaries[starts.findIndex((start) => start.jobId === jobId)],
+							tokens: { judgment: "normal", explanation: "Normal." },
+							checks: [{ item: "Tokens", judgment: "unverifiable", explanation: "No further evidence.", evidence: [] }],
+							recommendations: [], confidence: 0.8,
+						} };
+					},
+				};
+				const makeAuditor = () => createAuditor({ paths, config: loadConfig({ paths, env }).config, clock: { now: () => tickMs }, runner, env });
+				let auditor = makeAuditor();
+				t.after(async () => {
+					await Promise.all([ui.close(), auditor.close()]);
+					fs.rmSync(dir, { recursive: true, force: true });
+				});
+				const { port } = await ui.listen();
+				for (const response of [await postAt(port, "/api/audit", { sessionId }), await getAt(port, `/api/session?id=${sessionId}`), await getAt(port, `/api/diagnose?id=${sessionId}`)]) {
+					assert.deepEqual([response.status, response.body.error], [409, "ambiguous-session"]);
+				}
+				assert.equal(fs.existsSync(paths.health.auditRequestsDir), false);
+				assert.equal(fs.existsSync(paths.health.auditBudgetFile), false);
+				const open = (row) => getAt(port, `/api/session?id=${sessionId}&row=${expectedSelector(row)}`);
+				for (const [i, row] of rows.entries()) {
+					const selected = await open(row);
+					assert.equal(selected.status, 200);
+					assert.equal(selected.body.tokens.total, (i + 1) * 17);
+					assert.deepEqual(selected.body.tokens.models.map(({ key }) => key), [models[i]]);
+					assert.deepEqual(selected.body.health.messages.map((message) => message.text), [`project ${i}`]);
+					const posted = await postAt(port, "/api/audit", { sessionId, row: expectedSelector(row) });
+					assert.deepEqual([posted.status, posted.body.audit?.planned?.model], [202, models[1 - i]]);
+					auditor.tick(tickMs);
+					await auditor.preparing();
+					auditor.tick(tickMs);
+					const start = starts[i];
+					assert.ok(start, JSON.stringify(readAuditState(paths, subjectOf(row))));
+					const bundle = JSON.parse(fs.readFileSync(path.join(start.cwd, "bundle.md"), "utf8").split("\n").find((line) => line.startsWith('{"session":')));
+					assert.equal(bundle.tokens.total, (i + 1) * 17);
+					assert.deepEqual(bundle.omo_health_record.messages.map((message) => message.ms), [nowMs - 100 + i]);
+					tickMs += ANALYST_POLL_MS;
+					auditor.tick(tickMs);
+				}
+				await auditor.close();
+				auditor = makeAuditor();
+				assert.equal(auditor.busy(), false);
+				for (const [i, row] of rows.entries()) {
+					const state = (await open(row)).body.audit.state;
+					assert.deepEqual([state.status, state.projectKey, state.result?.summary], ["done", projectKeyOf(row.cwd), summaries[i]], state.detail ?? state.reason);
+				}
+			});
 
 			it("plan86: a redacted display ID still opens and queues an audit for the exact ledger ID", async (t) => {
 				const sessionId = "ghp_review1234";
@@ -877,7 +962,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 				assert.equal(row.title, "ghp_[REDACTED]");
 				assert.equal(detail.body.session.sessionId, "ghp_[REDACTED]");
 				assert.equal(posted.body.audit.sessionId, sessionId);
-				const name = `${createHash("sha256").update(sessionId).digest("hex").slice(0, 32)}.json`;
+				const name = `${createHash("sha256").update(subjectKey(sub(sessionId, world.dir))).digest("hex").slice(0, 32)}.json`;
 				assert.deepEqual(fs.readdirSync(paths.health.auditRequestsDir), [name]);
 				assert.equal(JSON.parse(fs.readFileSync(path.join(paths.health.auditRequestsDir, name), "utf8")).sessionId, sessionId);
 				const queued = await getAt(port, detailUrl);
@@ -922,14 +1007,14 @@ describe("ui server", { timeout: 20_000 }, () => {
 					assert.equal(detail.body.session.sessionId, sessionId);
 					assert.equal(posted.body.audit.sessionId, sessionId);
 					auditor.tick(now());
-					const state = readAuditState(paths, sessionId);
+					const state = readAuditState(paths, sub(sessionId, world.dir));
 					assert.deepEqual([state?.status, state?.sessionId], ["queued", sessionId]);
 					assert.deepEqual(fs.readdirSync(paths.health.auditRequestsDir), []);
 					if (length !== 300) return;
 
 					await auditor.preparing();
 					auditor.tick(nowMs);
-					const running = readAuditState(paths, sessionId);
+					const running = readAuditState(paths, sub(sessionId, world.dir));
 					assert.equal(running.status, "running", running.detail ?? running.reason);
 					assert.equal(starts.length, 1);
 					assert.equal(starts[0].jobId, running.jobId);
@@ -940,7 +1025,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 
 					nowMs += ANALYST_POLL_MS;
 					auditor.tick(nowMs);
-					const done = readAuditState(paths, sessionId);
+					const done = readAuditState(paths, sub(sessionId, world.dir));
 					assert.deepEqual([done.status, done.sessionId, done.result?.overall], ["done", sessionId, "sound"]);
 				});
 			}
@@ -984,8 +1069,8 @@ describe("ui server", { timeout: 20_000 }, () => {
 					// Replace the fixture's seeded index row with one produced by accounting.
 					fs.unlinkSync(paths.health.usageIndexFile);
 					const index = createUsageIndex({ file: paths.health.usageIndexFile, clock: { now } });
-					index.update(AUDIT_ID, sessionFile, { kind: "main" });
-					const { models, usedModels, modelsIncomplete } = index.get(AUDIT_ID).published;
+					index.update(sub(AUDIT_ID, world.dir), sessionFile, { kind: "main" });
+					const { models, usedModels, modelsIncomplete } = index.get(subjectKey(sub(AUDIT_ID, world.dir))).published;
 					assert.deepEqual([Object.keys(models), Object.keys(usedModels), modelsIncomplete], [[key], [key], false]);
 					index.save();
 
@@ -997,7 +1082,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 					auditor.tick(nowMs);
 					await auditor.preparing();
 					auditor.tick(nowMs);
-					const running = readAuditState(paths, AUDIT_ID);
+					const running = readAuditState(paths, sub(AUDIT_ID, world.dir));
 					assert.equal(running.status, "running", running.detail ?? running.reason);
 					assert.equal(starts.length, 1);
 					assert.equal(starts[0].args[starts[0].args.indexOf("--model") + 1], reviewer);
@@ -1009,7 +1094,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 
 					nowMs += ANALYST_POLL_MS;
 					auditor.tick(nowMs);
-					const done = readAuditState(paths, AUDIT_ID);
+					const done = readAuditState(paths, sub(AUDIT_ID, world.dir));
 					assert.deepEqual([done.status, done.model, done.result?.overall], ["done", reviewer, "sound"]);
 				});
 			}
@@ -1036,7 +1121,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 				assert.deepEqual([detail.status, posted.status], [200, 202]);
 				assert.equal(detail.body.session.sessionId, sessionId);
 				assert.equal(posted.body.audit.sessionId, sessionId);
-				assert.deepEqual(fs.readdirSync(paths.health.auditRequestsDir), [`${auditFileKey(sessionId)}.json`]);
+				assert.deepEqual(fs.readdirSync(paths.health.auditRequestsDir), [`${auditFileKey(sub(sessionId, world.dir))}.json`]);
 			});
 
 			it("plan78: the dashboard shows each case-distinct row its own saved verdict", async (t) => {
@@ -1046,11 +1131,11 @@ describe("ui server", { timeout: 20_000 }, () => {
 				const { paths, now } = world;
 				appendEnded(paths, { sessionId: ids[1], kind: "main", outcome: "answered", endedMs: now() }, { nowMs: now() });
 				for (const [i, id] of ids.entries()) {
-					assert.equal(requestAudit(paths, id, now()).created, true);
+					assert.equal(requestAudit(paths, sub(id, id === ids[0] ? world.dir : null), now()).created, true);
 					const [name] = fs.readdirSync(paths.health.auditRequestsDir);
 					fs.unlinkSync(path.join(paths.health.auditRequestsDir, name));
 					writeJson(path.join(paths.health.auditsDir, name), {
-						v: 1, sessionId: id, status: "done", result: { overall: "sound", summary: summaries[i] },
+						v: 1, ...sub(id, id === ids[0] ? world.dir : null), status: "done", result: { overall: "sound", summary: summaries[i] },
 					});
 				}
 				const ui = createUiServer({ paths, token: TOKEN, getState: () => STATE, sessionDetail: world.detail, now });
@@ -1088,16 +1173,122 @@ describe("ui server", { timeout: 20_000 }, () => {
 				assert.deepEqual([detail.status, posted.status], [200, 202], "detail and audit must accept the same Senpi ID");
 				assert.equal(detail.body.session.sessionId, sessionId);
 				assert.equal(posted.body.audit.sessionId, sessionId);
-				assert.equal(readAuditState(paths, sessionId).status, "requested");
+				assert.equal(readAuditState(paths, sub(sessionId, world.dir)).status, "requested");
 				const auditor = createAuditor({ paths, config: loadConfig({ paths, env }).config, clock: { now }, runner: {}, env });
 				try {
 					auditor.tick(now());
 					assert.deepEqual(fs.readdirSync(paths.health.auditRequestsDir), []);
-					const record = readAuditState(paths, sessionId);
+					const record = readAuditState(paths, sub(sessionId, world.dir));
 					assert.deepEqual([record.sessionId, record.status], [sessionId, "queued"]);
 				} finally {
 					await auditor.close();
 				}
+			});
+
+			it("plan87: same-ID projects get separate transcript bundles and audit results after restart", async (t) => {
+				const sessionId = "review.1";
+				const models = ["openai/project-a", "openai/project-b"];
+				const totals = [17, 29];
+				const world = makeWorld({ sessionId, lanes: { ultrabrain: [models[0]], architect: [models[1]] } });
+				const { paths, env, now } = world;
+				const cwds = [world.dir, path.join(world.dir, "project-b")];
+				const ui = createUiServer({ paths, token: TOKEN, getState: () => uiState({ paths, env, now: now() }),
+					sessionDetail: world.detail, startAudit: world.startAudit, diagnose: () => ({ ok: true }), now });
+				let tickMs = now();
+				let auditor;
+				t.after(async () => {
+					await Promise.all([ui.close(), auditor?.close()]);
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				});
+				fs.unlinkSync(paths.health.usageIndexFile);
+				const index = createUsageIndex({ file: paths.health.usageIndexFile, clock: { now } });
+				const subjects = cwds.map((cwd) => sub(sessionId, cwd));
+				for (const [i, cwd] of cwds.entries()) {
+					const file = i === 0 ? world.sessionFile : path.join(paths.sessionsDir, projectKeyOf(cwd), `2026-11-22T00-00-00-000Z_${sessionId}.jsonl`);
+					writeJsonl(file, [E.header(sessionId, cwd, now() - 1000),
+						E.assistant({ provider: "openai", model: models[i].split("/")[1], ms: now() - 500, usage: { input: totals[i], output: 0 } })]);
+					index.update(subjects[i], file, { kind: "main" });
+					if (i) appendEnded(paths, { sessionId, cwd, kind: "main", startedMs: now() - 1000, endedMs: now(), outcome: "answered" }, { nowMs: now() });
+					appendEnded(paths, { sessionId: `child-${i}`, parentSessionId: sessionId, taskId: `st_child_${i}`, cwd,
+						kind: "child", startedMs: now() - 800, endedMs: now() - 400 }, { nowMs: now() });
+				}
+				const unique = "unique-review";
+				const uniqueFile = path.join(paths.sessionsDir, projectKeyOf(cwds[0]), `2026-11-22T00-00-00-000Z_${unique}.jsonl`);
+				writeJsonl(uniqueFile, [E.header(unique, cwds[0], now() - 1000),
+					E.assistant({ provider: "openai", model: "project-a", ms: now() - 500, usage: { input: 1, output: 0 } })]);
+				index.update(sub(unique, cwds[0]), uniqueFile, { kind: "main" });
+				appendEnded(paths, { sessionId: unique, cwd: cwds[0], kind: "main", startedMs: now() - 1000, endedMs: now() }, { nowMs: now() });
+				index.save();
+				const { port } = await ui.listen();
+				const ambiguous = { status: 409, body: { error: "ambiguous-session", reasonKo: "같은 id의 세션이 여러 프로젝트에 있어 고를 수 없습니다" } };
+				assert.deepEqual(await postAt(port, "/api/audit", { sessionId }), ambiguous);
+				assert.deepEqual(await getAt(port, `/api/session?id=${sessionId}`), ambiguous);
+				assert.deepEqual(await getAt(port, `/api/diagnose?id=${sessionId}`), ambiguous);
+				assert.equal((await getAt(port, `/api/diagnose?id=${unique}`)).status, 200);
+				assert.equal(fs.existsSync(paths.health.auditRequestsDir), false);
+				assert.equal(fs.existsSync(paths.health.auditBudgetFile), false);
+				const { body: state } = await getAt(port, "/api/state");
+				const rows = totals.map((total) => state.ended.rows.find((row) => row.sessionId === sessionId && row.tokens?.total === total));
+				assert.ok(rows.every((row) => /^[0-9a-f]{16}$/.test(row?.detailRow)));
+				const urls = rows.map(({ detailRow }) => `/api/session?id=${sessionId}&row=${detailRow}`);
+				for (const [i, { detailRow }] of rows.entries()) {
+					const { status, body } = await getAt(port, urls[i]);
+					assert.deepEqual([status, body.tokens?.total, body.tokens?.models.map(({ key }) => key), body.children?.map(({ sessionId }) => sessionId)],
+						[200, totals[i], [models[i]], [`child-${i}`]]);
+					const posted = await postAt(port, "/api/audit", { sessionId, row: detailRow });
+					assert.deepEqual([posted.status, posted.body.audit?.planned?.model], [202, models[1 - i]]);
+					tickMs += 1;
+				}
+				const calls = [];
+				const summaries = ["첫 프로젝트 조사 결과", "두 번째 프로젝트 조사 결과"];
+				const runner = {
+					start(job) {
+						calls.push(job);
+						return { jobId: job.jobId, pid: 5000 + calls.length };
+					},
+					poll(jobId) {
+						const i = calls.findIndex((job) => job.jobId === jobId);
+						return { status: "done", exitCode: 0, result: {
+							overall: "sound", summary: summaries[i], tokens: { judgment: "normal", explanation: "정상 범위입니다." },
+							checks: [{ item: "토큰", judgment: "unverifiable", explanation: "자료가 부족합니다.", evidence: [] }],
+							recommendations: [], confidence: 0.8,
+						} };
+					},
+				};
+				const openAuditor = () => createAuditor({ paths, config: loadConfig({ paths, env }).config, clock: { now: () => tickMs }, runner, env });
+				auditor = openAuditor();
+				// Requests were made at the same injected time; their disk order is deliberately irrelevant.
+				const byReviewer = new Map(models.map((model, i) => [model, 1 - i]));
+				const resultForSubject = [];
+				for (let n = 0; n < 2; n++) {
+					auditor.tick(tickMs);
+					await auditor.preparing();
+					auditor.tick(tickMs);
+					const job = calls[n];
+					assert.ok(job, JSON.stringify(subjects.map((subject) => readAuditState(paths, subject))));
+					const i = byReviewer.get(job.args[job.args.indexOf("--model") + 1]);
+					const bundle = JSON.parse(fs.readFileSync(path.join(job.cwd, "bundle.md"), "utf8").split("\n").find((line) => line.startsWith('{"session":')));
+					assert.deepEqual(bundle.tokens.topTurns.map(({ key }) => key), [models[i]]);
+					assert.deepEqual(bundle.children.map(({ sessionId }) => sessionId), [`child-${i}`]);
+					resultForSubject[i] = summaries[n];
+					tickMs += ANALYST_POLL_MS;
+					auditor.tick(tickMs);
+				}
+				await auditor.close();
+				auditor = openAuditor();
+				auditor.tick(tickMs);
+				assert.equal(calls.length, 2, "completed audits are not relaunched on daemon restart");
+				for (const [i, url] of urls.entries()) {
+					const { status, body } = await getAt(port, url);
+					assert.deepEqual([status, body.audit?.state?.status, body.audit?.state?.result?.summary],
+						[200, "done", resultForSubject[i]]);
+				}
+				assert.notEqual(resultForSubject[0], resultForSubject[1]);
+				const resultFiles = subjects.map((subject) => path.join(paths.health.auditsDir, `${auditFileKey(subject)}.json`));
+				fs.copyFileSync(resultFiles[1], resultFiles[0]);
+				assert.equal(readAuditState(paths, subjects[0]), null, "a result with the wrong stored project is never read");
+				assert.equal(readAuditState(paths, subjects[1])?.result.summary, resultForSubject[1]);
+				assert.equal((await postAt(port, "/api/audit", { sessionId: unique })).status, 202);
 			});
 
 			it("IS-4 keeps state responsive across bounded worker replies for a large detail and every next page", async (t) => {
@@ -1226,11 +1417,11 @@ describe("ui server", { timeout: 20_000 }, () => {
 					{ kind: "child", sessionId: child, taskId, parentSessionId: selected },
 					{ kind: "main", sessionId: unindexed },
 					{ kind: "main", sessionId: headerOnly },
-				]) appendEnded(paths, { ...row, endedMs: nowMs, outcome: "answered" }, { nowMs });
+				]) appendEnded(paths, { ...row, cwd: world.dir, endedMs: nowMs, outcome: "answered" }, { nowMs });
 				fs.unlinkSync(paths.health.usageIndexFile);
 				const index = createUsageIndex({ file: paths.health.usageIndexFile, clock: { now } });
-				index.update(selected, sessionFile, { kind: "main" });
-				index.update(child, childFile, { kind: "child", taskId, parentSessionId: selected });
+				index.update(sub(selected, world.dir), sessionFile, { kind: "main" });
+				index.update(sub(child, world.dir), childFile, { kind: "child", taskId, parentSessionId: selected });
 				assert.equal(index.save(), true);
 
 				async function open(id) {
@@ -1339,7 +1530,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 						]);
 					});
 					const index = createUsageIndex({ file: world.paths.health.usageIndexFile, clock: { now: world.now } });
-					index.update(a.sessionId, files[0], { kind: "child", taskId: a.taskId });
+					index.update(subjectOf(a), files[0], { kind: "child", taskId: a.taskId });
 					index.save();
 					appendDecision(world.paths, { event: "opened", fp: "finding-a", detector: "D8", kind: "dead-child", severity: "warn", subject: { sessionId: a.sessionId, taskId: a.taskId }, ts: new Date(world.nowMs).toISOString() });
 
@@ -1374,9 +1565,9 @@ describe("ui server", { timeout: 20_000 }, () => {
 						]);
 					});
 					const index = createUsageIndex({ file: world.paths.health.usageIndexFile, clock: { now: world.now } });
-					index.update(taskId, files[0], { kind: "child", taskId });
-					assert.equal(index.fresh(index.get(taskId)), true);
-					assert.equal(index.has(children[1].sessionId), false);
+					index.update(sub(taskId, children[0].cwd), files[0], { kind: "child", taskId });
+					assert.equal(index.fresh(index.get(subjectKey(sub(taskId, children[0].cwd)))), true);
+					assert.equal(index.has(subjectKey(subjectOf(children[1]))), false);
 					index.save();
 
 					const { audit } = await world.detail(children[1].sessionId);
@@ -1403,7 +1594,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 					{ type: "message", message: { role: "assistant", provider: "anthropic", model: "claude-used", usage: { input: 42 }, stopReason: "stop" } },
 				]);
 				const index = createUsageIndex({ file: world.paths.health.usageIndexFile, clock: { now: world.now } });
-				index.update(taskId, file, { kind: "child", taskId });
+				index.update(sub(taskId, children[0].cwd), file, { kind: "child", taskId });
 				index.save();
 				return children;
 			}
@@ -1411,10 +1602,12 @@ describe("ui server", { timeout: 20_000 }, () => {
 			it("(plan 34) task-only ledger collisions leave detail and reviewer facts unknown", async () => {
 				const world = makeWorld();
 				try {
-					const [{ taskId }] = writeTaskOnlyCollision(world);
-					const detail = await world.detail(taskId);
-					const cached = await world.detail(taskId);
-					const [status, body] = await world.startAudit(taskId);
+					const [, selected] = writeTaskOnlyCollision(world);
+					const { taskId } = selected;
+					const selector = expectedSelector(selected);
+					const detail = await world.detail(taskId, selector);
+					const cached = await world.detail(taskId, selector);
+					const [status, body] = await world.startAudit(taskId, selector);
 					const facts = (r) => [r.session.title, r.tokens?.total ?? null, r.audit.blocked, r.audit.planned?.model ?? null];
 					assert.deepEqual([facts(detail), facts(cached), [status, body.error]], [
 						["task b", null, "models-unknown", null],
@@ -1471,11 +1664,11 @@ describe("ui server", { timeout: 20_000 }, () => {
 					const get = (query = "") => getAt(port, `/api/session?id=${a.sessionId}${query}`);
 					const facts = ({ status, body }) => [status, body.session?.title, body.session?.parentSessionId, body.tokens, body.audit?.blocked, body.audit?.planned];
 					const expect = (row) => [200, row.title, row.parentSessionId, null, "models-unknown", null];
-					assert.deepEqual(facts(await get()), expect(b));
+					assert.equal((await get()).body.error, "ambiguous-session");
 					assert.deepEqual(facts(await get(`&row=${expectedSelector(a)}`)), expect(a));
 					assert.deepEqual(facts(await get(`&row=${expectedSelector(b)}`)), expect(b));
 					assert.deepEqual(facts(await get(`&row=${expectedSelector(a)}`)), expect(a), "cached detail and preview");
-					assert.deepEqual(facts(await get()), expect(b), "unqualified cache entry still selects the newest");
+					assert.equal((await get()).status, 409, "cached selections do not disambiguate a bare ID");
 					assert.deepEqual(await get(`&row=${expectedSelector(a)}&list=children&offset=0`), {
 						status: 200, body: { list: "children", offset: 0, total: 0, items: [] },
 					});
@@ -1542,7 +1735,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 			it("shows a request as queued, stalls on a stale heartbeat and shows the finished record as done", async () => {
 				const world = makeWorld();
 				try {
-					writeJson(requestFileOf(world), { v: 1, sessionId: AUDIT_ID, requestedMs: world.nowMs });
+					writeJson(requestFileOf(world), { v: 1, ...sub(AUDIT_ID, world.dir), requestedMs: world.nowMs });
 					const queued = (await world.detail(AUDIT_ID)).audit;
 					assert.equal(queued.state.status, "queued");
 					assert.equal(queued.state.statusKo, "대기 중");
@@ -1556,9 +1749,9 @@ describe("ui server", { timeout: 20_000 }, () => {
 					assert.equal(stalled.stalled, true);
 
 					fs.rmSync(requestFileOf(world), { force: true });
-					writeJson(path.join(world.paths.health.auditsDir, `${auditFileKey(AUDIT_ID)}.json`), {
+					writeJson(path.join(world.paths.health.auditsDir, `${auditFileKey(sub(AUDIT_ID, world.dir))}.json`), {
 						v: 1,
-						sessionId: AUDIT_ID,
+						...sub(AUDIT_ID, world.dir),
 						status: "done",
 						requestedMs: world.nowMs - 60_000,
 						finishedMs: world.nowMs,
@@ -1581,8 +1774,8 @@ describe("ui server", { timeout: 20_000 }, () => {
 				const ui = createUiServer({ paths: world.paths, token: TOKEN, getState: () => STATE, sessionDetail: world.detail, now: world.now });
 				try {
 					const deadlineMs = world.nowMs - 30_000;
-					writeJson(path.join(world.paths.health.auditsDir, `${auditFileKey(AUDIT_ID)}.json`), {
-						v: 1, sessionId: AUDIT_ID, status: "running", startedMs: deadlineMs - 900_000,
+					writeJson(path.join(world.paths.health.auditsDir, `${auditFileKey(sub(AUDIT_ID, world.dir))}.json`), {
+						v: 1, ...sub(AUDIT_ID, world.dir), status: "running", startedMs: deadlineMs - 900_000,
 						terminationUnconfirmed: true, deadlineMs,
 					});
 					const { port } = await ui.listen();
@@ -1603,8 +1796,8 @@ describe("ui server", { timeout: 20_000 }, () => {
 				const world = makeWorld();
 				const { config } = loadConfig({ paths: world.paths, env: world.env });
 				const deadlineMs = world.nowMs - 1;
-				writeJson(path.join(world.paths.health.auditsDir, `${auditFileKey(AUDIT_ID)}.json`), {
-					v: 1, sessionId: AUDIT_ID, status: "running", startedMs: deadlineMs - config.audit.timeoutMs,
+				writeJson(path.join(world.paths.health.auditsDir, `${auditFileKey(sub(AUDIT_ID, world.dir))}.json`), {
+					v: 1, ...sub(AUDIT_ID, world.dir), status: "running", startedMs: deadlineMs - config.audit.timeoutMs,
 					jobId: "audit-lost-meta", model: "openai/gpt-review:high", laneSessionId: "audit-lane",
 				});
 				const auditor = createAuditor({
@@ -1637,8 +1830,8 @@ describe("ui server", { timeout: 20_000 }, () => {
 				const world = makeWorld();
 				const { config } = loadConfig({ paths: world.paths, env: world.env });
 				const deadlineMs = world.nowMs - 1;
-				writeJson(path.join(world.paths.health.auditsDir, `${auditFileKey(AUDIT_ID)}.json`), {
-					v: 1, sessionId: AUDIT_ID, status: "launching", launchMs: deadlineMs - config.audit.timeoutMs,
+				writeJson(path.join(world.paths.health.auditsDir, `${auditFileKey(sub(AUDIT_ID, world.dir))}.json`), {
+					v: 1, ...sub(AUDIT_ID, world.dir), status: "launching", launchMs: deadlineMs - config.audit.timeoutMs,
 					jobId: "audit-interrupted-launch", model: "openai/gpt-review:high", laneSessionId: "audit-lane",
 				});
 				let lookups = 0;
@@ -1822,12 +2015,15 @@ describe("ui server", { timeout: 20_000 }, () => {
 				const nowMs = Date.parse("2026-11-22T00:00:00.000Z");
 				const sessionId = "s_child01";
 				const taskId = "st_child01";
-				const sessionFile = path.join(worldPaths.sessionsDir, "slug", `2026-11-22T00-00-00-000Z_${sessionId}.jsonl`);
+				const sessionFile = path.join(worldPaths.sessionsDir, projectKeyOf(dir), `2026-11-22T00-00-00-000Z_${sessionId}.jsonl`);
 				fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
 				fs.writeFileSync(sessionFile, `${JSON.stringify({ type: "session", id: sessionId })}\n`);
 				const stat = fs.statSync(sessionFile);
 				writeIndexRow(worldPaths.health.usageIndexFile, {
 							id: sessionId,
+							projectKey: projectKeyOf(dir),
+							parentKey: null,
+							rootKey: null,
 							file: sessionFile,
 							kind: "child",
 							taskId,
@@ -1853,7 +2049,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 				writeJson(worldPaths.omoJsonc, { "[native]": { categories: { ultrabrain: { models: ["openai/gpt-review:high"] } } } });
 				writeJson(worldPaths.authFile, { anthropic: {}, openai: {} });
 				writeJson(worldPaths.health.daemonJson, { ts: nowMs, pid: process.pid, mode: "auto", version: "test" });
-				const record = { found: true, id: sessionId, session: { sessionId, taskId, kind: "child", title: "child" }, tokens: null, children: [], health: { findings: [], actions: [], investigations: [], messages: [], counts: { findings: 0, actions: 0, investigations: 0, messages: 0 } }, audit: null };
+				const record = { found: true, id: sessionId, session: { sessionId, taskId, cwd: dir, kind: "child", title: "child" }, tokens: null, children: [], health: { findings: [], actions: [], investigations: [], messages: [], counts: { findings: 0, actions: 0, investigations: 0, messages: 0 } }, audit: null };
 				return { dir, env, paths: worldPaths, now: () => nowMs, sessionId, taskId, load: () => record };
 			}
 
@@ -1873,7 +2069,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 						assert.deepEqual([accepted.status, accepted.body.audit.sessionId], [202, world.sessionId], `${first} must be accepted as the canonical session`);
 						const refused = await postAt(auditPort, "/api/audit", { sessionId: second });
 						assert.deepEqual([refused.status, refused.body.error], [409, "running"], `${second} must find the first request`);
-						assert.deepEqual(fs.readdirSync(world.paths.health.auditRequestsDir), [`${auditFileKey(world.sessionId)}.json`]);
+						assert.deepEqual(fs.readdirSync(world.paths.health.auditRequestsDir), [`${auditFileKey(sub(world.sessionId, world.dir))}.json`]);
 					} finally {
 						await auditServer.close();
 						fs.rmSync(world.dir, { recursive: true, force: true });
@@ -1886,9 +2082,9 @@ describe("ui server", { timeout: 20_000 }, () => {
 				fs.mkdirSync(world.paths.health.sessionsDir, { recursive: true });
 				fs.writeFileSync(
 					path.join(world.paths.health.sessionsDir, "ended-2026-11-22.jsonl"),
-					`${JSON.stringify({ v: 1, sessionId: world.sessionId, taskId: world.taskId, kind: "child", outcome: "answered", startedMs: world.now() - 1_000, endedMs: world.now() })}\n`,
+					`${JSON.stringify({ v: 1, sessionId: world.sessionId, taskId: world.taskId, cwd: world.dir, kind: "child", outcome: "answered", startedMs: world.now() - 1_000, endedMs: world.now() })}\n`,
 				);
-				writeJson(path.join(world.paths.health.auditRequestsDir, `${auditFileKey(world.sessionId)}.json`), { v: 1, sessionId: world.sessionId, requestedMs: world.now() - 1_000 });
+				writeJson(path.join(world.paths.health.auditRequestsDir, `${auditFileKey(sub(world.sessionId, world.dir))}.json`), { v: 1, ...sub(world.sessionId, world.dir), requestedMs: world.now() - 1_000 });
 				const auditServer = createUiServer({
 					paths: world.paths,
 					token: TOKEN,
@@ -1922,11 +2118,11 @@ describe("ui server", { timeout: 20_000 }, () => {
 					assert.equal(accepted.body.audit.status, "queued");
 					assert.equal(accepted.body.audit.planned.model, "openai/gpt-review:high");
 					const pending = JSON.parse(fs.readFileSync(requestFileOf(world), "utf8"));
-					assert.deepEqual(pending, { v: 1, sessionId: AUDIT_ID, requestedMs: world.nowMs, claimId: pending.claimId });
+					assert.deepEqual(pending, { v: 1, ...sub(AUDIT_ID, world.dir), requestedMs: world.nowMs, claimId: pending.claimId });
 					assert.equal(typeof pending.claimId, "string");
 					const again = await postAt(auditPort, "/api/audit", { sessionId: AUDIT_ID });
 					assert.deepEqual([again.status, again.body.error], [409, "running"]);
-					assert.deepEqual(fs.readdirSync(world.paths.health.auditRequestsDir), [`${auditFileKey(AUDIT_ID)}.json`]);
+					assert.deepEqual(fs.readdirSync(world.paths.health.auditRequestsDir), [`${auditFileKey(sub(AUDIT_ID, world.dir))}.json`]);
 				} finally {
 					await auditServer.close();
 					fs.rmSync(world.dir, { recursive: true, force: true });
@@ -1973,7 +2169,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 				await auditor.preparing();
 				auditor.tick(nowMs);
 				assert.equal(starts.length, 1);
-				assert.equal(readAuditState(paths, AUDIT_ID).status, "running");
+				assert.equal(readAuditState(paths, sub(AUDIT_ID, world.dir)).status, "running");
 				assert.equal(fs.existsSync(requestFileOf(world)), false);
 				assert.deepEqual(JSON.parse(fs.readFileSync(paths.health.auditBudgetFile, "utf8")), {
 					day: "2026-11-22", count: 1, jobs: [starts[0].jobId],
@@ -1994,7 +2190,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 						assert.equal(claim.created, true);
 						claimed = claim.request;
 						auditor.tick(now());
-						assert.equal(readAuditState(paths, AUDIT_ID).status, "queued");
+						assert.equal(readAuditState(paths, sub(AUDIT_ID, world.dir)).status, "queued");
 						assert.equal(fs.existsSync(requestFileOf(world)), false);
 						return claim;
 					},
@@ -2010,12 +2206,12 @@ describe("ui server", { timeout: 20_000 }, () => {
 				const accepted = await postAt(aPort, "/api/audit", { sessionId: AUDIT_ID });
 				assert.equal(accepted.status, 202);
 				assert.equal(accepted.body.audit.sessionId, AUDIT_ID);
-				assert.equal(readAuditState(paths, AUDIT_ID).claimId, claimed.claimId);
+				assert.equal(readAuditState(paths, sub(AUDIT_ID, world.dir)).claimId, claimed.claimId);
 				const refused = await postAt(bPort, "/api/audit", { sessionId: AUDIT_ID });
 				assert.deepEqual([refused.status, refused.body], [409, { error: "running", reasonKo: "이미 조사 중입니다" }]);
 				await auditor.preparing();
 				auditor.tick(now());
-				assert.equal(readAuditState(paths, AUDIT_ID).status, "running");
+				assert.equal(readAuditState(paths, sub(AUDIT_ID, world.dir)).status, "running");
 				assert.equal(fs.existsSync(requestFileOf(world)), false);
 				assert.equal(starts.length, 1);
 				assert.deepEqual(JSON.parse(fs.readFileSync(paths.health.auditBudgetFile, "utf8")), {
@@ -2041,12 +2237,12 @@ describe("ui server", { timeout: 20_000 }, () => {
 					const a = dashboard(world.startAudit);
 					const intake = () => {
 						auditor.tick(now());
-						assert.equal(readAuditState(paths, AUDIT_ID).status, "queued");
+						assert.equal(readAuditState(paths, sub(AUDIT_ID, world.dir)).status, "queued");
 						assert.equal(fs.existsSync(requestFileOf(world)), false);
 					};
 					let firstRead = interleave;
 					// For the interleaving, capture B's initial read before A posts.
-					const observed = readAuditState(paths, AUDIT_ID);
+					const observed = readAuditState(paths, sub(AUDIT_ID, world.dir));
 					const b = dashboard(createStartAudit({
 						paths, env, now: () => now() + 1,
 						readState: (...args) => {
@@ -2056,7 +2252,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 						},
 						request: (...args) => {
 							assert.equal(interleave, true, "B must not claim when it reads A's active record");
-							assert.equal(readAuditState(paths, AUDIT_ID).status, "requested");
+							assert.equal(readAuditState(paths, sub(AUDIT_ID, world.dir)).status, "requested");
 							intake();
 							const claim = requestAudit(...args);
 							assert.equal(claim.created, true, "B claims the slot released by intake");
@@ -2073,13 +2269,13 @@ describe("ui server", { timeout: 20_000 }, () => {
 						assert.equal(fs.existsSync(requestFileOf(world)), false);
 						await auditor.preparing();
 						auditor.tick(now());
-						assert.equal(readAuditState(paths, AUDIT_ID).status, "launching");
+						assert.equal(readAuditState(paths, sub(AUDIT_ID, world.dir)).status, "launching");
 						auditor.tick(now() + 30_000);
 						auditor.tick(now() + 60_000);
 						assert.equal(starts.length, 1);
-						assert.deepEqual(fs.readdirSync(paths.health.auditsDir).filter((name) => !name.startsWith("_") && name.endsWith(".json")), [`${auditFileKey(AUDIT_ID)}.json`]);
-						assert.equal(readAuditState(paths, AUDIT_ID).requestedMs, now());
-						assert.equal(readAuditState(paths, AUDIT_ID).status, "failed");
+						assert.deepEqual(fs.readdirSync(paths.health.auditsDir).filter((name) => !name.startsWith("_") && name.endsWith(".json")), [`${auditFileKey(sub(AUDIT_ID, world.dir))}.json`]);
+						assert.equal(readAuditState(paths, sub(AUDIT_ID, world.dir)).requestedMs, now());
+						assert.equal(readAuditState(paths, sub(AUDIT_ID, world.dir)).status, "failed");
 						assert.deepEqual(JSON.parse(fs.readFileSync(paths.health.auditBudgetFile, "utf8")), {
 							day: "2026-11-22", count: 1, jobs: [starts[0].jobId],
 						});
@@ -2112,7 +2308,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 				const auditServer = createUiServer({ paths: world.paths, token: TOKEN, getState: () => STATE, startAudit: world.startAudit, now: world.now });
 				const { port: auditPort } = await auditServer.listen();
 				try {
-					writeJson(path.join(world.paths.health.auditsDir, `${auditFileKey(AUDIT_ID)}.json`), { v: 1, sessionId: AUDIT_ID, status: "launching", requestedMs: world.nowMs - 1_000, jobId: "audit-1", model: "openai/gpt-review:high" });
+					writeJson(path.join(world.paths.health.auditsDir, `${auditFileKey(sub(AUDIT_ID, world.dir))}.json`), { v: 1, ...sub(AUDIT_ID, world.dir), status: "launching", requestedMs: world.nowMs - 1_000, jobId: "audit-1", model: "openai/gpt-review:high" });
 					const posted = await postAt(auditPort, "/api/audit", { sessionId: AUDIT_ID });
 					assert.deepEqual([posted.status, posted.body], [409, { error: "running", reasonKo: "이미 조사 중입니다" }]);
 					assert.equal(fs.existsSync(requestFileOf(world)), false);

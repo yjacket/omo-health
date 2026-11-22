@@ -35,6 +35,7 @@ import { pruneHome } from "./retention.mjs";
 import { backfillOnce } from "./session-backfill.mjs";
 import { buildSessionSnapshot, detectEnded } from "./session-board.mjs";
 import { appendEndedBatch, ENDED_LOCATION, streamEnded } from "./session-ledger.mjs";
+import { subjectKey } from "./session-subject.mjs";
 import { createSessionFileLocator } from "./collect/session-files.mjs";
 import { createUsageIndex } from "./usage-index.mjs";
 import { createUsageTracker } from "./usage-tracker.mjs";
@@ -333,7 +334,7 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 	// Plan todo 5: the token index and its tracker. This process is the only writer of usage.json; the
 	// tracker shares one 32 MiB budget per tick between live appends and the ended-session backlog.
 	const usageIndex = createUsageIndex({ file: paths.health.usageIndexFile, clock, log });
-	const usageTracker = createUsageTracker({ paths, index: usageIndex, locator: createSessionFileLocator({ paths, clock, indexedFile: (id) => usageIndex.get(id)?.file }), clock, log });
+	const usageTracker = createUsageTracker({ paths, index: usageIndex, locator: createSessionFileLocator({ paths, clock, indexedFile: (subject) => usageIndex.get(subjectKey(subject))?.file }), clock, log });
 	// Plan todo 12: owner-requested audits (display-only, so they run in shadow mode too); one runs at a time.
 	const auditor = (overrides.createAuditor ?? createAuditor)({ paths, config, clock, log, env, index: usageIndex, runner: createRunner({ paths, clock, contracts: { audit: AUDIT_CONTRACT } }) });
 	const savedBoard = readJsonSafe(paths.health.sessionsSnapshotFile);
@@ -430,7 +431,7 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 						log.error("usage_tick_failed", { error: error.message, stack: String(error.stack).slice(0, 800) });
 					}
 					const board = buildSessionSnapshot(result.world, result.findings ?? [], boardInvestigations.list({ sinceMs: boardNow - 7 * DAY_MS }), boardNow, {
-					tokensOf: (sessionId, taskId) => usageTracker.tokensOf(sessionId, taskId),
+					tokensOf: usageTracker.tokensOf,
 					});
 					atomicWriteJson(paths.health.sessionsSnapshotFile, board);
 					if (result.world.procsFresh !== false) {

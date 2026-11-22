@@ -1,3 +1,6 @@
+import { subjectOf, subjectKey } from "../src/session-subject.mjs";
+const sub = (sessionId, cwd) => subjectOf({ sessionId, cwd });
+const key = (sessionId, cwd) => subjectKey(sub(sessionId, cwd));
 import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -398,7 +401,7 @@ it("(plan 36) a failed token refetch keeps the open panel and retries on the nex
 
 it("(gate 16) history and board show a dash with the full-index tooltip", () => {
 	const id = "full-session";
-	const history = endedRow({ sessionId: id }, 0, new Map([[id, { id, state: "full" }]]));
+	const history = endedRow({ sessionId: id }, 0, new Map([[key(id), { id, state: "full" }]]));
 	const board = buildSessions({ now: NOW, sessionsSnapshot: { groups: [{ sessions: [{ sessionId: id, tokensState: "full" }] }] } }).groups[0].sessions[0];
 	const app = fs.readFileSync(new URL("../src/ui/static/app.js", import.meta.url), "utf8");
 	const readToken = runInNewContext(`(${app.match(/function tokenReading\([^]*?\n\t\}/)[0]})`, { lastState: {} });
@@ -419,7 +422,7 @@ it("(gate 16b) the board keeps a refused token state from the snapshot through t
 		sensors: [{ sessionId: "m-full", pid: 100, ts: NOW - 1000, idle: true, executingTools: 0 }],
 		procsFresh: true,
 	});
-	const snapshot = buildSessionSnapshot(world, [], [], NOW, { tokensOf: (id) => (id === "m-full" || id === "c-full" ? { state: "full" } : null) });
+	const snapshot = buildSessionSnapshot(world, [], [], NOW, { tokensOf: ({ sessionId: id }) => (id === "m-full" || id === "c-full" ? { state: "full" } : null) });
 	const board = buildSessions({ now: NOW, sessionsSnapshot: snapshot }).groups[0].sessions[0];
 	assert.equal(board.tokensState, "full", "the main card keeps the snapshot's full state");
 	assert.equal(board.children[0].tokensState, "full", "the child row keeps the snapshot's full state");
@@ -442,13 +445,13 @@ it("(gate 16b) the board keeps a refused token state from the snapshot through t
 
 const overflowTitle = "토큰 합계가 표시할 수 있는 범위를 넘었습니다";
 
-function overflowIndex(paths, rows) {
+function overflowIndex(paths, rows, cwd) {
 	const file = paths.health.usageIndexFile;
 	const index = createUsageIndex({ file, clock: createFakeClock(NOW) });
 	for (const [id, input, parentSessionId] of rows) {
 		const transcript = path.join(path.dirname(file), `${id}.jsonl`);
 		write(transcript, `{"type":"usage","provider":"p","model":"m","usage":{"input":${input}}}\n`);
-		index.update(id, transcript, { parentSessionId: parentSessionId ?? null });
+		index.update(sub(id, cwd), transcript, { parentSessionId: parentSessionId ?? null });
 	}
 	index.save();
 	return index;
@@ -466,9 +469,9 @@ function tokenFormatters(...names) {
 
 it("board overflow survives snapshot JSON and renders on the card and child row", () => {
 	const { paths } = makeHome();
-	const index = overflowIndex(paths, [["main", "1e309"], ["child", "1e309", "main"], ["finite", "5"], ["negative", "-1e309", "finite"]]);
+	const index = overflowIndex(paths, [["main", "1e309"], ["child", "1e309", "main"], ["finite", "5"], ["negative", "-1e309", "finite"]], "C:/dev/proj");
 	const tracker = createUsageTracker({ paths, index, clock: createFakeClock(NOW) });
-	assert.equal(tracker.tokensOf("main").tokens.total, Infinity);
+	assert.equal(tracker.tokensOf(sub("main", "C:/dev/proj")).tokens.total, Infinity);
 	const world = makeWorld({
 		now: NOW,
 		sessions: ["main", "finite"].map((id) => sessionState({ id, startedMs: NOW - 5000 })),
@@ -517,7 +520,7 @@ it("(IS-3) history renders a second line for equal and lower tree totals, but no
 		[id, "10"],
 		...(input === null ? [] : [[`${id}-child`, input, id]]),
 	]));
-	index.markMissing("missing-child", { kind: "child", parentSessionId: "missing" });
+	index.markMissing(sub("missing-child"), { kind: "child", parentSessionId: "missing" });
 	index.save();
 	const history = new Map(JSON.parse(JSON.stringify(uiState({ paths, env, now: NOW }))).ended.rows.map((row) => [row.sessionId, row]));
 	const { endedTokenCell } = tokenFormatters("endedTokenCell");
@@ -633,7 +636,7 @@ it("(plan 51) history marks a pending parent tree partial until its read finishe
 	const index = overflowIndex(paths, [["child", "20", "main"]]);
 	const file = path.join(paths.health.sessionsDir, "main.jsonl");
 	write(file, '{"type":"usage","provider":"p","model":"m","usage":{"input":100}}\n');
-	index.update("main", file, { kind: "main" }, { maxBytes: 1 });
+	index.update(sub("main"), file, { kind: "main" }, { maxBytes: 1 });
 	const { endedTokenCell } = tokenFormatters("endedTokenCell");
 	const display = () => {
 		index.save();
@@ -642,7 +645,7 @@ it("(plan 51) history marks a pending parent tree partial until its read finishe
 		return [row.tokensState, row.treeTokens, row.treeTokensComplete, mark.text, mark.title];
 	};
 	const pending = display();
-	index.update("main", file, { kind: "main" });
+	index.update(sub("main"), file, { kind: "main" });
 	assert.deepEqual([pending, display()], [
 		["pending", 20, false, "자식 포함 20+", "세지 못한 자식이 있어 일부만 더한 값입니다"],
 		["ok", 120, true, "자식 포함 120", "120"],
@@ -688,10 +691,10 @@ it("(gate 17) the disk-backed full state renders a dash in history, detail, and 
 		["full", "full", "full", "-", tooltip, "-", tooltip, "토큰 -", tooltip],
 	);
 
-	index.markMissing("old");
+	index.markMissing(sub("old"));
 	assert.equal(index.prune(NOW + DAY, 0), 1);
-	index.update("root", transcript);
-	index.update("child", transcript, { parentSessionId: "root" });
+	index.update(sub("root"), transcript);
+	index.update(sub("child"), transcript, { parentSessionId: "root" });
 	index.save();
 	const recovered = view();
 	assert.equal(recovered.tokens.total, 42);
@@ -1205,12 +1208,12 @@ describe("ui model", () => {
 			const index = createUsageIndex({ file: paths.health.usageIndexFile, clock: createFakeClock(NOW) });
 			for (const spec of specs) {
 				if (spec.state === "missing") {
-					index.markMissing(spec.id, spec.meta ?? {});
+					index.markMissing(sub(spec.id), spec.meta ?? {});
 					continue;
 				}
 				const file = path.join(dir, `${spec.id}.jsonl`);
 				write(file, usageLine(spec.total ?? 100));
-				index.update(spec.id, file, spec.meta ?? {}, spec.maxBytes ? { maxBytes: spec.maxBytes } : {});
+				index.update(sub(spec.id), file, spec.meta ?? {}, spec.maxBytes ? { maxBytes: spec.maxBytes } : {});
 			}
 			index.save();
 		};
@@ -1284,7 +1287,7 @@ describe("ui model", () => {
 		it("resolves only a unique taskId alias for a history row without a session id", () => {
 			const r = row(null, NOW - 1000, { kind: "child", taskId: "st_x" });
 			const entry = { id: "a", taskId: "st_x", state: "ok", complete: true, published: { total: 100 } };
-			const index = new Map([["a", entry]]);
+			const index = new Map([[key("a"), entry]]);
 			assert.equal(endedRow(r, 0, index).tokens.total, 100);
 			index.set("b", { ...entry, id: "b" });
 			assert.equal(endedRow(r, 0, index).tokensState, "pending");
@@ -1319,10 +1322,10 @@ describe("ui model", () => {
 			const file = path.join(home.paths.health.sessionsDir, "session.jsonl");
 			write(file, `${JSON.stringify({ type: "message", message: { role: "assistant", usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: { total: 0.1 } } } })}\n`);
 			const index = createUsageIndex({ file: home.paths.health.usageIndexFile, clock: createFakeClock(NOW) });
-			assert.ok(index.update("read", file, { kind: "main" }) > 0);
-			assert.equal(index.update("never", path.join(home.paths.health.sessionsDir, "absent.jsonl"), { kind: "main" }), 0);
+			assert.ok(index.update(sub("read"), file, { kind: "main" }) > 0);
+			assert.equal(index.update(sub("never"), path.join(home.paths.health.sessionsDir, "absent.jsonl"), { kind: "main" }), 0);
 			fs.rmSync(file);
-			assert.equal(index.update("read", file), 0);
+			assert.equal(index.update(sub("read"), file), 0);
 			index.save();
 			writeRows(home.paths, [row("read", NOW - 1000), row("never", NOW - 2000)]);
 			const rows = endedRows(home);
@@ -1404,7 +1407,7 @@ describe("ui model", () => {
 		});
 
 		it("exports the row builders for the session detail", () => {
-			const r = endedRow(row(MAIN, NOW), 0, new Map([[MAIN, entry(MAIN)]]), new Map([[MAIN, 250]]));
+			const r = endedRow(row(MAIN, NOW), 0, new Map([[key(MAIN), entry(MAIN)]]), new Map([[key(MAIN), 250]]));
 			assert.equal(r.sessionId, MAIN);
 			assert.equal(r.tokens.total, 100);
 			assert.equal(r.treeTokens, 250);

@@ -1,3 +1,6 @@
+import { projectKeyOf, subjectOf, subjectKey } from "../src/session-subject.mjs";
+const sub = (sessionId, cwd) => subjectOf({ sessionId, cwd });
+const key = (sessionId, cwd) => subjectKey(sub(sessionId, cwd));
 import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
 import childProcess from "node:child_process";
@@ -12,7 +15,7 @@ import { runDaemon } from "../src/daemon.mjs";
 import { DEFAULT_CONFIG } from "../src/config.mjs";
 import { laneArgs } from "../src/judge/lane.mjs";
 import { resolvePaths } from "../src/paths.mjs";
-import { auditFileKey } from "../src/session-id.mjs";
+import { auditFileKey } from "../src/session-subject.mjs";
 import { queueReport } from "../src/reports/intake.mjs";
 import { RUN_KEY } from "../src/install.mjs";
 import { makeWorld, sessionState, taskRecord } from "./helpers/world.mjs";
@@ -409,7 +412,7 @@ test("the daemon indexes a live session's tokens into sessions/usage.json and pu
 	const start = Date.parse("2026-09-28T12:00:00Z");
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "daemon-usage-"));
 	const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health") });
-	const file = path.join(paths.sessionsDir, "proj", "2026-09-28T12-00-00-000Z_m1.jsonl");
+	const file = path.join(paths.sessionsDir, projectKeyOf("C:/dev/proj"), "2026-09-28T12-00-00-000Z_m1.jsonl");
 	writeJsonl(file, [E.assistant({ ms: start, usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } })]);
 	let ticks = 0;
 	const clock = { now: () => start + ticks * 60_000 };
@@ -429,7 +432,7 @@ test("the daemon indexes a live session's tokens into sessions/usage.json and pu
 	});
 	await runDaemon({ proc: fakeProc(), paths, config: { ...DEFAULT_CONFIG, idleExitMs: 2 * 60_000 }, clock, overrides: { procs: { kind: "fake" }, createEngine: engine, env: {} } });
 
-	const entry = (await import("../src/usage-index.mjs")).readUsageIndex(paths.health.usageIndexFile).get("m1");
+	const entry = (await import("../src/usage-index.mjs")).readUsageIndex(paths.health.usageIndexFile).get(key("m1", "C:/dev/proj"));
 	assert.equal(entry.complete, true);
 	assert.equal(entry.published.total, 15);
 	assert.equal(entry.published.input, 10);
@@ -509,7 +512,7 @@ test("128 simultaneous live ends read at most one ledger day plus their appended
 	assert.ok(ledgerBytes[3] <= appended.length, `drain read ${ledgerBytes[3]} ledger bytes`);
 	const index = (await import("../src/usage-index.mjs")).readUsageIndex(paths.health.usageIndexFile);
 	for (const [i, task] of tasks.entries()) {
-		const entry = index.get(task.childSessionId);
+		const entry = index.get(subjectKey(subjectOf(rows.find((row) => row.sessionId === task.childSessionId))));
 		assert.equal(entry?.published?.total, i + 1, task.childSessionId);
 		assert.equal(entry.file, transcripts[i]);
 	}
@@ -584,17 +587,17 @@ test("a throwing audit tick is logged as audit_tick_failed and the daemon keeps 
 test("audit survivor lookup does not stall token publication or release the audit slot", { timeout: 10_000 }, async (t) => {
 	const { paths } = fixture();
 	const start = Date.UTC(2026, 8, 28, 12);
-	const file = path.join(paths.sessionsDir, "proj", "2026-09-28T12-00-00-000Z_m1.jsonl");
+	const file = path.join(paths.sessionsDir, projectKeyOf("C:/dev/proj"), "2026-09-28T12-00-00-000Z_m1.jsonl");
 	const line = (input) => E.assistant({ ms: start, usage: { input, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } });
 	writeJsonl(file, [line(10)]);
 	const jobId = "prior-audit";
 	const jobDir = path.join(paths.health.jobsDir, jobId);
-	const recordFile = path.join(paths.health.auditsDir, `${auditFileKey("m1")}.json`);
+	const recordFile = path.join(paths.health.auditsDir, `${auditFileKey(sub("m1", "C:/dev/proj"))}.json`);
 	const read = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
 	const write = (file, value) => fs.writeFileSync(file, JSON.stringify(value));
 	fs.mkdirSync(jobDir, { recursive: true });
 	fs.mkdirSync(paths.health.auditsDir, { recursive: true });
-	write(recordFile, { v: 1, sessionId: "m1", status: "running", jobId, startedMs: start, launchMs: start });
+	write(recordFile, { v: 1, ...sub("m1", "C:/dev/proj"), status: "running", jobId, startedMs: start, launchMs: start });
 	write(path.join(jobDir, "meta.json"), {
 		kind: "audit", pid: 70000, startedMs: start, timeoutMs: 900_000,
 		args: laneArgs({ model: "p/reviewer", bundleFile: path.join(jobDir, "bundle.md"), sessionId: "prior-lane" }),
@@ -602,7 +605,7 @@ test("audit survivor lookup does not stall token publication or release the audi
 	write(path.join(jobDir, "exit.json"), { code: 1 });
 	const budget = { day: "2026-09-28", count: 1, jobs: [jobId] };
 	write(paths.health.auditBudgetFile, budget);
-	requestAudit(paths, "next", start);
+	requestAudit(paths, sub("next", "C:/dev/proj"), start);
 
 	const signal = new Int32Array(new SharedArrayBuffer(4));
 	const entered = Promise.withResolvers();
@@ -664,7 +667,7 @@ test("audit survivor lookup does not stall token publication or release the audi
 					const row = board.groups.flatMap((g) => g.sessions).find((session) => session.sessionId === "m1");
 					assert.equal(row.tokens.total, ticks === 1 ? 10 : 30);
 					assert.equal(read(recordFile).status, "running");
-					assert.equal(read(path.join(paths.health.auditsDir, `${auditFileKey("next")}.json`)).status, "queued");
+					assert.equal(read(path.join(paths.health.auditsDir, `${auditFileKey(sub("next", "C:/dev/proj"))}.json`)).status, "queued");
 					assert.deepEqual(read(paths.health.auditBudgetFile), budget);
 					assert.equal(preparations, 0);
 					assert.equal(lookups, 1, "a pending lookup is not repeated even after the next poll interval");

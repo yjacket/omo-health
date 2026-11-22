@@ -1,3 +1,5 @@
+import { subjectOf } from "../src/session-subject.mjs";
+const sub = (sessionId, cwd) => subjectOf({ sessionId, cwd });
 import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -98,7 +100,7 @@ describe("session view", () => {
 		const count = (id, input, meta, options) => {
 			const file = path.join(root, `${id}.jsonl`);
 			fs.writeFileSync(file, `${JSON.stringify({ type: "usage", provider: "p", model: "m", usage: { input } })}\n`);
-			index.update(id, file, meta, options);
+			index.update(sub(id), file, meta, options);
 		};
 		for (const [id, input] of cases) {
 			const child = `${id}-child`;
@@ -106,7 +108,7 @@ describe("session view", () => {
 			appendEnded(paths, { ...row, sessionId: id }, { nowMs: T0 });
 			appendEnded(paths, { ...row, ...meta, sessionId: child }, { nowMs: T0 });
 			count(id, 10, { kind: "main" });
-			if (id === "missing") index.markMissing(child, meta);
+			if (id === "missing") index.markMissing(sub(child), meta);
 			else count(child, input ?? 0, meta, id === "pending" ? { maxBytes: 1 } : {});
 		}
 		index.save();
@@ -134,7 +136,7 @@ describe("session view", () => {
 		const count = (id, input, meta) => {
 			const file = path.join(root, `${id}.jsonl`);
 			fs.writeFileSync(file, `${JSON.stringify({ type: "usage", provider: "p", model: "m", usage: { input } })}\n`);
-			index.update(id, file, meta);
+			index.update(sub(id), file, meta);
 		};
 		const total = () => {
 			index.save();
@@ -146,7 +148,7 @@ describe("session view", () => {
 		assert.deepEqual(total(), [120, false]);
 		count("pending", 0, ledgerChild);
 		assert.deepEqual(total(), [120, true]);
-		index.markMissing("missing", { kind: "child", parentSessionId: "s-main" });
+		index.markMissing(sub("missing"), { kind: "child", parentSessionId: "s-main" });
 		assert.deepEqual(total(), [120, false]);
 	});
 
@@ -161,8 +163,8 @@ describe("session view", () => {
 			return file;
 		};
 		const parent = transcript("main", 100);
-		index.update("main", parent, { kind: "main" }, { maxBytes: 1 });
-		index.update("child", transcript("child", 20), { kind: "child", parentSessionId: "main" });
+		index.update(sub("main"), parent, { kind: "main" }, { maxBytes: 1 });
+		index.update(sub("child"), transcript("child", 20), { kind: "child", parentSessionId: "main" });
 		const app = fs.readFileSync(new URL("../src/ui/static/app.js", import.meta.url), "utf8");
 		const endedTokenBlock = runInNewContext(
 			["tokenReading", "treeTokenMark", "endedTokenBlock"].map((name) => app.match(new RegExp(`function ${name}\\([^]*?\\n\\t\\}`))[0]).join("\n") + "\nendedTokenBlock",
@@ -175,7 +177,7 @@ describe("session view", () => {
 			return [tokens.total, tokens.treeTotal, tokens.treeTokensComplete, mark.text, mark.title];
 		};
 		const pending = display();
-		index.update("main", parent, { kind: "main" });
+		index.update(sub("main"), parent, { kind: "main" });
 		assert.deepEqual([pending, display()], [
 			[null, 20, false, "자식 포함 20+", "세지 못한 자식이 있어 일부만 더한 값입니다"],
 			[100, 120, true, "자식 포함 120", "120"],
@@ -192,7 +194,7 @@ describe("session view", () => {
 		const count = (id, input, meta) => {
 			const file = path.join(root, `${id}.jsonl`);
 			fs.writeFileSync(file, `${JSON.stringify({ type: "usage", provider: "p", model: "m", usage: { input } })}\n`);
-			index.update(id, file, meta);
+			index.update(sub(id), file, meta);
 		};
 		for (const id of parents) {
 			count(id, 100, { kind: "main" });
@@ -222,7 +224,7 @@ describe("session view", () => {
 		const index = createUsageIndex({ file: paths.health.usageIndexFile, clock: { now: () => T0 } });
 		const file = path.join(root, "task.jsonl");
 		fs.writeFileSync(file, '{"type":"usage","provider":"p","model":"m","usage":{"input":42}}\n');
-		index.update(taskId, file, row);
+		index.update(sub(taskId), file, row);
 		const app = fs.readFileSync(new URL("../src/ui/static/app.js", import.meta.url), "utf8");
 		const endedTokenFacts = runInNewContext(
 			["tokenReading", "endedTokenFacts"].map((name) => app.match(new RegExp(`function ${name}\\([^]*?\\n\\t\\}`))[0]).join("\n") + "\nendedTokenFacts",
@@ -239,7 +241,7 @@ describe("session view", () => {
 		};
 		assert.deepEqual(status(), [42, false, "42", null]);
 		fs.rmSync(file);
-		index.markMissing(taskId);
+		index.markMissing(sub(taskId));
 		assert.deepEqual(status(), [42, true, "42", "파일 삭제됨"]);
 	});
 
@@ -253,7 +255,7 @@ describe("session view", () => {
 		for (const [id, value, parentSessionId] of [["s-main", "1e309"], ["s-child", "-1e309", "s-main"]]) {
 			const file = path.join(root, `${id}.jsonl`);
 			fs.writeFileSync(file, `{"type":"usage","provider":"p","model":"m","usage":{"input":${value}}}\n`);
-			index.update(id, file, { parentSessionId: parentSessionId ?? null });
+			index.update(sub(id), file, { parentSessionId: parentSessionId ?? null });
 		}
 		index.save();
 		const record = loadSessionRecord({ paths, id: row.sessionId, now: T0 });

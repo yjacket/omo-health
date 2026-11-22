@@ -7,7 +7,7 @@ import { createInvestigations } from "./investigations.mjs";
 import { auditBundle, auditDocument, detectorFindingRefs, firedDetectors, hasDetectorCoverage, resolveAuditModel, validateAudit } from "./judge/audit.mjs";
 import { ANALYST_POLL_MS, parseAnalystOutput, unavailableReason } from "./judge/analyst.mjs";
 import { laneArgs } from "./judge/lane.mjs";
-import { auditFileKey } from "./session-id.mjs";
+import { auditFileKey, subjectKey, subjectOf } from "./session-subject.mjs";
 import { collectAnalystDecisionModels, configDecisionFact, recoverPendingAnalystModels, usageEntryOf } from "./session-record.mjs";
 import { auditReasonLabel } from "./ui/labels.mjs";
 import { fresh, isSpillModelKey, readUsageIndex, relatedUsageEntries } from "./usage-index.mjs";
@@ -54,21 +54,21 @@ function readBudget(paths, now) {
 	return { day, count: 0, jobs: [], refunded: [] };
 }
 
-function auditFileName(sessionId) {
-	const key = auditFileKey(sessionId);
+function auditFileName(subject) {
+	const key = auditFileKey(subject);
 	return key === null ? null : `${key}.json`;
 }
 
 function readNamedRequest(dir, name) {
 	const request = readJsonSafe(path.join(dir, name));
-	return request?.v === 1 && auditFileName(request.sessionId) === name && Number.isFinite(request.requestedMs) ? request : null;
+	return request?.v === 1 && auditFileName(request) === name && Number.isFinite(request.requestedMs) ? request : null;
 }
 
 /** Publish a complete request without replacing an existing claim for the id. */
-export function requestAudit(paths, sessionId, nowMs) {
-	const name = auditFileName(sessionId);
+export function requestAudit(paths, subject, nowMs) {
+	const name = auditFileName(subject);
 	if (name === null) throw new Error("invalid session id");
-	const request = { v: 1, sessionId, requestedMs: nowMs, claimId: crypto.randomUUID() };
+	const request = { v: 1, ...subjectOf(subject), requestedMs: nowMs, claimId: crypto.randomUUID() };
 	const dir = ensureDir(paths.health.auditRequestsDir);
 	const file = path.join(dir, name);
 	const temp = path.join(dir, `.${request.claimId}.tmp`);
@@ -87,26 +87,26 @@ export function requestAudit(paths, sessionId, nowMs) {
 }
 
 /** Withdraw a claim only if the pending request still belongs to that caller. */
-export function withdrawAuditRequest(paths, sessionId, claimId) {
-	const name = auditFileName(sessionId);
+export function withdrawAuditRequest(paths, subject, claimId) {
+	const name = auditFileName(subject);
 	if (name === null || typeof claimId !== "string") return;
 	const file = path.join(paths.health.auditRequestsDir, name);
 	const pending = readJsonSafe(file);
-	if (pending?.v === 1 && pending.sessionId === sessionId && pending.claimId === claimId) removeSafe(file);
+	if (pending?.v === 1 && auditFileName(pending) === name && subjectKey(pending) === subjectKey(subject) && pending.claimId === claimId) removeSafe(file);
 }
 
 /** The session's audit record; an active one wins, else a waiting request, else the last finished record, else null. */
-export function readAuditState(paths, sessionId) {
-	const name = auditFileName(sessionId);
+export function readAuditState(paths, subject) {
+	const name = auditFileName(subject);
 	if (name === null) return null;
 	const raw = readJsonSafe(path.join(paths.health.auditsDir, name));
-	const record = raw?.sessionId === sessionId ? raw : null;
+	const record = raw?.v === 1 && auditFileName(raw) === name && subjectKey(raw) === subjectKey(subject) ? raw : null;
 	const held = record?.holdUntilExit === true;
 	if (!record || (!ACTIVE.has(record.status) && !held)) {
 		const request = readNamedRequest(paths.health.auditRequestsDir, name);
-		if (request?.sessionId === sessionId) {
+		if (request && subjectKey(request) === subjectKey(subject)) {
 			const { requestedMs, claimId } = request;
-			return { v: 1, sessionId, status: "requested", requestedMs, ...(typeof claimId === "string" ? { claimId } : {}) };
+			return { v: 1, ...subjectOf(subject), status: "requested", requestedMs, ...(typeof claimId === "string" ? { claimId } : {}) };
 		}
 	}
 	if (record?.status === "failed" && record.reason) return { ...record, reasonKo: auditReasonLabel(record.reason) };
@@ -120,9 +120,9 @@ export function auditsToday(paths, nowMs) {
 	return readBudget(paths, nowMs).count + pending;
 }
 
-const blankRecord = (sessionId, requestedMs) => ({
+const blankRecord = (subject, requestedMs) => ({
 	v: 1,
-	sessionId,
+	...subjectOf(subject),
 	status: "queued",
 	requestedMs,
 	startedMs: null,
@@ -290,12 +290,12 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 	let seq = 0;
 	let lastPruneMs = clock.now();
 
-	const recordFile = (sessionId) => {
-		const name = auditFileName(sessionId);
+	const recordFile = (subject) => {
+		const name = auditFileName(subject);
 		if (name === null) throw new Error("invalid session id");
 		return path.join(auditsDir, name);
 	};
-	const save = (record) => atomicWriteJson(recordFile(record.sessionId), record);
+	const save = (record) => atomicWriteJson(recordFile(record), record);
 	const bundleFileOf = (jobId) => path.join(jobsDir, jobId, "bundle.md");
 	const held = (record) => record.holdUntilExit === true;
 
@@ -322,9 +322,9 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 	for (const name of listDirSafe(auditsDir)) {
 		if (!name.endsWith(".json") || name.startsWith("_")) continue;
 		const record = readJsonSafe(path.join(auditsDir, name));
-		if (record?.v !== 1 || auditFileName(record.sessionId) !== name || typeof record.status !== "string") continue;
+		if (record?.v !== 1 || auditFileName(record) !== name || typeof record.status !== "string") continue;
 		if (record.status === "failed" && record.reason === "timeout" && held(record)) resumeLegacyTimeout(record);
-		records.set(record.sessionId, record);
+		records.set(subjectKey(record), record);
 	}
 
 	const clearUnconfirmedTermination = (record) => {
@@ -415,13 +415,13 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 				removeSafe(file);
 				continue;
 			}
-			const id = request.sessionId;
+			const id = subjectKey(request);
 			const existing = records.get(id);
 			if (existing && (ACTIVE.has(existing.status) || held(existing))) {
 				removeSafe(file);
 				continue;
 			}
-			const record = blankRecord(id, request.requestedMs);
+			const record = blankRecord(request, request.requestedMs);
 			if (typeof request.claimId === "string") record.claimId = request.claimId;
 			if (now - request.requestedMs > REQUEST_TTL_MS) {
 				record.status = "failed";
@@ -501,7 +501,7 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		record.status = "running";
 		record.startedMs = now;
 		save(record);
-		lastPollMs.set(record.sessionId, now);
+		lastPollMs.set(subjectKey(record), now);
 	}
 
 	const slotHeld = () => [...records.values()].some((record) => record.status === "launching" || record.status === "running" || held(record));
@@ -540,7 +540,9 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 			};
 			// The daemon passes its resident index; an auditor built without one reads the file here, never in the worker.
 			const source = index ?? readUsageIndex(paths.health.usageIndexFile);
-			worker.postMessage({ sessionId: record.sessionId, now, indexEntries: relatedUsageEntries(source, record.sessionId), indexFull: source?.full === true, bounds: {
+			// The record loader checks scoped ownership at each edge. A unique parent may
+			// have a child whose cwd is in another project, so preserve its candidate entries.
+			worker.postMessage({ subject: subjectOf(record), now, indexEntries: relatedUsageEntries(source, record.sessionId), indexFull: source?.full === true, bounds: {
 				preparationMaxBytes: TIMELINE_MAX_BYTES + MESSAGE_SCAN_TOTAL_BYTES,
 				messageScanMaxBytes: timelineMaxBytes, messageScanTotalBytes: MESSAGE_SCAN_TOTAL_BYTES,
 				descendantScanMax: DESCENDANT_SCAN_MAX, tokens: config.tokens,
@@ -641,11 +643,11 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		for (const record of records.values()) {
 			const running = record.status === "running";
 			if (!running && !(record.status === "failed" && held(record))) continue;
-			const last = lastPollMs.get(record.sessionId);
+			const last = lastPollMs.get(subjectKey(record));
 			const work = lookups.get(record);
 			if (!work) {
 				if (last !== undefined && now - last < ANALYST_POLL_MS) continue;
-				lastPollMs.set(record.sessionId, now);
+				lastPollMs.set(subjectKey(record), now);
 			}
 			if (held(record)) {
 				releaseHold(record, now);
@@ -673,7 +675,7 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		for (const [id, record] of records) {
 			if (ACTIVE.has(record.status) || held(record)) continue;
 			if ((record.finishedMs ?? record.requestedMs ?? now) >= cutoff) continue;
-			removeSafe(recordFile(id));
+			removeSafe(recordFile(record));
 			records.delete(id);
 			lastPollMs.delete(id);
 		}

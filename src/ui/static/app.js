@@ -872,7 +872,7 @@
 
 	/** Asks the daemon for an audit of the session, then re-reads the row's audit block before 조사 can be pressed again. */
 	function startAudit(r) {
-		return post("/api/audit", { sessionId: r.sessionId }, `audit:${endedDetailId(r)}`, () => loadAudit(r));
+		return post("/api/audit", { sessionId: r.sessionId, row: r.detailRow }, `audit:${endedDetailId(r)}`, () => loadAudit(r));
 	}
 
 	/**

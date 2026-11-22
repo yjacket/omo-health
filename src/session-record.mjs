@@ -7,6 +7,7 @@ import { streamDecisions } from "./decisions.mjs";
 import { streamInvestigations } from "./investigations.mjs";
 import { safeSubjectId } from "./session-id.mjs";
 import { ENDED_LOCATION, endedKey, endedSelector, streamEnded } from "./session-ledger.mjs";
+import { sessionSubjects, subjectKey, subjectOf } from "./session-subject.mjs";
 import { compactUsage, fresh, readUsageIndex, usageEntryFor } from "./usage-index.mjs";
 import { reasonCode } from "./audit-codes.mjs";
 import { AUDIT_CHECK_MAX, AUDIT_DETECTOR_ID, AUDIT_LIST_CAPS, BUNDLE_MAX_CHARS, auditEvidence, auditHistoryRow, auditMessageKind } from "./judge/audit.mjs";
@@ -534,15 +535,17 @@ export function ledgerUsageSessionId({ sessionId, taskId }) {
 }
 
 const ambiguousUsageFallback = (row, ambiguous, ids = row) =>
-	!ledgerUsageSessionId(ids) && (row.usageTaskIdAmbiguous === true || ambiguous?.has(ids.taskId));
+	!ledgerUsageSessionId(ids) && (row.usageTaskIdAmbiguous === true || ambiguous?.has(ids.taskId) ||
+		ambiguous?.has(subjectKey({ ...subjectOf(row), sessionId: ids.taskId })));
 
-export function ambiguousLedgerTaskIds(rows) {
+export function ambiguousLedgerTaskIds(rows, { scoped = false } = {}) {
 	const seen = new Set();
 	const ambiguous = new Set();
 	for (const row of rows) {
 		if (!isRecord(row) || !nonEmpty(row.taskId) || ledgerUsageSessionId(row)) continue;
-		if (seen.has(row.taskId)) ambiguous.add(row.taskId);
-		else seen.add(row.taskId);
+		const key = scoped ? subjectKey({ ...subjectOf(row), sessionId: row.taskId }) : row.taskId;
+		if (seen.has(key)) ambiguous.add(key);
+		else seen.add(key);
 	}
 	return ambiguous;
 }
@@ -550,13 +553,29 @@ export function ambiguousLedgerTaskIds(rows) {
 export function usageEntryOf(usage, row, ambiguous) {
 	const ids = row.ledgerIds ?? row;
 	if (ambiguousUsageFallback(row, ambiguous, ids)) return null;
-	return usageEntryFor(usage, ledgerUsageSessionId(ids), ids.taskId) ?? (usage.full === true ? FULL_USAGE : null);
+	const subject = { ...subjectOf(row), sessionId: ledgerUsageSessionId(ids) };
+	let entry = usageEntryFor(usage, subject, ids.taskId);
+	// An old cwd-less child may have been verified through a live parent not recorded in the ledger.
+	if (!entry && !subject.projectKey && ids.parentSessionId) {
+		const matches = new Set();
+		for (const candidate of usage.values()) {
+			if (candidate.parentSessionId !== ids.parentSessionId ||
+				(subject.sessionId ? candidate.id !== subject.sessionId : candidate.taskId !== ids.taskId)) continue;
+			matches.add(subjectOf(candidate).projectKey);
+		}
+		if (matches.size === 1) entry = usageEntryFor(usage, { ...subject, projectKey: matches.values().next().value }, ids.taskId);
+	}
+	return entry ?? (usage.full === true ? FULL_USAGE : null);
 }
 
 export function usageTreeLink(usage, row, ambiguous) {
 	const { parentSessionId } = row;
-	const id = ledgerUsageSessionId(row) ?? usageEntryOf(usage, row, ambiguous)?.id;
-	return id ? { id, parentSessionId } : { id: row.taskId, parentSessionId, unresolved: true };
+	const entry = usageEntryOf(usage, row, ambiguous);
+	const subject = subjectOf(row, subjectOf(entry));
+	const id = ledgerUsageSessionId(row) ?? entry?.id;
+	const key = subjectKey({ ...subject, sessionId: id ?? row.taskId });
+	const parentKey = row.parentKey ?? entry?.parentKey ?? subjectKey({ ...subject, sessionId: parentSessionId });
+	return { key, parentKey, ...(id ? {} : { unresolved: true }) };
 }
 
 /** Stream older descendants of the supplied history rows, one pass per depth. */
@@ -570,9 +589,9 @@ export function* retainedTreeRows(paths, rows, { beforeMs, withLocation } = {}) 
 	for (let depth = 0; depth < DEPTH_MAX && parents.size; depth += 1) {
 		const next = new Set();
 		for (const row of streamEnded(paths, { beforeMs, withLocation })) {
-			const { sessionId, taskId, kind, endedMs, parentSessionId, rootSessionId } = row;
+			const { sessionId, taskId, kind, endedMs, parentSessionId, rootSessionId, cwd } = row;
 			if (!parents.has(parentSessionId) || !nonEmpty(sessionId)) continue;
-			yield { sessionId, taskId, kind, endedMs, parentSessionId, rootSessionId, [ENDED_LOCATION]: row[ENDED_LOCATION] };
+			yield { sessionId, taskId, kind, endedMs, parentSessionId, rootSessionId, cwd, [ENDED_LOCATION]: row[ENDED_LOCATION] };
 			if (!seen.has(sessionId)) {
 				seen.add(sessionId);
 				next.add(sessionId);
@@ -776,7 +795,7 @@ export function buildSessionRecord(inputs = {}) {
 
 	const startedMs = msOf(row.startedMs);
 	const endedMs = msOf(row.endedMs);
-	const descendants = inputs.descendants ?? collectDescendants(row, ledger, usage.values());
+	const descendants = (inputs.descendants ?? collectDescendants(row, ledger, usage.values())).map((node) => ({ ...node, ...subjectOf(node, subjectOf(row)) }));
 	const ambiguous = inputs.ambiguous ?? ambiguousLedgerTaskIds(ledger);
 	const { health, infoFindings, configDecisions, analystModels, analystModelsKnown, pendingAnalystJobs, selectedFps } = recordHealth({ ...inputs, decisions, investigations, messages: messagesIn }, row, descendants);
 
@@ -832,13 +851,14 @@ export function buildSessionRecord(inputs = {}) {
 
 	const session = cleanValue(row);
 	// Keep exact join keys off the display fields that also feed the reviewer bundle.
+	session.projectKey = subjectOf(row, subjectOf(entry)).projectKey;
 	session.ledgerIds = {
 		sessionId: safeSubjectId(row.sessionId),
 		taskId: safeSubjectId(row.taskId),
 		parentSessionId: safeSubjectId(row.parentSessionId),
 	};
 	// Cached previews and audit preparation re-read the index from this session alone.
-	if (!ledgerUsageSessionId(row) && ambiguous.has(row.taskId)) session.usageTaskIdAmbiguous = true;
+	if (!ledgerUsageSessionId(row) && ambiguousUsageFallback(row, ambiguous)) session.usageTaskIdAmbiguous = true;
 	// Cached previews only receive session metadata and the model list.
 	if (!analystModelsKnown) session.analystModelsUnknown = true;
 	if (pendingAnalystJobs?.length) session.pendingAnalystJobs = pendingAnalystJobs;
@@ -960,7 +980,7 @@ function* dirNames(directory) {
 }
 
 function findRecordFiles(paths, nodes, ancestors, locator, usage, ambiguous) {
-	const wanted = new Set(nodes.filter((node) => !nonEmpty(node.taskId)).map((node) => node.sessionId));
+	const wanted = new Set(nodes.filter((node) => !nonEmpty(node.taskId)).map((node) => subjectKey(subjectOf(node))));
 	const main = new Map();
 	if (!locator && wanted.size) {
 		for (const slug of dirNames(paths.sessionsDir)) {
@@ -968,10 +988,13 @@ function findRecordFiles(paths, nodes, ancestors, locator, usage, ambiguous) {
 			for (const name of dirNames(dir)) {
 				if (!name.endsWith(".jsonl")) continue;
 				const sid = idFromFileName(name);
-				if (!wanted.has(sid)) continue;
+				const exact = subjectKey(subjectOf({ sessionId: sid, projectKey: slug }));
+				const unknown = subjectKey(subjectOf({ sessionId: sid }));
+				const key = wanted.has(exact) ? exact : wanted.has(unknown) ? unknown : null;
+				if (!key) continue;
 				const file = path.join(dir, name);
-				const prior = main.get(sid);
-				if ((!prior || file > prior) && statSafe(file)?.isFile()) main.set(sid, file);
+				const prior = main.get(key);
+				if ((!prior || file > prior) && statSafe(file)?.isFile()) main.set(key, file);
 			}
 		}
 	}
@@ -990,7 +1013,10 @@ function findRecordFiles(paths, nodes, ancestors, locator, usage, ambiguous) {
 	};
 	return nodes.map((node) => {
 		const { sessionId, taskId } = node;
-		if (!nonEmpty(taskId)) return { sessionId, file: locator ? locator.mainFile(sessionId) : main.get(sessionId) };
+		if (!nonEmpty(taskId)) {
+			const subject = subjectOf(node);
+			return { sessionId, file: locator ? locator.mainFile(subject) : main.get(subjectKey(subject)) };
+		}
 		// The tracker may have verified the transcript through a live ancestor whose cwd is absent from the ledger.
 		const entry = usageEntryOf(usage, node, ambiguous);
 		const file = entry?.readError !== true && fresh(entry) ? entry.file
@@ -1029,6 +1055,53 @@ function ledgerLookup(rows, ids, selector) {
 	return new Map([...ids].map((id) => [id, exact.get(id) ?? aliases.get(id)]));
 }
 
+/** Resolve a visible ledger ID (or unique task alias) without retaining the ledger. */
+export function resolveLedgerSubject(paths, id, { row: selector, now = Date.now(), subject, usage } = {}) {
+	const rows = () => streamEnded(paths, { sinceMs: now - 30 * DAY_MS });
+	const exact = new Map();
+	const aliases = new Map();
+	const candidates = new Map();
+	const parents = new Set();
+	for (const row of rows()) {
+		const isExact = row.sessionId === id && (selector === undefined || endedSelector(row) === selector);
+		if (!isExact && (selector !== undefined || subject || row.taskId !== id)) continue;
+		const own = subjectOf(row);
+		if (!own.projectKey && row.parentSessionId) parents.add(row.parentSessionId);
+		const key = JSON.stringify([subjectKey(own), row.parentSessionId ?? null, isExact]);
+		if (later(row, candidates.get(key)?.row)) candidates.set(key, { row, isExact });
+	}
+	const family = [...candidates.values()].map(({ row }) => row);
+	const visited = new Set();
+	for (let depth = 0; depth < DEPTH_MAX && parents.size; depth += 1) {
+		const next = new Set();
+		for (const id of parents) visited.add(id);
+		for (const row of streamEnded(paths)) {
+			if (!parents.has(row.sessionId)) continue;
+			family.push(row);
+			if (!subjectOf(row).projectKey && row.parentSessionId && !visited.has(row.parentSessionId)) next.add(row.parentSessionId);
+		}
+		parents.clear();
+		for (const id of next) parents.add(id);
+	}
+	const resolve = sessionSubjects(family);
+	const wanted = subjectKey(subject);
+	for (const { row, isExact } of candidates.values()) {
+		let scoped = resolve(row);
+		if (!scoped.projectKey && usage) scoped = subjectOf(row, subjectOf(usageEntryOf(usage, row)));
+		const key = subjectKey(scoped);
+		if (subject && key !== wanted) continue;
+		const matches = isExact ? exact : aliases;
+		if (later(row, matches.get(key))) matches.set(key, { ...row, projectKey: scoped.projectKey });
+	}
+	const matches = exact.size ? exact : aliases;
+	if (matches.size > 1) {
+		const projects = new Set([...matches.values()].map((row) => row.projectKey));
+		return projects.size > 1 ? { error: "ambiguous-session" } : {};
+	}
+	const row = matches.values().next().value;
+	return row ? { row, subject: subjectOf(row) } : {};
+}
+
 function recordDescendants(subject, rows, usage) {
 	const seen = new Set([descendantKey(subject, subject), descendantKey(subject)]);
 	const nodes = new Map();
@@ -1037,12 +1110,17 @@ function recordDescendants(subject, rows, usage) {
 		const owners = new Map();
 		const aliases = new Map(frontier.filter((node) => nonEmpty(node.taskId)).map((node) => [node.taskId, node.startedMs]));
 		const collisions = new Set();
+		const conflictingProjects = new Set();
+		const parentsById = new Map(frontier.flatMap((node) => [[node.sessionId, node], ...(node.taskId ? [[node.taskId, node]] : [])]));
 		const ids = new Map(frontier.map((node) => [node.sessionId, node.startedMs]));
 		// Stream both visible and retained rows once per depth. Buffer only the
 		// newest matching rows, separating direct matches from unverified aliases.
 		const direct = new Map();
 		const indirect = new Map();
 		const consider = (node, fromLedger) => {
+			const own = subjectOf(node);
+			const peer = parentsById.get(node.sessionId);
+			if (peer && own.projectKey && peer.projectKey && own.projectKey !== peer.projectKey) conflictingProjects.add(node.sessionId);
 			if (aliases.has(node.sessionId)) collisions.add(node.sessionId);
 			if (aliases.has(node.taskId)) trackOwner(owners, node.taskId, node.sessionId ?? "");
 			const parent = node.parentSessionId;
@@ -1056,13 +1134,13 @@ function recordDescendants(subject, rows, usage) {
 			const prior = matches.get(identity);
 			if (!prior || (fromLedger && later(node, prior.node))) {
 				const { sessionId, taskId, parentSessionId, title, outcome, startedMs, endedMs, cwd } = node;
-				matches.set(identity, { node: { sessionId, taskId, parentSessionId, title, outcome, startedMs, endedMs, cwd }, fromLedger });
+				matches.set(identity, { node: { sessionId, taskId, parentSessionId, title, outcome, startedMs, endedMs, cwd, projectKey: own.projectKey }, fromLedger });
 			}
 		};
 		consider(subject, true);
 		for (const row of rows()) consider(row, true);
-		for (const { id, taskId, parentSessionId, startedMs, checkedMs } of usage.values()) {
-			consider({ sessionId: id, taskId, parentSessionId, startedMs, endedMs: checkedMs }, false);
+		for (const { id, taskId, parentSessionId, startedMs, checkedMs, projectKey } of usage.values()) {
+			consider({ sessionId: id, taskId, parentSessionId, startedMs, endedMs: checkedMs, projectKey }, false);
 		}
 		const matches = direct.get(null) ?? new Map();
 		for (const [alias, candidates] of indirect) {
@@ -1076,12 +1154,15 @@ function recordDescendants(subject, rows, usage) {
 		// Index entries mirror sessions, not scoped ledger rows. Keep them only
 		// when no discovered ledger row represents the same session.
 		for (const { node, fromLedger } of matches.values()) {
+			if (conflictingProjects.has(node.parentSessionId) && node.projectKey !== parentsById.get(node.parentSessionId)?.projectKey) continue;
 			if (!fromLedger) continue;
 			const indexKey = descendantKey(node);
 			seen.add(indexKey);
 			nodes.delete(indexKey);
 		}
 		for (const [identity, { node, fromLedger }] of matches) {
+			const parent = parentsById.get(node.parentSessionId);
+			if (conflictingProjects.has(node.parentSessionId) && node.projectKey !== parent?.projectKey) continue;
 			if (!fromLedger && seen.has(identity)) continue;
 			const { sessionId, taskId, parentSessionId, title, outcome, endedMs, cwd } = node;
 			let { startedMs } = node;
@@ -1091,7 +1172,7 @@ function recordDescendants(subject, rows, usage) {
 				startedMs = ids.has(parentSessionId) ? ids.get(parentSessionId) : aliases.get(parentSessionId);
 			}
 			seen.add(identity);
-			const descendant = { sessionId, taskId: taskId ?? null, parentSessionId, title: title ?? null, outcome: outcome ?? null, startedMs, endedMs: Number.isFinite(msOf(endedMs)) ? msOf(endedMs) : null, cwd, depth, indexOnly: !fromLedger };
+			const descendant = { sessionId, taskId: taskId ?? null, parentSessionId, title: title ?? null, outcome: outcome ?? null, startedMs, endedMs: Number.isFinite(msOf(endedMs)) ? msOf(endedMs) : null, cwd, projectKey: subjectOf(node, parent).projectKey, depth, indexOnly: !fromLedger };
 			frontier.push(descendant);
 			nodes.set(identity, descendant);
 		}
@@ -1099,9 +1180,7 @@ function recordDescendants(subject, rows, usage) {
 	return [...nodes.values()];
 }
 
-function recordLedger(visibleRows, rows, id, selector, usage, descendantScanMax) {
-	const subject = ledgerLookup(visibleRows, new Set([id]), selector).get(id);
-	if (!subject) return null;
+function recordLedger(subject, rows, usage, descendantScanMax) {
 	const descendants = recordDescendants(subject, rows, usage);
 	const newest = [...descendants].sort((a, b) => (b.endedMs ?? 0) - (a.endedMs ?? 0));
 	const scanned = Number.isFinite(descendantScanMax) ? newest.slice(0, descendantScanMax) : newest;
@@ -1111,6 +1190,12 @@ function recordLedger(visibleRows, rows, id, selector, usage, descendantScanMax)
 	const visited = new Set();
 	for (let depth = 1; depth < DEPTH_MAX && parents.size; depth += 1) {
 		const found = ledgerLookup(rows, parents);
+		if (subject.projectKey) {
+			const scoped = ledgerLookup(function* () {
+				for (const row of rows()) if (subjectOf(row).projectKey === subject.projectKey) yield row;
+			}, parents);
+			for (const [id, row] of scoped) if (row) found.set(id, row);
+		}
 		for (const parent of parents) visited.add(parent);
 		parents = new Set();
 		for (const [id, node] of found) {
@@ -1135,14 +1220,12 @@ function recordLedger(visibleRows, rows, id, selector, usage, descendantScanMax)
  * daemon's audit samples; the dashboard defaults to no retention limit.
  * Non-audit records report the transcript paths scanned for detail caching.
  */
-export function loadSessionRecord({ paths, id, row: selector, now = Date.now(), messageScanMaxBytes = Infinity, messageScanTotalBytes = Infinity, descendantScanMax = Infinity, scanMessages, auditRetention = false, locator, index } = {}) {
+export function loadSessionRecord({ paths, subject, id = subject?.sessionId, row: selector, now = Date.now(), messageScanMaxBytes = Infinity, messageScanTotalBytes = Infinity, descendantScanMax = Infinity, scanMessages, auditRetention = false, locator, index } = {}) {
 	if (!nonEmpty(id)) return { found: false, id };
 	const usage = index ?? readUsageIndex(paths.health.usageIndexFile);
-	const joined = recordLedger(
-		() => streamEnded(paths, { sinceMs: now - 30 * DAY_MS }),
-		() => streamEnded(paths), id, selector, usage, descendantScanMax,
-	);
-	if (!joined) return { found: false, id };
+	const selected = resolveLedgerSubject(paths, id, { row: selector, now, subject, usage });
+	if (!selected.row) return { found: false, id, ...(selected.error ? { error: selected.error } : {}) };
+	const joined = recordLedger(selected.row, () => streamEnded(paths), usage, descendantScanMax);
 	const { row, descendants, ancestors, scanned, descendantsSkipped, ambiguous } = joined;
 	const startedMs = msOf(row.startedMs);
 	const sinceMs = (Number.isFinite(startedMs) ? startedMs : now) - 30 * DAY_MS;
@@ -1181,5 +1264,5 @@ export function loadSessionRecord({ paths, id, row: selector, now = Date.now(), 
 		id, row, descendants, ambiguous, usage, decisionJoin, decisionHistory, auditHealth, messages,
 		truncated: { messagesSkipped: skipped, descendantsSkipped },
 	});
-	return auditRetention ? { ...record, auditSubjectIds: decisionJoin.auditSubjectIds } : { ...record, transcriptFiles: [...transcriptFiles] };
+	return auditRetention ? { ...record, subject: selected.subject, auditSubjectIds: decisionJoin.auditSubjectIds } : { ...record, subject: selected.subject, transcriptFiles: [...transcriptFiles] };
 }

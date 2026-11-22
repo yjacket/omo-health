@@ -1,3 +1,6 @@
+import { subjectOf, subjectKey } from "../src/session-subject.mjs";
+const sub = (sessionId, cwd) => subjectOf({ sessionId, cwd });
+const key = (sessionId, cwd) => subjectKey(sub(sessionId, cwd));
 import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -103,6 +106,9 @@ test("(IS-1, IS-12) a dense 15 MiB tool result publishes under the daemon heap c
 		import fs from "node:fs";
 		import { usageTimeline } from ${JSON.stringify(new URL("../src/collect/usage.mjs", import.meta.url).href)};
 		import { createUsageIndex, USAGE_TICK_BYTES } from ${JSON.stringify(new URL("../src/usage-index.mjs", import.meta.url).href)};
+const sub = (sessionId) => ({ sessionId, projectKey: null });
+const key = (id) => subjectKey(sub(id));
+import { projectKeyOf, subjectKey } from ${JSON.stringify(new URL("../src/session-subject.mjs", import.meta.url).href)};
 		import { createFakeClock } from ${JSON.stringify(new URL("../src/util/time.mjs", import.meta.url).href)};
 		const [reader, file, next, indexFile] = process.argv.slice(1);
 		if (reader === "timeline") {
@@ -110,15 +116,15 @@ test("(IS-1, IS-12) a dense 15 MiB tool result publishes under the daemon heap c
 		} else {
 			const clock = createFakeClock(${T0});
 			const index = createUsageIndex({ file: indexFile, clock });
-			const update = () => index.update("dense", file, {}, { maxBytes: USAGE_TICK_BYTES });
+			const update = () => index.update(sub("dense"), file, {}, { maxBytes: USAGE_TICK_BYTES });
 			update();
-			assert.equal(index.get("dense").complete, true);
-			const first = index.get("dense").published;
+			assert.equal(index.get(key("dense")).complete, true);
+			const first = index.get(key("dense")).published;
 			fs.appendFileSync(file, fs.readFileSync(next));
 			clock.advance(10_000);
 			update();
-			assert.equal(index.get("dense").complete, true);
-			console.log(JSON.stringify({ first, next: index.get("dense").published }));
+			assert.equal(index.get(key("dense")).complete, true);
+			console.log(JSON.stringify({ first, next: index.get(key("dense")).published }));
 		}
 	`;
 	const results = {};
@@ -165,18 +171,18 @@ test("(IS-1) a 2 MiB EOF record keeps its JSON.parse billing row across newline 
 		observations[label] = models(usage);
 		expected[label] = oracle();
 	};
-	live.update(id, file, {}, budget);
-	observe("live EOF", live.get(id).published);
+	live.update(sub(id), file, {}, budget);
+	observe("live EOF", live.get(key(id)).published);
 	observe("timeline EOF", usageTimeline(file).totals);
 	assert.equal(live.save(), true);
 	const reloaded = indexOf();
-	observe("reloaded EOF", reloaded.get(id).published);
+	observe("reloaded EOF", reloaded.get(key(id)).published);
 
 	fs.appendFileSync(file, "\n");
-	live.update(id, file, {}, budget);
-	reloaded.update(id, file, {}, budget);
-	observe("live newline", live.get(id).published);
-	observe("reloaded newline", reloaded.get(id).published);
+	live.update(sub(id), file, {}, budget);
+	reloaded.update(sub(id), file, {}, budget);
+	observe("live newline", live.get(key(id)).published);
+	observe("reloaded newline", reloaded.get(key(id)).published);
 	observe("timeline newline", usageTimeline(file).totals);
 	assert.deepEqual(observations, expected);
 });
@@ -216,6 +222,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { getHeapSpaceStatistics } from "node:v8";
 import { createUsageIndex, INDEX_BYTE_BUDGET, INDEX_ENTRY_OVERHEAD } from ${JSON.stringify(new URL("../src/usage-index.mjs", import.meta.url).href)};
+const sub = (sessionId) => ({ sessionId, projectKey: null });
+const key = (id) => subjectKey(sub(id));
+import { projectKeyOf, subjectKey } from ${JSON.stringify(new URL("../src/session-subject.mjs", import.meta.url).href)};
 import { resolvePaths } from ${JSON.stringify(new URL("../src/paths.mjs", import.meta.url).href)};
 import { createAuditor, requestAudit, readAuditState } from ${JSON.stringify(new URL("../src/auditor.mjs", import.meta.url).href)};
 import { appendEnded } from ${JSON.stringify(new URL("../src/session-ledger.mjs", import.meta.url).href)};
@@ -238,17 +247,17 @@ let peak = oldSpace();
 const sample = () => { peak = Math.max(peak, oldSpace()); };
 if (stage === "write") {
 	fs.writeFileSync(transcript, '{"type":"usage","provider":"openai","model":"gpt-5-5","usage":{"input":42,"cost":{"total":0.0001}}}\\n');
-	index.update("reviewed", transcript, { kind: "main" });
+	index.update(sub("reviewed"), transcript, { kind: "main" });
 	for (let i = 0; i < 200000 && !index.full; i++) {
 		checked--;
 		const id = "01aaa000-0000-7000-8000-" + String(i).padStart(12, "0");
 		const parentSessionId = "group" + (i % 100);
 		if (shape === "models") {
-			index.update(id, transcript, { kind: "main", parentSessionId });
+			index.update(sub(id), transcript, { kind: "main", parentSessionId });
 		} else {
 			const file = shape === "mixed" ? "C:/작업/" + ("a".repeat(194) + "/").repeat(24) + id + ".jsonl"
 				: shape === "korean" ? "C:/" + ("작".repeat(195) + "/").repeat(18) + "업".repeat(7) + id : null;
-			index.markMissing(id, { kind: "main", parentSessionId: shape === "dense" ? parentSessionId : null, file });
+			index.markMissing(sub(id), { kind: "main", parentSessionId: shape === "dense" ? parentSessionId : null, file });
 		}
 		if (i % 1000 === 0) sample();
 	}
@@ -261,7 +270,7 @@ if (stage === "write") {
 	fs.writeFileSync(paths.omoJsonc, JSON.stringify({ "[native]": { categories: { ultrabrain: { models: ["google/gemini-3-pro"] } } } }));
 	fs.writeFileSync(paths.authFile, JSON.stringify({ google: {} }));
 	appendEnded(paths, { sessionId: "reviewed", kind: "main", startedMs: now - 120000, endedMs: now - 60000, outcome: "completed" });
-	requestAudit(paths, "reviewed", now);
+	requestAudit(paths, sub("reviewed"), now);
 	let starts = 0;
 	const auditor = createAuditor({ paths, index, config: DEFAULT_CONFIG, clock, env: {}, timelineMaxBytes: 0, runner: {
 		start() { starts++; sample(); return { pid: 1 }; },
@@ -270,10 +279,10 @@ if (stage === "write") {
 	await auditor.preparing();
 	auditor.tick(now + 1);
 	assert.equal(starts, 1);
-	assert.equal(readAuditState(paths, "reviewed").status, "running");
+	assert.equal(readAuditState(paths, sub("reviewed")).status, "running");
 }
 assert.equal(index.full, true);
-assert.equal(index.get("reviewed")?.published?.total, 42);
+assert.equal(index.get(key("reviewed"))?.published?.total, 42);
 sample();
 global.gc();
 let rows = 0;
@@ -307,15 +316,15 @@ test("(gate 17) corrupt lines do not hide the next intact publication in a satur
 	const index = indexOf();
 	const transcript = fileOf();
 	writeText(transcript, `${line()}\n`);
-	index.update("oldest", transcript);
+	index.update(sub("oldest"), transcript);
 	clock.advance(1);
-	for (let i = 0; !index.full; i++) index.markMissing(`missing-${i}`);
+	for (let i = 0; !index.full; i++) index.markMissing(sub(`missing-${i}`));
 	index.save();
 	const clean = fs.readFileSync(path.join(dir, "usage.json"));
 	const last = clean.lastIndexOf(10, clean.length - 2) + 1;
 	const damaged = fileOf("damaged.jsonl");
 	const junk = Buffer.alloc(64 * 1024, "!");
-	assert.equal(compactUsage(readUsageIndex(path.join(dir, "usage.json")).get("oldest"))?.total, 10);
+	assert.equal(compactUsage(readUsageIndex(path.join(dir, "usage.json")).get(key("oldest")))?.total, 10);
 	const results = [];
 	for (const size of [1, 8192, junk.length + 9, Math.ceil(INDEX_BYTE_BUDGET * 1.5) + junk.length]) {
 		const fd = fs.openSync(damaged, "w");
@@ -327,7 +336,7 @@ test("(gate 17) corrupt lines do not hide the next intact publication in a satur
 		} finally {
 			fs.closeSync(fd);
 		}
-		results.push([size, compactUsage(readUsageIndex(damaged).get("oldest"))?.total]);
+		results.push([size, compactUsage(readUsageIndex(damaged).get(key("oldest")))?.total]);
 	}
 	assert.deepEqual(results, results.map(([size]) => [size, 10]));
 });
@@ -337,21 +346,21 @@ test("(gate 18) an identifiable invalid line cannot displace an intact 42-token 
 	const index = indexOf();
 	const transcript = fileOf();
 	writeText(transcript, '{"type":"usage","provider":"p","model":"id","usage":{"input":42}}\n');
-	index.update("oldest", transcript);
+	index.update(sub("oldest"), transcript);
 	clock.advance(1);
-	for (let i = 0; !index.full; i++) index.markMissing(`m${i}`);
+	for (let i = 0; !index.full; i++) index.markMissing(sub(`m${i}`));
 	assert.ok(index.save());
 	const clean = fs.readFileSync(fileOf("usage.json"));
 	const last = clean.lastIndexOf(10, clean.length - 2) + 1;
 	const bad = Buffer.from('{"id":"identifiable-invalid","checkedMs":"not a number"}\n');
 	assert.equal(bad.length, 57);
-	assert.equal(compactUsage(readUsageIndex(fileOf("usage.json")).get("oldest"))?.total, 42);
+	assert.equal(compactUsage(readUsageIndex(fileOf("usage.json")).get(key("oldest")))?.total, 42);
 	const damaged = fileOf("damaged.jsonl");
 	writeText(damaged, Buffer.concat([clean.subarray(0, last), bad, clean.subarray(last)]));
 	const loaded = indexOf("damaged.jsonl");
-	assert.equal(compactUsage(loaded.get("oldest"))?.total, 42);
-	assert.equal(compactUsage(readUsageIndex(damaged).get("oldest"))?.total, 42);
-	const recount = loaded.get("identifiable-invalid");
+	assert.equal(compactUsage(loaded.get(key("oldest")))?.total, 42);
+	assert.equal(compactUsage(readUsageIndex(damaged).get(key("oldest")))?.total, 42);
+	const recount = loaded.get(key("identifiable-invalid"));
 	assert.equal(recount?.state, "ok");
 	assert.equal(recount.complete, false);
 	assert.equal(recount.offset, 0);
@@ -364,6 +373,9 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { createUsageIndex } from ${JSON.stringify(new URL("../src/usage-index.mjs", import.meta.url).href)};
+const sub = (sessionId) => ({ sessionId, projectKey: null });
+const key = (id) => subjectKey(sub(id));
+import { projectKeyOf, subjectKey } from ${JSON.stringify(new URL("../src/session-subject.mjs", import.meta.url).href)};
 import { createUsageTracker } from ${JSON.stringify(new URL("../src/usage-tracker.mjs", import.meta.url).href)};
 import { resolvePaths } from ${JSON.stringify(new URL("../src/paths.mjs", import.meta.url).href)};
 import * as ledger from ${JSON.stringify(new URL("../src/session-ledger.mjs", import.meta.url).href)};
@@ -384,8 +396,8 @@ const put = (file, data) => {
 if (stage === "fixture") {
 	const transcript = path.join(dir, "seed.jsonl");
 	put(transcript, '{"type":"usage","provider":"p","model":"id","usage":{"input":42}}\\n');
-	index.update("seed", transcript, { kind: "main" });
-	for (let i = 0; !index.full; i++) index.markMissing(id(i), { kind: "main", file: cwd + "/" + id(i) });
+	index.update(sub("seed"), transcript, { kind: "main" });
+	for (let i = 0; !index.full; i++) index.markMissing({ ...sub(id(i)), projectKey: projectKeyOf(cwd) }, { kind: "main", file: cwd + "/" + id(i) });
 	assert.ok(index.save());
 	const day = new Date(now).toISOString().slice(0, 10);
 	const name = "ended-" + day + ".jsonl";
@@ -404,7 +416,7 @@ if (stage === "fixture") {
 	put(paths.authFile, JSON.stringify({ other: {} }));
 } else {
 	assert.ok(index.full);
-	assert.equal(index.get("seed").published.total, 42);
+	assert.equal(index.get(key("seed")).published.total, 42);
 	if (stage === "retention") {
 		assert.equal(index.prune(now), 0);
 		const tracker = createUsageTracker({ paths, index, clock });
@@ -416,7 +428,7 @@ if (stage === "fixture") {
 		const record = loadSessionRecord({ paths, id: "seed", now, index, messageScanMaxBytes: 0 });
 		assert.deepEqual(record.children.map(({ sessionId, depth }) => [sessionId, depth]), [["child", 1], ["grand", 2]]);
 		assert.deepEqual(record.health.findings.map(({ fp, scope }) => [fp, scope]), [["grand-finding", "session"], ["machine-finding", "machine"]]);
-		requestAudit(paths, "seed", now);
+		requestAudit(paths, sub("seed"), now);
 		let starts = 0;
 		const auditor = createAuditor({ paths, index, config: DEFAULT_CONFIG, clock, env: {}, timelineMaxBytes: 0, runner: {
 			start() { starts++; return { pid: 1 }; },
@@ -425,7 +437,7 @@ if (stage === "fixture") {
 		await auditor.preparing();
 		auditor.tick(now + 1);
 		assert.equal(starts, 1);
-		assert.equal(readAuditState(paths, "seed").status, "running");
+		assert.equal(readAuditState(paths, sub("seed")).status, "running");
 	}
 }
 `;
@@ -452,7 +464,7 @@ let now = N;
 const open = () => mode === "dashboard" ? usage.readUsageIndex(file) : usage.createUsageIndex({ file, clock: { now: () => now } });
 if (mode === "fixture") {
 	const index = open();
-	const row = index.markMissing(id(0), { file: pathOf(0), kind: "main" });
+	const row = index.markMissing(sub(id(0)), { file: pathOf(0), kind: "main" });
 	const fd = fs.openSync(file, "w");
 	try {
 		fs.writeSync(fd, JSON.stringify({ v: usage.USAGE_INDEX_VERSION }) + "\\n");
@@ -464,7 +476,7 @@ if (mode === "fixture") {
 		for (let n = 0; n < N; ++n) {
 			const i = n < 2 ? 1 - n : n; // The first two are deliberately out of checked-time order.
 			now = N - i;
-			index.markMissing(id(i), { file: pathOf(i), kind: "main" });
+			index.markMissing(sub(id(i)), { file: pathOf(i), kind: "main" });
 		}
 		assert.equal(index.save(), true);
 	} else {
@@ -475,7 +487,7 @@ if (mode === "fixture") {
 		assert.ok(total <= usage.INDEX_BYTE_BUDGET && total + bytes(rows.at(-1)) - 1 > usage.INDEX_BYTE_BUDGET);
 		assert.deepEqual(rows.map((row) => row.id), Array.from({ length: rows.length }, (_, i) => id(i)));
 		assert.equal(index.full, true);
-		if (mode === "read") assert.equal(index.get(id(N - 1))?.state, "full");
+		if (mode === "read") assert.equal(index.get(key(id(N - 1)))?.state, "full");
 	}
 }
 `;
@@ -509,6 +521,9 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { createUsageIndex, INDEX_BYTE_BUDGET } from ${JSON.stringify(new URL("../src/usage-index.mjs", import.meta.url).href)};
+const sub = (sessionId) => ({ sessionId, projectKey: null });
+const key = (id) => subjectKey(sub(id));
+import { projectKeyOf, subjectKey } from ${JSON.stringify(new URL("../src/session-subject.mjs", import.meta.url).href)};
 const [mode, file, root] = process.argv.slice(1);
 const index = createUsageIndex({ file, clock: { now: () => 1 } });
 if (mode === "write") {
@@ -518,21 +533,21 @@ if (mode === "write") {
 		const id = "01aaa000-0000-7000-8000-" + String(i).padStart(12, "0");
 		const transcript = path.join(project, "2026-11-22_" + id + ".jsonl");
 		fs.writeFileSync(transcript, '{"type":"usage","model":"m","provider":"p","usage":{"input":1,"cost":{"total":0.25}}}\\n');
-		index.update(id, transcript, { kind: "main" });
+		index.update(sub(id), transcript, { kind: "main" });
 	}
 }
 const rows = index.entries();
 assert.equal(INDEX_BYTE_BUDGET, 16 * 1024 * 1024);
 assert.equal(index.full, true);
 assert.ok(rows.length >= 4000 && rows.length < 12000);
-assert.deepEqual(index.get("01aaa000-0000-7000-8000-000000011999"), { state: "full" });
+assert.deepEqual(index.get(key("01aaa000-0000-7000-8000-000000011999")), { state: "full" });
 const hash = crypto.createHash("sha256");
 for (const row of rows) {
 	assert.equal(row.published.total, 1);
 	assert.equal(row.published.cost, 0.25);
 	hash.update(JSON.stringify([row.id, row.published]));
 }
-if (mode === "reload") index.update(rows[0].id, rows[0].file, { kind: "main" });
+if (mode === "reload") index.update(sub(rows[0].id), rows[0].file, { kind: "main" });
 console.error(mode, "before save", rows.length, "rows", process.memoryUsage().heapUsed, "heap bytes");
 assert.equal(index.save(), true);
 console.error(mode, "after save", fs.statSync(file).size, "file bytes", process.memoryUsage().heapUsed, "heap bytes", process.resourceUsage().maxRSS, "KiB peak RSS");
@@ -558,11 +573,14 @@ test("(gate 14) 138 sessions with 1000 overflowing models save and reload in cap
 	const program = `
 import assert from "node:assert/strict";
 import { createUsageIndex, readUsageIndex } from ${JSON.stringify(new URL("../src/usage-index.mjs", import.meta.url).href)};
+const sub = (sessionId) => ({ sessionId, projectKey: null });
+const key = (id) => subjectKey(sub(id));
+import { projectKeyOf, subjectKey } from ${JSON.stringify(new URL("../src/session-subject.mjs", import.meta.url).href)};
 const [mode, file, transcript] = process.argv.slice(1);
 const clock = { now: () => 1 };
 if (mode === "write") {
 	const index = createUsageIndex({ file, clock });
-	for (let i = 0; i < 138; i++) index.update("s" + i, transcript);
+	for (let i = 0; i < 138; i++) index.update(sub("s" + i), transcript);
 	assert.equal(index.save(), true);
 } else {
 	const rows = mode === "dashboard" ? [...readUsageIndex(file).values()] : createUsageIndex({ file, clock }).entries();
@@ -586,8 +604,8 @@ test("(gate 14) exact budget, spill, and a previously oversized persisted row", 
 	const records = Array.from({ length: 512 }, (_, i) => JSON.stringify(assistant({ model: `m${i}` }))).join("\n") + "\n";
 	writeText(file, records);
 	const index = indexOf();
-	for (let i = 0; i < 3; i++) index.update(`s${i}`, file);
-	const beforeSave = index.get("s2").published;
+	for (let i = 0; i < 3; i++) index.update(sub(`s${i}`), file);
+	const beforeSave = index.get(key("s2")).published;
 	assert.deepEqual(beforeSave.models, {
 		"(other models)": { input: 512, output: 1024, cacheRead: 1536, cacheWrite: 2048, tokens: 5120, cost: beforeSave.cost },
 	});
@@ -598,20 +616,20 @@ test("(gate 14) exact budget, spill, and a previously oversized persisted row", 
 	const slots = rows.flatMap((row) => [row.usage, row.overlay, row.published]).flatMap((tree) =>
 		[...Object.keys(tree.models), ...Object.keys(tree.usedModels)]).filter((key) => !key.startsWith("("));
 	assert.equal(slots.length, 4096);
-	assert.equal(readUsageIndex(saved).get("s1").published.modelsIncomplete, false);
-	assert.equal(readUsageIndex(saved).get("s2").published.total, 5120);
+	assert.equal(readUsageIndex(saved).get(key("s1")).published.modelsIncomplete, false);
+	assert.equal(readUsageIndex(saved).get(key("s2")).published.total, 5120);
 	data.entries.s2 = { ...data.entries.s0, id: "s2" };
 	writeText(saved, indexText(data));
 	const loaded = readUsageIndex(saved);
-	assert.equal(compactUsage(loaded.get("s1")).total, 5120);
-	assert.equal(compactUsage(loaded.get("s2")), null);
+	assert.equal(compactUsage(loaded.get(key("s1"))).total, 5120);
+	assert.equal(compactUsage(loaded.get(key("s2"))), null);
 	const reopened = indexOf();
-	assert.equal(reopened.update("s2", file), fs.statSync(file).size);
-	assert.equal(reopened.get("s2").published.modelsIncomplete, true);
+	assert.equal(reopened.update(sub("s2"), file), fs.statSync(file).size);
+	assert.equal(reopened.get(key("s2")).published.modelsIncomplete, true);
 	const tail = `${line()}\n`;
 	fs.appendFileSync(file, tail);
-	assert.equal(reopened.update("s2", file), Buffer.byteLength(tail));
-	assert.equal(reopened.get("s2").published.total, 5130);
+	assert.equal(reopened.update(sub("s2"), file), Buffer.byteLength(tail));
+	assert.equal(reopened.get(key("s2")).published.total, 5130);
 });
 
 test("(gate 14) regrouped model cost need not reconcile in floating point", (t) => {
@@ -623,9 +641,9 @@ test("(gate 14) regrouped model cost need not reconcile in floating point", (t) 
 		assistant({ model: "m1", usage: use({ cost: -1e308 }) }),
 	].map((item) => JSON.stringify(item)).join("\n") + "\n");
 	const index = indexOf();
-	index.update("s", file);
+	index.update(sub("s"), file);
 	index.save();
-	const entry = indexOf().get("s");
+	const entry = indexOf().get(key("s"));
 	assert.equal(compactUsage(entry).cost, 0);
 	assert.equal(Object.values(entry.published.models).reduce((sum, model) => sum + model.cost, 0), 1);
 	assert.equal(fresh(entry), true);
@@ -638,8 +656,8 @@ test("save and load round-trip the entries without the in-memory fields", (t) =>
 	const second = fileOf("b.jsonl");
 	writeText(first, `${line()}\n`);
 	writeText(second, `${line()}\n${line()}`);
-	assert.equal(index.update("s1", first, { kind: "main", rootSessionId: "s1" }, { maxBytes: 1 * MiB }), fs.statSync(first).size);
-	assert.equal(index.update("s2", second, { kind: "child", taskId: "st_2", parentSessionId: "s1" }), fs.statSync(second).size);
+	assert.equal(index.update(sub("s1"), first, { kind: "main", rootSessionId: "s1" }, { maxBytes: 1 * MiB }), fs.statSync(first).size);
+	assert.equal(index.update(sub("s2"), second, { kind: "child", taskId: "st_2", parentSessionId: "s1" }), fs.statSync(second).size);
 	assert.equal(index.save(), true);
 	assert.equal(index.save(), false);
 	const raw = parseIndex(fs.readFileSync(path.join(dir, "usage.json"), "utf8"));
@@ -652,10 +670,10 @@ test("save and load round-trip the entries without the in-memory fields", (t) =>
 	const loaded = readUsageIndex(path.join(dir, "usage.json"));
 	assert.equal(loaded instanceof Map, true);
 	assert.equal(loaded.size, 2);
-	assert.equal(compactUsage(loaded.get("s1")).total, 10);
-	assert.equal(compactUsage(loaded.get("s2")).total, 20);
-	assert.equal(loaded.get("s2").taskId, "st_2");
-	assert.equal(loaded.get("s2").parentSessionId, "s1");
+	assert.equal(compactUsage(loaded.get(key("s1"))).total, 10);
+	assert.equal(compactUsage(loaded.get(key("s2"))).total, 20);
+	assert.equal(loaded.get(key("s2")).taskId, "st_2");
+	assert.equal(loaded.get(key("s2")).parentSessionId, "s1");
 	assert.equal(index.prune(T0), 0);
 });
 
@@ -670,19 +688,19 @@ for (const field of ["size", "offset", "evaluatedTo", "mtimeMs", "ino", "birthti
 			const savedFile = fileOf(indexName);
 			writeText(file, original);
 			const index = indexOf(indexName);
-			index.update("s", file);
+			index.update(sub("s"), file);
 			index.save();
 			const saved = fs.readFileSync(savedFile, "utf8");
 			const corrupt = saved.replace(new RegExp(`("${field}"\\s*:\\s*)[^,\\s}]+`), (_, key) => key + value);
 			assert.notEqual(corrupt, saved);
 			writeText(savedFile, corrupt);
 			const reloaded = indexOf(indexName);
-			const wasFresh = fresh(reloaded.get("s"));
+			const wasFresh = fresh(reloaded.get(key("s")));
 			fs.appendFileSync(file, second);
-			assert.equal(reloaded.update("s", file), Buffer.byteLength(original + second), value);
-			assert.equal(compactUsage(reloaded.get("s")).total, 20);
+			assert.equal(reloaded.update(sub("s"), file), Buffer.byteLength(original + second), value);
+			assert.equal(compactUsage(reloaded.get(key("s"))).total, 20);
 			assert.equal(reloaded.save(), true);
-			assert.equal(compactUsage(indexOf(indexName).get("s")).total, 20);
+			assert.equal(compactUsage(indexOf(indexName).get(key("s"))).total, 20);
 			assert.equal(wasFresh, false, value);
 		}
 		assert.deepEqual(logged, []);
@@ -706,7 +724,7 @@ test("constructing an index over a corrupt, different-version or absent file sta
 		fs.writeFileSync(file, text);
 		const index = createUsageIndex({ file, clock, log });
 		assert.deepEqual(index.entries(), []);
-		assert.equal(index.has("s1"), false);
+		assert.equal(index.has(key("s1")), false);
 		assert.equal(index.save(), false, "nothing was loaded, so nothing is written");
 	}
 	fs.rmSync(file);
@@ -715,17 +733,17 @@ test("constructing an index over a corrupt, different-version or absent file sta
 	const session = path.join(dir, "cursor.jsonl");
 	writeText(session, "{}\n".repeat(4));
 	const writer = createUsageIndex({ file, clock, log });
-	writer.update("s1", session);
+	writer.update(sub("s1"), session);
 	writer.save();
 	const saved = parseIndex(fs.readFileSync(file, "utf8"));
 	Object.assign(saved.entries.s1, { scanOffset: 5, partial: { start: 0 }, readError: true });
 	writeText(file, indexText(saved));
 	const loaded = createUsageIndex({ file, clock, log });
-	assert.equal(loaded.get("s1").state, "ok");
-	assert.equal(loaded.get("s1").offset, 12);
-	assert.equal("scanOffset" in loaded.get("s1"), false, "scanOffset is memory-only");
-	assert.equal("partial" in loaded.get("s1"), false, "partial is memory-only");
-	assert.equal("readError" in loaded.get("s1"), false, "readError is memory-only");
+	assert.equal(loaded.get(key("s1")).state, "ok");
+	assert.equal(loaded.get(key("s1")).offset, 12);
+	assert.equal("scanOffset" in loaded.get(key("s1")), false, "scanOffset is memory-only");
+	assert.equal("partial" in loaded.get(key("s1")), false, "partial is memory-only");
+	assert.equal("readError" in loaded.get(key("s1")), false, "readError is memory-only");
 });
 
 test("an index over the same file resumes an appended entry at its saved offset", (t) => {
@@ -733,27 +751,27 @@ test("an index over the same file resumes an appended entry at its saved offset"
 	const file = fileOf();
 	writeText(file, `${line()}\n`);
 	const first = indexOf();
-	assert.equal(first.update("s1", file), fs.statSync(file).size);
-	assert.equal(compactUsage(first.get("s1")).total, 10);
+	assert.equal(first.update(sub("s1"), file), fs.statSync(file).size);
+	assert.equal(compactUsage(first.get(key("s1"))).total, 10);
 
 	const appended = `${line()}\n${line()}\n`;
 	const lineBytes = Buffer.byteLength(`${line()}\n`);
 	fs.appendFileSync(file, appended);
-	assert.equal(first.update("s1", file, {}, { maxBytes: lineBytes }), lineBytes, "the first instance read one of the two appended records");
+	assert.equal(first.update(sub("s1"), file, {}, { maxBytes: lineBytes }), lineBytes, "the first instance read one of the two appended records");
 	assert.equal(first.save(), true);
-	const savedOffset = readUsageIndex(path.join(dir, "usage.json")).get("s1").offset;
+	const savedOffset = readUsageIndex(path.join(dir, "usage.json")).get(key("s1")).offset;
 	assert.equal(savedOffset, fs.statSync(file).size - lineBytes);
 
 	const restarted = indexOf();
-	assert.equal(restarted.get("s1").offset, savedOffset, "the new instance loaded the persisted cursor");
-	const bytesRead = restarted.update("s1", file, {}, { maxBytes: USAGE_TICK_BYTES });
+	assert.equal(restarted.get(key("s1")).offset, savedOffset, "the new instance loaded the persisted cursor");
+	const bytesRead = restarted.update(sub("s1"), file, {}, { maxBytes: USAGE_TICK_BYTES });
 	assert.equal(bytesRead, lineBytes, "only the bytes not yet read are read");
-	assert.equal(compactUsage(restarted.get("s1")).total, 30);
-	assert.equal(restarted.fresh(restarted.get("s1")), true);
+	assert.equal(compactUsage(restarted.get(key("s1"))).total, 30);
+	assert.equal(restarted.fresh(restarted.get(key("s1"))), true);
 
 	const oracle = indexOf("oracle.json");
-	oracle.update("s1", file, {}, { maxBytes: USAGE_TICK_BYTES });
-	assert.equal(compactUsage(oracle.get("s1")).total, 30, "the resumed total equals a one-shot read");
+	oracle.update(sub("s1"), file, {}, { maxBytes: USAGE_TICK_BYTES });
+	assert.equal(compactUsage(oracle.get(key("s1"))).total, 30, "the resumed total equals a one-shot read");
 });
 
 test("(IS-1) index save, reload and append preserve fractional per-model tokens", (t) => {
@@ -767,24 +785,24 @@ test("(IS-1) index save, reload and append preserve fractional per-model tokens"
 	const second = fractional(0, 0);
 	writeText(file, `${first}\n${second}`);
 	const index = indexOf();
-	index.update("s", file);
+	index.update(sub("s"), file);
 	assert.equal(index.save(), true);
 
 	const reloaded = indexOf();
-	const key = "anthropic-subscription/claude-opus-5-5";
-	assert.equal(reloaded.get("s").offset, Buffer.byteLength(`${first}\n`));
+	const modelKey = "anthropic-subscription/claude-opus-5-5";
+	assert.equal(reloaded.get(key("s")).offset, Buffer.byteLength(`${first}\n`));
 	const appended = `\n${fractional(0, 0.3)}\n`;
 	fs.appendFileSync(file, appended);
-	assert.equal(reloaded.update("s", file), Buffer.byteLength(second + appended));
-	const resumed = reloaded.get("s").published.models[key];
-	const once = readUsage(file).effective.models[key];
+	assert.equal(reloaded.update(sub("s"), file), Buffer.byteLength(second + appended));
+	const resumed = reloaded.get(key("s")).published.models[modelKey];
+	const once = readUsage(file).effective.models[modelKey];
 	assert.equal(once.tokens, 0.1 + (0 + 0.2 + 0.3) + 0 + 0, "senpi sums by counter before summing the key");
 	assert.equal(resumed.tokens, once.tokens);
 	assert.deepEqual(resumed, { input: 0.1, output: 0.5, cacheRead: 0, cacheWrite: 0, tokens: 0.6, cost: 0.375 });
 
 	const saved = parseIndex(fs.readFileSync(fileOf("usage.json"), "utf8")).entries.s;
 	for (const [tree, input, output] of [["usage", 0.1, 0.2], ["overlay", 0, 0], ["published", 0.1, 0.2]]) {
-		assert.deepEqual(saved[tree].models[key], {
+		assert.deepEqual(saved[tree].models[modelKey], {
 			input, output, cacheRead: 0, cacheWrite: 0, tokens: input + output,
 			cost: tree === "published" ? 0.25 : 0.125,
 		}, tree);
@@ -797,7 +815,7 @@ test("(IS-1) a v3 row without model counters starts empty and is recounted", (t)
 	const savedFile = fileOf("usage.json");
 	writeText(file, `${line()}\n`);
 	const writer = indexOf();
-	writer.update("s", file);
+	writer.update(sub("s"), file);
 	assert.equal(writer.save(), true);
 	const old = parseIndex(fs.readFileSync(savedFile, "utf8"));
 	old.v = 3;
@@ -807,14 +825,14 @@ test("(IS-1) a v3 row without model counters starts empty and is recounted", (t)
 		}
 	}
 	writeText(savedFile, indexText(old));
-	assert.equal(readUsageIndex(savedFile).has("s"), false, "the dashboard must not publish a v3 total");
+	assert.equal(readUsageIndex(savedFile).has(key("s")), false, "the dashboard must not publish a v3 total");
 	const restarted = indexOf();
-	assert.equal(restarted.has("s"), false, "there is no trusted v3 cursor");
-	assert.equal(restarted.update("s", file), fs.statSync(file).size);
-	assert.equal(restarted.get("s").complete, true);
-	assert.deepEqual(restarted.get("s").published.models, readUsage(file).effective.models);
+	assert.equal(restarted.has(key("s")), false, "there is no trusted v3 cursor");
+	assert.equal(restarted.update(sub("s"), file), fs.statSync(file).size);
+	assert.equal(restarted.get(key("s")).complete, true);
+	assert.deepEqual(restarted.get(key("s")).published.models, readUsage(file).effective.models);
 	assert.equal(restarted.save(), true);
-	assert.equal(readUsageIndex(savedFile).get("s").complete, true);
+	assert.equal(readUsageIndex(savedFile).get(key("s")).complete, true);
 });
 
 test("a resumable append reads only the appended bytes", (t) => {
@@ -822,15 +840,15 @@ test("a resumable append reads only the appended bytes", (t) => {
 	const file = fileOf();
 	writeText(file, `${line()}\n`);
 	const index = indexOf();
-	index.update("s1", file);
-	assert.equal(compactUsage(index.get("s1")).total, 10);
+	index.update(sub("s1"), file);
+	assert.equal(compactUsage(index.get(key("s1"))).total, 10);
 	const appended = `${line()}\n${line()}\n`;
 	fs.appendFileSync(file, appended);
-	assert.equal(index.fresh(index.get("s1")), false);
-	const bytesRead = index.update("s1", file, {}, { maxBytes: USAGE_TICK_BYTES });
+	assert.equal(index.fresh(index.get(key("s1"))), false);
+	const bytesRead = index.update(sub("s1"), file, {}, { maxBytes: USAGE_TICK_BYTES });
 	assert.equal(bytesRead, Buffer.byteLength(appended));
-	assert.equal(compactUsage(index.get("s1")).total, 30);
-	assert.equal(index.fresh(index.get("s1")), true);
+	assert.equal(compactUsage(index.get(key("s1"))).total, 30);
+	assert.equal(index.fresh(index.get(key("s1"))), true);
 });
 
 test("a file replaced with the same size and mtime is not fresh and is recounted", (t) => {
@@ -840,19 +858,19 @@ test("a file replaced with the same size and mtime is not fresh and is recounted
 	writeText(file, text);
 	fs.utimesSync(file, 1_700_000_000, 1_700_000_000);
 	const index = indexOf();
-	index.update("s1", file);
-	assert.equal(index.fresh(index.get("s1")), true);
+	index.update(sub("s1"), file);
+	assert.equal(index.fresh(index.get(key("s1"))), true);
 	const replacement = `${file}.new`;
 	writeText(replacement, text);
 	fs.utimesSync(replacement, 1_700_000_000, 1_700_000_000);
 	fs.renameSync(replacement, file);
 	const stat = fs.statSync(file);
-	assert.equal(stat.size, index.get("s1").size);
-	assert.equal(stat.mtimeMs, index.get("s1").mtimeMs);
-	assert.equal(index.fresh(index.get("s1")), false, "a new file identity is a replacement");
-	assert.equal(index.update("s1", file), Buffer.byteLength(text), "the replacement is read from the start");
-	assert.equal(compactUsage(index.get("s1")).total, 10);
-	assert.equal(index.fresh(index.get("s1")), true);
+	assert.equal(stat.size, index.get(key("s1")).size);
+	assert.equal(stat.mtimeMs, index.get(key("s1")).mtimeMs);
+	assert.equal(index.fresh(index.get(key("s1"))), false, "a new file identity is a replacement");
+	assert.equal(index.update(sub("s1"), file), Buffer.byteLength(text), "the replacement is read from the start");
+	assert.equal(compactUsage(index.get(key("s1"))).total, 10);
+	assert.equal(index.fresh(index.get(key("s1"))), true);
 });
 
 test("a valid final record without a newline is published and stays published through reload and its newline", (t) => {
@@ -861,15 +879,15 @@ test("a valid final record without a newline is published and stays published th
 	const fragment = JSON.stringify(assistant({ usage: use({ cacheWrite: 1 }) }));
 	writeText(file, `${line()}\n${fragment}`);
 	const index = indexOf();
-	index.update("s1", file);
-	assert.equal(compactUsage(index.get("s1")).total, 17);
+	index.update(sub("s1"), file);
+	assert.equal(compactUsage(index.get(key("s1"))).total, 17);
 	assert.equal(index.save(), true);
-	assert.equal(compactUsage(readUsageIndex(fileOf("usage.json")).get("s1")).total, 17, "dashboard reload");
+	assert.equal(compactUsage(readUsageIndex(fileOf("usage.json")).get(key("s1"))).total, 17, "dashboard reload");
 	const restarted = indexOf();
-	assert.equal(compactUsage(restarted.get("s1")).total, 17, "daemon restart");
+	assert.equal(compactUsage(restarted.get(key("s1"))).total, 17, "daemon restart");
 	fs.appendFileSync(file, "\n");
-	restarted.update("s1", file, {}, { maxBytes: USAGE_TICK_BYTES });
-	assert.equal(compactUsage(restarted.get("s1")).total, 17, "the fragment is counted once, now as a committed record");
+	restarted.update(sub("s1"), file, {}, { maxBytes: USAGE_TICK_BYTES });
+	assert.equal(compactUsage(restarted.get(key("s1"))).total, 17, "the fragment is counted once, now as a committed record");
 });
 
 test("(gate 10) finite records that overflow survive a reload and a resumable append", (t) => {
@@ -878,26 +896,26 @@ test("(gate 10) finite records that overflow survive a reload and a resumable ap
 	const overflowing = JSON.stringify(assistant({ usage: use({ input: 1e308, output: 1e308, cost: 1e308 }) }));
 	writeText(file, `${overflowing}\n${overflowing}\n${overflowing}`);
 	const index = indexOf();
-	index.update("s1", file);
-	const { usage, overlay, published } = index.get("s1");
+	index.update(sub("s1"), file);
+	const { usage, overlay, published } = index.get(key("s1"));
 	assert.equal(usage.cost, Infinity);
 	assert.equal(overlay.total, Infinity, "the unterminated record has its own overflow");
 	assert.equal(published.models["anthropic-subscription/claude-opus-5-5"].tokens, Infinity);
-	const before = compactUsage(index.get("s1"));
+	const before = compactUsage(index.get(key("s1")));
 	assert.equal(before.total, Infinity);
 	assert.equal(index.save(), true);
-	assert.deepEqual(compactUsage(readUsageIndex(fileOf("usage.json")).get("s1")), before, "dashboard reload");
+	assert.deepEqual(compactUsage(readUsageIndex(fileOf("usage.json")).get(key("s1"))), before, "dashboard reload");
 
 	const reloaded = indexOf();
-	assert.equal(reloaded.fresh(reloaded.get("s1")), true);
-	assert.deepEqual(reloaded.get("s1").usage, usage);
-	assert.deepEqual(reloaded.get("s1").overlay, overlay);
-	assert.deepEqual(reloaded.get("s1").published, published);
+	assert.equal(reloaded.fresh(reloaded.get(key("s1"))), true);
+	assert.deepEqual(reloaded.get(key("s1")).usage, usage);
+	assert.deepEqual(reloaded.get(key("s1")).overlay, overlay);
+	assert.deepEqual(reloaded.get(key("s1")).published, published);
 	const append = `\n${line()}\n`;
 	fs.appendFileSync(file, append);
-	assert.equal(reloaded.update("s1", file), Buffer.byteLength(overflowing + append), "re-read only the previous EOF fragment and new bytes");
-	assert.deepEqual(reloaded.get("s1").published, readUsage(file).effective);
-	assert.equal(compactUsage(reloaded.get("s1")).total, Infinity);
+	assert.equal(reloaded.update(sub("s1"), file), Buffer.byteLength(overflowing + append), "re-read only the previous EOF fragment and new bytes");
+	assert.deepEqual(reloaded.get(key("s1")).published, readUsage(file).effective);
+	assert.equal(compactUsage(reloaded.get(key("s1"))).total, Infinity);
 });
 
 const tagNumber = (value) => (Number.isFinite(value) ? value : { $n: Number.isNaN(value) ? "NaN" : value > 0 ? "Infinity" : "-Infinity" });
@@ -909,7 +927,7 @@ for (const [expected, taggedCounters, appendUsage] of [[-Infinity, { input: -Inf
 		const savedFile = fileOf("usage.json");
 		writeText(file, `${line()}\n`);
 		const index = indexOf();
-		index.update("s1", file);
+		index.update(sub("s1"), file);
 		index.save();
 		const tagged = parseIndex(fs.readFileSync(savedFile, "utf8"));
 		// A total is now recomputed from the four counters, so tag the counters that produce it.
@@ -919,19 +937,19 @@ for (const [expected, taggedCounters, appendUsage] of [[-Infinity, { input: -Inf
 		}
 		writeText(savedFile, indexText(tagged));
 		const migrated = indexOf();
-		assert.equal(migrated.get("s1").usage.total, expected);
+		assert.equal(migrated.get(key("s1")).usage.total, expected);
 		const appended = `${JSON.stringify(assistant({ usage: appendUsage }))}\n`;
 		fs.appendFileSync(file, appended);
-		assert.equal(migrated.update("s1", file), Buffer.byteLength(appended), "resume the tagged cursor");
-		assert.equal(compactUsage(migrated.get("s1")).total, expected);
+		assert.equal(migrated.update(sub("s1"), file), Buffer.byteLength(appended), "resume the tagged cursor");
+		assert.equal(compactUsage(migrated.get(key("s1"))).total, expected);
 		assert.equal(migrated.save(), true);
 
 		const reloaded = indexOf();
-		assert.deepEqual(compactUsage(reloaded.get("s1")), compactUsage(migrated.get("s1")));
+		assert.deepEqual(compactUsage(reloaded.get(key("s1"))), compactUsage(migrated.get(key("s1"))));
 		const last = `${line()}\n`;
 		fs.appendFileSync(file, last);
-		assert.equal(reloaded.update("s1", file), Buffer.byteLength(last));
-		assert.equal(compactUsage(reloaded.get("s1")).total, expected);
+		assert.equal(reloaded.update(sub("s1"), file), Buffer.byteLength(last));
+		assert.equal(compactUsage(reloaded.get(key("s1"))).total, expected);
 	});
 }
 
@@ -941,7 +959,10 @@ test("(gate 11) a 105,000-model entry saves and reloads under a 96 MiB heap", (t
 	const indexUrl = new URL("../src/usage-index.mjs", import.meta.url).href;
 	const child = [
 		'import fs from "node:fs";',
-		`import { createUsageIndex, readUsageIndex } from ${JSON.stringify(indexUrl)};`,
+		`import { createUsageIndex, readUsageIndex } from ${JSON.stringify(indexUrl)};
+const sub = (sessionId) => ({ sessionId, projectKey: null });
+const key = (id) => subjectKey(sub(id));
+import { projectKeyOf, subjectKey } from ${JSON.stringify(new URL("../src/session-subject.mjs", import.meta.url).href)};`,
 		"const dir = process.argv[2];",
 		'const session = dir + "/session.jsonl";',
 		'const indexFile = dir + "/usage.json";',
@@ -953,11 +974,11 @@ test("(gate 11) a 105,000-model entry saves and reloads under a 96 MiB heap", (t
 		"}",
 		"fs.closeSync(fd);",
 		"const index = createUsageIndex({ file: indexFile, clock: Date });",
-		'index.update("s1", session);',
-		'const total = index.get("s1").published.total;',
+		'index.update(sub("s1"), session);',
+		'const total = index.get(key("s1")).published.total;',
 		'if (total !== 105000) throw new Error("read total " + total);',
 		"index.save();",
-		'const reloaded = readUsageIndex(indexFile).get("s1");',
+		'const reloaded = readUsageIndex(indexFile).get(key("s1"));',
 		"const models = Object.keys(reloaded.published.models).length;",
 		'console.log("ok " + total + " " + models);',
 	];
@@ -965,7 +986,7 @@ test("(gate 11) a 105,000-model entry saves and reloads under a 96 MiB heap", (t
 	const result = spawnSync(process.execPath, ["--max-old-space-size=96", script, dir], { encoding: "utf8", timeout: 180_000 });
 	assert.equal(result.status, 0, `child exit ${result.status}: ${result.stderr}`);
 	assert.match(result.stdout, /^ok 105000 (?:[1-9]\d{0,2}|1000)$/m);
-	const reloaded = readUsageIndex(path.join(dir, "usage.json")).get("s1");
+	const reloaded = readUsageIndex(path.join(dir, "usage.json")).get(key("s1"));
 	assert.equal(reloaded.published.total, 105000);
 	assert.equal(reloaded.usage.total, 105000);
 	assert.ok(Object.keys(reloaded.published.models).length <= 1000);
@@ -979,7 +1000,10 @@ test("(gate 12) a 105,000-model entry with one overflow record loads and saves u
 	const indexUrl = new URL("../src/usage-index.mjs", import.meta.url).href;
 	const child = [
 		'import fs from "node:fs";',
-		`import { createUsageIndex } from ${JSON.stringify(indexUrl)};`,
+		`import { createUsageIndex } from ${JSON.stringify(indexUrl)};
+const sub = (sessionId) => ({ sessionId, projectKey: null });
+const key = (id) => subjectKey(sub(id));
+import { projectKeyOf, subjectKey } from ${JSON.stringify(new URL("../src/session-subject.mjs", import.meta.url).href)};`,
 		"const dir = process.argv[2];",
 		'const session = dir + "/session.jsonl";',
 		'const indexFile = dir + "/usage.json";',
@@ -994,8 +1018,8 @@ test("(gate 12) a 105,000-model entry with one overflow record loads and saves u
 		"\tfs.closeSync(fd);",
 		"}",
 		'const index = createUsageIndex({ file: indexFile, clock: Date });',
-		'index.update("s1", session);',
-		'const published = index.get("s1").published;',
+		'index.update(sub("s1"), session);',
+		'const published = index.get(key("s1")).published;',
 		'console.log("ok " + published.total + " " + Object.keys(published.models).length);',
 		"index.save();",
 	];
@@ -1008,7 +1032,7 @@ test("(gate 12) a 105,000-model entry with one overflow record loads and saves u
 	assert.equal(reloadedRun.status, 0, `reload child exit ${reloadedRun.status}: ${reloadedRun.stderr}`);
 	assert.match(reloadedRun.stdout, /^ok Infinity (?:[1-9]\d{0,2}|1000)$/m);
 	assert.equal(reloadedRun.stdout.split("\n")[0], saved.stdout.split("\n")[0], "the reloaded published totals equal the saved ones");
-	const reloaded = readUsageIndex(path.join(dir, "usage.json")).get("s1");
+	const reloaded = readUsageIndex(path.join(dir, "usage.json")).get(key("s1"));
 	assert.equal(reloaded.published.total, Infinity);
 	assert.equal(reloaded.usage.total, Infinity);
 	assert.ok(Object.keys(reloaded.published.models).length <= 1000);
@@ -1025,6 +1049,9 @@ test("(gate 13) a capped reader and fresh daemon constructor handle 135,000 over
 	fs.writeFileSync(script, `
 import fs from "node:fs";
 import { createUsageIndex, readUsageIndex } from ${JSON.stringify(indexUrl)};
+const sub = (sessionId) => ({ sessionId, projectKey: null });
+const key = (id) => subjectKey(sub(id));
+import { projectKeyOf, subjectKey } from ${JSON.stringify(new URL("../src/session-subject.mjs", import.meta.url).href)};
 import { readUsage } from ${JSON.stringify(usageUrl)};
 const dir = process.argv[2];
 const session = dir + "/dense.jsonl";
@@ -1048,12 +1075,12 @@ if (process.argv[3] === "save") {
 		console.log(describe(result.effective));
 		return result;
 	} });
-	index.update("s", session);
+	index.update(sub("s"), session);
 	if (!index.save()) throw new Error("no index saved");
 } else if (process.argv[3] === "dashboard") {
-	console.log(describe(readUsageIndex(file).get("s").published));
+	console.log(describe(readUsageIndex(file).get(key("s")).published));
 } else {
-	console.log(describe(createUsageIndex({ file, clock }).get("s").published));
+	console.log(describe(createUsageIndex({ file, clock }).get(key("s")).published));
 }
 `);
 	const run = (mode) => spawnSync(process.execPath, ["--max-old-space-size=96", script, dir, mode], { encoding: "utf8", timeout: 180_000 });
@@ -1073,15 +1100,15 @@ test("(gate 13) a markMissing row keeps all its writer fields", (t) => {
 	const file = fileOf("usage.json");
 	const meta = { kind: "child", taskId: "st_missing", file: fileOf("not-found.jsonl") };
 	const index = indexOf();
-	index.markMissing("s", meta);
+	index.markMissing(sub("s"), meta);
 	index.save();
 	const original = fs.readFileSync(file, "utf8");
-	const loaded = readUsageIndex(file).get("s");
+	const loaded = readUsageIndex(file).get(key("s"));
 	assert.equal(JSON.stringify(loaded), JSON.stringify(parseIndex(original).entries.s));
 	const restarted = indexOf();
-	assert.deepEqual(restarted.get("s"), loaded);
+	assert.deepEqual(restarted.get(key("s")), loaded);
 	// Dirty the index without rewriting the missing row itself.
-	restarted.markMissing("other");
+	restarted.markMissing(sub("other"));
 	assert.equal(restarted.save(), true);
 	const saved = fs.readFileSync(file, "utf8");
 	assert.equal(saved.slice(0, original.length), original);
@@ -1096,7 +1123,7 @@ for (const treeName of ["usage", "overlay", "published"]) {
 		// The unterminated record populates overlay; the terminated one populates usage.
 		writeText(file, `${line()}\n${line()}`);
 		const index = indexOf();
-		index.update("s", file);
+		index.update(sub("s"), file);
 		index.save();
 		const original = fs.readFileSync(indexFile, "utf8");
 		for (const mapName of ["models", "usedModels"]) {
@@ -1108,7 +1135,7 @@ for (const treeName of ["usage", "overlay", "published"]) {
 					for (let i = 0; i < 1000; i += 1) map[`p/${i}`] = sample;
 				} else map[`p/${"x".repeat(255)}`] = sample;
 				writeText(indexFile, indexText(data));
-				const loaded = readUsageIndex(indexFile).get("s");
+				const loaded = readUsageIndex(indexFile).get(key("s"));
 				const label = `${treeName}.${mapName}: ${failure}`;
 				assert.equal(loaded.offset, 0, label);
 				assert.equal(compactUsage(loaded), null, label);
@@ -1126,7 +1153,7 @@ for (const treeName of ["usage", "overlay", "published"]) {
 		const indexFile = fileOf("usage.json");
 		writeText(file, `${line()}\n${line()}`);
 		const index = indexOf();
-		index.update("s", file);
+		index.update(sub("s"), file);
 		index.save();
 		const original = fs.readFileSync(indexFile, "utf8");
 		for (const leaf of [
@@ -1141,7 +1168,7 @@ for (const treeName of ["usage", "overlay", "published"]) {
 				if (malformed) node[tail ?? head] = null;
 				else delete node[tail ?? head];
 				writeText(indexFile, indexText(data));
-				const loaded = readUsageIndex(indexFile).get("s");
+				const loaded = readUsageIndex(indexFile).get(key("s"));
 				const label = `${treeName}.${leaf}: ${malformed ? "null" : "absent"}`;
 				assert.equal(loaded.offset, 0, label);
 				assert.equal(compactUsage(loaded), null, label);
@@ -1155,7 +1182,7 @@ test("(gate 12) malformed numeric fields invalidate a row at load: null, malform
 	const file = fileOf();
 	writeText(file, `${line()}\n`);
 	const index = indexOf();
-	index.update("s1", file);
+	index.update(sub("s1"), file);
 	index.save();
 	const savedFile = path.join(dir, "usage.json");
 	const template = fs.readFileSync(savedFile, "utf8");
@@ -1170,7 +1197,7 @@ test("(gate 12) malformed numeric fields invalidate a row at load: null, malform
 		const data = parseIndex(template);
 		mutate(data);
 		writeText(savedFile, indexText(data));
-		const loaded = readUsageIndex(savedFile).get("s1");
+		const loaded = readUsageIndex(savedFile).get(key("s1"));
 		assert.equal(loaded.offset, 0, name);
 		assert.equal(loaded.complete, false, name);
 		assert.equal("published" in loaded, false, name);
@@ -1184,10 +1211,10 @@ test("(gate 12) a valid current file loads and legacy files start empty", (t) =>
 	const file = fileOf();
 	writeText(file, `${line()}\n`);
 	const index = indexOf();
-	index.update("s1", file);
+	index.update(sub("s1"), file);
 	index.save();
 	const savedFile = path.join(dir, "usage.json");
-	const current = readUsageIndex(savedFile).get("s1");
+	const current = readUsageIndex(savedFile).get(key("s1"));
 	assert.equal(compactUsage(current).total, 10);
 	assert.equal(fresh(current), true);
 	const { entries } = parseIndex(fs.readFileSync(savedFile, "utf8"));
@@ -1204,14 +1231,14 @@ test("a three-call first read shows nothing until the file is read to the end", 
 	writeText(file, `${JSON.stringify(assistant({ text: "x".repeat(900) }))}\n${JSON.stringify(assistant({ text: "y".repeat(900) }))}\n${JSON.stringify(assistant({ text: "z".repeat(900) }))}\n`);
 	const maxBytes = Math.ceil(fs.statSync(file).size / 3) + 1;
 	const index = indexOf();
-	const entry = () => index.get("s1");
-	assert.equal(index.update("s1", file, {}, { maxBytes }), maxBytes);
+	const entry = () => index.get(key("s1"));
+	assert.equal(index.update(sub("s1"), file, {}, { maxBytes }), maxBytes);
 	assert.equal(entry().complete, false);
 	assert.equal(compactUsage(entry()), null);
-	assert.ok(index.update("s1", file, {}, { maxBytes }) > 0);
+	assert.ok(index.update(sub("s1"), file, {}, { maxBytes }) > 0);
 	assert.equal(entry().complete, false);
 	assert.equal(compactUsage(entry()), null);
-	assert.ok(index.update("s1", file, {}, { maxBytes }) > 0);
+	assert.ok(index.update(sub("s1"), file, {}, { maxBytes }) > 0);
 	assert.equal(entry().complete, true);
 	assert.equal(index.fresh(entry()), true);
 	assert.equal(compactUsage(entry()).total, 30);
@@ -1222,12 +1249,12 @@ test("an append to a complete entry keeps it complete", (t) => {
 	const file = fileOf();
 	writeText(file, `${line()}\n`);
 	const index = indexOf();
-	index.update("s1", file);
-	assert.equal(index.get("s1").complete, true);
+	index.update(sub("s1"), file);
+	assert.equal(index.get(key("s1")).complete, true);
 	fs.appendFileSync(file, `${line()}\n`);
-	index.update("s1", file);
-	assert.equal(index.get("s1").complete, true);
-	assert.equal(compactUsage(index.get("s1")).total, 20);
+	index.update(sub("s1"), file);
+	assert.equal(index.get(key("s1")).complete, true);
+	assert.equal(compactUsage(index.get(key("s1"))).total, 20);
 });
 
 test("ten 4 MiB records appended to a complete entry are counted eight per 32 MiB update", (t) => {
@@ -1236,8 +1263,8 @@ test("ten 4 MiB records appended to a complete entry are counted eight per 32 Mi
 	writeText(file, `${line()}\n`);
 	const oldEnd = fs.statSync(file).size;
 	const index = indexOf();
-	index.update("s1", file);
-	assert.equal(compactUsage(index.get("s1")).total, 10);
+	index.update(sub("s1"), file);
+	assert.equal(compactUsage(index.get(key("s1"))).total, 10);
 
 	const record = assistant();
 	const target = 4 * MiB - 1;
@@ -1247,15 +1274,15 @@ test("ten 4 MiB records appended to a complete entry are counted eight per 32 Mi
 	assert.equal(Buffer.byteLength(bigLine) + 1, 4 * MiB);
 	fs.appendFileSync(file, `${bigLine}\n`.repeat(10));
 
-	const entry = index.get("s1");
-	assert.equal(index.update("s1", file, {}, { maxBytes: USAGE_TICK_BYTES }), 8 * 4 * MiB);
+	const entry = index.get(key("s1"));
+	assert.equal(index.update(sub("s1"), file, {}, { maxBytes: USAGE_TICK_BYTES }), 8 * 4 * MiB);
 	assert.equal(entry.usage.total, 90);
 	assert.equal(entry.offset, oldEnd + 8 * 4 * MiB);
 	assert.equal(entry.complete, true);
 	assert.equal(entry.evaluatedTo < entry.size, true);
 	assert.equal(compactUsage(entry).total, 10);
 
-	assert.equal(index.update("s1", file, {}, { maxBytes: USAGE_TICK_BYTES }), 2 * 4 * MiB);
+	assert.equal(index.update(sub("s1"), file, {}, { maxBytes: USAGE_TICK_BYTES }), 2 * 4 * MiB);
 	assert.equal(entry.complete, true);
 	assert.equal(entry.evaluatedTo, entry.size);
 	assert.equal(compactUsage(entry).total, 110);
@@ -1268,8 +1295,8 @@ test("a 40 MiB record appended to a complete entry keeps the previous total unti
 	writeText(file, `${line()}\n`);
 	const oldEnd = fs.statSync(file).size;
 	const index = indexOf();
-	index.update("s1", file);
-	assert.equal(compactUsage(index.get("s1")).total, 10);
+	index.update(sub("s1"), file);
+	assert.equal(compactUsage(index.get(key("s1"))).total, 10);
 
 	const record = assistant({ usage: use({ input: 1, output: 1, cacheRead: 1, cacheWrite: 1, cost: 0 }) });
 	const target = 40 * MiB;
@@ -1279,15 +1306,15 @@ test("a 40 MiB record appended to a complete entry keeps the previous total unti
 	assert.equal(Buffer.byteLength(bigLine), target);
 	fs.appendFileSync(file, `${bigLine}\n`);
 
-	const entry = index.get("s1");
-	index.update("s1", file, {}, { maxBytes: USAGE_TICK_BYTES });
+	const entry = index.get(key("s1"));
+	index.update(sub("s1"), file, {}, { maxBytes: USAGE_TICK_BYTES });
 	assert.equal(entry.complete, true);
 	assert.equal(compactUsage(entry).total, 10);
 	assert.equal(entry.offset, oldEnd);
 	assert.equal(entry.evaluatedTo, oldEnd + USAGE_TICK_BYTES);
 	assert.equal(index.fresh(entry), false);
 
-	index.update("s1", file, {}, { maxBytes: USAGE_TICK_BYTES });
+	index.update(sub("s1"), file, {}, { maxBytes: USAGE_TICK_BYTES });
 	assert.equal(entry.complete, true);
 	assert.equal(compactUsage(entry).total, 14);
 	assert.equal(entry.evaluatedTo, entry.size);
@@ -1298,13 +1325,13 @@ test("a missing file marks the entry missing", (t) => {
 	const { dir, fileOf, indexOf } = setup(t);
 	const index = indexOf();
 	const file = fileOf("never.jsonl");
-	assert.equal(index.update("s1", file, { kind: "main" }), 0);
-	const entry = index.get("s1");
+	assert.equal(index.update(sub("s1"), file, { kind: "main" }), 0);
+	const entry = index.get(key("s1"));
 	assert.equal(entry.state, "missing");
 	assert.equal(entry.complete, false);
 	assert.equal(compactUsage(entry), null);
 	index.save();
-	assert.equal(readUsageIndex(path.join(dir, "usage.json")).get("s1").state, "missing");
+	assert.equal(readUsageIndex(path.join(dir, "usage.json")).get(key("s1")).state, "missing");
 });
 
 test("deleting a complete file marks it gone and keeps its total", (t) => {
@@ -1312,10 +1339,10 @@ test("deleting a complete file marks it gone and keeps its total", (t) => {
 	const file = fileOf();
 	writeText(file, `${line()}\n`);
 	const index = indexOf();
-	index.update("s1", file);
+	index.update(sub("s1"), file);
 	fs.rmSync(file);
-	assert.equal(index.update("s1", file), 0);
-	const entry = index.get("s1");
+	assert.equal(index.update(sub("s1"), file), 0);
+	const entry = index.get(key("s1"));
 	assert.equal(entry.state, "ok");
 	assert.equal(entry.gone, true);
 	assert.equal(compactUsage(entry).total, 10);
@@ -1328,21 +1355,21 @@ test("(IS-3) deleted task-only usage survives zero candidates, not a competing f
 	const id = "st_deleted";
 	const index = indexOf();
 	writeText(file, `${line()}\n`);
-	index.update(id, file, { kind: "child", taskId: id });
-	assert.equal(compactUsage(index.get(id))?.total, 10);
+	index.update(sub(id), file, { kind: "child", taskId: id });
+	assert.equal(compactUsage(index.get(key(id)))?.total, 10);
 
 	fs.rmSync(file);
-	assert.equal(compactUsage(index.get(id))?.total, 10, "unlink alone must not blank the verified total");
-	index.markMissing(id);
+	assert.equal(compactUsage(index.get(key(id)))?.total, 10, "unlink alone must not blank the verified total");
+	index.markMissing(sub(id));
 	index.save();
-	const saved = readUsageIndex(path.join(dir, "usage.json")).get(id);
+	const saved = readUsageIndex(path.join(dir, "usage.json")).get(key(id));
 	assert.deepEqual([saved.state, saved.complete, saved.gone, compactUsage(saved)?.total, fresh(saved)], ["ok", true, true, 10, false]);
 
 	writeText(fileOf("replacement.jsonl"), `${line()}\n`);
 	// Publish the daemon's revocation before a replacement can be counted.
-	index.markMissing(id, {}, { withdraw: true });
+	index.markMissing(sub(id), {}, { withdraw: true });
 	index.save();
-	assert.equal(compactUsage(readUsageIndex(path.join(dir, "usage.json")).get(id)), null,
+	assert.equal(compactUsage(readUsageIndex(path.join(dir, "usage.json")).get(key(id))), null,
 		"a different candidate cannot inherit the deleted file's total");
 });
 
@@ -1351,15 +1378,15 @@ test("markMissing keeps a complete entry's published total and marks it gone, wh
 	const index = indexOf();
 	const file = fileOf();
 	writeText(file, `${line()}\n`);
-	index.update("s1", file);
+	index.update(sub("s1"), file);
 
-	const gone = index.markMissing("s1");
+	const gone = index.markMissing(sub("s1"));
 	assert.equal(gone.state, "ok");
 	assert.equal(gone.complete, true);
 	assert.equal(gone.gone, true);
 	assert.equal(compactUsage(gone).total, 10, "the last published total survives the deletion");
 
-	const never = index.markMissing("s2");
+	const never = index.markMissing(sub("s2"));
 	assert.equal(never.state, "missing");
 	assert.equal(never.complete, false);
 	assert.equal(never.gone, false);
@@ -1367,9 +1394,9 @@ test("markMissing keeps a complete entry's published total and marks it gone, wh
 
 	index.save();
 	const saved = readUsageIndex(path.join(dir, "usage.json"));
-	assert.equal(saved.get("s1").gone, true);
-	assert.equal(saved.get("s1").state, "ok");
-	assert.equal(saved.get("s1").published.total, 10);
+	assert.equal(saved.get(key("s1")).gone, true);
+	assert.equal(saved.get(key("s1")).state, "ok");
+	assert.equal(saved.get(key("s1")).published.total, 10);
 });
 
 test("get and has resolve only an explicit, unique taskId alias without a session id", (t) => {
@@ -1377,10 +1404,10 @@ test("get and has resolve only an explicit, unique taskId alias without a sessio
 	const file = fileOf();
 	writeText(file, `${line()}\n`);
 	const index = indexOf();
-	index.update("s1", file, { kind: "child", taskId: "st_01a2" });
-	assert.equal(index.get(undefined, "st_01a2"), index.get("s1"));
-	assert.equal(index.has(undefined, "st_01a2"), true);
-	assert.equal(index.has(undefined, "st_absent"), false);
+	index.update(sub("s1"), file, { kind: "child", taskId: "st_01a2" });
+	assert.equal(index.get(sub(undefined), "st_01a2"), index.get(key("s1")));
+	assert.equal(index.has(sub(undefined), "st_01a2"), true);
+	assert.equal(index.has(sub(undefined), "st_absent"), false);
 });
 
 test("get and has never cross session identities or resolve ambiguous task ids", (t) => {
@@ -1388,11 +1415,11 @@ test("get and has never cross session identities or resolve ambiguous task ids",
 	const file = fileOf();
 	writeText(file, `${line()}\n`);
 	const index = indexOf();
-	index.update("child-a", file, { kind: "child", taskId: "st_x" });
-	assert.deepEqual([index.get("child-b", "st_x"), index.get("st_x"), index.has("st_x")], [undefined, undefined, false]);
-	index.update("child-b", file, { kind: "child", taskId: "st_x" });
-	assert.deepEqual([index.get(null, "st_x"), index.has(null, "st_x")], [undefined, false]);
-	assert.equal(index.get("child-b", "st_x").id, "child-b");
+	index.update(sub("child-a"), file, { kind: "child", taskId: "st_x" });
+	assert.deepEqual([index.get(sub("child-b"), "st_x"), index.get(key("st_x")), index.has(key("st_x"))], [undefined, undefined, false]);
+	index.update(sub("child-b"), file, { kind: "child", taskId: "st_x" });
+	assert.deepEqual([index.get(sub(null), "st_x"), index.has(sub(null), "st_x")], [undefined, false]);
+	assert.equal(index.get(sub("child-b"), "st_x").id, "child-b");
 });
 
 test("prune drops entries by checkedMs against the injected clock", (t) => {
@@ -1402,21 +1429,21 @@ test("prune drops entries by checkedMs against the injected clock", (t) => {
 	const b = fileOf("b.jsonl");
 	writeText(a, `${line()}\n`);
 	writeText(b, `${line()}\n`);
-	index.update("a", a);
+	index.update(sub("a"), a);
 	clock.advance(44 * DAY);
-	index.update("b", b);
+	index.update(sub("b"), b);
 	clock.advance(2 * DAY);
 	assert.equal(index.prune(clock.now()), 1);
-	assert.equal(index.has("a"), false);
-	assert.equal(index.has("b"), true);
+	assert.equal(index.has(key("a")), false);
+	assert.equal(index.has(key("b")), true);
 	assert.equal(index.prune(clock.now() + 45 * DAY), 1);
-	assert.equal(index.has("b"), false);
+	assert.equal(index.has(key("b")), false);
 });
 
 test("treeTotals sums descendants, survives a cycle, and skips an incomplete child", () => {
 	const entry = (id, parentSessionId, total, complete = true) => ({
 		id,
-		parentSessionId,
+		parentKey: key(parentSessionId),
 		state: "ok",
 		complete,
 		published: { total, input: total, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, costUnknown: false, turns: 0 },
@@ -1430,17 +1457,17 @@ test("treeTotals sums descendants, survives a cycle, and skips an incomplete chi
 		entry("main2", null, 50),
 		entry("child2", "main2", 999, false),
 	]);
-	assert.equal(totals.get("main"), 125);
-	assert.equal(totals.get("child"), 25);
-	assert.equal(totals.get("grandchild"), null);
-	assert.equal(totals.get("x"), 16);
-	assert.equal(totals.get("y"), 16);
-	assert.equal(totals.get("main2"), null);
-	assert.equal(totals.get("child2"), null);
+	assert.equal(totals.get(key("main")), 125);
+	assert.equal(totals.get(key("child")), 25);
+	assert.equal(totals.get(key("grandchild")), null);
+	assert.equal(totals.get(key("x")), 16);
+	assert.equal(totals.get(key("y")), 16);
+	assert.equal(totals.get(key("main2")), null);
+	assert.equal(totals.get(key("child2")), null);
 
 	const index = createUsageIndex({ file: "unused.json", clock: createFakeClock(T0) });
-	const map = treeTotals(new Map([["main", { id: "main", state: "ok", complete: true, published: { total: 3 } }]]));
-	assert.equal(map.get("main"), null);
+	const map = treeTotals(new Map([[key("main"), { id: "main", state: "ok", complete: true, published: { total: 3 } }]]));
+	assert.equal(map.get(key("main")), null);
 });
 
 test("(IS-1) a negative total and cost save and reload through the index", (t) => {
@@ -1462,21 +1489,21 @@ test("(IS-1) a negative total and cost save and reload through the index", (t) =
 	});
 	writeText(file, `${negative}\n`);
 	const index = indexOf();
-	index.update("s1", file);
-	assert.equal(compactUsage(index.get("s1")).total, -2);
-	assert.equal(compactUsage(index.get("s1")).cost, -0.5);
-	assert.deepEqual(index.get("s1").published.models["p/m"], { input: -5, output: 3, cacheRead: 0, cacheWrite: 0, tokens: -2, cost: -0.5 });
+	index.update(sub("s1"), file);
+	assert.equal(compactUsage(index.get(key("s1"))).total, -2);
+	assert.equal(compactUsage(index.get(key("s1"))).cost, -0.5);
+	assert.deepEqual(index.get(key("s1")).published.models["p/m"], { input: -5, output: 3, cacheRead: 0, cacheWrite: 0, tokens: -2, cost: -0.5 });
 	assert.equal(index.save(), true);
 	const saved = fileOf("usage.json");
-	assert.equal(compactUsage(readUsageIndex(saved).get("s1")).total, -2);
+	assert.equal(compactUsage(readUsageIndex(saved).get(key("s1"))).total, -2);
 	const reloaded = indexOf();
-	assert.equal(compactUsage(reloaded.get("s1")).total, -2);
-	assert.equal(compactUsage(reloaded.get("s1")).cost, -0.5);
+	assert.equal(compactUsage(reloaded.get(key("s1"))).total, -2);
+	assert.equal(compactUsage(reloaded.get(key("s1"))).cost, -0.5);
 	fs.appendFileSync(file, `${line()}\n`);
-	reloaded.update("s1", file);
-	assert.equal(compactUsage(reloaded.get("s1")).total, 8);
+	reloaded.update(sub("s1"), file);
+	assert.equal(compactUsage(reloaded.get(key("s1"))).total, 8);
 	assert.equal(reloaded.save(), true);
-	assert.equal(compactUsage(indexOf().get("s1")).total, 8);
+	assert.equal(compactUsage(indexOf().get(key("s1"))).total, 8);
 });
 
 test("usage_read_failed is logged once for a directory path and the next successful read clears it", (t) => {
@@ -1484,13 +1511,13 @@ test("usage_read_failed is logged once for a directory path and the next success
 	const file = fileOf();
 	writeText(file, `${line()}\n`);
 	const index = indexOf();
-	index.update("s1", file);
-	const entry = index.get("s1");
+	index.update(sub("s1"), file);
+	const entry = index.get(key("s1"));
 	assert.equal(compactUsage(entry).total, 10);
 
 	fs.rmSync(file);
 	fs.mkdirSync(file);
-	assert.equal(index.update("s1", file), 0);
+	assert.equal(index.update(sub("s1"), file), 0);
 	assert.equal(entry.readError, true);
 	assert.equal(compactUsage(entry), null);
 	assert.equal(entry.complete, true);
@@ -1500,13 +1527,13 @@ test("usage_read_failed is logged once for a directory path and the next success
 	assert.match(logged[0].detail.error, /EISDIR|EPERM|EACCES/);
 
 	clock.advance(1000);
-	assert.equal(index.update("s1", file), 0);
+	assert.equal(index.update(sub("s1"), file), 0);
 	assert.equal(logged.length, 1);
 
 	fs.rmdirSync(file);
 	writeText(file, `${line()}\n`);
 	fs.utimesSync(file, new Date(T0 + 60_000), new Date(T0 + 60_000));
-	assert.equal(index.update("s1", file), fs.statSync(file).size);
+	assert.equal(index.update(sub("s1"), file), fs.statSync(file).size);
 	assert.equal(entry.readError, false);
 	assert.equal(compactUsage(entry).total, 10);
 	assert.equal(logged.length, 1);

@@ -1,3 +1,4 @@
+import { sessionSubjects, subjectKey, subjectOf } from "../session-subject.mjs";
 import path from "node:path";
 import { DEFAULT_CONFIG, loadConfig, SWITCH_KEYS } from "../config.mjs";
 import { getPath, pauseState, SWITCHES } from "../control.mjs";
@@ -282,8 +283,9 @@ export function endedRow(r, childRows = 0, usage = null, trees = null, full = us
 	const endedMs = num(r.endedMs);
 	const cwd = clean(r.cwd, 300);
 	const entry = usage && usageEntryOf(publishedUsageView(usage), r, ambiguous);
-	const tokens = compactUsage(entry);
-	const treeId = entry?.id ?? r.sessionId;
+	const compact = compactUsage(entry);
+	const tokens = compact && { ...compact, models: Object.entries(entry.published.models ?? {}).map(([key, { tokens, cost }]) => ({ key, tokens, cost })) };
+	const treeId = subjectKey(subjectOf(entry?.id ? entry : r));
 	const tree = trees?.get(treeId) ?? null;
 	const overflow = tokens !== null && !Number.isFinite(tokens.total);
 	const treeOverflow = tree !== null && !Number.isFinite(tree);
@@ -321,7 +323,9 @@ export function endedRow(r, childRows = 0, usage = null, trees = null, full = us
 /** The ended-session history: the last 30 days newest first (as `readEnded` returns them), capped, with counts per outcome over the whole window. */
 export function buildEnded(inputs) {
 	if (isRecord(inputs.ended) && "error" in inputs.ended) throw new Error(inputs.ended.error);
-	const all = (Array.isArray(inputs.ended) ? inputs.ended : []).filter((r) => isRecord(r) && Number.isFinite(r.endedMs));
+	const rows = (Array.isArray(inputs.ended) ? inputs.ended : []).filter((r) => isRecord(r) && Number.isFinite(r.endedMs));
+	const resolve = sessionSubjects(rows);
+	const all = rows.map((row) => ({ ...row, ...resolve(row) }));
 	const tally = new Map(Object.keys(OUTCOME_LABELS).map((outcome) => [outcome, 0]));
 	const idCounts = new Map();
 	for (const r of all) {
@@ -330,7 +334,10 @@ export function buildEnded(inputs) {
 		idCounts.set(r.sessionId, (idCounts.get(r.sessionId) ?? 0) + 1);
 	}
 	const childRows = new Map();
-	for (const r of all) if (r.kind === "child" && typeof r.parentSessionId === "string") childRows.set(r.parentSessionId, (childRows.get(r.parentSessionId) ?? 0) + 1);
+	for (const r of all) if (r.kind === "child" && typeof r.parentSessionId === "string") {
+		const parentKey = subjectKey({ ...subjectOf(r), sessionId: r.parentSessionId });
+		childRows.set(parentKey, (childRows.get(parentKey) ?? 0) + 1);
+	}
 	// Main and child rows are capped separately, then put back in the ledger's newest-first order.
 	const mains = all.filter((r) => r.kind !== "child");
 	const children = all.filter((r) => r.kind === "child");
@@ -338,7 +345,7 @@ export function buildEnded(inputs) {
 	const shownChildren = children.slice(0, ENDED_LIMIT);
 	const selected = new Set([...shownMains, ...shownChildren]);
 	const usage = inputs.usage instanceof Map ? inputs.usage : new Map();
-	const ambiguous = ambiguousLedgerTaskIds(all);
+	const ambiguous = ambiguousLedgerTaskIds(all, { scoped: true });
 	const published = publishedUsageView(usage);
 	// Retained descendants join through published index parent links. Only
 	// visible ledger rows supplement those links (e.g. for pending children).
@@ -352,7 +359,7 @@ export function buildEnded(inputs) {
 		shown: { main: shownMains.length, child: shownChildren.length },
 		totals: { main: mains.length, child: children.length },
 		rows: all.filter((r) => selected.has(r)).map((r) => {
-			const row = endedRow(r, childRows.get(r.sessionId), usage, trees, usage.full === true, ambiguous);
+			const row = endedRow(r, childRows.get(subjectKey(subjectOf(r))), usage, trees, usage.full === true, ambiguous);
 			if (idCounts.get(r.sessionId) > 1) row.detailRow = endedSelector(r);
 			return row;
 		}),

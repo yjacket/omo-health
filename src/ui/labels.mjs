@@ -208,6 +208,7 @@ export const AUDIT_REASON_LABELS = Object.freeze({
 	expired: "요청이 오래되어 시작하지 않았습니다",
 	disabled: "설정에서 조사가 꺼져 있습니다",
 	"not-found": "세션 기록을 찾지 못했습니다",
+	"ambiguous-session": "같은 id의 세션이 여러 프로젝트에 있어 고를 수 없습니다",
 	"no-model": "세션과 분석가 모델과 다른 상위 모델이 없습니다",
 	"models-unknown": "세션이 쓴 모델을 다 확인하지 못해 조사할 수 없습니다",
 	"analyst-models-unknown": "분석가가 쓴 모델을 다 확인하지 못해 조사할 수 없습니다",

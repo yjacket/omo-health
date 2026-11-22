@@ -223,7 +223,7 @@ test("buildSessionSnapshot puts the injected token totals on every main and chil
 		["no-session", { tokens: { total: 7, input: 5, output: 2 }, treeTokens: null }],
 	]);
 	const asked = [];
-	const tokensOf = (sessionId, taskId) => {
+	const tokensOf = ({ sessionId }, taskId) => {
 		asked.push([sessionId, taskId]);
 		return seen.get(sessionId ?? taskId);
 	};
@@ -254,7 +254,7 @@ test("buildSessionSnapshot puts the injected token totals on every main and chil
 });
 
 test("buildSessionSnapshot flags a row whose first token read has not finished", () => {
-	const tokensOf = (id) => (id === "m1" ? { pending: true } : { tokens: { total: 5, input: 3, output: 2 }, treeTokens: null });
+	const tokensOf = ({ sessionId: id }) => (id === "m1" ? { pending: true } : { tokens: { total: 5, input: 3, output: 2 }, treeTokens: null });
 	const m1 = rowsOf(buildSessionSnapshot(boardWorld(), [], [], NOW, { tokensOf })).get("m1");
 	assert.equal(m1.tokensPending, true);
 	assert.equal(m1.tokens, null);
@@ -264,7 +264,7 @@ test("buildSessionSnapshot flags a row whose first token read has not finished",
 
 test("buildSessionSnapshot keeps the tokensState full of a refused lookup on the main and the child row", () => {
 	const full = new Set(["m1", "c1"]);
-	const tokensOf = (id) => (full.has(id) ? { state: "full" } : id.startsWith("c") ? { tokens: { total: 5, input: 3, output: 2 }, treeTokens: null } : null);
+	const tokensOf = ({ sessionId: id }) => (full.has(id) ? { state: "full" } : id.startsWith("c") ? { tokens: { total: 5, input: 3, output: 2 }, treeTokens: null } : null);
 	const m1 = rowsOf(buildSessionSnapshot(boardWorld(), [], [], NOW, { tokensOf })).get("m1");
 	assert.equal(m1.tokensState, "full");
 	assert.equal(m1.tokens, null);
@@ -279,7 +279,7 @@ test("buildSessionSnapshot keeps the tokensState full of a refused lookup on the
 });
 
 test("buildSessionSnapshot applies the full state per lookup, so an indexed main keeps its full child", () => {
-	const tokensOf = (id) => (id === "c1" ? { state: "full" } : { tokens: { total: 7, input: 5, output: 2 }, treeTokens: null });
+	const tokensOf = ({ sessionId: id }) => (id === "c1" ? { state: "full" } : { tokens: { total: 7, input: 5, output: 2 }, treeTokens: null });
 	const m1 = rowsOf(buildSessionSnapshot(boardWorld(), [], [], NOW, { tokensOf })).get("m1");
 	assert.equal(m1.tokensState, undefined);
 	assert.deepEqual(m1.tokens, { total: 7, input: 5, output: 2 });
