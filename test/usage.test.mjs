@@ -638,6 +638,59 @@ test("a 20 MiB escaped ignored value streams under a 96 MB heap", (t) => {
 	assert.deepEqual(JSON.parse(child.stdout), { total: 7, badLines: 0 });
 });
 
+test("a 40 MiB model id streams under a 96 MB heap and marks the model list incomplete", (t) => {
+	const { file } = setup(t);
+	const usage = use({ input: 1, output: 2, cacheRead: 3, cacheWrite: 4 });
+	const head = `{"type":"message","pad":"${"a".repeat(MiB)}","message":{"role":"assistant","provider":"openai","model":"`;
+	const tail = `","usage":${JSON.stringify(usage)}}}\n`;
+	const fd = fs.openSync(file(), "w");
+	try {
+		fs.writeSync(fd, head);
+		const chunk = Buffer.alloc(MiB, 0x6d);
+		for (let index = 0; index < 40; index += 1) fs.writeSync(fd, chunk);
+		fs.writeSync(fd, tail);
+	} finally {
+		fs.closeSync(fd);
+	}
+	const source = new URL("../src/collect/usage.mjs", import.meta.url).href;
+	const script = [
+		"const { readUsage } = await import(process.argv[1]);",
+		"const result = readUsage(process.argv[2]);",
+		"process.stdout.write(JSON.stringify({ total: result.effective.total, modelsIncomplete: result.effective.modelsIncomplete, models: Object.keys(result.effective.models) }));",
+	].join("\n");
+	const child = spawnSync(process.execPath, ["--max-old-space-size=96", "--input-type=module", "-e", script, source, file()], {
+		encoding: "utf8",
+	});
+	assert.equal(child.status, 0, child.stderr);
+	assert.deepEqual(JSON.parse(child.stdout), { total: 10, modelsIncomplete: true, models: ["openai/(model id too long)"] });
+});
+
+test("a 40 MiB usage object streams under a 96 MB heap and counts as a bad line, not as usage", (t) => {
+	const { file } = setup(t);
+	const head = `{"type":"message","pad":"${"a".repeat(MiB)}","message":{"role":"assistant","provider":"openai","model":"m","usage":{"input":13,"note":"`;
+	const tail = `"}}}\n`;
+	const fd = fs.openSync(file(), "w");
+	try {
+		fs.writeSync(fd, head);
+		const chunk = Buffer.alloc(MiB, 0x6e);
+		for (let index = 0; index < 40; index += 1) fs.writeSync(fd, chunk);
+		fs.writeSync(fd, tail);
+	} finally {
+		fs.closeSync(fd);
+	}
+	const source = new URL("../src/collect/usage.mjs", import.meta.url).href;
+	const script = [
+		"const { readUsage } = await import(process.argv[1]);",
+		"const result = readUsage(process.argv[2]);",
+		"process.stdout.write(JSON.stringify({ total: result.effective.total, badLines: result.effective.diagnostics.badLines }));",
+	].join("\n");
+	const child = spawnSync(process.execPath, ["--max-old-space-size=96", "--input-type=module", "-e", script, source, file()], {
+		encoding: "utf8",
+	});
+	assert.equal(child.status, 0, child.stderr);
+	assert.deepEqual(JSON.parse(child.stdout), { total: 0, badLines: 1 });
+});
+
 test("the scanner validates skipped literals and containers the way JSON.parse does", () => {
 	for (const value of ["true", "false", "null", "0", "-0", "12", "-12", "1.5", "0.5", "1e3", "1E-4", "-1.25e+6"]) {
 		const record = `{"type":"message","x":${value},"usage":{"input":1}}`;
@@ -708,6 +761,38 @@ test("a large record gives a repeated selected key its last value like JSON.pars
 			check(got, parsed) {
 				assert.equal(got.total, 13);
 				assert.deepEqual(Object.keys(got.models), [`${parsed.provider}/${parsed.model}`]);
+			},
+		},
+		{
+			label: "message cleared by null",
+			line: `{"type":"message","pad":"${pad}","message":{"role":"assistant","provider":"openai","model":"gpt-5","usage":{"input":13,"output":0,"cacheRead":0,"cacheWrite":0,"cost":{"total":0}}},"message":null}`,
+			check(got) {
+				assert.equal(got.total, 0);
+				assert.deepEqual(got.models, {});
+			},
+		},
+		{
+			label: "message replaced by an object without usage",
+			line: `{"type":"message","pad":"${pad}","message":{"role":"assistant","provider":"openai","model":"gpt-5","usage":{"input":13,"output":0,"cacheRead":0,"cacheWrite":0,"cost":{"total":0}}},"message":{"role":"assistant","provider":"openai","model":"gpt-5"}}`,
+			check(got) {
+				assert.equal(got.total, 0);
+				assert.deepEqual(got.models, {});
+			},
+		},
+		{
+			label: "data cleared by null",
+			line: `{"type":"custom","customType":"prompt-cache-prewarm","pad":"${pad}","data":{"phase":"warmed","provider":"openai","model":"gpt-5","usage":{"input":13,"output":0,"cacheRead":0,"cacheWrite":0,"cost":{"total":0}}},"data":null}`,
+			check(got) {
+				assert.equal(got.total, 0);
+				assert.deepEqual(got.models, {});
+			},
+		},
+		{
+			label: "data replaced by an object without usage",
+			line: `{"type":"custom","customType":"prompt-cache-prewarm","pad":"${pad}","data":{"phase":"warmed","provider":"openai","model":"gpt-5","usage":{"input":13,"output":0,"cacheRead":0,"cacheWrite":0,"cost":{"total":0}}},"data":{"phase":"warmed","provider":"openai","model":"gpt-5"}}`,
+			check(got) {
+				assert.equal(got.total, 0);
+				assert.deepEqual(got.models, {});
 			},
 		},
 	];

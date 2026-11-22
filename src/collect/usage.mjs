@@ -47,7 +47,10 @@ const PLUS = 0x2b;
 const DOT = 0x2e;
 const LOWER_E = 0x65;
 const UPPER_E = 0x45;
-const STRING_RETAIN_LIMIT = 4096;
+const STRING_CAPTURE_LIMIT = 64 * 1024;
+const STRING_CHUNK_SIZE = 4096;
+const MODEL_ID_TOO_LONG = "(model id too long)";
+const TOO_LONG = Symbol("scannerStringTooLong");
 const MODELS_INCOMPLETE = Symbol("scannerModelsIncomplete");
 
 const isObject = (value) => typeof value === "object" && value !== null;
@@ -125,7 +128,8 @@ function mergeUsage(into, extra) {
 	into.turns += extra.turns;
 	if (extra.modelsIncomplete) into.modelsIncomplete = true;
 	for (const [key, value] of Object.entries(extra.models)) {
-		const model = into.models[key] ?? (into.models[key] = { tokens: 0, cost: 0 });
+		into.models[key] ??= { tokens: 0, cost: 0 };
+		const model = into.models[key];
 		model.tokens += value.tokens;
 		model.cost += value.cost;
 	}
@@ -185,7 +189,8 @@ export function addUsage(totals, hit) {
 	if (usage.costUnknown === true) totals.costUnknown = true;
 	if (hit.turn) totals.turns += 1;
 	const key = hit.key ?? USAGE_TOOLS_KEY;
-	const model = totals.models[key] ?? (totals.models[key] = { tokens: 0, cost: 0 });
+	totals.models[key] ??= { tokens: 0, cost: 0 };
+	const model = totals.models[key];
 	model.tokens += tokens;
 	model.cost += cost;
 }
@@ -278,7 +283,10 @@ export function createRecordScanner() {
 	let inString = false;
 	let escaped = false;
 	let unicodeLeft = 0;
-	let stringBytes = [];
+	let stringChunks = [];
+	let stringChunk;
+	let stringChunkFill = 0;
+	let stringLength = 0;
 	let stringTarget;
 	let stringIsKey = false;
 	let stringIsIdentity = false;
@@ -332,7 +340,7 @@ export function createRecordScanner() {
 	const decodeString = () => {
 		if (stringOverflow) return undefined;
 		try {
-			return JSON.parse(`"${Buffer.from(stringBytes).toString("utf8")}"`);
+			return JSON.parse(`"${Buffer.concat(stringChunks, stringLength).toString("utf8")}"`);
 		} catch {
 			malformed = true;
 			if (stringIsIdentity) identityLost = true;
@@ -340,22 +348,40 @@ export function createRecordScanner() {
 		}
 	};
 
+	// Captured strings are capped at 64 KiB and stored in Buffer chunks: an
+	// identity over the cap is dropped (never retained byte by byte), and the
+	// record is materialized with the "(model id too long)" key and a models
+	// list flagged incomplete.
 	const retainStringByte = (byte) => {
 		if (!(stringIsKey || stringTarget) || stringOverflow) return;
-		const limit = stringIsIdentity && !stringIsKey ? Infinity : STRING_RETAIN_LIMIT;
-		if (stringBytes.length >= limit) {
+		if (stringLength >= STRING_CAPTURE_LIMIT) {
 			stringOverflow = true;
-			if (stringIsIdentity) identityLost = true;
 			return;
 		}
-		stringBytes.push(byte);
+		if (!stringChunk || stringChunkFill === stringChunk.length) {
+			stringChunk = Buffer.allocUnsafe(Math.min(STRING_CHUNK_SIZE, STRING_CAPTURE_LIMIT - stringLength));
+			stringChunkFill = 0;
+			stringChunks.push(stringChunk);
+		}
+		stringChunk[stringChunkFill] = byte;
+		stringChunkFill += 1;
+		stringLength += 1;
 	};
 
 	// A selected key that recurs gets its last value. Clear the previous capture
-	// before a new value starts; a null literal replaces it with null.
+	// before a new value starts; a null literal replaces it with null. A recurring
+	// depth-1 parent (message, data) discards everything captured under the
+	// earlier value, because JSON.parse keeps only the last member.
+	const clearBucket = (bucket) => {
+		for (const key of Object.keys(bucket)) delete bucket[key];
+	};
 	const clearSelectedValue = (byte) => {
 		const container = currentContainer();
 		if (!container) return;
+		if (stack.length === 1) {
+			if (container.key === "message") clearBucket(message);
+			else if (container.key === "data") clearBucket(data);
+		}
 		const target = stringValueTarget(container);
 		if (target) {
 			const key = container.key;
@@ -450,7 +476,10 @@ export function createRecordScanner() {
 		inString = true;
 		escaped = false;
 		unicodeLeft = 0;
-		stringBytes = [];
+		stringChunks = [];
+		stringChunk = undefined;
+		stringChunkFill = 0;
+		stringLength = 0;
 		stringOverflow = false;
 		stringIsKey = expect === "key";
 		stringIsIdentity = false;
@@ -476,6 +505,9 @@ export function createRecordScanner() {
 		if (stringTarget) {
 			const value = decodeString();
 			if (value !== undefined && container && container.key !== undefined) stringTarget[container.key] = value;
+			else if (stringOverflow && stringIsIdentity && container && container.key !== undefined) {
+				stringTarget[container.key] = TOO_LONG;
+			}
 		}
 		if (container) container.count += 1;
 		expect = "after";
@@ -532,7 +564,13 @@ export function createRecordScanner() {
 				if (!isWhitespace(byte)) malformed = true;
 				continue;
 			}
-			if (capture) capture.bytes.push(byte);
+			// A senpi usage object is a few numbers; one over the string cap is not one, and buffering it would break the heap bound.
+		if (capture) {
+			if (capture.bytes.length >= STRING_CAPTURE_LIMIT) {
+				capture = undefined;
+				malformed = true;
+			} else capture.bytes.push(byte);
+		}
 			if (inString) {
 				if (unicodeLeft > 0) {
 					retainStringByte(byte);
@@ -618,6 +656,23 @@ export function createRecordScanner() {
 		if (inString || escaped || unicodeLeft > 0 || literal || stack.length > 0 || !done) malformed = true;
 		let entry;
 		if (!malformed) {
+			let incomplete = identityLost;
+			const materialize = (bucket) => {
+				let lost = false;
+				for (const key of Object.keys(bucket)) {
+					if (bucket[key] !== TOO_LONG) continue;
+					delete bucket[key];
+					lost = true;
+				}
+				if (!lost) return;
+				incomplete = true;
+				if (typeof bucket.provider !== "string") bucket.provider = "";
+				bucket.model = MODEL_ID_TOO_LONG;
+				delete bucket.responseModel;
+			};
+			materialize(root);
+			materialize(message);
+			materialize(data);
 			entry = {};
 			if (root.type !== undefined) entry.type = root.type;
 			if (root.customType !== undefined) entry.customType = root.customType;
@@ -626,7 +681,7 @@ export function createRecordScanner() {
 			if (root.usage !== undefined) entry.usage = root.usage;
 			if (Object.keys(message).length) entry.message = { ...message };
 			if (Object.keys(data).length) entry.data = { ...data };
-			if (identityLost) entry[MODELS_INCOMPLETE] = true;
+			if (incomplete) entry[MODELS_INCOMPLETE] = true;
 		}
 		result = entry;
 		return entry;
