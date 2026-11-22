@@ -30,6 +30,9 @@ export const MODEL_KEY_LIMIT = 1000;
 export const MODEL_KEY_LENGTH = 256;
 
 const RECORD_PARSE_LIMIT = 16 * 1024 * 1024;
+// A 16 MiB record at this bound peaked at ~62 MiB with ~26 MiB already live
+// under the daemon's 96 MiB old-space cap.
+export const RECORD_STRUCTURE_LIMIT = 64 * 1024;
 const USAGE_BUFFER_LIMIT = 1024 * 1024;
 const READ_CHUNK = 4 * 1024 * 1024;
 const HEAD_LIMIT = 4096;
@@ -729,7 +732,31 @@ export function createRecordScanner() {
 }
 
 function newAccumulator(start) {
-	return { [RECORD_ACCUMULATOR]: true, start, kind: "buffer", parts: [], len: 0 };
+	return { [RECORD_ACCUMULATOR]: true, start, kind: "buffer", parts: [], len: 0,
+		structure: { tokens: 0, string: false, escape: false } };
+}
+
+// Scan only the bytes new to this record. In JSON, every additional property
+// or array slot needs a comma or a container opener; payload strings do not.
+function withinParseLimits(acc, bytes) {
+	if (!acc.structure || acc.len + bytes.length > RECORD_PARSE_LIMIT) return false;
+	let { tokens, string, escape } = acc.structure;
+	for (let i = 0; i < bytes.length; i += 1) {
+		const byte = bytes[i];
+		if (string) {
+			if (escape) escape = false;
+			else if (byte === BACKSLASH) escape = true;
+			else if (byte === QUOTE) string = false;
+		} else if (byte === QUOTE) {
+			string = true;
+		} else if (byte === OPEN_OBJECT || byte === OPEN_ARRAY || byte === COMMA) {
+			if (++tokens > RECORD_STRUCTURE_LIMIT) return false;
+		}
+	}
+	acc.structure.tokens = tokens;
+	acc.structure.string = string;
+	acc.structure.escape = escape;
+	return true;
 }
 
 const USAGE_MARKER_BYTES = Math.max(...USAGE_MARKERS.map((marker) => marker.length)) - 1;
@@ -746,9 +773,9 @@ function pushScanner(acc, bytes) {
 	acc.scanner.push(bytes);
 }
 
-function scannerAccumulator(start, parts, len) {
-	const acc = { [RECORD_ACCUMULATOR]: true, start, kind: "scanner", scanner: createRecordScanner(), len,
-		markerTail: len <= RECORD_PARSE_LIMIT ? Buffer.alloc(0) : undefined };
+function scannerAccumulator(start, parts, len, structure) {
+	const acc = { [RECORD_ACCUMULATOR]: true, start, kind: "scanner", scanner: createRecordScanner(), len, structure,
+		markerTail: structure ? Buffer.alloc(0) : undefined };
 	let skip = 0;
 	if (start === 0) {
 		const first = parts[0].length < 3 ? Buffer.concat(parts.slice(0, 3), 3) : parts[0];
@@ -762,16 +789,19 @@ function scannerAccumulator(start, parts, len) {
 	return acc;
 }
 
-function appendBytes(accumulator, bytes) {
-	if (!bytes.length) return accumulator;
-	const acc = accumulator;
+function appendBytes(acc, bytes, owned = false) {
+	if (!bytes.length) return acc;
+	const parseable = withinParseLimits(acc, bytes);
 	if (acc.kind === "buffer") {
-		if (acc.len + bytes.length > RECORD_PARSE_LIMIT) {
+		if (!parseable) {
 			return scannerAccumulator(acc.start, [...acc.parts, bytes], acc.len + bytes.length);
 		}
-		acc.parts.push(Buffer.from(bytes));
+		acc.parts.push(owned ? bytes : Buffer.from(bytes));
 	} else {
-		if (acc.len + bytes.length > RECORD_PARSE_LIMIT) acc.markerTail = undefined;
+		if (!parseable) {
+			acc.structure = undefined;
+			acc.markerTail = undefined;
+		}
 		pushScanner(acc, bytes);
 	}
 	acc.len += bytes.length;
@@ -779,7 +809,7 @@ function appendBytes(accumulator, bytes) {
 }
 
 function needsWholeRecord(acc) {
-	return acc.len <= RECORD_PARSE_LIMIT && acc.kind === "scanner" && !acc.markerTail &&
+	return acc.kind === "scanner" && acc.structure && !acc.markerTail &&
 		hasTruncatedIdentity(acc.scanner.preview());
 }
 
@@ -936,7 +966,7 @@ export function readUsage(file, from, { maxBytes = Infinity } = {}) {
 			const bytes = readRange(fd, start, len);
 			bytesRead += bytes.length;
 			if (bytes.length !== len) return undefined;
-			return { start, kind: "buffer", parts: [bytes], len };
+			return appendBytes(newAccumulator(start), bytes, true);
 		};
 		if (acc?.kind === "reread") {
 			const whole = reread(acc.start, position - acc.start - 1);
@@ -986,7 +1016,7 @@ export function readUsage(file, from, { maxBytes = Infinity } = {}) {
 			// Keep the bounded projection at a budget boundary or EOF. If the
 			// first EOF preview needs full parsing, the bytes are still at hand.
 			const buffered = acc;
-			acc = scannerAccumulator(buffered.start, buffered.parts, buffered.len);
+			acc = scannerAccumulator(buffered.start, buffered.parts, buffered.len, buffered.structure);
 			if (position === size && needsWholeRecord(acc)) {
 				const entry = finalFragment(buffered);
 				if (entry !== undefined) consumeEntry(overlay, entry);
@@ -999,8 +1029,12 @@ export function readUsage(file, from, { maxBytes = Infinity } = {}) {
 			} else {
 				const whole = acc.kind === "buffer" ? acc : reread(acc.start, acc.len);
 				if (whole) {
-					const entry = finalFragment(whole);
-					if (entry !== undefined) consumeEntry(overlay, entry);
+					if (whole.kind === "scanner") {
+						consumeScannerRecord(overlay, whole.scanner, true);
+					} else {
+						const entry = finalFragment(whole);
+						if (entry !== undefined) consumeEntry(overlay, entry);
+					}
 				} else {
 					pending = true;
 				}

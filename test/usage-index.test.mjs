@@ -5,7 +5,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
 import { tmpDir } from "./helpers/fixtures.mjs";
-import { readUsage, usageTimeline } from "../src/collect/usage.mjs";
+import { readUsage, RECORD_STRUCTURE_LIMIT, usageTimeline } from "../src/collect/usage.mjs";
+import { DAEMON_NODE_ARGS } from "../src/launch.mjs";
 import { createFakeClock, iso } from "../src/util/time.mjs";
 import {
 	USAGE_INDEX_VERSION,
@@ -81,6 +82,63 @@ function indexText({ v, entries }) {
 	return [JSON.stringify({ v }), ...Object.values(entries).map((entry) => JSON.stringify(entry))].join("\n") + "\n";
 }
 
+test("(IS-1, IS-12) a dense 15 MiB tool result publishes under the daemon heap cap", (t) => {
+	const { dir, fileOf } = setup(t);
+	const file = fileOf();
+	const next = fileOf("next.jsonl");
+	const item = '{"x":[{}],"y":0},';
+	fs.writeFileSync(file, `{"type":"message","message":{"role":"toolResult","provider":"p","model":"m","content":[${item.repeat(980_000)}{}],"usage":{"input":40,"output":2}}}\n`);
+	assert.ok(fs.statSync(file).size > 14 * MiB && fs.statSync(file).size < 16 * MiB);
+	fs.writeFileSync(next, '{"type":"usage","provider":"p","model":"m","usage":{"input":7}}\n');
+	const oracle = (path) => {
+		const entry = JSON.parse(fs.readFileSync(path, "utf8"));
+		const { input, output = 0, cacheRead = 0, cacheWrite = 0 } = entry.message?.usage ?? entry.usage;
+		return input + output + cacheRead + cacheWrite;
+	};
+	const expected = oracle(file);
+	assert.equal(expected, 42);
+
+	const program = `
+		import assert from "node:assert/strict";
+		import fs from "node:fs";
+		import { usageTimeline } from ${JSON.stringify(new URL("../src/collect/usage.mjs", import.meta.url).href)};
+		import { createUsageIndex, USAGE_TICK_BYTES } from ${JSON.stringify(new URL("../src/usage-index.mjs", import.meta.url).href)};
+		import { createFakeClock } from ${JSON.stringify(new URL("../src/util/time.mjs", import.meta.url).href)};
+		const [reader, file, next, indexFile] = process.argv.slice(1);
+		if (reader === "timeline") {
+			console.log(JSON.stringify(usageTimeline(file).totals));
+		} else {
+			const clock = createFakeClock(${T0});
+			const index = createUsageIndex({ file: indexFile, clock });
+			const update = () => index.update("dense", file, {}, { maxBytes: USAGE_TICK_BYTES });
+			update();
+			assert.equal(index.get("dense").complete, true);
+			const first = index.get("dense").published;
+			fs.appendFileSync(file, fs.readFileSync(next));
+			clock.advance(10_000);
+			update();
+			assert.equal(index.get("dense").complete, true);
+			console.log(JSON.stringify({ first, next: index.get("dense").published }));
+		}
+	`;
+	const results = {};
+	const errors = [];
+	// Run the timeline first: the index subprocess appends a second record.
+	for (const reader of ["timeline", "index"]) {
+		const child = spawnSync(process.execPath, [
+			...DAEMON_NODE_ARGS, "--input-type=module", "-e", program, reader, file, next, fileOf("usage.json"),
+		], { cwd: dir, encoding: "utf8" });
+		if (child.status !== 0) {
+			errors.push(`${reader}: exit ${child.status}, signal ${child.signal}\n${child.stderr || child.error}`);
+		} else results[reader] = JSON.parse(child.stdout);
+	}
+	assert.equal(errors.join("\n"), "");
+	assert.equal(results.index.first.total, expected);
+	assert.deepEqual(results.timeline, results.index.first);
+	assert.deepEqual(results.index.first.diagnostics, { badLines: 0, skippedLines: 0 });
+	assert.equal(results.index.next.total, expected + oracle(next));
+});
+
 test("(IS-1) a 2 MiB EOF record keeps its JSON.parse billing row across newline and index reload", (t) => {
 	const { fileOf, indexOf } = setup(t);
 	const file = fileOf();
@@ -121,6 +179,33 @@ test("(IS-1) a 2 MiB EOF record keeps its JSON.parse billing row across newline 
 	observe("reloaded newline", reloaded.get(id).published);
 	observe("timeline newline", usageTimeline(file).totals);
 	assert.deepEqual(observations, expected);
+});
+
+test("(IS-1, IS-12) resumed records reread at the structural limit but stream one token above it", (t) => {
+	const { fileOf } = setup(t);
+	const file = fileOf();
+	const model = JSON.stringify({ label: "m".repeat(128 * 1024) });
+	// Cut immediately after the backslash of an escaped quote, inside a string
+	// full of punctuation. Neither the punctuation nor the quote is structural.
+	const prefix = `{"type":"usage","provider":"p","model":${model},"usage":{"input":42},"padding":"${"x".repeat(MiB)}\\`;
+	for (const extra of [0, 1]) {
+		// Four container openers and five commas before the array elements.
+		const suffix = `"${",[{".repeat(RECORD_STRUCTURE_LIMIT)}","ignored":[${"0,".repeat(RECORD_STRUCTURE_LIMIT - 9 + extra)}0]}\n`;
+		fs.writeFileSync(file, prefix + suffix);
+		const partial = readUsage(file, undefined, { maxBytes: Buffer.byteLength(prefix) });
+		assert.equal(partial.done, false);
+		const delimited = readUsage(file, partial, { maxBytes: Buffer.byteLength(suffix) });
+		assert.equal(delimited.pending, extra === 0);
+		assert.equal(delimited.done, extra === 1);
+		const resumed = extra ? delimited : readUsage(file, delimited);
+		assert.equal(resumed.done, true);
+		assert.equal(resumed.bytesRead, extra ? suffix.length : prefix.length + suffix.length - 1);
+		assert.deepEqual(resumed.effective, usageTimeline(file).totals);
+		assert.equal(resumed.effective.total, 42);
+		assert.deepEqual(resumed.effective.diagnostics, { badLines: 0, skippedLines: 0 });
+		assert.deepEqual(Object.keys(resumed.effective.models), [extra ? "p/(model id too long)" : "p/[object Object]"]);
+		assert.equal(resumed.effective.modelsIncomplete, true);
+	}
 });
 
 test("(gate 17) saturated index save, daemon reload, and audit preparation fit in 66 MiB", (t) => {
