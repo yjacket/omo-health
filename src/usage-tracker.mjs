@@ -15,10 +15,8 @@ import { statSafe } from "./util/fsx.mjs";
  * including live verification and discovery of the backlog's main-session files.
  *
  * Live sessions are indexed only from their own file: a main file name or
- * session header must carry its session id, and a child file must be the one
- * the locator returns for its task and session id. The live collector can
- * attach a task directory's newest file to the wrong child
- * (`findChildSessionFile`), and that file's usage must never be billed there.
+ * session header must carry its session id, and children use the spawning-store
+ * locator rather than trusting the live collector's newest-file fallback.
  */
 const DAY_MS = 24 * 60 * 60_000;
 const ANCESTOR_DEPTH = 8;
@@ -117,13 +115,20 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 		}
 	};
 
-	const cwdCandidates = (row, liveSessions, cwdOf) => {
+	const childStoreQuery = (row, liveSessions, cwdOf) => {
+		const storeDir = row.task?.storeDir ?? row.storeDir ?? liveSessions.get(identityOf(row))?.task?.storeDir;
+		if (isNonEmptyString(storeDir)) return { storeDir };
 		const cwds = new Set();
-		for (const node of cwdChain(row, liveSessions)) {
+		const chain = cwdChain(row, liveSessions);
+		chain.next(); // The child's own cwd is only a fallback candidate.
+		const parent = chain.next().value;
+		const parentCwd = parent && cwdOf(parent);
+		if (isNonEmptyString(parentCwd)) return { parentCwd };
+		for (const node of [row, ...chain]) {
 			const cwd = cwdOf(node);
 			if (isNonEmptyString(cwd)) cwds.add(cwd);
 		}
-		return [...cwds];
+		return { cwds: [...cwds] };
 	};
 
 	const metaOf = (source) => ({
@@ -141,6 +146,11 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 	/** Verify that the live collector's file belongs to this session before billing it. */
 	const verify = (session, file, liveSessions, cwdOf, maxBytes) => {
 		const result = (matches) => ({ matches, bytesRead: 0 });
+		if (session.kind === "child" && isNonEmptyString(session.taskId)) {
+			const query = { taskId: session.taskId, sessionId: session.id, ...childStoreQuery(session, liveSessions, cwdOf) };
+			const candidate = childCandidate(query);
+			return { ...result(Boolean(candidate)), candidate };
+		}
 		if (!isNonEmptyString(file)) return result(false);
 		if (session.kind === "main") {
 			if (idFromFileName(file) === session.id) return result(true);
@@ -160,17 +170,13 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			if (!probe.pending && (probe.bytesRead > 0 || size === 0)) liveHeaders.set(subject, { file, size, mtimeMs, ino, matches });
 			return { matches, pending: probe.pending, bytesRead: probe.bytesRead };
 		}
-		if (session.kind !== "child" || !isNonEmptyString(session.taskId)) return result(false);
-		const query = { taskId: session.taskId, sessionId: session.id, cwds: cwdCandidates(session, liveSessions, cwdOf) };
-		const candidate = session.id === session.taskId ? childCandidate(query) : locator?.childFile?.(query);
-		return { ...result(candidate && pathKey(candidate) === pathKey(file)), candidate };
+		return result(false);
 	};
 
 	const locate = (row, liveSessions, cwdOf, maxBytes) => {
 		if (row.kind === "child") {
-			const query = { taskId: row.taskId ?? row.sessionId, sessionId: row.sessionId, cwds: cwdCandidates(row, liveSessions, cwdOf) };
-			const file = ledgerUsageSessionId(row) ? locator?.childFile?.(query) : childCandidate(query);
-			return { file, bytesRead: 0 };
+			const query = { taskId: row.taskId ?? row.sessionId, sessionId: row.sessionId, ...childStoreQuery(row, liveSessions, cwdOf) };
+			return { file: childCandidate(query), bytesRead: 0 };
 		}
 		const subject = subjectOf(identityOf(row));
 		return locator?.findMainFile?.(subject, index.get(subjectKey(subject))?.file ?? null, { maxBytes }) ?? { bytesRead: 0 };
@@ -243,6 +249,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 					sessionId, taskId, kind, endedMs, parentSessionId, rootSessionId, [ENDED_LOCATION]: source[ENDED_LOCATION],
 				});
 				compactProject(row, projectKey);
+				if (isNonEmptyString(source.storeDir)) row.storeDir = source.storeDir;
 				if (source.parentProjectKey != null) row.packedParentProject = packScopedText(source.parentProjectKey);
 				// Unpositioned callers keep any supplied cwd. Daemon rows always
 				// have locations and resolve cwd from the ledger line instead.
@@ -285,7 +292,8 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 				if (!entry || entry.state === "full") need = true;
 				else if (entry.state === "ok" && entry.complete !== true) need = true;
 				else if (entry.gone === true) need = checkedAgo;
-				else if (entry.complete === true && (entry.readError === true || !isFresh(entry))) need = true;
+				else if (entry.complete === true && (entry.readError === true || !isFresh(entry) ||
+					(row.kind === "child" && ledgerUsageSessionId(row) && (row.parentSessionId || row.storeDir)))) need = true;
 				else if (entry.state === "missing" && checkedAgo) need = true;
 				if (need) queue.set(row, row);
 			}
@@ -347,7 +355,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 					for (const row of queue.values()) if (row.kind === "child") collect(row);
 					for (const row of taskOnlyChecks.values()) collect(row);
 					for (const session of liveSessions.values()) {
-						if (session.kind === "child" && isNonEmptyString(session.file) && isNonEmptyString(session.taskId)) collect(session);
+						if (session.kind === "child" && isNonEmptyString(session.taskId)) collect(session);
 					}
 					locateEndedRows(paths, pending, ledgerOptions);
 				}
@@ -382,6 +390,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 					if (!file) continue;
 				}
 				const { matches, pending, bytesRead, candidate } = verify(session, file, liveSessions, cwdOf, budget);
+				if (session.kind === "child") file = candidate;
 				budget -= bytesRead;
 				if (pending || (matches && budget === 0 && !entry)) pendingLive.set(subject, true);
 				if (isTaskOnlyEntry(entry) && entry.state === "ok" && (!matches || pathKey(file) !== pathKey(entry.file))) {

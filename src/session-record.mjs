@@ -1,11 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import { idFromFileName } from "./collect/sessions.mjs";
+import { createSessionFileLocator } from "./collect/session-files.mjs";
 import { senpiTaskStoreDir } from "./collect/tasks.mjs";
 import { DEFAULT_CONFIG } from "./config.mjs";
 import { streamDecisions } from "./decisions.mjs";
 import { streamInvestigations } from "./investigations.mjs";
 import { safeSubjectId } from "./session-id.mjs";
+import { pathKey } from "./paths.mjs";
 import { ENDED_LOCATION, endedKey, endedSelector, streamEnded } from "./session-ledger.mjs";
 import { ledgerParentSubject, rememberParentOwner, sessionSubjects, subjectKey, subjectOf, uniqueMatch } from "./session-subject.mjs";
 import { compactUsage, fresh, parentSubject, readUsageIndex, usageEntryFor } from "./usage-index.mjs";
@@ -501,6 +503,7 @@ export function ambiguousLedgerTaskIds(rows, { scoped = false } = {}) {
 }
 
 export function usageEntryOf(usage, row, ambiguous) {
+	if (row.usageStoreUnresolved) return null;
 	const ids = row.ledgerIds ?? row;
 	if (ambiguousUsageFallback(row, ambiguous, ids)) return null;
 	const subject = { ...subjectOf(row), sessionId: ledgerUsageSessionId(ids) };
@@ -845,6 +848,7 @@ export function buildSessionRecord(inputs = {}) {
 		: null;
 
 	const session = cleanValue(row);
+	delete session.storeDir;
 	// Keep exact join keys off the display fields that also feed the reviewer bundle.
 	session.projectKey = subjectOf(row, subjectOf(entry)).projectKey;
 	session.ledgerIds = {
@@ -1000,19 +1004,7 @@ function findRecordFiles(paths, nodes, ancestors, locator, usage, ambiguous) {
 			}
 		}
 	}
-	const childFile = ({ taskId, sessionId, cwds }) => {
-		for (const cwd of cwds) {
-			const dir = path.join(senpiTaskStoreDir(cwd, paths.agentDir), "children", taskId, "sessions", taskId);
-			let found;
-			const exact = sessionId && sessionId !== taskId;
-			for (const name of dirNames(dir)) {
-				if (!name.endsWith(".jsonl") || (exact && idFromFileName(name) !== sessionId)) continue;
-				if (found && !exact) return undefined;
-				if (!found || name < found) found = name;
-			}
-			if (found) return path.join(dir, found);
-		}
-	};
+	const childCandidate = locator?.childCandidate ?? createSessionFileLocator({ paths }).childCandidate;
 	return nodes.map((node) => {
 		const { sessionId, taskId } = node;
 		if (!nonEmpty(taskId)) {
@@ -1020,15 +1012,29 @@ function findRecordFiles(paths, nodes, ancestors, locator, usage, ambiguous) {
 			const key = subjectKey(subject);
 			return { sessionId, file: locator ? locator.mainFile(subject) : subject.projectKey == null ? unscoped.get(key)?.file : main.get(key) };
 		}
-		// The tracker may have verified the transcript through a live ancestor whose cwd is absent from the ledger.
+		const owner = childStoreOf(node, ancestors);
+		const candidate = childCandidate({ taskId, sessionId, ...owner });
 		const entry = usageEntryOf(usage, node, ambiguous);
-		const file = entry?.readError !== true && fresh(entry) ? entry.file
-			: (locator?.childFile ?? childFile)({ taskId, sessionId, cwds: cwdsOf(node, ancestors) });
+		const store = owner.storeDir ?? (owner.parentCwd && senpiTaskStoreDir(owner.parentCwd, paths.agentDir));
+		const taskDirectory = path.join("children", taskId, "sessions", taskId);
+		const indexedDir = entry?.file && pathKey(path.dirname(entry.file));
+		const taskLayout = indexedDir?.endsWith(`/${taskDirectory.replaceAll("\\", "/").toLowerCase()}`);
+		// A competing candidate (or an ambiguous fallback) invalidates a
+		// pre-existing cursor, even when its file has not changed.
+		const mismatch = entry?.file && (candidate ? pathKey(entry.file) !== pathKey(candidate)
+			: taskLayout && store && indexedDir !== pathKey(path.join(store, taskDirectory)));
+		if (candidate === null || mismatch) node.usageStoreUnresolved = true;
+		// A tracker-verified file may be outside the known ledger cwds (e.g.
+		// the spawning parent was still live when the tracker saw it).
+		const file = candidate ?? (!node.usageStoreUnresolved && entry?.readError !== true && fresh(entry) ? entry.file : undefined);
 		return { sessionId, file };
 	}).filter(({ file }) => file);
 }
 
-function cwdsOf(node, ancestors) {
+function childStoreOf(node, ancestors) {
+	if (nonEmpty(node.storeDir)) return { storeDir: node.storeDir };
+	const parent = ancestors.get(parentLookupKey(node));
+	if (nonEmpty(parent?.cwd)) return { parentCwd: parent.cwd };
 	const out = [];
 	let current = node;
 	const seen = new Set();
@@ -1040,7 +1046,7 @@ function cwdsOf(node, ancestors) {
 		seen.add(key);
 		current = parent;
 	}
-	return out;
+	return { cwds: out };
 }
 
 const later = (a, b) => !b || Number(a.endedMs) > Number(b.endedMs);
@@ -1265,7 +1271,7 @@ function recordDescendants(subject, rows, usage) {
 				: peers.size === 1 ? peers.values().next().value : null;
 			if (!parent || (!owner && fromLedger && ids.has(parentId) && !parent.indexOnly)) continue;
 			const parentProject = subjectOf(parent).projectKey;
-			const { sessionId, taskId, parentSessionId, title, outcome, endedMs, cwd } = node;
+			const { sessionId, taskId, parentSessionId, title, outcome, endedMs, cwd, storeDir } = node;
 			let { startedMs } = node;
 			// An index-only child with no known start inherits its parent's start
 			// for machine overlap: it spawns while the parent is active, so the union is unchanged.
@@ -1274,6 +1280,7 @@ function recordDescendants(subject, rows, usage) {
 			}
 			seen.add(identity);
 			const descendant = { sessionId, taskId: taskId ?? null, parentSessionId, parentProjectKey: parentProject, title: title ?? null, outcome: outcome ?? null, startedMs, endedMs: Number.isFinite(msOf(endedMs)) ? msOf(endedMs) : null, cwd, projectKey: subjectOf(node, parent).projectKey, depth, indexOnly: !fromLedger };
+			if (nonEmpty(storeDir)) descendant.storeDir = storeDir;
 			frontier.push(descendant);
 			nodes.set(identity, descendant);
 		}

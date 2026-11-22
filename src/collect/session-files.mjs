@@ -187,47 +187,52 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 	const childFiles = new Map();
 	const childMisses = new Map();
 
-	const childKey = (taskId, sessionId, cwds) => packScopedText(JSON.stringify([taskId, sessionId ?? null, cwds ?? []]));
+	const ownerStore = ({ storeDir, parentCwd }) =>
+		storeDir || (parentCwd && senpiTaskStoreDir(parentCwd, paths.agentDir));
 
-	const locateChild = ({ taskId, sessionId, cwds }) => {
+	const locateChild = ({ taskId, sessionId, cwds }, owner) => {
 		if (!taskId) return undefined;
-		const stores = [];
-		const seen = new Set();
-		for (const cwd of cwds ?? []) {
-			if (typeof cwd !== "string" || !cwd || seen.has(cwd)) continue;
-			seen.add(cwd);
-			stores.push(senpiTaskStoreDir(cwd, paths.agentDir));
-		}
 		const wantId = sessionId && sessionId !== taskId ? sessionId : undefined;
-		for (const storeDir of stores) {
+		const inStore = (storeDir) => {
 			const dir = path.join(storeDir, "children", taskId, "sessions", taskId);
-			if (!wantId) {
-				// An ambiguous store must not fall through to an ancestor.
-				const sole = soleChildSessionFile(dir);
-				if (sole !== undefined) return sole;
-			} else {
-				const exact = listDirSafe(dir).find((name) => idFromFileName(name) === wantId);
-				if (exact) return path.join(dir, exact);
-			}
+			if (!wantId) return soleChildSessionFile(dir);
+			const exact = listDirSafe(dir).find((name) =>
+				idFromFileName(name) === wantId && statSafe(path.join(dir, name))?.isFile());
+			return exact && path.join(dir, exact);
+		};
+		if (owner) return inStore(owner);
+		const seen = new Set();
+		let match;
+		for (const cwd of cwds ?? []) {
+			if (typeof cwd !== "string" || !cwd) continue;
+			const storeDir = senpiTaskStoreDir(cwd, paths.agentDir);
+			const key = pathKey(storeDir);
+			if (seen.has(key)) continue;
+			seen.add(key);
+			const file = inStore(storeDir);
+			if (file === null || (file && match)) return null;
+			if (file) match = file;
 		}
-		return undefined;
+		return match;
 	};
 
-	/** The child file of `{taskId, sessionId, cwds}`; stores are tried in cwd order (a child may live in an ancestor's cwd). */
+	/** A known spawning store is authoritative; otherwise require a unique store. */
 	const childFile = (row = {}) => {
 		const { taskId, sessionId, cwds } = row;
 		if (!taskId) return undefined;
-		const key = childKey(taskId, sessionId, cwds);
-		const exact = sessionId && sessionId !== taskId;
+		const owner = ownerStore(row);
+		const key = packScopedText(JSON.stringify([taskId, sessionId ?? null, owner ? pathKey(owner) : cwds ?? []]));
+		// A second store can acquire the same exact ID after a successful fallback.
+		const cacheExact = owner && sessionId && sessionId !== taskId;
 		const cached = childFiles.get(key);
-		if (exact && cached && statSafe(cached)?.isFile()) return cached;
+		if (cacheExact && cached && statSafe(cached)?.isFile()) return cached;
 		childFiles.delete(key);
 		const now = nowMs();
 		const missedAt = childMisses.get(key);
 		if (missedAt !== undefined && now - missedAt < rescanMs) return undefined;
-		const file = locateChild({ taskId, sessionId, cwds });
+		const file = locateChild(row, owner);
 		if (file) {
-			if (exact) childFiles.set(key, file);
+			if (cacheExact) childFiles.set(key, file);
 			childMisses.delete(key);
 			return file;
 		}
@@ -237,5 +242,5 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 	};
 
 	// Ownership checks need an uncached answer: undefined is absence, null is a veto.
-	return { mainFile, findMainFile, childFile, childCandidate: locateChild };
+	return { mainFile, findMainFile, childFile, childCandidate: (row) => locateChild(row, ownerStore(row)) };
 }

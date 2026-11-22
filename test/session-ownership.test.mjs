@@ -4,11 +4,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
 import { prepareAudit } from "../src/audit-prepare-worker.mjs";
+import { auditModelFacts } from "../src/auditor.mjs";
 import { DEFAULT_CONFIG } from "../src/config.mjs";
 import { auditBundle } from "../src/judge/audit.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 import { buildSessionSnapshot, detectEnded } from "../src/session-board.mjs";
 import { appendEnded, appendEndedBatch, streamEnded } from "../src/session-ledger.mjs";
+import { loadSessionRecord, usageEntryOf } from "../src/session-record.mjs";
 import { boardLiveOwners, subjectOf } from "../src/session-subject.mjs";
 import { createDetailOperations } from "../src/ui/detail-worker.mjs";
 import { buildEnded, loadUiInputs } from "../src/ui/model.mjs";
@@ -16,7 +18,7 @@ import { createSessionFileLocator } from "../src/collect/session-files.mjs";
 import { createUsageIndex } from "../src/usage-index.mjs";
 import { createUsageTracker } from "../src/usage-tracker.mjs";
 import { expectedSelector } from "./helpers/ended-selector.mjs";
-import { E, tmpDir, writeJsonl } from "./helpers/fixtures.mjs";
+import { E, tmpDir, writeJsonl, writeTask } from "./helpers/fixtures.mjs";
 
 const now = Date.UTC(2026, 9, 10, 12);
 const clock = { now: () => now };
@@ -42,9 +44,104 @@ function bundleFor(paths, row, indexEntries = []) {
 	return auditBundle(loaded, null, { config: DEFAULT_CONFIG, now });
 }
 
-function writeUsage(file, tokens) {
-	writeJsonl(file, [E.assistant({ ms: now - 50, usage: { input: tokens, output: 0, cacheRead: 0, cacheWrite: 0 } })]);
+function writeUsage(file, tokens, model) {
+	writeJsonl(file, [E.assistant({ ms: now - 50, model, usage: { input: tokens, output: 0, cacheRead: 0, cacheWrite: 0 } })]);
 }
+
+test("plan94 a cross-project child bills and excludes the model from its spawning store", (t) => {
+	const { paths, a, b } = setup(t);
+	const parent = main("review.1", a);
+	const child = { ...main("review.child", b), kind: "child", taskId: "st_cross", parentSessionId: parent.sessionId, parentProjectKey: subjectOf(parent).projectKey };
+	assert.ok(appendEnded(paths, parent, { nowMs: now }));
+	assert.ok(appendEnded(paths, child, { nowMs: now }));
+	for (const cwd of [a, b]) writeTask(cwd, {
+		task_id: child.taskId, child_session_id: child.sessionId,
+		parent_session_id: parent.sessionId, spawn_spec: { cwd: b }, status: "completed",
+	});
+	const transcript = (cwd) => path.join(cwd, ".omo", "senpi-task", "children", child.taskId, "sessions", child.taskId, `2026-10-10T12-00-00-000Z_${child.sessionId}.jsonl`);
+	writeUsage(transcript(a), 17, "parent-model");
+	writeUsage(transcript(b), 99, "spawn-cwd-model");
+
+	const lookup = { paths, id: child.sessionId, row: expectedSelector(child), now };
+	const direct = loadSessionRecord(lookup);
+	const index = createUsageIndex({ file: paths.health.usageIndexFile, clock });
+	const tracker = createUsageTracker({ paths, clock, index, locator: createSessionFileLocator({ paths, clock }) });
+	const world = { now, sessions: new Map(), tasks: [] };
+	tracker.queueLedger(streamEnded(paths, { withLocation: true }));
+	tracker.tick(world);
+	const indexEntries = [...index.values()];
+	const prepared = prepareAudit({
+		subject: subjectOf(child), now, indexEntries,
+		bounds: { messageScanMaxBytes: 4096, messageScanTotalBytes: 4096, preparationMaxBytes: 65536 },
+	}, { paths });
+	let modelFacts;
+	const detail = createDetailOperations({ paths, resolveModel: (_paths, _config, facts) => { modelFacts = facts; } })({
+		kind: "detail", id: child.sessionId, row: expectedSelector(child), now,
+	});
+	assert.deepEqual({
+		directFiles: direct.transcriptFiles,
+		detailFiles: detail.files,
+		trackerTokens: tracker.tokensOf(subjectOf(child))?.tokens.total,
+		detailTokens: detail.record.tokens.total,
+		excluded: modelFacts?.sessionModels,
+		modelsKnown: modelFacts?.sessionModelsKnown,
+		auditTimeline: prepared.timelineSource?.file,
+	}, {
+		directFiles: [transcript(a)],
+		detailFiles: [transcript(a)],
+		trackerTokens: 17,
+		detailTokens: 17,
+		excluded: ["anthropic-subscription/parent-model"],
+		modelsKnown: true,
+		auditTimeline: transcript(a),
+	});
+
+	const liveIndex = createUsageIndex({ file: path.join(paths.healthHome, "live-usage.json"), clock });
+	const liveTracker = createUsageTracker({ paths, clock, index: liveIndex, locator: createSessionFileLocator({ paths, clock }) });
+	const liveChild = { ...child, id: child.sessionId, file: transcript(b), task: { storeDir: path.join(a, ".omo", "senpi-task"), spawnCwd: b } };
+	liveTracker.tick({ ...world, sessions: new Map([[parent.sessionId, { id: parent.sessionId, kind: "main", cwd: b }], [liveChild.id, liveChild]]) });
+	assert.equal(liveTracker.tokensOf(subjectOf(child))?.tokens.total, 17, "live task storeDir wins even against the parent cwd and attached file");
+});
+
+test("plan94 an unknown spawning store with two matches has no usage or audit model coverage", (t) => {
+	const { paths, a, b } = setup(t);
+	const grandparent = main("root", a);
+	const parent = { ...main("parent", null), kind: "child", taskId: "st_parent", parentSessionId: grandparent.sessionId };
+	const child = { ...main("review.child", b), kind: "child", taskId: "st_nested", parentSessionId: parent.sessionId };
+	for (const row of [grandparent, parent, child]) assert.ok(appendEnded(paths, row, { nowMs: now }));
+	for (const [cwd, total, model] of [[a, 17, "a-model"], [b, 99, "b-model"]]) {
+		writeUsage(path.join(cwd, ".omo", "senpi-task", "children", child.taskId, "sessions", child.taskId, `2026-10-10T12-00-00-000Z_${child.sessionId}.jsonl`), total, model);
+	}
+	const index = createUsageIndex({ file: paths.health.usageIndexFile, clock });
+	const tracker = createUsageTracker({ paths, clock, index, locator: createSessionFileLocator({ paths, clock }) });
+	tracker.queueLedger(streamEnded(paths, { withLocation: true }));
+	tracker.tick({ now, sessions: new Map(), tasks: [] });
+	const detail = readDetail(paths, child);
+	const indexEntries = [...index.values()];
+	const prepared = prepareAudit({
+		subject: subjectOf(child), now, indexEntries,
+		bounds: { messageScanMaxBytes: 4096, messageScanTotalBytes: 4096, preparationMaxBytes: 65536 },
+	}, { paths });
+	assert.equal(tracker.tokensOf(subjectOf(child)), null);
+	assert.equal(detail.found, true);
+	assert.equal(detail.tokens?.total ?? null, null);
+	assert.equal(prepared.loaded?.found, true);
+	assert.deepEqual(auditModelFacts(usageEntryOf(index, prepared.loaded.session), prepared.full), { sessionModels: [], sessionModelsKnown: false });
+});
+
+test("plan94 a same-named main enters history only for the project that ended", (t) => {
+	const { paths, a, b } = setup(t);
+	const alice = { ...main("review.1", a), children: [] };
+	const bob = { ...main("review.1", b), children: [] };
+	const snapshot = (ts, sessions) => ({ v: 1, ts, groups: [{ sessions }] });
+	const current = snapshot(now, [bob]);
+	const world = { now, paths, sessions: new Map(), tasks: [], hostExits: {} };
+	const ended = detectEnded(snapshot(now - 1, [alice]), current, world, now);
+	assert.equal(appendEndedBatch(paths, ended, { nowMs: now }).filter(({ appended }) => appended).length, 1);
+	const history = buildEnded(loadUiInputs({ paths, now, env: {} }));
+	assert.deepEqual(history.rows.map(({ sessionId, cwd }) => [sessionId, cwd]), [["review.1", a]]);
+	assert.deepEqual(current.groups.flatMap(({ sessions }) => sessions.map(({ sessionId, cwd }) => [sessionId, cwd])), [["review.1", b]]);
+});
 
 test("plan93 cross-project child belongs only to its actual parent after rebuilding the index", (t) => {
 	const { paths, a, b } = setup(t);
@@ -61,8 +158,8 @@ test("plan93 cross-project child belongs only to its actual parent after rebuild
 	for (const [row, tokens] of [[alice, 10], [bob, 20]]) {
 		writeUsage(path.join(paths.sessionsDir, subjectOf(row).projectKey, `2026-10-10T12-00-00-000Z_${row.sessionId}.jsonl`), tokens);
 	}
-	for (const [row, tokens] of [[child, 6], [legacy, 9]]) {
-		writeUsage(path.join(b, ".omo", "senpi-task", "children", row.taskId, "sessions", row.taskId, `2026-10-10T12-00-00-000Z_${row.sessionId}.jsonl`), tokens);
+	for (const [row, cwd, tokens] of [[child, a, 6], [legacy, b, 9]]) {
+		writeUsage(path.join(cwd, ".omo", "senpi-task", "children", row.taskId, "sessions", row.taskId, `2026-10-10T12-00-00-000Z_${row.sessionId}.jsonl`), tokens);
 	}
 	const index = createUsageIndex({ file: paths.health.usageIndexFile, clock });
 	const tracker = createUsageTracker({ paths, clock, index, locator: createSessionFileLocator({ paths, clock }) });

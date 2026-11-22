@@ -219,6 +219,28 @@ test("childFile finds a child only through the second cwd (the ancestor)", (t) =
 	assert.equal(locator.childFile({ taskId: "t-ancestor", sessionId: "child-ancestor", cwds: [childCwd, parent] }), file);
 });
 
+test("plan94 childFile prioritizes explicit store and parent, otherwise requires a unique store", (t) => {
+	const { root, paths, locator, proj } = setup(t);
+	const spawn = path.join(root, "spawn");
+	const storeDir = path.join(root, "explicit-store");
+	const taskId = "st_cross";
+	const sessionId = "cross";
+	const name = `${STAMP}_${sessionId}.jsonl`;
+	const parentFile = writeChild(paths, proj, taskId, name);
+	const spawnFile = writeChild(paths, spawn, taskId, name);
+	const explicitFile = writeChild(paths, proj, taskId, name, storeDir);
+	const query = { taskId, sessionId, cwds: [spawn, proj] };
+	assert.deepEqual([
+		locator.childFile({ ...query, parentCwd: proj, storeDir }),
+		locator.childFile({ ...query, parentCwd: proj }),
+		locator.childFile(query),
+		locator.childCandidate(query),
+	], [explicitFile, parentFile, undefined, null]);
+	fs.rmSync(parentFile);
+	assert.equal(locator.childFile({ ...query, parentCwd: proj }), undefined, "a known store must not fall through");
+	assert.equal(locator.childFile(query), spawnFile, "ambiguity can clear without waiting for rescan");
+});
+
 test("childFile retries a negative result after the fake clock passes rescanMs", (t) => {
 	const { paths, clock, locator, proj } = setup(t);
 	assert.equal(locator.childFile({ taskId: "t-late", cwds: [proj] }), undefined);

@@ -121,7 +121,7 @@ export function createDetailOperations({
 		const { taskId, sessionId } = session?.ledgerIds ?? session ?? {};
 		// Injected loaders may not report dependencies; retain the selected-file lookup for them.
 		const file = transcriptFiles === undefined && (taskId
-			? locator.childFile({ taskId, sessionId, cwds: session.cwd ? [session.cwd] : [] })
+			? locator.childFile({ taskId, sessionId, storeDir: session.storeDir, parentCwd: session.parentCwd, cwds: [session.cwd] })
 			: locator.mainFile(subjectOfRecord(record, job.id)));
 		const files = transcriptFiles ?? (file ? [file] : []);
 		return { record, files, signature: detailSignature(paths, files), owners: job.owners };
