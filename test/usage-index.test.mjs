@@ -69,6 +69,87 @@ function setup(t) {
 
 const writeText = (file, text) => fs.writeFileSync(file, text);
 
+test("(gate 14) 138 sessions with 1000 overflowing models save and reload in capped children", (t) => {
+	const { fileOf } = setup(t);
+	const file = fileOf("usage.json");
+	const transcript = fileOf("session.jsonl");
+	writeText(transcript, Array.from({ length: 1000 }, (_, i) =>
+		JSON.stringify({ type: "usage", provider: "p", model: `m${i}`, usage: use({ input: 1e308, output: 1e308, cost: 0.25 }) }),
+	).join("\n") + "\n");
+	const program = `
+import assert from "node:assert/strict";
+import { createUsageIndex, readUsageIndex } from ${JSON.stringify(new URL("../src/usage-index.mjs", import.meta.url).href)};
+const [mode, file, transcript] = process.argv.slice(1);
+const clock = { now: () => 1 };
+if (mode === "write") {
+	const index = createUsageIndex({ file, clock });
+	for (let i = 0; i < 138; i++) index.update("s" + i, transcript);
+	assert.equal(index.save(), true);
+} else {
+	const rows = mode === "dashboard" ? [...readUsageIndex(file).values()] : createUsageIndex({ file, clock }).entries();
+	assert.equal(rows.length, 138);
+	assert.equal(rows.at(-1).published.total, Infinity);
+	assert.equal(rows.at(-1).published.cost, 250);
+	assert.equal(rows.at(-1).published.models["(other models)"].tokens, Infinity);
+	assert.equal(rows.at(-1).published.modelsIncomplete, true);
+}
+`;
+	for (const mode of ["write", "dashboard", "daemon"]) {
+		const result = spawnSync(process.execPath, ["--max-old-space-size=96", "--input-type=module", "--eval", program, mode, file, transcript], { encoding: "utf8" });
+		assert.equal(result.status, 0, `${mode}:\n${result.stderr}`);
+	}
+});
+
+test("(gate 14) exact budget, spill, and a previously oversized persisted row", (t) => {
+	const { fileOf, indexOf } = setup(t);
+	const file = fileOf();
+	const saved = fileOf("usage.json");
+	const records = Array.from({ length: 512 }, (_, i) => JSON.stringify(assistant({ model: `m${i}` }))).join("\n") + "\n";
+	writeText(file, records);
+	const index = indexOf();
+	for (let i = 0; i < 3; i++) index.update(`s${i}`, file);
+	const beforeSave = index.get("s2").published;
+	assert.deepEqual(beforeSave.models, { "(other models)": { tokens: 5120, cost: beforeSave.cost } });
+	assert.equal(beforeSave.modelsIncomplete, true);
+	index.save();
+	const data = JSON.parse(fs.readFileSync(saved, "utf8"));
+	const rows = Object.values(data.entries);
+	const slots = rows.flatMap((row) => [row.usage, row.overlay, row.published]).flatMap((tree) =>
+		[...Object.keys(tree.models), ...Object.keys(tree.usedModels)]).filter((key) => !key.startsWith("("));
+	assert.equal(slots.length, 4096);
+	assert.equal(readUsageIndex(saved).get("s1").published.modelsIncomplete, false);
+	assert.equal(readUsageIndex(saved).get("s2").published.total, 5120);
+	data.entries.s2 = { ...data.entries.s0, id: "s2" };
+	writeText(saved, JSON.stringify(data));
+	const loaded = readUsageIndex(saved);
+	assert.equal(compactUsage(loaded.get("s1")).total, 5120);
+	assert.equal(compactUsage(loaded.get("s2")), null);
+	const reopened = indexOf();
+	assert.equal(reopened.update("s2", file), fs.statSync(file).size);
+	assert.equal(reopened.get("s2").published.modelsIncomplete, true);
+	const tail = `${line()}\n`;
+	fs.appendFileSync(file, tail);
+	assert.equal(reopened.update("s2", file), Buffer.byteLength(tail));
+	assert.equal(reopened.get("s2").published.total, 5130);
+});
+
+test("(gate 14) regrouped model cost need not reconcile in floating point", (t) => {
+	const { fileOf, indexOf } = setup(t);
+	const file = fileOf();
+	writeText(file, [
+		assistant({ model: "m1", usage: use({ cost: 1e308 }) }),
+		assistant({ model: "m2", usage: use({ cost: 1 }) }),
+		assistant({ model: "m1", usage: use({ cost: -1e308 }) }),
+	].map((item) => JSON.stringify(item)).join("\n") + "\n");
+	const index = indexOf();
+	index.update("s", file);
+	index.save();
+	const entry = indexOf().get("s");
+	assert.equal(compactUsage(entry).cost, 0);
+	assert.equal(Object.values(entry.published.models).reduce((sum, model) => sum + model.cost, 0), 1);
+	assert.equal(fresh(entry), true);
+});
+
 test("save and load round-trip the entries without the in-memory fields", (t) => {
 	const { dir, fileOf, indexOf } = setup(t);
 	const index = indexOf();
@@ -150,10 +231,14 @@ test("constructing an index over a corrupt, different-version or absent file sta
 	fs.rmSync(file);
 	assert.deepEqual(createUsageIndex({ file, clock, log }).entries(), []);
 
-	fs.writeFileSync(
-		file,
-		JSON.stringify({ v: USAGE_INDEX_VERSION, entries: { s1: { id: "s1", state: "ok", complete: true, offset: 12, scanOffset: 5, partial: { start: 0 }, readError: true } } }),
-	);
+	const session = path.join(dir, "cursor.jsonl");
+	writeText(session, "{}\n".repeat(4));
+	const writer = createUsageIndex({ file, clock, log });
+	writer.update("s1", session);
+	writer.save();
+	const saved = JSON.parse(fs.readFileSync(file, "utf8"));
+	Object.assign(saved.entries.s1, { scanOffset: 5, partial: { start: 0 }, readError: true });
+	writeText(file, JSON.stringify(saved));
 	const loaded = createUsageIndex({ file, clock, log });
 	assert.equal(loaded.get("s1").state, "ok");
 	assert.equal(loaded.get("s1").offset, 12);

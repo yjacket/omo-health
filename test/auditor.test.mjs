@@ -520,6 +520,31 @@ test("a prewarm entry alone excludes the first candidate, a failed prewarm in an
 	assert.equal(modelOf(g.runner.starts[0]), "google/gemini-3-pro");
 });
 
+for (const incomplete of ["timeline", "index"]) {
+	test(`(gate 14) the auditor refuses when only the ${incomplete} lost model identities`, () => {
+		const h = harness();
+		indexed(h, "m1");
+		if (incomplete === "index") {
+			const file = h.paths.health.usageIndexFile;
+			const saved = JSON.parse(fs.readFileSync(file, "utf8"));
+			saved.entries.m1.published.modelsIncomplete = true;
+			fs.writeFileSync(file, JSON.stringify(saved));
+		}
+		const a = h.auditor({
+			timeline: (...args) => {
+				const full = usageTimeline(...args);
+				if (incomplete === "timeline") full.totals.modelsIncomplete = true;
+				return full;
+			},
+		});
+		h.request("m1");
+		h.tick(a);
+		assert.equal(h.record("m1").reason, "models-unknown");
+		assert.equal(h.runner.starts.length, 0);
+		assert.equal(h.budget(), undefined);
+	});
+}
+
 test("preparing a file above timelineMaxBytes neither scans messages nor reads it through usageTimeline", () => {
 	const h = harness();
 	const scans = [];

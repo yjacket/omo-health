@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { after, before, beforeEach, describe, it } from "node:test";
 import { resolvePaths } from "../src/paths.mjs";
+import { emptyUsage } from "../src/collect/usage.mjs";
 import { createSessionDetail, createStartAudit } from "../src/ui/cli.mjs";
 import { daemonStatus, loadDaemonInputs } from "../src/ui/model.mjs";
 import { createUiServer } from "../src/ui/server.mjs";
@@ -631,6 +632,9 @@ describe("ui server", { timeout: 20_000 }, () => {
 							id: AUDIT_ID,
 							file: sessionFile,
 							kind: "main",
+							taskId: null,
+							parentSessionId: null,
+							rootSessionId: null,
 							state: "ok",
 							complete: true,
 							gone: false,
@@ -644,7 +648,9 @@ describe("ui server", { timeout: 20_000 }, () => {
 							tail: "",
 							evaluatedTo: stat.size,
 							checkedMs: nowMs,
-							published: { total: 10, input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0, costUnknown: false, turns: 1, models: {}, usedModels },
+							usage: emptyUsage(),
+							overlay: emptyUsage(),
+							published: { ...emptyUsage(), usedModels },
 						},
 					},
 				});
@@ -776,6 +782,8 @@ describe("ui server", { timeout: 20_000 }, () => {
 							file: sessionFile,
 							kind: "child",
 							taskId,
+							parentSessionId: null,
+							rootSessionId: null,
 							state: "ok",
 							complete: true,
 							gone: false,
@@ -789,7 +797,9 @@ describe("ui server", { timeout: 20_000 }, () => {
 							tail: "",
 							evaluatedTo: stat.size,
 							checkedMs: nowMs,
-							published: { total: 10, input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0, costUnknown: false, turns: 1, models: {}, usedModels: { "anthropic/claude-used": true } },
+							usage: emptyUsage(),
+							overlay: emptyUsage(),
+							published: { ...emptyUsage(), usedModels: { "anthropic/claude-used": true } },
 						},
 					},
 				});
@@ -921,6 +931,34 @@ describe("ui server", { timeout: 20_000 }, () => {
 					fs.rmSync(world.dir, { recursive: true, force: true });
 				}
 			});
+
+			for (const incomplete of ["timeline", "index"]) {
+				it(`(gate 14) preview and POST refuse when only the ${incomplete} lost model identities`, () => {
+					const world = makeWorld();
+					try {
+						const indexFile = world.paths.health.usageIndexFile;
+						const saved = JSON.parse(fs.readFileSync(indexFile, "utf8"));
+						const entry = saved.entries[AUDIT_ID];
+						if (incomplete === "index") entry.published.modelsIncomplete = true;
+						else {
+							const row = { type: "message", message: { role: "assistant", provider: "openai", model: "x".repeat(257) } };
+							fs.appendFileSync(world.sessionFile, `${JSON.stringify(row)}\n`);
+							// Keep the simulated index fresh, while only the full timeline sees the loss.
+							const stat = fs.statSync(world.sessionFile);
+							entry.size = entry.offset = entry.evaluatedTo = stat.size;
+							entry.mtimeMs = stat.mtimeMs;
+						}
+						writeJson(indexFile, saved);
+						const detail = world.detail(AUDIT_ID).audit;
+						assert.equal(detail.blocked, "models-unknown");
+						assert.equal(detail.planned, null);
+						assert.equal(world.startAudit(AUDIT_ID)[1].error, "models-unknown");
+						assert.equal(fs.existsSync(requestFileOf(world)), false);
+					} finally {
+						fs.rmSync(world.dir, { recursive: true, force: true });
+					}
+				});
+			}
 
 			it("reports the first block in order: disabled, daemon-off, cap, then no-model", () => {
 				const disabled = makeWorld({ daemon: "off", enabled: false });

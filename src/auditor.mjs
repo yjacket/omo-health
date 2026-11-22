@@ -24,6 +24,7 @@ const MIN = 60_000;
 const DAY_MS = 24 * 60 * MIN;
 export const REQUEST_TTL_MS = 10 * MIN;
 const DESCENDANT_SCAN_MAX = 50;
+const TIMELINE_MAX_BYTES = 256 * 1024 * 1024;
 const SAFE_ID = /^[A-Za-z0-9][\w.-]{0,127}$/;
 const ACTIVE = new Set(["queued", "launching", "running"]);
 
@@ -94,10 +95,36 @@ const refsOf = (bundle) => {
 	return ["T", ...["findings", "actions", "investigations", "messages"].flatMap((key) => (record[key] ?? []).map((row) => row.ref))].filter(Boolean);
 };
 
+/** Use a full timeline or fresh publication as proof of coverage. Either source
+ * can veto the choice if it lost identities; even a stale publication supplies
+ * identities to exclude, but cannot establish coverage on its own. */
+export function auditModelFacts(entry, full) {
+	const indexed = entry?.published;
+	const totals = full?.totals;
+	const indexComplete = indexed?.modelsIncomplete === false;
+	const timelineComplete = totals?.modelsIncomplete === false;
+	return {
+		sessionModels: [...new Set([...Object.keys(totals?.usedModels ?? {}), ...Object.keys(indexed?.usedModels ?? {})])],
+		sessionModelsKnown: (!entry || indexComplete) && (!full || timelineComplete) &&
+			(timelineComplete || (indexComplete && fresh(entry))),
+	};
+}
+
+export function readAuditTimeline(file, tokens, { maxFileBytes = TIMELINE_MAX_BYTES, timeline = usageTimeline, log } = {}) {
+	const stat = file ? statSafe(file) : null;
+	if (!stat?.isFile() || stat.size > maxFileBytes) return null;
+	try {
+		return timeline(file, { ...tokens, maxFileBytes });
+	} catch (error) {
+		log?.warn?.("audit_timeline_failed", { file: path.basename(file), error: error.message });
+		return null;
+	}
+}
+
 /**
  * @returns {{tick(now: number): void, busy(): boolean}}
  */
-export function createAuditor({ paths, config, clock, log, runner, env = process.env, timelineMaxBytes = 256 * 1024 * 1024, loadRecord = loadSessionRecord, timeline = usageTimeline, afterStart } = {}) {
+export function createAuditor({ paths, config, clock, log, runner, env = process.env, timelineMaxBytes = TIMELINE_MAX_BYTES, loadRecord = loadSessionRecord, timeline = usageTimeline, afterStart } = {}) {
 	const auditsDir = paths.health.auditsDir;
 	const jobsDir = paths.health.jobsDir;
 	const locator = createSessionFileLocator({ paths, clock });
@@ -206,21 +233,10 @@ export function createAuditor({ paths, config, clock, log, runner, env = process
 		if (readBudget(paths, now).count >= config.audit.perDay) return fail(record, "cap", null, now);
 
 		const { entry, file } = usageFacts(loaded);
-		const stat = file ? statSafe(file) : null;
-		let full = null;
-		if (stat?.isFile() && stat.size <= timelineMaxBytes) {
-			try {
-				full = timeline(file, { ...config.tokens, maxFileBytes: timelineMaxBytes });
-			} catch (error) {
-				log?.warn?.("audit_timeline_failed", { sessionId: record.sessionId, error: error.message });
-			}
-		}
-		const timelineKnown = full !== null && full.totals?.modelsIncomplete !== true;
-		const indexKnown = entry?.complete === true && fresh(entry) && entry.published?.modelsIncomplete !== true;
-		const sessionModels = [...new Set([...Object.keys(full?.totals?.usedModels ?? {}), ...(entry?.complete === true ? Object.keys(entry.published?.usedModels ?? {}) : [])])];
+		const full = readAuditTimeline(file, config.tokens, { maxFileBytes: timelineMaxBytes, timeline, log });
 		// The record join already collected every analyst model for its selected fps, including decision-only fps.
 		const analystModels = loaded.analystModels ?? [];
-		const choice = resolveAuditModel(paths, config, { sessionModels, sessionModelsKnown: timelineKnown || indexKnown, analystModels });
+		const choice = resolveAuditModel(paths, config, { ...auditModelFacts(entry, full), analystModels });
 		if (choice?.blocked === "models-unknown") return fail(record, "models-unknown", null, now);
 		if (!choice) return fail(record, "no-model", null, now);
 

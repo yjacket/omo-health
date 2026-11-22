@@ -1,6 +1,7 @@
+import fs from "node:fs";
 import { basename } from "node:path";
 import { MODEL_KEY_LENGTH, MODEL_KEY_LIMIT, readUsage } from "./collect/usage.mjs";
-import { atomicWriteFile, readTextSafe, statSafe } from "./util/fsx.mjs";
+import { atomicWriteFile, statSafe } from "./util/fsx.mjs";
 
 /**
  * The token index (plan todo 3, GAP-3): one JSON file holding, per session id, the
@@ -17,14 +18,18 @@ import { atomicWriteFile, readTextSafe, statSafe } from "./util/fsx.mjs";
 export const USAGE_INDEX_VERSION = 2;
 /** Per-tick byte budget for live appends, first reads and the backlog. */
 export const USAGE_TICK_BYTES = 32 * 1024 * 1024;
+/** Total named model slots, including repeats between rows or counter maps. */
+export const USAGE_INDEX_MODEL_BUDGET = 4096;
 const PRUNE_KEEP_MS = 45 * 24 * 3600_000;
 const TREE_DEPTH = 8;
 
 const isObject = (value) => typeof value === "object" && value !== null;
 
 const META_KEYS = ["kind", "taskId", "parentSessionId", "rootSessionId"];
-const MEMORY_ONLY_KEYS = new Set(["scanOffset", "partial", "readError"]);
+const MEMORY_ONLY_KEYS = ["scanOffset", "partial", "readError"];
 const USAGE_KEYS = ["usage", "overlay", "published"];
+const OTHER_MODELS = "(other models)";
+const SPILL_KEYS = new Set([OTHER_MODELS, "(model id too long)", "(model id unreadable)"]);
 const COUNTER_KEYS = ["input", "output", "cacheRead", "cacheWrite", "total", "cost", "turns"];
 const CURSOR_NUMBERS = ["size", "offset", "evaluatedTo", "mtimeMs", "ino", "birthtimeMs", "headLen"];
 const PERSISTED_KEYS = [
@@ -185,15 +190,49 @@ export function treeTotals(entries) {
 
 function persisted(entry) {
 	const out = {};
-	for (const key of PERSISTED_KEYS) {
-		if (Object.hasOwn(entry, key)) out[key] = entry[key];
-	}
-	for (const [key, value] of Object.entries(entry)) {
-		if (!Object.hasOwn(out, key) && !MEMORY_ONLY_KEYS.has(key) && value !== undefined) out[key] = value;
-	}
+	for (const key of PERSISTED_KEYS) out[key] = entry[key];
 	// Non-finite leaves are tagged by the serializer, not by copying the trees here:
 	// a 105k-model entry copied into a second tree of the same size aborts at 96 MiB.
 	return out;
+}
+
+function persistedMeta(entry) {
+	const meta = { file: entry.file };
+	for (const key of META_KEYS) meta[key] = entry[key];
+	return meta;
+}
+
+function boundedModels(entry, remaining) {
+	const budget = remaining;
+	for (const name of USAGE_KEYS) {
+		const tree = entry[name];
+		if (!tree) continue;
+		const { models, usedModels } = tree;
+		let spill;
+		for (const key in models) {
+			if (SPILL_KEYS.has(key)) continue;
+			if (remaining > 0) remaining--;
+			else {
+				spill ??= models[OTHER_MODELS] ?? { tokens: 0, cost: 0 };
+				spill.tokens += models[key].tokens;
+				spill.cost += models[key].cost;
+				delete models[key];
+			}
+		}
+		if (spill) {
+			models[OTHER_MODELS] = spill;
+			tree.modelsIncomplete = true;
+		}
+		for (const key in usedModels) {
+			if (SPILL_KEYS.has(key)) continue;
+			if (remaining > 0) remaining--;
+			else {
+				delete usedModels[key];
+				tree.modelsIncomplete = true;
+			}
+		}
+	}
+	return budget - remaining;
 }
 
 const NUMBER_TAG = "$n";
@@ -236,77 +275,69 @@ function normalizeNumber(node, key, version) {
 	return false;
 }
 
-/**
- * A persisted counter tree may be absent as a whole (a never-read row), but every
- * numeric leaf must be a number, or for v2 a well-formed tag. JSON.stringify turns
- * Infinity/NaN into null, so a null (or any other non-number) there is data loss;
- * the row must be recounted.
- */
-function validCounterTree(tree, version) {
-	if (tree === null || tree === undefined) return true;
-	if (!isObject(tree) || Array.isArray(tree)) return false;
-	for (const key of COUNTER_KEYS) if (!normalizeNumber(tree, key, version)) return false;
-	if ("costUnknown" in tree && typeof tree.costUnknown !== "boolean") return false;
-	if ("modelsIncomplete" in tree && typeof tree.modelsIncomplete !== "boolean") return false;
-	for (const models of [tree.models, tree.usedModels, tree.diagnostics]) {
-		if (models === null || models === undefined) continue;
-		if (!isObject(models) || Array.isArray(models)) return false;
-	}
-	// Reject legacy oversized maps in place; don't build an array or copy of the models.
-	const models = tree.models;
-	if (models) {
-		let count = 0;
-		for (const key in models) {
-			if (!Object.hasOwn(models, key)) continue;
-			if (++count > MODEL_KEY_LIMIT || key.length > MODEL_KEY_LENGTH) return false;
-			const model = models[key];
-			if (!isObject(model) || Array.isArray(model)) return false;
-			if (!normalizeNumber(model, "tokens", version) || !normalizeNumber(model, "cost", version)) return false;
-		}
-	}
-	const usedModels = tree.usedModels;
-	if (usedModels) {
-		let count = 0;
-		for (const key in usedModels) {
-			if (!Object.hasOwn(usedModels, key)) continue;
-			if (++count > MODEL_KEY_LIMIT || key.length > MODEL_KEY_LENGTH || usedModels[key] !== true) return false;
-		}
-	}
-	const diagnostics = tree.diagnostics;
-	if (diagnostics) {
-		if (!normalizeNumber(diagnostics, "badLines", version) || !normalizeNumber(diagnostics, "skippedLines", version)) return false;
-	}
-	return true;
-}
-
 const ENTRY_NUMBERS = [...CURSOR_NUMBERS, "checkedMs"];
+const CURSOR_NULLS = [...CURSOR_NUMBERS, "head", "tail", ...USAGE_KEYS];
+const record = (value) => isObject(value) && !Array.isArray(value);
+const nullableString = (value) => value === null || typeof value === "string";
+const hasShape = (value, fields) => record(value) && Object.keys(value).length === fields.length &&
+	fields.every((key) => Object.hasOwn(value, key));
+const DIAGNOSTICS_KEYS = ["badLines", "skippedLines"];
+const MODEL_COUNTERS = ["tokens", "cost"];
+const TREE_KEYS = [...COUNTER_KEYS, "costUnknown", "modelsIncomplete", "models", "usedModels", "diagnostics"];
 
-/** Every persisted numeric slot and counter leaf must fit the file's version. */
-function validEntry(entry, version) {
-	const neverRead = entry.state === "missing" && entry.complete === false && entry.gone === false &&
-		CURSOR_NUMBERS.every((key) => entry[key] === null) &&
-		USAGE_KEYS.every((key) => entry[key] === null) &&
-		entry.head === null && entry.tail === null;
-	if (neverRead) return Number.isFinite(entry.checkedMs);
-	for (const key of ENTRY_NUMBERS) {
-		if (Object.hasOwn(entry, key) && (!normalizeNumber(entry, key, version) || !Number.isFinite(entry[key]))) return false;
+/** Validate and decode a whole row atomically; -1 means recount, never publish. */
+function validateEntry(entry, id, version, remaining) {
+	if (entry.state === "ok") for (const key of MEMORY_ONLY_KEYS) delete entry[key];
+	if (!hasShape(entry, PERSISTED_KEYS)) return -1;
+	if (entry.id !== id || !META_KEYS.every((key) => nullableString(entry[key]))) return -1;
+	if (!Number.isFinite(entry.checkedMs) || typeof entry.complete !== "boolean" || typeof entry.gone !== "boolean") return -1;
+	if (entry.state === "missing") {
+		return nullableString(entry.file) && !entry.complete && !entry.gone &&
+			CURSOR_NULLS.every((key) => entry[key] === null) ? 0 : -1;
 	}
-	for (const key of ["size", "offset", "evaluatedTo", "headLen"]) {
-		if (Object.hasOwn(entry, key) && (!Number.isSafeInteger(entry[key]) || entry[key] < 0)) return false;
+	if (entry.state !== "ok" || typeof entry.file !== "string" || typeof entry.head !== "string" || typeof entry.tail !== "string") return -1;
+	if (!ENTRY_NUMBERS.every((key) => Number.isFinite(entry[key]))) return -1;
+	if (!["size", "offset", "evaluatedTo", "headLen"].every((key) => Number.isSafeInteger(entry[key]) && entry[key] >= 0)) return -1;
+	if (entry.offset > entry.evaluatedTo || entry.evaluatedTo > entry.size || entry.headLen > Math.min(entry.size, 4096)) return -1;
+	if (!entry.complete && (entry.gone || entry.published !== null)) return -1;
+	let named = 0;
+	for (const name of USAGE_KEYS) {
+		if (name === "published" && !entry.complete) continue;
+		const tree = entry[name];
+		if (!hasShape(tree, TREE_KEYS) || typeof tree.costUnknown !== "boolean" || typeof tree.modelsIncomplete !== "boolean") return -1;
+		const { models, usedModels, diagnostics } = tree;
+		if (!record(models) || !record(usedModels) || !COUNTER_KEYS.every((key) => normalizeNumber(tree, key, version))) return -1;
+		if (!hasShape(diagnostics, DIAGNOSTICS_KEYS) || !DIAGNOSTICS_KEYS.every((key) => normalizeNumber(diagnostics, key, version))) return -1;
+		let sum = Number.isSafeInteger(tree.total) ? 0n : null;
+		for (const map of [models, usedModels]) {
+			let count = 0;
+			for (const key in map) {
+				if (++count > MODEL_KEY_LIMIT || key.length > MODEL_KEY_LENGTH) return -1;
+				if (!SPILL_KEYS.has(key) && ++named > remaining) return -1;
+				const value = map[key];
+				if (map === usedModels) {
+					if (value !== true) return -1;
+				} else {
+					if (!hasShape(value, MODEL_COUNTERS) || !MODEL_COUNTERS.every((field) => normalizeNumber(value, field, version))) return -1;
+					if (sum !== null) sum = Number.isSafeInteger(value.tokens) ? sum + BigInt(value.tokens) : null;
+				}
+			}
+		}
+		// Costs are grouped in a different floating-point order than the owner total.
+		if (sum !== null && sum !== BigInt(tree.total)) return -1;
 	}
-	if (entry.offset > entry.evaluatedTo || entry.evaluatedTo > entry.size || entry.headLen > Math.min(entry.size, 4096)) return false;
-	return USAGE_KEYS.every((key) => validCounterTree(entry[key], version));
+	return named;
 }
 
 /** Drop a lossy cursor and publication so the tracker recounts the session file. */
-function invalidateCursor(entry) {
-	delete entry.usage;
-	delete entry.overlay;
-	delete entry.published;
-	delete entry.evaluatedTo;
+function invalidated(id, row) {
+	const entry = newEntry(id);
+	for (const key of ["file", ...META_KEYS]) if (typeof row?.[key] === "string") entry[key] = row[key];
+	entry.checkedMs = Number.isFinite(row?.checkedMs) ? row.checkedMs : null;
+	entry.state = "ok"; // The tracker queues incomplete reads immediately, unlike missing rows.
 	entry.offset = 0;
-	entry.complete = false;
-	entry.gone = false;
+	for (const key of [...USAGE_KEYS, "evaluatedTo"]) delete entry[key];
+	return entry;
 }
 
 /**
@@ -317,16 +348,9 @@ function invalidateCursor(entry) {
  * lets tests inject a read failure.
  */
 export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
-	const entries = new Map();
+	const { entries, weights, count } = loadUsageIndex(file);
+	let named = count;
 	let dirty = false;
-	for (const [id, loaded] of readUsageIndex(file)) {
-		const entry = newEntry(id);
-		for (const [key, value] of Object.entries(loaded)) {
-			if (!MEMORY_ONLY_KEYS.has(key)) entry[key] = value;
-		}
-		entry.id = id;
-		entries.set(id, entry);
-	}
 
 	const ensure = (id) => {
 		let entry = entries.get(id);
@@ -342,6 +366,14 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 		if (direct) return direct;
 		for (const entry of entries.values()) if (entry.taskId === id) return entry;
 		return undefined;
+	};
+
+	const dropCursor = (entry) => {
+		named -= weights.get(entry.id) ?? 0;
+		weights.delete(entry.id);
+		Object.assign(entry, newEntry(entry.id), persistedMeta(entry), { checkedMs: entry.checkedMs });
+		entry.partial = undefined;
+		entry.scanOffset = undefined;
 	};
 
 	return {
@@ -384,9 +416,7 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 				if (entry.complete === true) {
 					entry.gone = true;
 				} else {
-					entry.state = "missing";
-					entry.complete = false;
-					entry.gone = false;
+					dropCursor(entry);
 				}
 				dirty = true;
 				return 0;
@@ -409,6 +439,11 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			entry.scanOffset = result.scanOffset;
 			entry.partial = result.partial;
 			if (result.done === true) entry.published = result.effective;
+			else if (restart) entry.published = null;
+			named -= weights.get(id) ?? 0;
+			const slots = boundedModels(entry, USAGE_INDEX_MODEL_BUDGET - named);
+			weights.set(id, slots);
+			named += slots;
 			dirty = true;
 			return result.bytesRead;
 		},
@@ -424,9 +459,7 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			if (entry.state === "ok" && entry.complete === true) {
 				entry.gone = true;
 			} else {
-				entry.state = "missing";
-				entry.complete = false;
-				entry.gone = false;
+				dropCursor(entry);
 			}
 			entry.checkedMs = clock.now();
 			dirty = true;
@@ -440,8 +473,11 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 		/** Write the index when anything changed; returns whether it wrote. */
 		save() {
 			if (!dirty) return false;
-			const out = { v: USAGE_INDEX_VERSION, entries: {} };
-			for (const [id, entry] of entries) out.entries[id] = persisted(entry);
+			const out = { v: USAGE_INDEX_VERSION, entries: Object.create(null) };
+			for (const [id, entry] of entries) {
+				if (entry.state === "ok" && !weights.has(id)) continue; // Recount still pending.
+				out.entries[id] = persisted(entry);
+			}
 			atomicWriteFile(file, `${JSON.stringify(out, encodeNonFinite, 2)}\n`);
 			dirty = false;
 			return true;
@@ -452,7 +488,11 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			let removed = 0;
 			for (const [id, entry] of entries) {
 				const checked = Number.isFinite(entry.checkedMs) ? entry.checkedMs : 0;
-				if (checked < cutoff && entries.delete(id)) removed += 1;
+				if (checked < cutoff && entries.delete(id)) {
+					named -= weights.get(id) ?? 0;
+					weights.delete(id);
+					removed += 1;
+				}
 			}
 			if (removed) dirty = true;
 			return removed;
@@ -460,29 +500,115 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 	};
 }
 
-/** The index as the dashboard reads it: a Map of entries, empty when absent, unsupported or corrupt. */
-export function readUsageIndex(file) {
-	const out = new Map();
-	const text = readTextSafe(file);
-	if (text === undefined) return out;
-	let data;
+function loadUsageIndex(file, trackWeights = true) {
+	const entries = new Map();
+	const weights = new Map();
+	let count = 0;
+	const clear = () => {
+		entries.clear();
+		weights.clear();
+		return { entries, weights, count: 0 };
+	};
 	try {
-		const body = text.replace(/^\uFEFF/, "");
-		// No reviver: V8's reviver path keeps a temporary node array for the whole
-		// document, which aborts a 105,000-model index under the daemon's 96 MiB cap.
-		// The tagged leaves are rare and decoded in place per entry below.
-		data = JSON.parse(body);
+		// Keep the source bytes outside the V8 heap and materialize one row at a
+		// time. Old writers' oversized indexes can OOM before whole-file JSON.parse
+		// completes, too early for a post-parse budget check.
+		const bytes = fs.readFileSync(file);
+		let i = bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf ? 3 : 0;
+		const fail = () => { throw new SyntaxError("invalid usage index"); };
+		const peek = () => {
+			while (bytes[i] === 32 || bytes[i] === 9 || bytes[i] === 10 || bytes[i] === 13) i++;
+			return bytes[i];
+		};
+		const expect = (byte) => {
+			if (peek() !== byte) fail();
+			i++;
+		};
+		const stringEnd = () => {
+			while (++i < bytes.length) {
+				if (bytes[i] === 92) i++;
+				else if (bytes[i] === 34) {
+					i++;
+					return;
+				}
+			}
+			fail();
+		};
+		// Locate a value's byte span; JSON.parse still checks its actual grammar.
+		const skipValue = () => {
+			const first = peek();
+			if (first === 34) return stringEnd();
+			if (first !== 123 && first !== 91) {
+				while (i < bytes.length && bytes[i] !== 44 && bytes[i] !== 125 && bytes[i] !== 93) i++;
+				return;
+			}
+			let depth = 0;
+			while (i < bytes.length) {
+				const byte = bytes[i];
+				if (byte === 34) {
+					stringEnd();
+					continue;
+				}
+				i++;
+				if (byte === 123 || byte === 91) depth++;
+				else if ((byte === 125 || byte === 93) && --depth === 0) return;
+			}
+			fail();
+		};
+		const fields = (visit) => {
+			expect(123);
+			if (peek() !== 125) {
+				for (;;) {
+					if (peek() !== 34) fail();
+					const start = i;
+					stringEnd();
+					const key = JSON.parse(bytes.toString("utf8", start, i));
+					expect(58);
+					visit(key);
+					if (peek() !== 44) break;
+					i++;
+				}
+			}
+			expect(125);
+		};
+		const parseValue = () => {
+			peek();
+			const start = i;
+			skipValue();
+			return JSON.parse(bytes.toString("utf8", start, i));
+		};
+		// Find the version before validating rows, including old compact files
+		// with `entries` before `v`. Do not decode the entries object itself.
+		let version;
+		let entriesStart;
+		fields((key) => {
+			if (key === "entries") {
+				peek();
+				entriesStart = i;
+				skipValue();
+			} else {
+				const value = parseValue();
+				if (key === "v") version = value;
+			}
+		});
+		if (peek() !== undefined || entriesStart === undefined || (version !== 1 && version !== USAGE_INDEX_VERSION)) return clear();
+		i = entriesStart;
+		fields((id) => {
+			const row = parseValue();
+			if (!record(row)) return;
+			if (entries.has(id)) fail();
+			const slots = validateEntry(row, id, version, USAGE_INDEX_MODEL_BUDGET - count);
+			entries.set(id, slots < 0 ? invalidated(id, row) : row);
+			if (slots >= 0) {
+				count += slots;
+				if (trackWeights) weights.set(id, slots);
+			}
+		});
+		return { entries, weights, count };
 	} catch {
-		return out;
+		return clear();
 	}
-	if (!isObject(data) || (data.v !== 1 && data.v !== USAGE_INDEX_VERSION) || !isObject(data.entries)) return out;
-	const version = data.v;
-	for (const [id, entry] of Object.entries(data.entries)) {
-		if (!isObject(entry)) continue;
-		// A version mismatch, a malformed tag, a null or a string in a numeric slot
-		// would otherwise publish a total the one-shot read disagrees with (IS-1).
-		if (!validEntry(entry, version)) invalidateCursor(entry);
-		out.set(id, entry);
-	}
-	return out;
 }
+
+/** The index as the dashboard reads it: a Map of entries, empty when absent, unsupported or corrupt. */
+export const readUsageIndex = (file) => loadUsageIndex(file, false).entries;

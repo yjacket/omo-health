@@ -4,12 +4,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig } from "../config.mjs";
 import { createSessionFileLocator } from "../collect/session-files.mjs";
-import { auditsToday, readAuditState, requestAudit } from "../auditor.mjs";
+import { auditModelFacts, auditsToday, readAuditState, readAuditTimeline, requestAudit } from "../auditor.mjs";
 import { listSubjectsNow, runDiagnose } from "../diagnose.mjs";
 import { resolveAuditModel } from "../judge/audit.mjs";
 import { createLogger } from "../log.mjs";
 import { loadSessionRecord } from "../session-record.mjs";
-import { atEnd, readUsageIndex } from "../usage-index.mjs";
+import { fresh, readUsageIndex } from "../usage-index.mjs";
 import { listDirSafe, statSafe } from "../util/fsx.mjs";
 import { daemonStatus, loadDaemonInputs, uiState } from "./model.mjs";
 import { auditReasonLabel, auditStatusLabel } from "./labels.mjs";
@@ -32,12 +32,13 @@ function usageEntryFor(usage, record, id) {
 	return usage.get(session.sessionId) ?? (session.taskId ? usage.get(session.taskId) : undefined) ?? usage.get(id) ?? null;
 }
 
-/** The model list is known only when the whole file was read and nothing was incomplete. */
-function modelsKnownOf(entry) {
-	return Boolean(entry && entry.state === "ok" && entry.complete === true && atEnd(entry) && entry.published?.modelsIncomplete !== true);
+function auditFactsFor(paths, record, id, tokens) {
+	const entry = usageEntryFor(readUsageIndex(paths.health.usageIndexFile), record, id);
+	// Keep the dashboard's existing freshness gate: do not queue a request
+	// against an index row the daemon still has to finish or refresh.
+	if (!fresh(entry)) return { sessionModels: [], sessionModelsKnown: false };
+	return auditModelFacts(entry, readAuditTimeline(entry.file, tokens));
 }
-
-const sessionModelsOf = (entry) => Object.keys(entry?.published?.usedModels ?? {});
 
 /** The first refusal, in the order the detail and the POST agree on: disabled, daemon-off, cap, models-unknown, no-model. */
 function blockedOf({ config, daemon, usedToday, perDay, modelsKnown, planned }) {
@@ -61,10 +62,10 @@ export function createAuditDetail({ paths, env = process.env, now = Date.now, re
 		const state = readState(paths, canonicalId);
 		const perDay = Number.isFinite(config.audit?.perDay) ? config.audit.perDay : null;
 		const usedToday = today(paths, at);
-		const entry = usageEntryFor(readUsageIndex(paths.health.usageIndexFile), record, id);
-		const modelsKnown = modelsKnownOf(entry);
+		const facts = auditFactsFor(paths, record, id, config.tokens);
+		const modelsKnown = facts.sessionModelsKnown;
 		const analystModels = Array.isArray(record?.analystModels) ? record.analystModels : [];
-		const choice = modelsKnown ? resolveModel(paths, config, { sessionModels: sessionModelsOf(entry), sessionModelsKnown: true, analystModels }) : null;
+		const choice = modelsKnown ? resolveModel(paths, config, { ...facts, analystModels }) : null;
 		const planned = choice && !choice.blocked ? choice : null;
 		const blocked = blockedOf({ config, daemon, usedToday, perDay, modelsKnown, planned });
 		return { state, planned, blocked, stalled: isAuditActive(state) && daemon.state !== "running", usedToday, perDay };
@@ -93,9 +94,9 @@ export function createStartAudit({ paths, env = process.env, now = Date.now, loa
 		if (isAuditActive(state)) return refuse(409, "running");
 		const perDay = config.audit.perDay;
 		if (Number.isFinite(perDay) && today(paths, at) >= perDay) return refuse(429, "cap");
-		const entry = usageEntryFor(readUsageIndex(paths.health.usageIndexFile), record, canonicalId);
-		if (!modelsKnownOf(entry)) return refuse(409, "models-unknown");
-		const choice = resolveModel(paths, config, { sessionModels: sessionModelsOf(entry), sessionModelsKnown: true, analystModels: Array.isArray(record.analystModels) ? record.analystModels : [] });
+		const facts = auditFactsFor(paths, record, canonicalId, config.tokens);
+		if (!facts.sessionModelsKnown) return refuse(409, "models-unknown");
+		const choice = resolveModel(paths, config, { ...facts, analystModels: Array.isArray(record.analystModels) ? record.analystModels : [] });
 		if (!choice || choice.blocked) return refuse(409, "no-model");
 		request(paths, canonicalId, at);
 		return [202, { ok: true, audit: { sessionId: canonicalId, status: "queued", statusKo: auditStatusLabel("queued"), planned: choice } }];

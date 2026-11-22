@@ -435,6 +435,63 @@ for (const version of [1, 2]) {
 	}
 }
 
+test("(gate 14) deletion of each written field unpublishes the row until a one-shot-equivalent recount", async (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const id = "omissions";
+	const file = mainFile(s.paths, id);
+	const indexFile = s.paths.health.usageIndexFile;
+	const hit = JSON.stringify({ type: "message", message: { role: "assistant", provider: "p", model: "m", usage: usage(42) } });
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	fs.writeFileSync(file, `${hit}\n${hit}`); // Populate both committed usage and the EOF overlay.
+	s.index.update(id, file, { kind: "main", taskId: "alias", parentSessionId: "parent", rootSessionId: "root" });
+	s.index.save();
+	const saved = fs.readFileSync(indexFile, "utf8");
+	const fields = (node, prefix = []) => Object.entries(node).flatMap(([key, value]) => {
+		const field = [...prefix, key];
+		return [field, ...(key !== "usedModels" && value && typeof value === "object" ? fields(value, field) : [])];
+	});
+	const row = { sessionId: id, kind: "main", endedMs: T0 };
+	const expected = readUsage(file).effective;
+	assert.equal(expected.total, 84);
+	for (const field of fields(JSON.parse(saved).entries[id])) {
+		await t.test(field.join("."), () => {
+			const data = JSON.parse(saved);
+			const object = field.slice(0, -1).reduce((node, key) => node[key], data.entries[id]);
+			delete object[field.at(-1)];
+			fs.writeFileSync(indexFile, JSON.stringify(data));
+			const loaded = readUsageIndex(indexFile);
+			const index = createUsageIndex({ file: indexFile, clock: s.clock, log: s.log });
+			const tracker = createUsageTracker({ paths: s.paths, index, locator: s.locator, clock: s.clock, log: s.log });
+			assert.equal(endedRow(row, 0, loaded).tokensState, "pending");
+			assert.deepEqual(tracker.tokensOf(id), { pending: true });
+			assert.equal(tracker.queueLedger([row]), 1);
+			assert.equal(tracker.tick(emptyWorld(s.clock)).bytesRead, fs.statSync(file).size);
+			assert.deepEqual(readUsageIndex(indexFile).get(id).published, expected);
+		});
+	}
+});
+
+test("(gate 14) a mismatched billing token map forces a recount without publishing", (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const id = "mismatch";
+	const file = mainFile(s.paths, id);
+	const indexFile = s.paths.health.usageIndexFile;
+	writeJsonl(file, [E.assistant({ ms: T0, usage: usage(42) })]);
+	s.index.update(id, file);
+	s.index.save();
+	const data = JSON.parse(fs.readFileSync(indexFile, "utf8"));
+	Object.values(data.entries[id].usage.models)[0].tokens--;
+	fs.writeFileSync(indexFile, JSON.stringify(data));
+	const index = createUsageIndex({ file: indexFile, clock: s.clock, log: s.log });
+	const tracker = createUsageTracker({ paths: s.paths, index, locator: s.locator, clock: s.clock, log: s.log });
+	assert.deepEqual(tracker.tokensOf(id), { pending: true });
+	assert.equal(tracker.queueLedger([{ sessionId: id, kind: "main", endedMs: T0 }]), 1);
+	assert.equal(tracker.tick(emptyWorld(s.clock)).bytesRead, fs.statSync(file).size);
+	assert.deepEqual(readUsageIndex(indexFile).get(id).published, readUsage(file).effective);
+});
+
 test("a child of a child is located through its grandparent's cwd", () => {
 	const s = setup();
 	writeJsonl(childFile(s.cwd, "st_mid", "mid1"), [E.assistant({ ms: T0, usage: usage(3) })]);

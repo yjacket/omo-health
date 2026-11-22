@@ -520,7 +520,23 @@ describe("ui model", () => {
 		const MAIN = "01a20000-0000-7000-8000-000000000001";
 		const totals = (total, extra = {}) => ({ total, input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.1, costUnknown: false, turns: 1, ...extra });
 		const entry = (id, extra = {}) => ({ id, state: "ok", complete: true, gone: false, published: totals(100), ...extra });
-		const writeUsage = (paths, entries) => write(paths.health.usageIndexFile, { v: 1, entries: Object.fromEntries(entries.map((e) => [e.id, e])) });
+		const usageLine = (total) => `${JSON.stringify({ type: "usage", provider: "fixture", model: "fixture", usage: { input: total, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } })}\n`;
+		/** Write the index as the daemon does: a complete read per session file, a byte-capped read for `maxBytes`, and `markMissing` for `state: "missing"`. */
+		const writeUsage = (paths, specs) => {
+			const dir = path.join(paths.health.sessionsDir, "index-fixtures");
+			fs.mkdirSync(dir, { recursive: true });
+			const index = createUsageIndex({ file: paths.health.usageIndexFile, clock: createFakeClock(NOW) });
+			for (const spec of specs) {
+				if (spec.state === "missing") {
+					index.markMissing(spec.id, spec.meta ?? {});
+					continue;
+				}
+				const file = path.join(dir, `${spec.id}.jsonl`);
+				write(file, usageLine(spec.total ?? 100));
+				index.update(spec.id, file, spec.meta ?? {}, spec.maxBytes ? { maxBytes: spec.maxBytes } : {});
+			}
+			index.save();
+		};
 		const row = (sessionId, endedMs, extra = {}) => ({ v: 1, sessionId, kind: "main", parentSessionId: null, taskId: null, title: sessionId, cwd: null, terminal: null, omoVersion: null, startedMs: endedMs - 60_000, endedMs, outcome: "closed", reason: null, childCount: 0, estimated: false, source: "live", ...extra });
 		const writeRows = (paths, rows) => write(path.join(paths.health.sessionsDir, "ended-2026-09-29.jsonl"), `${rows.map((r) => JSON.stringify(r)).join("\n")}\n`);
 		const endedRows = (home) => new Map(uiState({ paths: home.paths, env: home.env, now: NOW }).ended.rows.map((r) => [r.sessionId, r]));
@@ -563,9 +579,9 @@ describe("ui model", () => {
 		it("marks an ended row ok, pending (incomplete or unindexed) or missing", () => {
 			const home = makeHome();
 			writeUsage(home.paths, [
-				entry("ok"),
-				entry("incomplete", { complete: false }),
-				{ id: "missing", state: "missing", complete: false, gone: false, published: null },
+				{ id: "ok", total: 100 },
+				{ id: "incomplete", maxBytes: 1 },
+				{ id: "missing", state: "missing" },
 			]);
 			writeRows(home.paths, [row("ok", NOW - 1000), row("incomplete", NOW - 2000), row("missing", NOW - 3000), row("unindexed", NOW - 4000)]);
 			const rows = endedRows(home);
@@ -581,7 +597,7 @@ describe("ui model", () => {
 
 		it("finds an entry by the taskId alias when the session id does not match", () => {
 			const home = makeHome();
-			writeUsage(home.paths, [entry("01a20000-0000-7000-8000-0000000000aa", { taskId: "st_alias" })]);
+			writeUsage(home.paths, [{ id: "01a20000-0000-7000-8000-0000000000aa", total: 100, meta: { taskId: "st_alias" } }]);
 			writeRows(home.paths, [row("01a20000-0000-7000-8000-0000000000bb", NOW - 1000, { taskId: "st_alias" })]);
 			const [r] = uiState({ paths: home.paths, env: home.env, now: NOW }).ended.rows;
 			assert.equal(r.tokensState, "ok");
@@ -612,9 +628,9 @@ describe("ui model", () => {
 		it("shows a tree total only when descendants add tokens", () => {
 			const home = makeHome();
 			writeUsage(home.paths, [
-				entry("m", { published: totals(100) }),
-				entry("c", { parentSessionId: "m", published: totals(50) }),
-				entry("g", { parentSessionId: "c", published: totals(25) }),
+				{ id: "m", total: 100 },
+				{ id: "c", total: 50, meta: { parentSessionId: "m" } },
+				{ id: "g", total: 25, meta: { parentSessionId: "c" } },
 			]);
 			writeRows(home.paths, [
 				row("m", NOW - 1000),
