@@ -4,10 +4,12 @@ import fs from "node:fs";
 import http from "node:http";
 import { syncBuiltinESMExports } from "node:module";
 import net from "node:net";
+import { once } from "node:events";
 import os from "node:os";
 import path from "node:path";
 import { after, before, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import { MessageChannel, receiveMessageOnPort, Worker } from "node:worker_threads";
 import { createAuditor, readAuditState, requestAudit } from "../src/auditor.mjs";
 import { createSessionFileLocator } from "../src/collect/session-files.mjs";
 import { senpiTaskStoreDir } from "../src/collect/tasks.mjs";
@@ -1105,6 +1107,75 @@ describe("ui server", { timeout: 20_000 }, () => {
 					assert.equal(pageReplies[i].record, undefined, `${name}: no record accompanies the worker's list page`);
 					assert.equal(pageReplies[i].page.items.length, Math.min(total - 50, 50));
 				}
+			});
+
+			it("IS-4 / IS-7: cold History detail opens only the selected session tree's transcripts", async (t) => {
+				const selected = "selected";
+				const world = makeWorld({ sessionId: selected });
+				const { paths, env, now, nowMs, sessionFile } = world;
+				const { port1, port2 } = new MessageChannel();
+				const worker = new Worker(new URL("./helpers/observe-detail-worker.mjs", import.meta.url), {
+					workerData: { paths, env, detailWorker: true, observed: port2 },
+					transferList: [port2],
+				});
+				t.after(async () => {
+					await worker.terminate();
+					port1.close();
+					await world.detail.close();
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				});
+
+				const child = "child";
+				const taskId = "st_detail";
+				const unindexed = "filename-match";
+				const headerOnly = "unindexed-header";
+				const message = (content) => ({ type: "custom_message", customType: "omo-health", timestamp: new Date(nowMs).toISOString(), content });
+				const usage = (input) => ({ type: "message", message: { role: "assistant", provider: "anthropic", model: "claude-used", usage: { input }, stopReason: "stop" } });
+				const dir = path.dirname(sessionFile);
+				const childFile = path.join(dir, "custom-child.jsonl");
+				const unindexedFile = path.join(dir, `2026-11-22_${unindexed}.jsonl`);
+				appendJsonl(sessionFile, [message("selected message"), usage(42)]);
+				writeJsonl(childFile, [{ type: "session", id: child }, message("child message"), usage(7)]);
+				writeJsonl(unindexedFile, [{ type: "session", id: unindexed }, message("filename message")]);
+				writeJsonl(path.join(dir, "custom-miss.jsonl"), [{ type: "session", id: headerOnly }, message("header-only message")]);
+				for (let i = 0; i < 24; i++) {
+					writeJsonl(path.join(dir, `custom-${i}.jsonl`), [{ type: "session", id: `unrelated-${i}` }]);
+				}
+				for (const row of [
+					{ kind: "child", sessionId: child, taskId, parentSessionId: selected },
+					{ kind: "main", sessionId: unindexed },
+					{ kind: "main", sessionId: headerOnly },
+				]) appendEnded(paths, { ...row, endedMs: nowMs, outcome: "answered" }, { nowMs });
+				fs.unlinkSync(paths.health.usageIndexFile);
+				const index = createUsageIndex({ file: paths.health.usageIndexFile, clock: { now } });
+				index.update(selected, sessionFile, { kind: "main" });
+				index.update(child, childFile, { kind: "child", taskId, parentSessionId: selected });
+				assert.equal(index.save(), true);
+
+				async function open(id) {
+					const reply = once(worker, "message");
+					worker.postMessage({ kind: "detail", id, now: nowMs });
+					const [{ result, error }] = await reply;
+					assert.equal(error, undefined);
+					const opened = new Set();
+					for (let entry; (entry = receiveMessageOnPort(port1));) opened.add(entry.message);
+					assert.equal(result.record.found, true);
+					return { record: result.record, opened: [...opened].sort() };
+				}
+				const selectedDetail = await open(selected);
+				assert.deepEqual(selectedDetail.record.health.messages.map(({ text }) => text).sort(), ["child message", "selected message"]);
+				assert.deepEqual([selectedDetail.record.tokens.total, selectedDetail.record.tokens.treeTotal], [42, 49]);
+				assert.deepEqual(selectedDetail.opened, [sessionFile, childFile].sort(), "the worker opened transcripts outside the selected tree");
+
+				const fallback = await open(unindexed);
+				assert.deepEqual(fallback.record.health.messages.map(({ text }) => text), ["filename message"]);
+				assert.equal(fallback.record.tokens, null);
+				assert.deepEqual(fallback.opened, [unindexedFile]);
+
+				const missing = await open(headerOnly);
+				assert.deepEqual(missing.record.health.messages, []);
+				assert.equal(missing.record.tokens, null);
+				assert.deepEqual(missing.opened, []);
 			});
 
 			it("IS-7 refreshes cached parent detail after a child-only transcript change", async (t) => {

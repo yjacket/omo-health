@@ -49,7 +49,7 @@ export function createDetailOperations({
 } = {}) {
 	let at;
 	const cache = new Map();
-	const locator = createSessionFileLocator({ paths, clock: { now: () => at } });
+	const locator = createSessionFileLocator({ paths, clock: { now: () => at }, probeHeaders: false });
 	const loadRecord = ({ id, row, now }) => load({ paths, id, row, now, locator });
 	const plan = (config, facts, analystModels) =>
 		resolveModel(paths, config, { ...facts, analystModels: Array.isArray(analystModels) ? analystModels : [] });

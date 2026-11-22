@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { listDirSafe, statSafe } from "../util/fsx.mjs";
-import { readUsageIndex, soleChildSessionFile } from "../usage-index.mjs";
+import { fresh, readUsageIndex, soleChildSessionFile } from "../usage-index.mjs";
 import { idFromFileName } from "./sessions.mjs";
 import { senpiTaskStoreDir } from "./tasks.mjs";
 
@@ -43,14 +43,15 @@ export function probeSessionHeader(file, size, maxBytes) {
 /**
  * `indexedFile(sessionId)` is an optional lookup into a token index the caller already holds (the daemon's resident
  * index); without it the locator reads the index file, once per change of that file.
+ * With `probeHeaders: false`, use fresh on-disk index entries instead of probing, and discover by filename only.
  */
-export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, indexedFile } = {}) {
+export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, indexedFile, probeHeaders = true } = {}) {
 	const nowMs = typeof clock?.now === "function" ? () => clock.now() : () => Date.now();
 	let mainFiles = new Map();
 	let mainScannedMs = -Infinity;
 	let mainScan;
 	let usageStamp;
-	let customMainFiles = new Map();
+	let indexedMainEntries = new Map();
 
 	const residentMainFile = (sessionId) => {
 		const file = indexedFile(sessionId);
@@ -63,14 +64,16 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 		const stamp = stat?.isFile() ? `${stat.ino}:${stat.birthtimeMs}:${stat.mtimeMs}:${stat.size}` : null;
 		if (stamp !== usageStamp) {
 			usageStamp = stamp;
-			customMainFiles = new Map();
+			indexedMainEntries = new Map();
 			if (stamp !== null) {
 				for (const [id, entry] of readUsageIndex(file)) {
-					if (entry.kind === "main" && entry.file && idFromFileName(entry.file) !== id) customMainFiles.set(id, entry.file);
+					if (entry.kind === "main" && entry.file && (!probeHeaders || idFromFileName(entry.file) !== id)) indexedMainEntries.set(id, entry);
 				}
 			}
 		}
-		return customMainFiles.get(sessionId);
+		const entry = indexedMainEntries.get(sessionId);
+		if (!probeHeaders && (entry?.readError === true || !fresh(entry))) return undefined;
+		return entry?.file;
 	};
 
 	const indexedMainFile = typeof indexedFile === "function" ? residentMainFile : readMainFile;
@@ -85,7 +88,7 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 	}
 
 	/** A header probe is atomic; leave the candidate at the cursor if its prefix won't fit. */
-	const findMainFile = (sessionId, indexedFile = indexedMainFile(sessionId), { maxBytes = Infinity } = {}) => {
+	const findMainFile = (sessionId, indexedFile, { maxBytes = Infinity } = {}) => {
 		let bytesRead = 0;
 		const result = (file, pending = false) => ({ file, pending, bytesRead });
 		const header = (file, size) => {
@@ -94,7 +97,13 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 			return probe;
 		};
 		if (!sessionId) return result();
-		if (indexedFile && idFromFileName(indexedFile) !== sessionId) {
+		if (!probeHeaders) {
+			const verified = readMainFile(sessionId);
+			if (verified) return result(verified);
+		} else if (indexedFile === undefined) {
+			indexedFile = indexedMainFile(sessionId);
+		}
+		if (probeHeaders && indexedFile && idFromFileName(indexedFile) !== sessionId) {
 			const stat = statSafe(indexedFile);
 			if (stat?.isFile()) {
 				const probe = header(indexedFile, stat.size);
@@ -115,10 +124,10 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 			const candidate = scan.next.value;
 			const stat = statSafe(candidate);
 			if (!stat?.isFile()) continue;
-			const probe = header(candidate, stat.size);
-			if (probe.pending) return result(undefined, true);
+			const probe = probeHeaders ? header(candidate, stat.size) : undefined;
+			if (probe?.pending) return result(undefined, true);
 			const nameId = idFromFileName(candidate);
-			const headerId = probe.id;
+			const headerId = probe?.id;
 			if (typeof headerId === "string" && headerId && headerId !== nameId) {
 				// A differing header identifies this file, but don't displace a matching filename for that id.
 				if (!scan.found.has(headerId)) scan.found.set(headerId, candidate);
