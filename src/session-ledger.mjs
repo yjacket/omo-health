@@ -44,6 +44,45 @@ export function readEnded(paths, { sinceMs } = {}) {
 		.sort((a, b) => Number(b.endedMs) - Number(a.endedMs));
 }
 
+function* ledgerLines(file) {
+	const chunk = Buffer.allocUnsafe(64 * 1024);
+	let fd;
+	try {
+		fd = fs.openSync(file, "r");
+		let parts = [];
+		for (let n; (n = fs.readSync(fd, chunk, 0, chunk.length, null));) {
+			const bytes = chunk.subarray(0, n);
+			let start = 0;
+			for (let end; (end = bytes.indexOf(10, start)) !== -1; start = end + 1) {
+				const tail = bytes.subarray(start, end);
+				yield parts.length ? Buffer.concat([...parts, tail]) : tail;
+				parts = [];
+			}
+			if (start < n) parts.push(Buffer.from(bytes.subarray(start)));
+		}
+		if (parts.length) yield Buffer.concat(parts);
+	} catch {
+		// Like the array reader, tolerate a ledger file disappearing during a read.
+	} finally {
+		if (fd !== undefined) fs.closeSync(fd);
+	}
+}
+
+/** Ended records in file/line order; callers needing newest-first order sort their selections. */
+export function* streamEnded(paths, { sinceMs } = {}) {
+	for (const file of ledgerFiles(paths, sinceMs)) {
+		for (const line of ledgerLines(file)) {
+			let row;
+			try {
+				row = JSON.parse(line.toString("utf8"));
+			} catch {
+				continue;
+			}
+			if (typeof row?.sessionId === "string" && (!Number.isFinite(sinceMs) || Number(row.endedMs) >= sinceMs)) yield row;
+		}
+	}
+}
+
 /** True when the sessionId appears in the ledger files of the last 30 days. */
 export function hasEnded(paths, sessionId, { nowMs = Date.now() } = {}) {
 	for (const file of ledgerFiles(paths, nowMs - DEDUPE_DAYS * DAY_MS)) {

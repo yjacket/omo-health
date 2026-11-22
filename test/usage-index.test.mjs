@@ -203,6 +203,109 @@ test("(gate 17) corrupt lines do not hide the next intact publication in a satur
 	assert.deepEqual(results, results.map(([size]) => [size, 10]));
 });
 
+test("(gate 18) an identifiable invalid line cannot displace an intact 42-token publication", (t) => {
+	const { fileOf, indexOf, clock } = setup(t);
+	const index = indexOf();
+	const transcript = fileOf();
+	writeText(transcript, '{"type":"usage","provider":"p","model":"id","usage":{"input":42}}\n');
+	index.update("oldest", transcript);
+	clock.advance(1);
+	for (let i = 0; !index.full; i++) index.markMissing(`m${i}`);
+	assert.ok(index.save());
+	const clean = fs.readFileSync(fileOf("usage.json"));
+	const last = clean.lastIndexOf(10, clean.length - 2) + 1;
+	const bad = Buffer.from('{"id":"identifiable-invalid","checkedMs":"not a number"}\n');
+	assert.equal(bad.length, 57);
+	assert.equal(compactUsage(readUsageIndex(fileOf("usage.json")).get("oldest"))?.total, 42);
+	const damaged = fileOf("damaged.jsonl");
+	writeText(damaged, Buffer.concat([clean.subarray(0, last), bad, clean.subarray(last)]));
+	const loaded = indexOf("damaged.jsonl");
+	assert.equal(compactUsage(loaded.get("oldest"))?.total, 42);
+	assert.equal(compactUsage(readUsageIndex(damaged).get("oldest"))?.total, 42);
+	const recount = loaded.get("identifiable-invalid");
+	assert.equal(recount?.state, "ok");
+	assert.equal(recount.complete, false);
+	assert.equal(recount.offset, 0);
+});
+
+test("(gate 18) retention and audit preparation with a saturated index and the long-path ledger fit in 66 MiB", async (t) => {
+	const { dir } = setup(t);
+	const program = `
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { createUsageIndex } from ${JSON.stringify(new URL("../src/usage-index.mjs", import.meta.url).href)};
+import { createUsageTracker } from ${JSON.stringify(new URL("../src/usage-tracker.mjs", import.meta.url).href)};
+import { resolvePaths } from ${JSON.stringify(new URL("../src/paths.mjs", import.meta.url).href)};
+import * as ledger from ${JSON.stringify(new URL("../src/session-ledger.mjs", import.meta.url).href)};
+import { createAuditor, requestAudit, readAuditState } from ${JSON.stringify(new URL("../src/auditor.mjs", import.meta.url).href)};
+import { DEFAULT_CONFIG } from ${JSON.stringify(new URL("../src/config.mjs", import.meta.url).href)};
+import { loadSessionRecord } from ${JSON.stringify(new URL("../src/session-record.mjs", import.meta.url).href)};
+const [stage, dir] = process.argv.slice(1);
+const paths = resolvePaths({ USERPROFILE: dir, OMO_HEALTH_HOME: path.join(dir, "health"), OMO_HEALTH_OMO_HOME: path.join(dir, ".omo") });
+const now = ${T0};
+const clock = { now: () => now };
+const index = createUsageIndex({ file: paths.health.usageIndexFile, clock });
+const cwd = "C:/작업/" + ("a".repeat(194) + "/").repeat(100).slice(0, -1);
+const id = (i) => "01aaa000-0000-7000-8000-" + String(i).padStart(12, "0");
+const put = (file, data) => {
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	fs.writeFileSync(file, data);
+};
+if (stage === "fixture") {
+	const transcript = path.join(dir, "seed.jsonl");
+	put(transcript, '{"type":"usage","provider":"p","model":"id","usage":{"input":42}}\\n');
+	index.update("seed", transcript, { kind: "main" });
+	for (let i = 0; !index.full; i++) index.markMissing(id(i), { kind: "main", file: cwd + "/" + id(i) });
+	assert.ok(index.save());
+	const day = new Date(now).toISOString().slice(0, 10);
+	const name = "ended-" + day + ".jsonl";
+	ledger.appendEnded(paths, { sessionId: "seed", kind: "main", startedMs: now - 120000, endedMs: now - 1000 });
+	const file = path.join(paths.health.sessionsDir, name);
+	for (let i = 0; i < 1030; i++) fs.appendFileSync(file, JSON.stringify({
+		v: 1, sessionId: id(i), kind: "main", cwd, startedMs: now - 20000, endedMs: now - 2000, outcome: "completed",
+	}) + "\\n");
+	ledger.appendEnded(paths, { sessionId: "child", taskId: "st_child", parentSessionId: "seed", kind: "child", endedMs: now - 2000 });
+	ledger.appendEnded(paths, { sessionId: "grand", taskId: "st_grand", parentSessionId: "st_child", kind: "child", endedMs: now - 3000 });
+	put(path.join(paths.health.decisionsDir, day + ".jsonl"), [
+		{ fp: "grand-finding", event: "opened", subject: { sessionId: "grand" } },
+		{ fp: "machine-finding", event: "opened", subject: {} },
+	].map((row) => JSON.stringify({ ts: new Date(now - 10000).toISOString(), ...row })).join("\\n") + "\\n");
+	put(paths.omoJsonc, JSON.stringify({ "[native]": { categories: { ultrabrain: { models: ["other/reviewer"] } } } }));
+	put(paths.authFile, JSON.stringify({ other: {} }));
+} else {
+	assert.ok(index.full);
+	assert.equal(index.get("seed").published.total, 42);
+	if (stage === "retention") {
+		assert.equal(index.prune(now), 0);
+		const tracker = createUsageTracker({ paths, index, clock });
+		// Exercise the same prune/queue sequence on both the old and new reader.
+		const read = ledger.streamEnded ?? ledger.readEnded;
+		const missing = 1030 - (index.entries().length - 1);
+		assert.equal(tracker.queueLedger(read(paths, { sinceMs: now - 30 * ${DAY} })), Math.max(0, missing) + 2);
+	} else {
+		const record = loadSessionRecord({ paths, id: "seed", now, index, messageScanMaxBytes: 0 });
+		assert.deepEqual(record.children.map(({ sessionId, depth }) => [sessionId, depth]), [["child", 1], ["grand", 2]]);
+		assert.deepEqual(record.health.findings.map(({ fp, scope }) => [fp, scope]), [["grand-finding", "session"], ["machine-finding", "machine"]]);
+		requestAudit(paths, "seed", now);
+		let starts = 0;
+		createAuditor({ paths, index, config: DEFAULT_CONFIG, clock, env: {}, timelineMaxBytes: 0, runner: {
+			start() { starts++; return { pid: 1 }; },
+		} }).tick(now + 1);
+		assert.equal(starts, 1);
+		assert.equal(readAuditState(paths, "seed").status, "running");
+	}
+}
+`;
+	const run = (stage) => {
+		const result = spawnSync(process.execPath, ["--max-old-space-size=66", "--max-semi-space-size=1", "--input-type=module", "--eval", program, stage, dir], { encoding: "utf8", timeout: 60_000 });
+		assert.equal(result.status, 0, `${stage} exit ${result.status}, ${result.signal ?? ""}:\n${result.stderr}\n${result.error ?? ""}`);
+	};
+	run("fixture");
+	await t.test("daily retention queues only the rows that need reads", () => run("retention"));
+	await t.test("audit starts and the record joins grandchildren and machine findings", () => run("audit"));
+});
+
 const longPathProgram = `
 import assert from "node:assert/strict";
 import fs from "node:fs";

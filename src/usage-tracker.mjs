@@ -28,7 +28,7 @@ const isNonEmptyString = (value) => typeof value === "string" && value.length > 
  */
 export function createUsageTracker({ paths, index, locator, clock, log } = {}) {
 	const nowMs = () => (typeof clock?.now === "function" ? clock.now() : Date.now());
-	/** Every ledger row seen so far, for the ancestor cwd walk. */
+	/** Compact ledger rows, for the ancestor cwd walk. */
 	const ledgerRows = new Map();
 	/** Rows waiting for bytes: id -> ledger row, newest first. */
 	let queue = new Map();
@@ -101,8 +101,24 @@ export function createUsageTracker({ paths, index, locator, clock, log } = {}) {
 		 * complete read) checked more than a day ago.
 		 */
 		queueLedger(rows) {
-			for (const row of rows ?? []) {
-				if (!isNonEmptyString(row?.sessionId)) continue;
+			const cutoff = nowMs() - 30 * DAY_MS;
+			const sharedCwds = new Map();
+			// The daemon passes a stream for the daily window and a one-row
+			// array for live exits. Only sweep the old window on refresh.
+			if (!Array.isArray(rows)) {
+				for (const [id, row] of ledgerRows) {
+					if (row.endedMs < cutoff) {
+						ledgerRows.delete(id);
+						queue.delete(id);
+					} else if (row.cwd) sharedCwds.set(row.cwd, row.cwd);
+				}
+			}
+			for (const source of rows ?? []) {
+				if (!isNonEmptyString(source?.sessionId)) continue;
+				const { sessionId, taskId, kind, cwd, endedMs, parentSessionId, rootSessionId } = source;
+				// Many sessions share a workspace; do not retain a decoded copy per row.
+				if (isNonEmptyString(cwd) && !sharedCwds.has(cwd)) sharedCwds.set(cwd, cwd);
+				const row = { sessionId, taskId, kind, cwd: sharedCwds.get(cwd), endedMs, parentSessionId, rootSessionId };
 				ledgerRows.set(row.sessionId, row);
 				const entry = index.get(row.sessionId);
 				const checkedAgo = nowMs() - (Number.isFinite(entry?.checkedMs) ? entry.checkedMs : 0) > DAY_MS;

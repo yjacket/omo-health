@@ -21,7 +21,8 @@ const FULL_HEADER = JSON.stringify({ v: USAGE_INDEX_VERSION, full: true });
 const FULL_ENTRY = Object.freeze({ state: "full" });
 /** Fixed per-row allowance for V8 objects, map entries and writer bookkeeping. */
 export const INDEX_ENTRY_OVERHEAD = 1536;
-export const INDEX_BYTE_BUDGET = 40 * 1024 * 1024;
+// Leave room for the streamed ledger and a tracker scan on the 66 MiB gate.
+export const INDEX_BYTE_BUDGET = 36 * 1024 * 1024;
 // Separate from resident rows: only one serialized/decoded line is processed at a time.
 const INDEX_LINE_BYTE_BUDGET = 8 * 1024 * 1024;
 /** Per-tick byte budget for live appends, first reads and the backlog. */
@@ -333,17 +334,6 @@ function validateEntry(entry, remaining) {
 	return named;
 }
 
-/** Drop a lossy cursor and publication so the tracker recounts the session file. */
-function invalidated(id, row) {
-	const entry = newEntry(id);
-	for (const key of ["file", ...META_KEYS]) if (typeof row?.[key] === "string") entry[key] = row[key];
-	entry.checkedMs = Number.isFinite(row?.checkedMs) ? row.checkedMs : null;
-	entry.state = "ok"; // The tracker queues incomplete reads immediately, unlike missing rows.
-	entry.offset = 0;
-	for (const key of [...USAGE_KEYS, "evaluatedTo"]) delete entry[key];
-	return entry;
-}
-
 const serializeEntry = (entry) => JSON.stringify(persisted(entry), encodeNonFinite);
 
 function stringBytes(value) {
@@ -444,7 +434,12 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 		 * error keeps the saved totals while `readError` hides them from the board.
 		 */
 		update(id, path, meta = {}, { maxBytes = Infinity } = {}) {
-			const entry = entries.get(id) ?? newEntry(id);
+			const stored = entries.get(id);
+			const entry = stored && Object.hasOwn(stored, "file") ? stored : newEntry(id);
+			if (stored && entry !== stored) {
+				entry.state = "ok";
+				entry.offset = 0;
+			}
 			const previousSlots = weights.get(id)?.slots ?? null;
 			unweigh(id);
 			entry.file = path;
@@ -599,39 +594,58 @@ function loadUsageIndex(file, trackWeights = true) {
 	let truncated = false;
 	try {
 		const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
-		let header = true;
-		for (const line of indexLines(file)) {
-			if (header) {
-				const signature = line.toString("utf8").replace(/\r$/, "");
-				if (signature !== INDEX_HEADER && signature !== FULL_HEADER) break;
-				full = signature === FULL_HEADER;
-				header = false;
-				continue;
+		function* rows() {
+			let header = true;
+			for (const line of indexLines(file)) {
+				if (header) {
+					const signature = line.toString("utf8").replace(/\r$/, "");
+					if (signature !== INDEX_HEADER && signature !== FULL_HEADER) return;
+					full ||= signature === FULL_HEADER;
+					header = false;
+					continue;
+				}
+				let text;
+				let row;
+				try {
+					text = decoder.decode(line);
+					if (stringBytes(text) > INDEX_LINE_BYTE_BUDGET) continue;
+					row = JSON.parse(text);
+				} catch {
+					continue;
+				}
+				if (record(row) && typeof row.id === "string" && !entries.has(row.id)) yield { row, text };
 			}
-			let text;
-			let row;
-			try {
-				text = decoder.decode(line);
-				if (stringBytes(text) > INDEX_LINE_BYTE_BUDGET) continue;
-				row = JSON.parse(text);
-			} catch {
-				continue;
-			}
-			if (!record(row) || typeof row.id !== "string" || entries.has(row.id)) continue;
+		}
+		let sawInvalid = false;
+		for (const { row, text } of rows()) {
 			const { id } = row;
 			const slots = validateEntry(row, USAGE_INDEX_MODEL_BUDGET - named);
-			// Keep only a pending marker for an identifiable but invalid row.
-			const entry = slots < 0 ? invalidated(id, row) : row;
-			const size = entryBytes(entry, slots < 0 ? serializeEntry(entry) : text.trimEnd());
+			if (slots < 0) {
+				sawInvalid = true;
+				continue;
+			}
+			const size = entryBytes(row, text.trimEnd());
 			if (bytes + size > INDEX_BYTE_BUDGET) {
-				if (slots < 0) continue;
 				full = truncated = true;
 				break;
 			}
-			entries.set(id, entry);
+			entries.set(id, row);
 			bytes += size;
-			if (slots >= 0) named += slots;
-			if (trackWeights) weights.set(id, { slots: slots < 0 ? null : slots, bytes: size });
+			named += slots;
+			if (trackWeights) weights.set(id, { slots, bytes: size });
+		}
+		// The writer orders intact rows newest first. Only spend leftover space
+		// on recounts; a second pass avoids buffering damaged rows or their IDs.
+		const markerOverhead = 128; // Map/weight bookkeeping and the fixed marker shape.
+		if (sawInvalid && bytes + markerOverhead < INDEX_BYTE_BUDGET) {
+			for (const { row } of rows()) {
+				const { id } = row;
+				const size = markerOverhead + stringBytes(id);
+				if (bytes + size > INDEX_BYTE_BUDGET || validateEntry(row, USAGE_INDEX_MODEL_BUDGET - named) >= 0) continue;
+				entries.set(id, { id, state: "ok", complete: false, offset: 0 });
+				bytes += size;
+				if (trackWeights) weights.set(id, { slots: null, bytes: size });
+			}
 		}
 		return { entries, weights, named, bytes, full, truncated };
 	} catch {

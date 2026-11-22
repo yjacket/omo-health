@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createSessionFileLocator } from "./collect/session-files.mjs";
 import { actionDetail, readDecisions } from "./decisions.mjs";
-import { readEnded } from "./session-ledger.mjs";
+import { streamEnded } from "./session-ledger.mjs";
 import { compactUsage, readUsageIndex, treeTotals } from "./usage-index.mjs";
 import { reasonCode } from "./audit-codes.mjs";
 import { listDirSafe, readJsonSafe, statSafe } from "./util/fsx.mjs";
@@ -71,7 +71,7 @@ function collectDescendants(row, ledger, usageEntries) {
 	const nodes = new Map();
 	const discovered = new Set([row.sessionId, row.taskId].filter(nonEmpty));
 	const all = [];
-	for (const r of ledger) if (isRecord(r)) all.push({ sessionId: r.sessionId ?? null, taskId: r.taskId ?? null, parentSessionId: r.parentSessionId ?? null, title: r.title ?? null, outcome: r.outcome ?? null, endedMs: msOf(r.endedMs), cwd: r.cwd ?? null });
+	for (const r of ledger) if (isRecord(r)) all.push({ sessionId: r.sessionId ?? null, taskId: r.taskId ?? null, parentSessionId: r.parentSessionId ?? null, title: r.title ?? null, outcome: r.outcome ?? null, endedMs: msOf(r.endedMs), cwd: r.cwd ?? null, ledgerRow: r });
 	for (const e of usageEntries) if (nonEmpty(e?.parentSessionId)) all.push({ sessionId: e.id ?? null, taskId: e.taskId ?? null, parentSessionId: e.parentSessionId, title: null, outcome: null, endedMs: msOf(e.checkedMs), cwd: null });
 	let frontier = new Set(discovered);
 	for (let depth = 1; depth <= DEPTH_MAX && frontier.size; depth += 1) {
@@ -91,6 +91,7 @@ function collectDescendants(row, ledger, usageEntries) {
 				endedMs: Number.isFinite(n.endedMs) ? n.endedMs : null,
 				cwd: n.cwd,
 				depth,
+				ledgerRow: n.ledgerRow,
 			});
 			if (nonEmpty(n.sessionId)) next.add(n.sessionId);
 			if (nonEmpty(n.taskId)) next.add(n.taskId);
@@ -260,7 +261,7 @@ export function buildSessionRecord(inputs = {}) {
 
 	const startedMs = msOf(row.startedMs);
 	const endedMs = msOf(row.endedMs);
-	const descendants = collectDescendants(row, ledger, usage.values());
+	const descendants = inputs.descendants ?? collectDescendants(row, ledger, usage.values());
 	const descSessionIds = new Set(descendants.map((node) => node.sessionId).filter(nonEmpty));
 	const descTaskIds = new Set(descendants.map((node) => node.taskId).filter(nonEmpty));
 	const sessionAllowed = new Set([row.sessionId, ...descSessionIds].filter(nonEmpty));
@@ -472,7 +473,7 @@ function readAllInvestigations(paths) {
 	return out;
 }
 
-function cwdsOf(node, ledger) {
+function cwdsOf(node, ancestors) {
 	const out = [];
 	let current = node;
 	const seen = new Set();
@@ -481,9 +482,67 @@ function cwdsOf(node, ledger) {
 		const parentId = current.parentSessionId;
 		if (!nonEmpty(parentId) || seen.has(parentId)) break;
 		seen.add(parentId);
-		current = ledger.find((r) => r.sessionId === parentId || r.taskId === parentId);
+		current = ancestors.get(parentId);
 	}
 	return out;
+}
+
+function recordLedger(rows, id, usage) {
+	// First pass: keep only identities, links and ordering. In particular, an
+	// unrelated row's cwd must not stay resident alongside the usage index.
+	const links = [];
+	for (const { sessionId, taskId, parentSessionId, endedMs } of rows()) links.push({ sessionId, taskId, parentSessionId, endedMs });
+	links.sort((a, b) => Number(b.endedMs) - Number(a.endedMs));
+	const byId = new Map();
+	for (const link of links) {
+		for (const alias of [link.sessionId, link.taskId]) if (nonEmpty(alias) && !byId.has(alias)) byId.set(alias, link);
+	}
+	const subject = byId.get(id);
+	if (!subject) return null;
+	const descendants = collectDescendants(subject, links, usage.values());
+	const selected = new Map();
+	const select = (link) => {
+		if (!selected.has(link.sessionId)) selected.set(link.sessionId, new Set());
+		selected.get(link.sessionId).add(link);
+	};
+	select(subject);
+	const children = new Map();
+	for (const node of descendants) {
+		if (!node.ledgerRow) continue;
+		select(node.ledgerRow);
+		children.set(node.ledgerRow, node);
+	}
+	const ancestors = new Map();
+	for (const node of [subject, ...descendants]) {
+		let parentId = node.parentSessionId;
+		const seen = new Set();
+		for (let depth = 1; depth < DEPTH_MAX && nonEmpty(parentId) && !seen.has(parentId); depth += 1) {
+			seen.add(parentId);
+			const parent = byId.get(parentId);
+			if (!parent) break;
+			select(parent);
+			ancestors.set(parentId, parent);
+			parentId = parent.parentSessionId;
+		}
+	}
+	// Second pass: hydrate only the subject, descendant details and ancestor
+	// directories. Match by ledger identity, not offsets that appends can shift.
+	let row;
+	for (const rec of rows()) {
+		const candidates = selected.get(rec.sessionId);
+		if (!candidates) continue;
+		for (const link of candidates) {
+			if (link.endedMs !== rec.endedMs || link.taskId !== rec.taskId || link.parentSessionId !== rec.parentSessionId) continue;
+			candidates.delete(link);
+			if (link === subject) row = rec;
+			link.cwd = rec.cwd;
+			const child = children.get(link);
+			if (child) Object.assign(child, { title: rec.title ?? null, outcome: rec.outcome ?? null, cwd: rec.cwd ?? null });
+		}
+		if (!candidates.size) selected.delete(rec.sessionId);
+		if (!selected.size) break;
+	}
+	return row ? { row, descendants, ancestors } : null;
 }
 
 /**
@@ -494,23 +553,23 @@ function cwdsOf(node, ledger) {
  */
 export function loadSessionRecord({ paths, id, now = Date.now(), messageScanMaxBytes = Infinity, descendantScanMax = Infinity, scanMessages = scanOmoHealthMessages, locator, index } = {}) {
 	if (!nonEmpty(id)) return { found: false, id };
-	const ledger = readEnded(paths, { sinceMs: now - 30 * DAY_MS });
-	const row = ledger.find((r) => r.sessionId === id || r.taskId === id);
-	if (!row) return { found: false, id };
 	const usage = index ?? readUsageIndex(paths.health.usageIndexFile);
+	const joined = recordLedger(() => streamEnded(paths, { sinceMs: now - 30 * DAY_MS }), id, usage);
+	if (!joined) return { found: false, id };
+	const { row, descendants, ancestors } = joined;
 	const startedMs = msOf(row.startedMs);
 	const decisions = readDecisions(paths, (Number.isFinite(startedMs) ? startedMs : now) - 30 * DAY_MS);
 	const investigations = readAllInvestigations(paths);
-	const descendants = collectDescendants(row, ledger, usage.values()).sort((a, b) => (b.endedMs ?? 0) - (a.endedMs ?? 0));
+	const newest = [...descendants].sort((a, b) => (b.endedMs ?? 0) - (a.endedMs ?? 0));
 	const loc = locator ?? createSessionFileLocator({ paths, clock: { now: () => now } });
 
 	const files = [];
 	const own = nonEmpty(row.taskId)
-		? loc.childFile({ taskId: row.taskId, sessionId: row.sessionId, cwds: cwdsOf(row, ledger) })
+		? loc.childFile({ taskId: row.taskId, sessionId: row.sessionId, cwds: cwdsOf(row, ancestors) })
 		: loc.mainFile(row.sessionId);
 	if (own) files.push({ sessionId: row.sessionId, file: own });
-	for (const node of descendants.slice(0, Number.isFinite(descendantScanMax) ? descendantScanMax : descendants.length)) {
-		const file = nonEmpty(node.taskId) ? loc.childFile({ taskId: node.taskId, sessionId: node.sessionId, cwds: cwdsOf(node, ledger) }) : loc.mainFile(node.sessionId);
+	for (const node of newest.slice(0, Number.isFinite(descendantScanMax) ? descendantScanMax : newest.length)) {
+		const file = nonEmpty(node.taskId) ? loc.childFile({ taskId: node.taskId, sessionId: node.sessionId, cwds: cwdsOf(node, ancestors) }) : loc.mainFile(node.sessionId);
 		if (file) files.push({ sessionId: node.sessionId, file });
 	}
 
@@ -526,5 +585,5 @@ export function loadSessionRecord({ paths, id, now = Date.now(), messageScanMaxB
 		for (const message of scanMessages(file) ?? []) messages.push({ ...message, recipient: sessionId });
 	}
 
-	return buildSessionRecord({ id, row, ledger, usage, decisions, investigations, messages, truncated: { messagesSkipped: skipped } });
+	return buildSessionRecord({ id, row, descendants, usage, decisions, investigations, messages, truncated: { messagesSkipped: skipped } });
 }

@@ -34,7 +34,7 @@ import { createInvestigations } from "./investigations.mjs";
 import { pruneHome } from "./retention.mjs";
 import { backfillOnce } from "./session-backfill.mjs";
 import { buildSessionSnapshot, detectEnded } from "./session-board.mjs";
-import { appendEnded, readEnded } from "./session-ledger.mjs";
+import { appendEnded, streamEnded } from "./session-ledger.mjs";
 import { createSessionFileLocator } from "./collect/session-files.mjs";
 import { createUsageIndex } from "./usage-index.mjs";
 import { createUsageTracker } from "./usage-tracker.mjs";
@@ -466,7 +466,7 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 					log.error("session_backfill_failed", { error: error.message });
 				}
 				try {
-					usageTracker.queueLedger(readEnded(paths, { sinceMs: clock.now() - 30 * DAY_MS }));
+					usageTracker.queueLedger(streamEnded(paths, { sinceMs: clock.now() - 30 * DAY_MS }));
 				} catch (error) {
 					log.error("usage_queue_failed", { error: error.message });
 				}
@@ -476,7 +476,7 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 				runRetention(paths, lastRetentionMs, log);
 				try {
 					usageIndex.prune(lastRetentionMs);
-					usageTracker.queueLedger(readEnded(paths, { sinceMs: lastRetentionMs - 30 * DAY_MS }));
+					usageTracker.queueLedger(streamEnded(paths, { sinceMs: lastRetentionMs - 30 * DAY_MS }));
 				} catch (error) {
 					log.error("usage_queue_failed", { error: error.message });
 				}
