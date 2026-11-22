@@ -8,7 +8,7 @@ const src = process.env.OMOH_MEMORY_BASELINE
 	? pathToFileURL(path.resolve(process.env.OMOH_MEMORY_BASELINE, "src") + path.sep)
 	: new URL("../../src/", import.meta.url);
 const load = (name) => import(new URL(`${name}.mjs`, src));
-const { createUsageIndex, INDEX_BYTE_BUDGET } = await load("usage-index");
+const { createUsageIndex, INDEX_BYTE_BUDGET, USAGE_TICK_BYTES } = await load("usage-index");
 const { resolvePaths } = await load("paths");
 const { appendEnded, hasEnded, streamEnded } = await load("session-ledger");
 const { backfillOnce } = await load("session-backfill");
@@ -26,10 +26,40 @@ const put = (file, text) => {
 	fs.writeFileSync(file, text);
 };
 const usageLine = '{"type":"usage","provider":"p","model":"one","usage":{"input":42}}\n';
-const indexFile = paths.health.usageIndexFile;
+const sparseTick = operation === "sparse-tick" || operation === "positioned-tick";
+const indexFile = sparseTick ? path.join(dir, `${mode}-${operation}.json`) : paths.health.usageIndexFile;
 const open = () => createUsageIndex({ file: indexFile, clock });
 
-if (operation === "build-index") {
+if (operation === "build-sparse") {
+	const cwd = path.join(dir, "prj");
+	const target = path.join(cwd, ".omo", "senpi-task", "children", "st_seed", "sessions", "st_seed", "2026-11-22_seed.jsonl");
+	put(target, "");
+	const fd = fs.openSync(target, "w");
+	const chunk = '{"x":"' + "x".repeat(65527) + '"}\n';
+	try {
+		for (let i = 0; i < 511; i++) fs.writeSync(fd, chunk);
+		fs.writeSync(fd, chunk.slice(0, -usageLine.length - 3) + '"}\n' + usageLine);
+	} finally {
+		fs.closeSync(fd);
+	}
+	const index = open();
+	assert.equal(index.update("seed", target, { kind: "child", taskId: "st_seed" }), USAGE_TICK_BYTES);
+	const prefix = "C:/작업/" + ("a".repeat(194) + "/").repeat(100);
+	for (let i = 0; !index.full; i++) index.markMissing(`existing-${i}`, { kind: "main", file: `${prefix}${i}` });
+	assert.ok(index.save());
+	const ledger = path.join(paths.health.sessionsDir, "ended-2026-11-22.jsonl");
+	const out = fs.openSync(ledger, "w");
+	try {
+		const write = (row) => fs.writeSync(out, JSON.stringify(row) + "\n");
+		write({ sessionId: "seed", taskId: "st_seed", kind: "child", endedMs: now, cwd });
+		const longCwd = path.join(dir, "작업") + "/" + ("a".repeat(194) + "/").repeat(99);
+		for (let i = 0; i < 1030; i++) {
+			write({ sessionId: `c${i}`, taskId: `st_${i}`, kind: "child", endedMs: now - 1, cwd: `${longCwd}${i}` });
+		}
+	} finally {
+		fs.closeSync(out);
+	}
+} else if (operation === "build-index") {
 	const index = open();
 	const seed = path.join(dir, "seed.jsonl");
 	put(seed, usageLine);
@@ -48,6 +78,19 @@ if (operation === "build-index") {
 	const queue = () => tracker.queueLedger(streamEnded(paths, { sinceMs: now - 30 * day, withLocation: true }));
 	const ended = { sessionId: "gate19-new", kind: "main", endedMs: now };
 	switch (operation) {
+		case "sparse-tick":
+		case "positioned-tick": {
+			function* sparse() {
+				for (const { sessionId, taskId, kind, endedMs } of streamEnded(paths)) {
+					yield { sessionId, taskId, kind, endedMs };
+				}
+			}
+			assert.equal(operation === "positioned-tick" ? queue() : tracker.queueLedger(sparse()), full ? 1030 : 1031);
+			const tick = tracker.tick({ sessions: new Map() });
+			assert.equal(tick.bytesRead, full ? 0 : USAGE_TICK_BYTES);
+			assert.equal(tracker.tokensOf("seed")?.tokens?.total, 42);
+			break;
+		}
 		case "append":
 			assert.equal(appendEnded(paths, ended, { nowMs: now }), true);
 			assert.equal(appendEnded(paths, ended, { nowMs: now }), false);

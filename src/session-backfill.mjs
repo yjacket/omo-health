@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { entryMs, idFromFileName, readSessionHeader } from "./collect/sessions.mjs";
 import { normalizeTask, senpiTaskStoreDir, taskStoreDir } from "./collect/tasks.mjs";
-import { appendEnded, streamEnded } from "./session-ledger.mjs";
+import { appendEndedBatch, streamEnded } from "./session-ledger.mjs";
 import { atomicWriteJson, ensureDir, listDirSafe, readJsonSafe, readTextSafe, statSafe } from "./util/fsx.mjs";
 import { redact, truncate } from "./util/text.mjs";
 import { kst, toMs } from "./util/time.mjs";
@@ -229,21 +229,11 @@ export function backfillOnce(paths, nowMs, { days = 30 } = {}) {
 	const recorded = new Set();
 	for (const row of streamEnded(paths, { sinceMs })) recorded.add(row.sessionId);
 
+	const pending = [];
 	const write = (record) => {
 		counts[record.kind] += 1;
 		counts.outcomes[record.outcome] = (counts.outcomes[record.outcome] ?? 0) + 1;
-		if (recorded.has(record.sessionId)) {
-			counts.duplicate += 1;
-			return;
-		}
-		try {
-			if (appendEnded(paths, record)) {
-				counts.written += 1;
-				recorded.add(record.sessionId);
-			} else counts.duplicate += 1;
-		} catch (error) {
-			errors.push(`append ${record.sessionId}: ${error.message}`);
-		}
+		pending.push(record);
 	};
 
 	for (const m of mains) {
@@ -318,6 +308,11 @@ export function backfillOnce(paths, nowMs, { days = 30 } = {}) {
 		});
 	}
 
+	for (const [i, { appended, error }] of appendEndedBatch(paths, pending, { nowMs, recorded }).entries()) {
+		if (error) errors.push(`append ${pending[i].sessionId}: ${error.message}`);
+		else if (appended) counts.written += 1;
+		else counts.duplicate += 1;
+	}
 	const summary = { skipped: false, sinceMs, sessionFiles: files.length, sessionDirs: slugDirs.length, counts, errors: errors.map((e) => clean(e, 300)) };
 	try {
 		ensureDir(paths.health.sessionsDir);

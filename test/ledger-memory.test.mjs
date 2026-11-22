@@ -138,3 +138,17 @@ for (const [operation, shape, cap] of [
 		assertsExit(result, `${shape} ${operation} full at ${cap} MiB`);
 	});
 }
+
+test("gate 22 sparse child tick fits the same fixture at empty80 and full96", (t) => {
+	const dir = fs.mkdtempSync(path.join(root, "sparse-"));
+	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+	assertsExit(invoke(96, "build-sparse", dir), "build sparse fixture");
+	for (const operation of ["positioned-tick", "sparse-tick"]) {
+		fs.copyFileSync(path.join(ledgerDir(dir), "usage.json"), path.join(dir, `full-${operation}.json`));
+		const empty = invoke(80, operation, dir, "empty");
+		const full = invoke(96, operation, dir, "full");
+		t.diagnostic(`${operation} empty80=${empty.status} full96=${full.status}`);
+		assertsExit(empty, `${operation} empty at 80 MiB`);
+		assertsExit(full, `${operation} full at 96 MiB`);
+	}
+});

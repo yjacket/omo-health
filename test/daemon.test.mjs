@@ -509,6 +509,40 @@ test("128 simultaneous live ends read at most one ledger day plus their appended
 	}
 });
 
+test("a bad live end logs its own append failure without discarding valid siblings", async () => {
+	const { paths } = fixture();
+	const start = Date.UTC(2026, 8, 28, 12);
+	let tick = 0;
+	const clock = { now: () => start + tick * 60_000 };
+	const parent = sessionState({ id: "parent", startedMs: start });
+	const tasks = ["good1", "bad", "good2"].map((id) => taskRecord({
+		taskId: `st_${id}`, childSessionId: id, parentSessionId: parent.id, rootSessionId: parent.id,
+	}));
+	const createEngine = () => ({
+		async tick() {
+			tick++;
+			return { findings: [], world: makeWorld({
+				now: clock.now(), procsFresh: true, sessions: [parent],
+				sensors: [{ sessionId: parent.id, pid: 4321, ts: clock.now(), idle: true }],
+				tasks: tick === 1 ? tasks : tick === 2 ? tasks.map((task) => ({
+					...task, status: "completed", terminal: true, active: false,
+					terminalAtMs: task.childSessionId === "bad" ? 1e20 : clock.now(),
+				})) : [],
+			}) };
+		},
+		table: { all: () => [] }, close() {},
+	});
+	await runDaemon({
+		paths, clock, proc: fakeProc(), config: { ...DEFAULT_CONFIG, idleExitMs: 2 * 60_000 },
+		overrides: { createEngine, env: {}, procs: { kind: "fake" }, sleep: async () => {} },
+	});
+	const log = fs.readFileSync(path.join(paths.health.logsDir, "daemon.log"), "utf8");
+	assert.match(log, /session_ended_write_failed[^\n]*"sessionId":"bad"[^\n]*Invalid time value/);
+	assert.doesNotMatch(log, /session_board_failed/);
+	const { readEnded } = await import("../src/session-ledger.mjs");
+	assert.deepEqual(readEnded(paths).map(({ sessionId }) => sessionId), ["good1", "good2"]);
+});
+
 test("the idle exit is held while the auditor is busy, and the auditor ticks on the daemon clock in every mode", async () => {
 	const f = fixture();
 	const ticked = [];

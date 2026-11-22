@@ -12,6 +12,74 @@ function setup() {
 	return resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "h"), OMO_HEALTH_OMO_HOME: path.join(root, "o") });
 }
 
+function compareAppends(t, seeds, rows, nowMs, decisions) {
+	const run = (batched) => {
+		const paths = setup();
+		t.after(() => fs.rmSync(paths.health.sessionsDir, { recursive: true, force: true }));
+		fs.mkdirSync(paths.health.sessionsDir, { recursive: true });
+		for (const [day, bytes] of Object.entries(seeds)) {
+			fs.writeFileSync(path.join(paths.health.sessionsDir, `ended-${day}.jsonl`), bytes);
+		}
+		const results = batched ? appendEndedBatch(paths, rows, { nowMs }) : rows.map((row) => {
+			try {
+				return appendEndedLocated(paths, row, { nowMs });
+			} catch (error) {
+				return { appended: false, location: null, error };
+			}
+		});
+		return {
+			decisions: results.map(({ appended, error }) => error ? String(error) : appended),
+			locations: results.map(({ location }) => location && { ...location, file: path.basename(location.file) }),
+			files: fs.readdirSync(paths.health.sessionsDir).sort().map((file) => [file, fs.readFileSync(path.join(paths.health.sessionsDir, file))]),
+		};
+	};
+	const sequential = run(false);
+	if (decisions) assert.deepEqual(sequential.decisions, decisions);
+	assert.deepEqual(run(true), sequential);
+}
+
+const batchNow = Date.UTC(2026, 10, 22, 20);
+const batchDay = 86_400_000;
+const batchDate = (ms) => new Date(ms).toISOString().slice(0, 10);
+const batchRow = (sessionId, endedMs = batchNow) => ({ sessionId, endedMs });
+
+test("batch matches sequential append after a readable tail without LF", (t) => {
+	compareAppends(t, { [batchDate(batchNow)]: JSON.stringify(batchRow("seed")) },
+		[batchRow("a"), batchRow("a"), batchRow("seed")], batchNow, [true, true, true]);
+});
+
+test("batch isolates an invalid timestamp between two valid rows", (t) => {
+	compareAppends(t, {}, [batchRow("good1"), batchRow("bad", 1e20), batchRow("good2")],
+		batchNow, [true, "RangeError: Invalid time value", true]);
+});
+
+test("generated batches match sequential decisions, offsets and bytes across cutoff days", (t) => {
+	let state = 22;
+	const next = (n) => {
+		state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+		return (state >>> 16) % n;
+	};
+	for (let i = 0; i < 48; i++) {
+		const cutoff = batchNow - 30 * batchDay;
+		const tail = JSON.stringify(batchRow("tail", batchNow));
+		const eol = i % 2 ? "\n" : "";
+		const seeds = {
+			[batchDate(cutoff - batchDay)]: `${JSON.stringify(batchRow("outside", cutoff - batchDay))}\n`,
+			[batchDate(cutoff)]: `${JSON.stringify(batchRow("cutoff", cutoff - 1000))}\n`,
+			[batchDate(batchNow)]: (i % 3 === 0 ? `${tail}\n` : "") + (i % 4 === 1 ? " \t\r" : tail + eol),
+		};
+		const ids = ["a", "가", "tail", "outside", "cutoff"];
+		const days = [-31, -30, -5, 0, 1, 31];
+		const rows = [batchRow("a"), batchRow("a"), batchRow("tail"), batchRow("cutoff"), batchRow("outside")];
+		for (let j = 0; j < 12; j++) {
+			rows.push(batchRow(ids[next(ids.length)], batchNow + days[next(days.length)] * batchDay));
+		}
+		if (i % 5 === 0) rows.splice(7, 0, batchRow("invalid", i % 2 ? NaN : 1e20));
+		if (i % 7 === 0) rows.push(batchRow("outside", Date.UTC(10_000, 2, 1)));
+		compareAppends(t, seeds, rows, batchNow);
+	}
+});
+
 const rec = (sessionId, endedMs, extra = {}) => ({ sessionId, kind: "main", parentSessionId: null, taskId: null, title: "t", cwd: null, terminal: null, omoVersion: null, startedMs: null, endedMs, outcome: "closed", reason: "x", childCount: 0, estimated: false, source: "live", ...extra });
 
 test("append and read back newest first", () => {

@@ -610,6 +610,7 @@ test("sparse queued children recover ledger-only cwds in one pass per needed day
 	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
 	const files = new Map();
 	const reads = new Map();
+	const positionedBytes = new Map();
 	const tracker = createUsageTracker({ paths: s.paths, index: s.index, locator: s.locator, clock: s.clock, ledgerFs: {
 		...fs,
 		openSync(file, ...args) {
@@ -620,7 +621,8 @@ test("sparse queued children recover ledger-only cwds in one pass per needed day
 		readSync(fd, ...args) {
 			const n = fs.readSync(fd, ...args);
 			const file = files.get(fd);
-			reads.set(file, (reads.get(file) ?? 0) + n);
+			const counts = args[3] === null ? reads : positionedBytes;
+			counts.set(file, (counts.get(file) ?? 0) + n);
 			return n;
 		},
 	} });
@@ -644,6 +646,54 @@ test("sparse queued children recover ledger-only cwds in one pass per needed day
 	assert.deepEqual(totals, [42, 7, null, 19]);
 	assert.equal(tick.missing, 1);
 	assert.deepEqual(reads, dayBytes);
+	for (const [file, bytes] of positionedBytes) assert.ok(bytes < dayBytes.get(file));
+});
+
+test("sparse children queued once use only positioned ledger reads after the first tick", (t) => {
+	const s = setup("usage-tracker-sparse-drain-");
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const rows = [];
+	const positions = [];
+	const seed = appendEndedLocated(s.paths, { sessionId: "seed", endedMs: T0, title: "x" }, { nowMs: T0 }).location;
+	fs.appendFileSync(seed.file, `${JSON.stringify({ sessionId: "padding", endedMs: T0, reason: "x".repeat(128 * 1024) })}\n`);
+	const fullLine = '{"x":"' + "x".repeat(65527) + '"}\n';
+	const usageLine = '{"type":"usage","usage":{"input":42}}\n';
+	for (let i = 0; i < 4; i++) {
+		const row = { sessionId: `sparse-${i}`, taskId: `st_sparse_${i}`, kind: "child", endedMs: T0 - i };
+		const cwd = path.join(s.cwd, `proj-${i}`);
+		positions.push(appendEndedLocated(s.paths, { ...row, cwd }, { nowMs: T0 }).location);
+		rows.push(row);
+		writeLines(childFile(cwd, row.taskId, row.sessionId), [
+			fullLine.repeat(511) + fullLine.slice(0, -usageLine.length - 3) + '"}\n' + usageLine.slice(0, -1),
+		]);
+	}
+	rows.push({ sessionId: "absent", taskId: "st_absent", kind: "child", endedMs: T0 - 5 });
+	const reads = [];
+	const tracker = createUsageTracker({ paths: s.paths, index: s.index, locator: s.locator, clock: s.clock, ledgerFs: {
+		...fs,
+		readSync(fd, buffer, offset, length, position) {
+			const n = fs.readSync(fd, buffer, offset, length, position);
+			if (n) reads.push({ n, position });
+			return n;
+		},
+	} });
+	assert.equal(tracker.queueLedger(rows), 5);
+	const ledgerSize = fs.statSync(seed.file).size;
+	const ledgerReads = [];
+	for (let i = 0; i < 5; i++) {
+		reads.length = 0;
+		const tick = tracker.tick(emptyWorld(s.clock));
+		assert.equal(tick.indexed, Math.min(i + 1, 4));
+		assert.equal(tick.bytesRead, i < 4 ? USAGE_TICK_BYTES : 0);
+		ledgerReads.push([...reads]);
+	}
+	assert.deepEqual(rows.slice(0, 4).map(({ sessionId }) => tracker.tokensOf(sessionId)?.tokens?.total), [42, 42, 42, 42]);
+	assert.deepEqual(ledgerReads.map((reads) => reads.filter(({ position }) => position === null).reduce((n, read) => n + read.n, 0)),
+		[ledgerSize, 0, 0, 0, 0]);
+	for (let i = 1; i < 4; i++) {
+		assert.deepEqual(ledgerReads[i], [{ n: positions[i].length, position: positions[i].offset }]);
+	}
+	assert.deepEqual(ledgerReads[4], []);
 });
 
 test("(gate 20) a 128-child live burst reads each appended ledger line once, not the whole day", (t) => {

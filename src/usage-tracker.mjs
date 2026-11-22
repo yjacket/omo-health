@@ -1,6 +1,6 @@
 import { idFromFileName } from "./collect/sessions.mjs";
 import { pathKey } from "./paths.mjs";
-import { ENDED_LOCATION, readEndedCwd, readEndedCwds } from "./session-ledger.mjs";
+import { ENDED_LOCATION, locateEndedRows, readEndedCwd } from "./session-ledger.mjs";
 import { USAGE_TICK_BYTES, compactUsage, fresh as isFresh, treeTotals } from "./usage-index.mjs";
 
 /**
@@ -35,6 +35,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 	const ledgerRows = new Map();
 	/** Rows waiting for bytes: id -> ledger row, newest first. */
 	let queue = new Map();
+	let searched = new WeakSet();
 	let trees;
 	let backlogLogged = false;
 	let fullLogged = false;
@@ -108,6 +109,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 		 * complete read) checked more than a day ago.
 		 */
 		queueLedger(rows) {
+			searched = new WeakSet();
 			const cutoff = nowMs() - 30 * DAY_MS;
 			// The daemon passes a stream for the daily window and an array
 			// for live exits. Only sweep the old window on refresh.
@@ -152,27 +154,26 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			const sessions = [...(world?.sessions?.values?.() ?? [])];
 			const liveSessions = new Map(sessions.filter((session) => isNonEmptyString(session?.id)).map((session) => [session.id, session]));
 			const ledgerOptions = ledgerFs ? { fs: ledgerFs } : undefined;
-			let sparseCwds;
 			const cwdOf = (node) => {
 				if (!paths) return undefined;
-				if (node[ENDED_LOCATION]) return readEndedCwd(paths, node, ledgerOptions);
-				if (!needsLedgerCwd(node)) return node.cwd;
-				if (!sparseCwds) {
+				if (needsLedgerCwd(node) && !searched.has(node)) {
 					// Share one scan across pending child lookups, including their
-					// ancestors. Do not retain recovered cwds past this tick.
-					const pending = new Set();
+					// ancestors. Keep positions and remember misses until requeued.
+					const pending = [];
 					const collect = (row) => {
 						for (const candidate of cwdChain(row, liveSessions)) {
-							if (needsLedgerCwd(candidate)) pending.add(candidate);
+							if (!needsLedgerCwd(candidate) || searched.has(candidate)) continue;
+							searched.add(candidate);
+							pending.push(candidate);
 						}
 					};
 					for (const row of queue.values()) if (row.kind === "child") collect(row);
 					for (const session of liveSessions.values()) {
 						if (session.kind === "child" && isNonEmptyString(session.file) && isNonEmptyString(session.taskId)) collect(session);
 					}
-					sparseCwds = readEndedCwds(paths, pending, ledgerOptions);
+					locateEndedRows(paths, pending, ledgerOptions);
 				}
-				return sparseCwds.get(node);
+				return node[ENDED_LOCATION] ? readEndedCwd(paths, node, ledgerOptions) : node.cwd;
 			};
 			const liveAppends = [];
 			const liveFirstReads = [];

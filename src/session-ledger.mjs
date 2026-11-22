@@ -13,8 +13,7 @@ function dayOf(ms) {
 	return new Date(ms).toISOString().slice(0, 10);
 }
 
-function ledgerFiles(paths, sinceMs) {
-	const sinceDay = Number.isFinite(sinceMs) ? dayOf(sinceMs) : null;
+function ledgerFiles(paths, sinceDay) {
 	return listDirSafe(paths.health.sessionsDir)
 		.map((name) => ({ name, m: FILE_RE.exec(name) }))
 		.filter((f) => f.m && (!sinceDay || f.m[1] >= sinceDay))
@@ -50,7 +49,7 @@ function* ledgerLines(file, fsImpl = fs) {
 			}
 			if (start < n) parts.push(Buffer.from(bytes.subarray(start)));
 		}
-		if (parts.length) yield { line: Buffer.concat(parts), offset };
+		if (parts.length) yield { line: Buffer.concat(parts), offset, unterminated: true };
 	} catch {
 		// Like the array reader, tolerate a ledger file disappearing during a read.
 	} finally {
@@ -78,7 +77,8 @@ function* streamFile(file, sinceMs, withLocation, fsImpl = fs) {
 
 /** Ended records in file/line order; callers needing newest-first order sort their selections. */
 export function* streamEnded(paths, { sinceMs, withLocation = false, fs: fsImpl = fs } = {}) {
-	for (const file of ledgerFiles(paths, sinceMs)) yield* streamFile(file, sinceMs, withLocation, fsImpl);
+	const sinceDay = Number.isFinite(sinceMs) ? dayOf(sinceMs) : "";
+	for (const file of ledgerFiles(paths, sinceDay)) yield* streamFile(file, sinceMs, withLocation, fsImpl);
 }
 
 /**
@@ -89,8 +89,11 @@ export function* streamEnded(paths, { sinceMs, withLocation = false, fs: fsImpl 
 export function readEndedCwd(paths, row, { fs: fsImpl = fs } = {}) {
 	const location = row?.[ENDED_LOCATION];
 	if (!location) return undefined;
-	const matches = (rec) => rec?.sessionId === row.sessionId && rec.endedMs === row.endedMs;
-	const { file, offset, length } = location;
+	const rec = readLocatedRow(location, fsImpl);
+	if (rec?.sessionId === row.sessionId && rec.endedMs === row.endedMs) return rec.cwd;
+}
+
+function readLocatedRow({ file, offset, length }, fsImpl = fs) {
 	let fd;
 	try {
 		fd = fsImpl.openSync(file, "r");
@@ -101,8 +104,7 @@ export function readEndedCwd(paths, row, { fs: fsImpl = fs } = {}) {
 			if (!read) break;
 			n += read;
 		}
-		const rec = n === length ? parseRow(line) : undefined;
-		if (matches(rec)) return rec.cwd;
+		if (n === length) return parseRow(line);
 	} catch {
 		// The ledger may have been rotated since queueing.
 	} finally {
@@ -110,8 +112,8 @@ export function readEndedCwd(paths, row, { fs: fsImpl = fs } = {}) {
 	}
 }
 
-/** Resolve only the requested unpositioned rows, scanning each affected day once. */
-export function readEndedCwds(paths, rows, { fs: fsImpl = fs } = {}) {
+/** Attach positions to requested unpositioned rows, scanning each affected day once. */
+export function locateEndedRows(paths, rows, { fs: fsImpl = fs } = {}) {
 	const days = new Map();
 	for (const row of rows) {
 		const endedMs = Number(row.endedMs);
@@ -122,28 +124,28 @@ export function readEndedCwds(paths, rows, { fs: fsImpl = fs } = {}) {
 		if (!ids.has(row.sessionId)) ids.set(row.sessionId, new Set());
 		ids.get(row.sessionId).add(row);
 	}
-	const cwds = new Map();
 	for (const [file, ids] of days) {
-		for (const rec of streamFile(file, undefined, false, fsImpl)) {
+		for (const rec of streamFile(file, undefined, true, fsImpl)) {
 			const pending = ids.get(rec.sessionId);
 			if (!pending) continue;
 			for (const row of pending) {
 				if (rec.endedMs !== row.endedMs) continue;
-				cwds.set(row, rec.cwd);
+				row[ENDED_LOCATION] = rec[ENDED_LOCATION];
 				pending.delete(row);
 			}
 			if (!pending.size) ids.delete(rec.sessionId);
 			if (!ids.size) break;
 		}
 	}
-	return cwds;
 }
 
 /** True when the sessionId appears in the ledger files of the last 30 days. */
 export function hasEnded(paths, sessionId, { nowMs = Date.now() } = {}) {
 	// The cutoff selects files, not rows: the entire cutoff day's file
 	// participates in duplicate detection.
-	for (const file of ledgerFiles(paths, nowMs - DEDUPE_DAYS * DAY_MS)) {
+	const cutoff = nowMs - DEDUPE_DAYS * DAY_MS;
+	const sinceDay = Number.isFinite(cutoff) ? dayOf(cutoff) : "";
+	for (const file of ledgerFiles(paths, sinceDay)) {
 		for (const row of streamFile(file)) if (row.sessionId === sessionId) return true;
 	}
 	return false;
@@ -165,47 +167,79 @@ export function appendEndedLocated(paths, record, { nowMs = Date.now() } = {}) {
 }
 
 /**
- * Append live ends in input order. Only candidate ids are retained from disk,
- * with their newest day so each row keeps its own 30-day duplicate cutoff.
- * A failed write is reported on that row without dropping the rest of the batch.
+ * Append ends in input order with a shared disk scan. Backfill can also supply
+ * its own window's recorded IDs; successful writes are added to that set.
  */
-export function appendEndedBatch(paths, records, { nowMs = Date.now() } = {}) {
-	if (!records.length) return [];
-	const newest = new Map(records.map(({ sessionId }) => [sessionId, ""]));
-	let earliest = Infinity;
-	const cutoffs = records.map((record) => {
-		const ms = Math.max(nowMs, Number(record.endedMs) || 0) - DEDUPE_DAYS * DAY_MS;
-		const day = dayOf(ms);
-		earliest = Math.min(earliest, ms);
-		return `ended-${day}.jsonl`;
+export function appendEndedBatch(paths, records, { nowMs = Date.now(), recorded } = {}) {
+	const skipped = { appended: false, location: null };
+	const candidates = new Set();
+	let earliest;
+	const pending = records.map((record) => {
+		let id;
+		try {
+			id = record.sessionId;
+			if (recorded?.has(id)) return { id, result: skipped };
+			const ms = Math.max(nowMs, Number(record.endedMs) || 0) - DEDUPE_DAYS * DAY_MS;
+			const cutoff = Number.isFinite(ms) ? dayOf(ms) : "";
+			if (earliest === undefined || cutoff < earliest) earliest = cutoff;
+			if (typeof id === "string") candidates.add(id);
+			return { record, id, cutoff };
+		} catch (error) {
+			return { id, result: { ...skipped, error } };
+		}
 	});
-	for (const file of ledgerFiles(paths, earliest)) {
-		const day = path.basename(file);
-		for (const { sessionId } of streamFile(file)) {
-			if (newest.get(sessionId) === "") newest.set(sessionId, day);
+	const newest = new Map();
+	const tails = new Map();
+	const tailDays = new Map();
+	for (const file of candidates.size ? ledgerFiles(paths, earliest) : []) {
+		const [, day] = FILE_RE.exec(path.basename(file));
+		for (const { line, offset, unterminated } of ledgerLines(file)) {
+			const id = parseRow(line)?.sessionId;
+			if (unterminated) {
+				tails.set(file, { offset, id });
+				if (candidates.has(id)) {
+					if (!tailDays.has(id)) tailDays.set(id, new Set());
+					tailDays.get(id).add(day);
+				}
+			} else if (candidates.has(id) && !newest.has(id)) {
+				newest.set(id, day);
+			}
 		}
 	}
-	return records.map((record, i) => {
-		const id = record.sessionId;
-		const previous = newest.get(id);
-		if (previous >= cutoffs[i]) return { appended: false, location: null };
+	return pending.map(({ record, id, cutoff, result }) => {
+		if (recorded?.has(id)) return skipped;
+		if (result) return result;
+		if (newest.get(id) >= cutoff) return skipped;
+		for (const day of tailDays.get(id) ?? []) if (day >= cutoff) return skipped;
 		try {
-			const result = writeEnded(paths, record);
-			const day = path.basename(result.location.file);
-			if (typeof id === "string" && FILE_RE.test(day) && day > previous) newest.set(id, day);
-			return result;
+			let writtenId;
+			const written = writeEnded(paths, record, (line) => { writtenId = parseRow(line)?.sessionId; });
+			recorded?.add(id);
+			const { file, offset, length } = written.location;
+			const day = FILE_RE.exec(path.basename(file))?.[1];
+			const tail = tails.get(file);
+			if (tail) {
+				// Preserve sequential bytes: the write joined the old tail. Only
+				// that merged line (not the old tail or the new row alone) is visible.
+				tails.delete(file);
+				tailDays.get(tail.id)?.delete(day);
+				writtenId = readLocatedRow({ file, offset: tail.offset, length: offset - tail.offset + length })?.sessionId;
+			}
+			if (day && candidates.has(writtenId) && day > (newest.get(writtenId) ?? "")) newest.set(writtenId, day);
+			return written;
 		} catch (error) {
-			return { appended: false, location: null, error };
+			return { ...skipped, error };
 		}
 	});
 }
 
-function writeEnded(paths, record) {
+function writeEnded(paths, record, onLine) {
 	const rec = { v: 1, ...record, reason: truncate(redact(String(record.reason ?? "")), REASON_MAX) };
 	ensureDir(paths.health.sessionsDir);
 	const file = ledgerFile(paths, Number(rec.endedMs));
 	const line = `${JSON.stringify(rec)}\n`;
 	const offset = fs.statSync(file, { throwIfNoEntry: false })?.size ?? 0;
 	fs.appendFileSync(file, line);
+	onLine?.(line);
 	return { appended: true, location: { file, offset, length: Buffer.byteLength(line) - 1 } };
 }

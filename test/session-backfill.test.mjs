@@ -9,6 +9,50 @@ import { resolvePaths } from "../src/paths.mjs";
 import { BACKFILL_MARKER, backfillOnce } from "../src/session-backfill.mjs";
 import { readEnded } from "../src/session-ledger.mjs";
 
+test("eight backfill appends read the seed day only for the window and shared dedupe", (t) => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "backfill-batch-"));
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health"), OMO_HEALTH_OMO_HOME: path.join(root, ".omo") });
+	const now = Date.UTC(2026, 10, 22, 20);
+	const ledger = path.join(paths.health.sessionsDir, "ended-2026-11-22.jsonl");
+	writeJsonl(ledger, [{ sessionId: "seed", endedMs: now, reason: "x".repeat(128 * 1024) }]);
+	const size = fs.statSync(ledger).size;
+	for (let i = 0; i < 8; i++) {
+		const file = writeSession(paths, "proj", `backfill-${i}`, root, now - 2 * HOUR, now - HOUR);
+		fs.utimesSync(file, (now - i * 1000) / 1000, (now - i * 1000) / 1000);
+	}
+	const { openSync, readSync, closeSync } = fs;
+	const fds = new Set();
+	let opens = 0;
+	let bytes = 0;
+	t.mock.method(Date, "now", () => now);
+	t.mock.method(fs, "openSync", (file, flags, ...args) => {
+		const fd = openSync(file, flags, ...args);
+		if (file === ledger && flags === "r") {
+			opens++;
+			fds.add(fd);
+		}
+		return fd;
+	});
+	t.mock.method(fs, "readSync", (fd, ...args) => {
+		const n = readSync(fd, ...args);
+		if (fds.has(fd)) bytes += n;
+		return n;
+	});
+	t.mock.method(fs, "closeSync", (fd) => {
+		fds.delete(fd);
+		return closeSync(fd);
+	});
+	const result = backfillOnce(paths, now);
+	t.mock.restoreAll();
+	assert.deepEqual(result.errors, []);
+	assert.equal(result.counts.written, 8);
+	assert.equal(result.counts.duplicate, 0);
+	assert.deepEqual(readEnded(paths).map(({ sessionId }) => sessionId),
+		["seed", ...Array.from({ length: 8 }, (_, i) => `backfill-${i}`)]);
+	assert.ok(opens <= 2 && bytes <= 2 * size, `seed size=${size}, opens=${opens}, bytes=${bytes}`);
+});
+
 const MIN = 60_000;
 const HOUR = 60 * MIN;
 const iso = (ms) => new Date(ms).toISOString();
