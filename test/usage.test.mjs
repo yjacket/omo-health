@@ -901,6 +901,97 @@ test("counts a malformed large record in badLines", (t) => {
 	assert.equal(got.effective.total, 0);
 });
 
+function childUsageTotal(filePath) {
+	const source = new URL("../src/collect/usage.mjs", import.meta.url).href;
+	const script = [
+		"const { readUsage } = await import(process.argv[1]);",
+		"const result = readUsage(process.argv[2]);",
+		"process.stdout.write(JSON.stringify({ total: result.effective.total, badLines: result.usage.diagnostics.badLines }));",
+	].join("\n");
+	const child = spawnSync(process.execPath, ["--max-old-space-size=96", "--input-type=module", "-e", script, source, filePath], { encoding: "utf8" });
+	assert.equal(child.status, 0, child.stderr);
+	return JSON.parse(child.stdout);
+}
+
+const gate5Usage = () => ({ input: 7, output: 2, cacheRead: 3, cacheWrite: 1, cost: { total: 0.125 }, costUnknown: true });
+
+test("(gate 5) a 35 MiB reply made of 32 KiB text blocks counts like JSON.parse in readUsage and usageTimeline", (t) => {
+	const { file } = setup(t);
+	const usage = gate5Usage();
+	const record = {
+		type: "message",
+		message: { role: "assistant", provider: "p", model: "alpha", usage, content: Array(1088).fill({ type: "text", text: "z".repeat(32768) }) },
+	};
+	fs.writeFileSync(file(), `${JSON.stringify(record)}\n`);
+	assert.ok(fs.statSync(file()).size > 16 * MiB);
+	const got = readUsage(file()).effective;
+	assert.equal(got.total, 13);
+	assert.equal(got.total, oracleTotals(file()).total);
+	assert.deepEqual(got.usedModels, { "p/alpha": true });
+	assert.deepEqual(got.models, { "p/alpha": { tokens: 13, cost: 0.125 } });
+	assert.equal(got.modelsIncomplete, false);
+	assert.equal(usageTimeline(file()).totals.total, oracleTotals(file()).total);
+});
+
+test("(gate 5) a short literal \"\\u0000omoh-truncated\" model id counts as a normal model", (t) => {
+	const { file } = setup(t);
+	const line = `{${" ".repeat(17 * MiB)}"type":"message","message":${JSON.stringify({ role: "assistant", provider: "p", model: "\u0000omoh-truncated", usage: gate5Usage() })}}`;
+	assert.ok(Buffer.byteLength(line) > 16 * MiB);
+	fs.writeFileSync(file(), `${line}\n`);
+	const got = readUsage(file()).effective;
+	assert.equal(got.total, 13);
+	assert.equal(got.total, oracleTotals(file()).total);
+	assert.deepEqual(got.usedModels, { "p/\u0000omoh-truncated": true });
+	assert.deepEqual(Object.keys(got.models), ["p/\u0000omoh-truncated"]);
+	assert.equal(got.modelsIncomplete, false);
+});
+
+test("(gate 5) a long responseModel on a toolResult never marks the model list incomplete", (t) => {
+	const { file } = setup(t);
+	const line = `{${" ".repeat(17 * MiB)}"type":"message","message":${JSON.stringify({ role: "toolResult", content: [], responseModel: "r".repeat(65537) })}}`;
+	assert.ok(Buffer.byteLength(line) > 16 * MiB);
+	fs.writeFileSync(file(), `${line}\n`);
+	const got = readUsage(file()).effective;
+	assert.equal(got.total, 0);
+	assert.equal(got.total, oracleTotals(file()).total);
+	assert.deepEqual(got.usedModels, {});
+	assert.equal(got.modelsIncomplete, false);
+	assert.equal(got.diagnostics.badLines, 0);
+});
+
+test("(gate 5) a 22 MiB retained structure streams under a 96 MB heap with the JSON.parse-equal total", (t) => {
+	const { file } = setup(t);
+	const message = { role: "assistant", provider: "p", model: "alpha", usage: gate5Usage() };
+	const line = `{${" ".repeat(17 * MiB)}"type":"message","message":${JSON.stringify(message)},"data":[${'{},'.repeat(1600000)}{}]}`;
+	assert.ok(Buffer.byteLength(line) > 16 * MiB);
+	fs.writeFileSync(file(), `${line}\n`);
+	const got = readUsage(file()).effective;
+	assert.equal(got.total, 13);
+	assert.equal(got.total, oracleTotals(file()).total);
+	assert.deepEqual(got.usedModels, { "p/alpha": true });
+	assert.equal(got.modelsIncomplete, false);
+	assert.equal(got.diagnostics.badLines, 0);
+	const child = childUsageTotal(file());
+	assert.equal(child.badLines, 0);
+	assert.equal(child.total, oracleTotals(file()).total);
+});
+
+test("(gate 5) a 17 MiB duplicate message replacement is the JSON.parse total under a 96 MB heap", (t) => {
+	const { file } = setup(t);
+	const message = { role: "assistant", provider: "p", model: "alpha", usage: gate5Usage() };
+	const line = `{"pad":"${'x'.repeat(17 * MiB)}","type":"message","message":${JSON.stringify(message)},"message":{"role":"assistant","provider":"p","model":"beta"}}`;
+	assert.ok(Buffer.byteLength(line) > 16 * MiB);
+	fs.writeFileSync(file(), `${line}\n`);
+	const got = readUsage(file()).effective;
+	assert.equal(got.total, 0);
+	assert.equal(got.total, oracleTotals(file()).total);
+	assert.deepEqual(got.usedModels, { "p/beta": true });
+	assert.equal(got.modelsIncomplete, false);
+	const child = childUsageTotal(file());
+	assert.equal(child.badLines, 0);
+	assert.equal(child.total, oracleTotals(file()).total);
+});
+
 test("returns null for a missing file", (t) => {
 	const { file } = setup(t);
 	assert.equal(readUsage(file("absent.jsonl")), null);

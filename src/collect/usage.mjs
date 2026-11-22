@@ -37,11 +37,42 @@ const SLASH = 0x2f;
 const ZERO = 0x30;
 const NINE = 0x39;
 const STRING_KEEP_LIMIT = 64 * 1024;
+const KEY_RAW_LIMIT = 512;
+const MAX_STRING_RAW = 6 * STRING_KEEP_LIMIT + 16;
+const MAX_NESTING = 1024;
 const REDUCED_CHUNK = 64 * 1024;
 const MODEL_ID_TOO_LONG = "(model id too long)";
-const TRUNCATION_MARKER = "\u0000omoh-truncated";
-const TRUNCATION_CONTENT = Buffer.from("\\u0000omoh-truncated");
 const MODELS_INCOMPLETE = Symbol("scannerModelsIncomplete");
+
+const STATE_VALUE = 0;
+const STATE_KEY = 1;
+const STATE_COLON = 2;
+const STATE_AFTER = 3;
+const STATE_END = 4;
+const STATE_NUMBER = 5;
+const STATE_LITERAL = 6;
+
+const NUMBER_START = 0;
+const NUMBER_AFTER_MINUS = 1;
+const NUMBER_ZERO = 2;
+const NUMBER_INT = 3;
+const NUMBER_AFTER_DOT = 4;
+const NUMBER_FRAC = 5;
+const NUMBER_AFTER_E = 6;
+const NUMBER_AFTER_E_SIGN = 7;
+const NUMBER_EXP = 8;
+
+const OPEN_OBJECT = 0x7b;
+const CLOSE_OBJECT = 0x7d;
+const OPEN_ARRAY = 0x5b;
+const CLOSE_ARRAY = 0x5d;
+const COMMA = 0x2c;
+const COLON = 0x3a;
+const MINUS = 0x2d;
+const PLUS = 0x2b;
+const DOT = 0x2e;
+const UPPER_E = 0x45;
+const LOWER_E = 0x65;
 
 const isSimpleEscape = (byte) =>
 	byte === QUOTE || byte === BACKSLASH || byte === SLASH || byte === LOWER_B || byte === LOWER_F || byte === LOWER_N || byte === LOWER_R || byte === LOWER_T || byte === LOWER_U;
@@ -51,6 +82,8 @@ const isHexDigit = (byte) => (byte >= ZERO && byte <= NINE) || (byte >= 0x41 && 
 const isObject = (value) => typeof value === "object" && value !== null;
 const nonNegative = (value) => (Number.isFinite(value) && value >= 0 ? value : 0);
 const isWhitespace = (byte) => byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d;
+const isDigit = (byte) => byte >= ZERO && byte <= NINE;
+const isNumberDelimiter = (byte) => isWhitespace(byte) || byte === COMMA || byte === CLOSE_OBJECT || byte === CLOSE_ARRAY;
 
 function isFiniteCounter(value) {
 	return Number.isFinite(value) && value >= 0;
@@ -260,45 +293,72 @@ function sha1(buffer) {
 	return crypto.createHash("sha1").update(buffer).digest("hex");
 }
 
-const isTruncatedString = (value) => value === TRUNCATION_MARKER;
+function memberPlan(out, key) {
+	if (typeof key !== "string") return { kind: "drop" };
+	if (out === "root") {
+		if (key === "type" || key === "customType") return { kind: "string" };
+		if (key === "provider" || key === "model") return { kind: "identity", flagPath: key };
+		if (key === "usage") return { kind: "full" };
+		if (key === "message") return { kind: "object", frame: "message" };
+		if (key === "data") return { kind: "object", frame: "data" };
+	} else if (out === "message") {
+		if (key === "role") return { kind: "string" };
+		if (key === "provider" || key === "model" || key === "responseModel") return { kind: "identity", flagPath: `message.${key}` };
+		if (key === "usage") return { kind: "full" };
+	} else if (out === "data") {
+		if (key === "phase") return { kind: "string" };
+		if (key === "provider" || key === "model") return { kind: "identity", flagPath: `data.${key}` };
+		if (key === "usage") return { kind: "full" };
+	}
+	return { kind: "drop" };
+}
+
+function decodeKey(buffer, length) {
+	if (!length) return "";
+	try {
+		return JSON.parse(`"${buffer.toString("utf8", 0, length)}"`);
+	} catch {
+		return null;
+	}
+}
 
 /**
- * A reduced record still carries every byte outside long strings, so only an
- * identity field can hold the truncation marker. Mark it unknown, and set
- * `MODELS_INCOMPLETE` only when `modelsOfEntry` would have used that field for
- * the record's carrier.
+ * Long identity strings are never replaced by a marker inside the reduced text.
+ * The flag says "this field was too long to keep"; it is applied only when the
+ * field is one usageOfEntry/modelsOfEntry would have read for this carrier.
  */
-function normalizeTruncatedIdentities(entry) {
+function applyTruncatedIdentities(entry, flags) {
 	if (!isObject(entry)) return;
-	const unknown = (bucket, keys) => {
-		let found = false;
-		for (const key of keys) {
-			if (!isTruncatedString(bucket[key])) continue;
-			bucket[key] = MODEL_ID_TOO_LONG;
-			found = true;
-		}
-		return found;
-	};
 	let incomplete = false;
+	const apply = (bucket, path, field) => {
+		if (flags[path] !== true) return;
+		bucket[field] = MODEL_ID_TOO_LONG;
+		incomplete = true;
+	};
 	if (entry.type === "message" && isObject(entry.message)) {
-		const message = entry.message;
-		const used = unknown(message, ["provider", "model", "responseModel"]);
-		if (used && (message.role === "assistant" || message.role === "toolResult")) incomplete = true;
+		if (entry.message.role === "assistant") {
+			apply(entry.message, "message.provider", "provider");
+			apply(entry.message, "message.model", "model");
+			apply(entry.message, "message.responseModel", "responseModel");
+		}
 	} else if (entry.type === "usage") {
-		if (unknown(entry, ["provider", "model"])) incomplete = true;
-	} else if (entry.type === "custom" && entry.customType === "prompt-cache-prewarm") {
-		if (isObject(entry.data) && unknown(entry.data, ["provider", "model"])) incomplete = true;
+		apply(entry, "provider", "provider");
+		apply(entry, "model", "model");
+	} else if (entry.type === "custom" && entry.customType === "prompt-cache-prewarm" && isObject(entry.data)) {
+		apply(entry.data, "data.provider", "provider");
+		apply(entry.data, "data.model", "model");
 	}
 	if (incomplete) entry[MODELS_INCOMPLETE] = true;
 }
 
 /**
- * Streaming reducer for records larger than `RECORD_PARSE_LIMIT`. Whitespace
- * runs outside strings collapse to one separator, and a string longer than
- * 64 KiB becomes the fixed marker `"\u0000omoh-truncated"` (every skipped byte
- * is still validated the way JSON.parse validates a string). `finish()` parses
- * the reduced text with JSON.parse, so structure, literals and duplicate keys
- * keep their JSON meaning.
+ * Streaming reducer for records larger than RECORD_PARSE_LIMIT. It emits only
+ * the fields usageOfEntry/modelsOfEntry read — top-level `type`, `customType`,
+ * `provider`, `model`, `usage`, the filtered `message` and `data` objects, and
+ * usage objects in full. Every other value is validated the way JSON.parse
+ * validates it but never retained. Duplicate keys are emitted in order, so
+ * JSON.parse of the reduced text keeps the last value. An identity string over
+ * 64 KiB is omitted and remembered as a flag for that exact path.
  *
  * `push(chunk)` accepts a Buffer/Uint8Array/string. `finish()` returns the
  * parsed entry; `.malformed` and `.oversized` report why it is undefined.
@@ -312,13 +372,19 @@ export function createRecordScanner() {
 	let malformed = false;
 	let finished = false;
 	let result;
-	let inString = false;
-	let escaped = false;
-	let unicodeLeft = 0;
-	let stringFill = 0;
-	let stringTruncated = false;
-	let stringScratch;
-	let pendingWhitespace = false;
+	const flags = Object.create(null);
+	const stack = [];
+	let state = STATE_VALUE;
+	let rootSeen = false;
+	let pendingKey = null;
+	let numberState = NUMBER_START;
+	let numberEmit = false;
+	let literalWord = "";
+	let literalIndex = 0;
+	let literalEmit = false;
+	let stringCtx = null;
+	const keyBuffer = Buffer.allocUnsafe(KEY_RAW_LIMIT);
+	const stringBuffer = Buffer.allocUnsafe(MAX_STRING_RAW);
 
 	const emit = (byte) => {
 		if (oversized) return;
@@ -339,37 +405,492 @@ export function createRecordScanner() {
 		total += 1;
 	};
 
-	const beginString = () => {
-		inString = true;
-		escaped = false;
-		unicodeLeft = 0;
-		stringFill = 0;
-		stringTruncated = false;
-		pendingWhitespace = false;
-		emit(QUOTE);
+	const top = () => stack[stack.length - 1];
+
+	const pushFrame = (kind, out) => {
+		if (stack.length >= MAX_NESTING) {
+			oversized = true;
+			return false;
+		}
+		stack.push({ kind, out, first: true, outCount: 0 });
+		return true;
+	};
+
+	const finishValue = () => {
+		state = stack.length ? STATE_AFTER : STATE_END;
+	};
+
+	const clearPrefix = (prefix) => {
+		for (const key of Object.keys(flags)) {
+			if (key === prefix || key.startsWith(`${prefix}.`)) delete flags[key];
+		}
+	};
+
+	const clearMemberFlags = (frame, key) => {
+		if (typeof key !== "string") return;
+		if (frame.out === "root") {
+			if (key === "provider" || key === "model") delete flags[key];
+			else if (key === "message") clearPrefix("message");
+			else if (key === "data") clearPrefix("data");
+		} else if (frame.out === "message") {
+			if (key === "provider" || key === "model" || key === "responseModel") delete flags[`message.${key}`];
+		} else if (frame.out === "data") {
+			if (key === "provider" || key === "model") delete flags[`data.${key}`];
+		}
+	};
+
+	const emitNull = () => {
+		emit(0x6e);
+		emit(0x75);
+		emit(0x6c);
+		emit(0x6c);
+	};
+
+	const emitMemberPrefix = (frame, key) => {
+		if (frame.outCount > 0) emit(COMMA);
+		const encoded = Buffer.from(JSON.stringify(key));
+		for (let index = 0; index < encoded.length; index += 1) emit(encoded[index]);
+		emit(COLON);
+		frame.outCount += 1;
+	};
+
+	const beginString = (kind, mode, flagPath, memberFrame, memberKey) => {
+		stringCtx = { kind, mode, flagPath, memberFrame, memberKey, fill: 0, units: 0, over: false, escaped: false, unicodeLeft: 0 };
+		if (mode === "emit") emit(QUOTE);
+		else if (mode === "key-full") {
+			const frame = top();
+			if (frame.outCount > 0) emit(COMMA);
+			frame.outCount += 1;
+			emit(QUOTE);
+		}
 	};
 
 	const keepStringByte = (byte) => {
-		if (stringTruncated) return;
-		if (stringFill >= STRING_KEEP_LIMIT) {
-			stringTruncated = true;
+		const ctx = stringCtx;
+		if (ctx.mode === "emit" || ctx.mode === "key-full") {
+			emit(byte);
 			return;
 		}
-		if (!stringScratch) stringScratch = Buffer.allocUnsafe(STRING_KEEP_LIMIT);
-		stringScratch[stringFill] = byte;
-		stringFill += 1;
+		if (ctx.mode === "buffer" || ctx.mode === "full-buffer") {
+			if (ctx.over) return;
+			if (ctx.fill >= MAX_STRING_RAW) {
+				ctx.over = true;
+				return;
+			}
+			stringBuffer[ctx.fill] = byte;
+			ctx.fill += 1;
+			return;
+		}
+		if (ctx.mode === "key-filter") {
+			if (ctx.over) return;
+			if (ctx.fill >= KEY_RAW_LIMIT) {
+				ctx.over = true;
+				return;
+			}
+			keyBuffer[ctx.fill] = byte;
+			ctx.fill += 1;
+		}
 	};
 
 	const endString = () => {
-		inString = false;
-		if (stringTruncated) {
-			for (let index = 0; index < TRUNCATION_CONTENT.length; index += 1) emit(TRUNCATION_CONTENT[index]);
-		} else {
-			for (let index = 0; index < stringFill; index += 1) emit(stringScratch[index]);
+		const ctx = stringCtx;
+		stringCtx = null;
+		if (ctx.escaped || ctx.unicodeLeft > 0) malformed = true;
+		if (ctx.mode === "emit") {
+			emit(QUOTE);
+			finishValue();
+			return;
 		}
-		emit(QUOTE);
-		stringFill = 0;
-		pendingWhitespace = false;
+		if (ctx.mode === "full-buffer") {
+			const kept = !ctx.over && ctx.units <= STRING_KEEP_LIMIT;
+			emit(QUOTE);
+			if (kept) {
+				for (let index = 0; index < ctx.fill; index += 1) emit(stringBuffer[index]);
+			}
+			emit(QUOTE);
+			finishValue();
+			return;
+		}
+		if (ctx.mode === "key-full") {
+			emit(QUOTE);
+			emit(COLON);
+			state = STATE_COLON;
+			return;
+		}
+		if (ctx.mode === "key-filter") {
+			pendingKey = ctx.over ? null : decodeKey(keyBuffer, ctx.fill);
+			state = STATE_COLON;
+			return;
+		}
+		if (ctx.mode === "skip") {
+			if (ctx.kind === "key") state = STATE_COLON;
+			else finishValue();
+			return;
+		}
+		const kept = !ctx.over && ctx.units <= STRING_KEEP_LIMIT;
+		if (kept) {
+			emitMemberPrefix(ctx.memberFrame, ctx.memberKey);
+			emit(QUOTE);
+			for (let index = 0; index < ctx.fill; index += 1) emit(stringBuffer[index]);
+			emit(QUOTE);
+		} else if (ctx.flagPath) {
+			flags[ctx.flagPath] = true;
+		}
+		finishValue();
+	};
+
+	const stepString = (byte) => {
+		const ctx = stringCtx;
+		if (ctx.unicodeLeft > 0) {
+			if (!isHexDigit(byte)) malformed = true;
+			ctx.unicodeLeft -= 1;
+			keepStringByte(byte);
+			return;
+		}
+		if (ctx.escaped) {
+			ctx.escaped = false;
+			if (byte === LOWER_U) ctx.unicodeLeft = 4;
+			else if (!isSimpleEscape(byte)) malformed = true;
+			keepStringByte(byte);
+			return;
+		}
+		if (byte === BACKSLASH) {
+			ctx.escaped = true;
+			if (ctx.mode === "buffer" || ctx.mode === "full-buffer") ctx.units += 1;
+			keepStringByte(byte);
+			return;
+		}
+		if (byte === QUOTE) {
+			endString();
+			return;
+		}
+		if (byte < SPACE) malformed = true;
+		if ((ctx.mode === "buffer" || ctx.mode === "full-buffer") && (byte & 0xc0) !== 0x80) ctx.units += 1;
+		keepStringByte(byte);
+	};
+
+	const validNumberEnd = () => numberState === NUMBER_ZERO || numberState === NUMBER_INT || numberState === NUMBER_FRAC || numberState === NUMBER_EXP;
+
+	const stepNumber = (byte) => {
+		if (isNumberDelimiter(byte)) {
+			if (!validNumberEnd()) {
+				malformed = true;
+				return;
+			}
+			finishValue();
+			step(byte);
+			return;
+		}
+		const digit = isDigit(byte);
+		if (numberState === NUMBER_START) {
+			if (byte === MINUS) numberState = NUMBER_AFTER_MINUS;
+			else if (byte === ZERO) numberState = NUMBER_ZERO;
+			else if (digit) numberState = NUMBER_INT;
+			else {
+				malformed = true;
+				return;
+			}
+		} else if (numberState === NUMBER_AFTER_MINUS) {
+			if (byte === ZERO) numberState = NUMBER_ZERO;
+			else if (digit) numberState = NUMBER_INT;
+			else {
+				malformed = true;
+				return;
+			}
+		} else if (numberState === NUMBER_ZERO) {
+			if (byte === DOT) numberState = NUMBER_AFTER_DOT;
+			else if (byte === LOWER_E || byte === UPPER_E) numberState = NUMBER_AFTER_E;
+			else {
+				malformed = true;
+				return;
+			}
+		} else if (numberState === NUMBER_INT) {
+			if (byte === DOT) numberState = NUMBER_AFTER_DOT;
+			else if (byte === LOWER_E || byte === UPPER_E) numberState = NUMBER_AFTER_E;
+			else if (!digit) {
+				malformed = true;
+				return;
+			}
+		} else if (numberState === NUMBER_AFTER_DOT) {
+			if (digit) numberState = NUMBER_FRAC;
+			else {
+				malformed = true;
+				return;
+			}
+		} else if (numberState === NUMBER_FRAC) {
+			if (byte === LOWER_E || byte === UPPER_E) numberState = NUMBER_AFTER_E;
+			else if (!digit) {
+				malformed = true;
+				return;
+			}
+		} else if (numberState === NUMBER_AFTER_E) {
+			if (byte === MINUS || byte === PLUS) numberState = NUMBER_AFTER_E_SIGN;
+			else if (digit) numberState = NUMBER_EXP;
+			else {
+				malformed = true;
+				return;
+			}
+		} else if (numberState === NUMBER_AFTER_E_SIGN) {
+			if (digit) numberState = NUMBER_EXP;
+			else {
+				malformed = true;
+				return;
+			}
+		} else if (!digit) {
+			malformed = true;
+			return;
+		}
+		if (numberEmit) emit(byte);
+	};
+
+	const beginLiteral = (byte, shouldEmit) => {
+		literalWord = byte === 0x74 ? "true" : byte === 0x66 ? "false" : "null";
+		literalIndex = 1;
+		literalEmit = shouldEmit;
+		state = STATE_LITERAL;
+		if (shouldEmit) emit(byte);
+	};
+
+	const stepLiteral = (byte) => {
+		if (byte !== literalWord.charCodeAt(literalIndex)) {
+			malformed = true;
+			return;
+		}
+		if (literalEmit) emit(byte);
+		literalIndex += 1;
+		if (literalIndex === literalWord.length) finishValue();
+	};
+
+	const beginNumber = (byte, shouldEmit) => {
+		numberState = NUMBER_START;
+		numberEmit = shouldEmit;
+		state = STATE_NUMBER;
+		stepNumber(byte);
+	};
+
+	const beginFullValue = (byte) => {
+		if (byte === QUOTE) {
+			beginString("value", "full-buffer", null, null, null);
+			return;
+		}
+		if (byte === OPEN_OBJECT) {
+			emit(OPEN_OBJECT);
+			if (pushFrame("obj", "full")) state = STATE_KEY;
+			return;
+		}
+		if (byte === OPEN_ARRAY) {
+			emit(OPEN_ARRAY);
+			if (pushFrame("arr", "full")) state = STATE_VALUE;
+			return;
+		}
+		if (byte === MINUS || isDigit(byte)) {
+			beginNumber(byte, true);
+			return;
+		}
+		if (byte === 0x74 || byte === 0x66 || byte === 0x6e) {
+			beginLiteral(byte, true);
+			return;
+		}
+		malformed = true;
+	};
+
+	const beginDropValue = (byte) => {
+		if (byte === QUOTE) {
+			beginString("value", "skip", null, null, null);
+			return;
+		}
+		if (byte === OPEN_OBJECT) {
+			if (pushFrame("obj", "skip")) state = STATE_KEY;
+			return;
+		}
+		if (byte === OPEN_ARRAY) {
+			if (pushFrame("arr", "skip")) state = STATE_VALUE;
+			return;
+		}
+		if (byte === MINUS || isDigit(byte)) {
+			beginNumber(byte, false);
+			return;
+		}
+		if (byte === 0x74 || byte === 0x66 || byte === 0x6e) {
+			beginLiteral(byte, false);
+			return;
+		}
+		malformed = true;
+	};
+
+	const closeFrame = () => {
+		const frame = stack.pop();
+		if (frame.out !== "skip") emit(frame.kind === "obj" ? CLOSE_OBJECT : CLOSE_ARRAY);
+		finishValue();
+	};
+
+	const stepValue = (byte) => {
+		if (isWhitespace(byte)) return;
+		const frame = stack.length ? top() : undefined;
+		if (!frame) {
+			if (rootSeen) {
+				malformed = true;
+				return;
+			}
+			rootSeen = true;
+			if (byte === OPEN_OBJECT) {
+				emit(OPEN_OBJECT);
+				if (pushFrame("obj", "root")) state = STATE_KEY;
+				return;
+			}
+			beginDropValue(byte);
+			return;
+		}
+		if (frame.kind === "arr") {
+			if (frame.first && byte === CLOSE_ARRAY) {
+				closeFrame();
+				return;
+			}
+			frame.first = false;
+			if (frame.out === "full") {
+				if (frame.outCount > 0) emit(COMMA);
+				frame.outCount += 1;
+				beginFullValue(byte);
+			} else {
+				beginDropValue(byte);
+			}
+			return;
+		}
+		frame.first = false;
+		const key = pendingKey;
+		pendingKey = undefined;
+		clearMemberFlags(frame, key);
+		if (frame.out === "skip") {
+			beginDropValue(byte);
+			return;
+		}
+		if (frame.out === "full") {
+			beginFullValue(byte);
+			return;
+		}
+		const plan = memberPlan(frame.out, key);
+		if (plan.kind === "object") {
+			if (byte === OPEN_OBJECT) {
+				emitMemberPrefix(frame, key);
+				emit(OPEN_OBJECT);
+				if (pushFrame("obj", plan.frame)) state = STATE_KEY;
+				return;
+			}
+			emitMemberPrefix(frame, key);
+			emitNull();
+			beginDropValue(byte);
+			return;
+		}
+		if (plan.kind === "full") {
+			emitMemberPrefix(frame, key);
+			beginFullValue(byte);
+			return;
+		}
+		if (plan.kind === "string" || plan.kind === "identity") {
+			if (byte === QUOTE) {
+				beginString("value", "buffer", plan.flagPath ?? null, frame, key);
+				return;
+			}
+			if (byte === MINUS || isDigit(byte)) {
+				emitMemberPrefix(frame, key);
+				beginNumber(byte, true);
+				return;
+			}
+			if (byte === 0x74 || byte === 0x66 || byte === 0x6e) {
+				emitMemberPrefix(frame, key);
+				beginLiteral(byte, true);
+				return;
+			}
+			emitMemberPrefix(frame, key);
+			emitNull();
+			beginDropValue(byte);
+			return;
+		}
+		beginDropValue(byte);
+	};
+
+	const stepKey = (byte) => {
+		if (isWhitespace(byte)) return;
+		const frame = top();
+		if (byte === CLOSE_OBJECT) {
+			if (!frame.first) {
+				malformed = true;
+				return;
+			}
+			closeFrame();
+			return;
+		}
+		if (byte === QUOTE) {
+			if (frame.out === "full") beginString("key", "key-full", null, null, null);
+			else if (frame.out === "skip") beginString("key", "skip", null, null, null);
+			else beginString("key", "key-filter", null, null, null);
+			return;
+		}
+		malformed = true;
+	};
+
+	const stepAfter = (byte) => {
+		if (isWhitespace(byte)) return;
+		const frame = top();
+		if (!frame) {
+			malformed = true;
+			return;
+		}
+		if (frame.kind === "obj") {
+			if (byte === COMMA) {
+				state = STATE_KEY;
+				return;
+			}
+			if (byte === CLOSE_OBJECT) {
+				closeFrame();
+				return;
+			}
+			malformed = true;
+			return;
+		}
+		if (byte === COMMA) {
+			state = STATE_VALUE;
+			return;
+		}
+		if (byte === CLOSE_ARRAY) {
+			closeFrame();
+			return;
+		}
+		malformed = true;
+	};
+
+	const step = (byte) => {
+		if (stringCtx) {
+			stepString(byte);
+			return;
+		}
+		if (state === STATE_NUMBER) {
+			stepNumber(byte);
+			return;
+		}
+		if (state === STATE_LITERAL) {
+			stepLiteral(byte);
+			return;
+		}
+		if (state === STATE_VALUE) {
+			stepValue(byte);
+			return;
+		}
+		if (state === STATE_KEY) {
+			stepKey(byte);
+			return;
+		}
+		if (state === STATE_COLON) {
+			if (isWhitespace(byte)) return;
+			if (byte === COLON) state = STATE_VALUE;
+			else malformed = true;
+			return;
+		}
+		if (state === STATE_AFTER) {
+			stepAfter(byte);
+			return;
+		}
+		if (!isWhitespace(byte)) malformed = true;
 	};
 
 	const push = (chunk) => {
@@ -377,57 +898,30 @@ export function createRecordScanner() {
 		const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
 		for (let index = 0; index < buffer.length; index += 1) {
 			if (oversized) return;
-			const byte = buffer[index];
-			if (inString) {
-				if (unicodeLeft > 0) {
-					if (!isHexDigit(byte)) malformed = true;
-					unicodeLeft -= 1;
-					keepStringByte(byte);
-					continue;
-				}
-				if (escaped) {
-					escaped = false;
-					if (byte === LOWER_U) unicodeLeft = 4;
-					else if (!isSimpleEscape(byte)) malformed = true;
-					keepStringByte(byte);
-					continue;
-				}
-				if (byte === BACKSLASH) {
-					escaped = true;
-					keepStringByte(byte);
-					continue;
-				}
-				if (byte === QUOTE) {
-					endString();
-					continue;
-				}
-				if (byte < SPACE) malformed = true;
-				keepStringByte(byte);
-				continue;
-			}
-			if (isWhitespace(byte)) {
-				if (!pendingWhitespace) {
-					pendingWhitespace = true;
-					emit(SPACE);
-				}
-				continue;
-			}
-			pendingWhitespace = false;
-			if (byte === QUOTE) beginString();
-			else emit(byte);
+			step(buffer[index]);
 		}
 	};
 
 	const finish = () => {
 		if (finished) return result;
 		finished = true;
-		if (inString || escaped || unicodeLeft > 0) malformed = true;
+		if (oversized) return undefined;
+		if (stringCtx) {
+			stringCtx = null;
+			malformed = true;
+		}
+		if (state === STATE_NUMBER) {
+			if (!validNumberEnd()) malformed = true;
+		} else if (state !== STATE_END) {
+			malformed = true;
+		}
+		if (stack.length) malformed = true;
 		if (malformed || oversized) return undefined;
 		if (part) {
 			parts.push(partFill === part.length ? part : part.subarray(0, partFill));
 			part = undefined;
 		}
-		const text = Buffer.concat(parts, total).toString("utf8");
+		const text = total > 0 ? Buffer.concat(parts, total).toString("utf8") : "null";
 		parts = [];
 		let entry;
 		try {
@@ -436,7 +930,7 @@ export function createRecordScanner() {
 			malformed = true;
 			return undefined;
 		}
-		normalizeTruncatedIdentities(entry);
+		applyTruncatedIdentities(entry, flags);
 		result = entry;
 		return entry;
 	};
