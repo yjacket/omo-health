@@ -992,11 +992,13 @@ describe("ui server", { timeout: 20_000 }, () => {
 					const unknown = source === "missing" || source === "no-job-id";
 					for (const pass of ["initial", "cached"]) {
 						const { blocked, planned } = (await world.detail(AUDIT_ID)).audit;
-						assert.deepEqual([blocked, planned?.model ?? null], unknown ? ["models-unknown", null] : [null, next], pass);
+						assert.deepEqual([blocked, planned?.model ?? null], unknown ? ["analyst-models-unknown", null] : [null, next], pass);
 					}
 					const [status, body] = await world.startAudit(AUDIT_ID);
 					if (unknown) {
-						assert.deepEqual([status, body.error], [409, "models-unknown"]);
+						assert.deepEqual([status, body], [409, {
+							error: "analyst-models-unknown", reasonKo: "분석가가 쓴 모델을 다 확인하지 못해 조사할 수 없습니다",
+						}]);
 						assert.equal(fs.existsSync(requestFileOf(world)), false);
 						assert.equal(fs.existsSync(world.paths.health.auditBudgetFile), false);
 					} else assert.deepEqual([status, body.audit.planned.model], [202, next]);
@@ -1008,27 +1010,52 @@ describe("ui server", { timeout: 20_000 }, () => {
 
 			it("IS-9 unfinished analyst run: preview and POST refuse until the fallback history is recorded", async () => {
 				const world = makeWorld({ providers: ["p"], lanes: { ultrabrain: ["p/b"], architect: ["p/c"] } });
+				const auditServer = createUiServer({ paths: world.paths, token: TOKEN, getState: () => STATE, startAudit: world.startAudit, now: world.now });
 				try {
+					const { port: auditPort } = await auditServer.listen();
+					const posted = () => postAt(auditPort, "/api/audit", { sessionId: AUDIT_ID });
 					const ts = new Date(world.nowMs - 120_000).toISOString();
 					const run = { event: "investigation", ts, fp: "current-fp", jobId: "analyst-current" };
 					const dir = path.join(world.paths.health.jobsDir, run.jobId);
 					fs.mkdirSync(dir, { recursive: true });
 					fs.writeFileSync(path.join(dir, "err.log"), "Model fallback: p/a -> p/b\n");
 					appendDecision(world.paths, { ...run, status: "analyzing", subject: { sessionId: AUDIT_ID }, model: "p/a" });
+					const refused = await posted();
+					assert.deepEqual([refused.status, refused.body], [409, {
+						error: "analyst-models-unknown", reasonKo: "분석가가 쓴 모델을 다 확인하지 못해 조사할 수 없습니다",
+					}]);
 					for (const pass of ["initial", "cached"]) {
 						const { blocked, planned } = (await world.detail(AUDIT_ID)).audit;
-						assert.deepEqual([blocked, planned], ["models-unknown", null], pass);
+						assert.deepEqual([blocked, planned], ["analyst-models-unknown", null], pass);
 					}
-					assert.deepEqual(await world.startAudit(AUDIT_ID), [409, {
-						error: "models-unknown", reasonKo: "세션이 쓴 모델을 다 확인하지 못해 조사할 수 없습니다",
-					}]);
 					assert.equal(fs.existsSync(requestFileOf(world)), false);
 					assert.equal(fs.existsSync(world.paths.health.auditBudgetFile), false);
 					appendDecision(world.paths, { ...run, status: "verdict", analyst: { verdict: "act" }, usedModels: ["p/a", "p/b"] });
 					const { blocked, planned } = (await world.detail(AUDIT_ID)).audit;
 					assert.deepEqual([blocked, planned?.model], [null, "p/c"]);
-					const [status, body] = await world.startAudit(AUDIT_ID);
+					const { status, body } = await posted();
 					assert.deepEqual([status, body.audit.planned.model], [202, "p/c"]);
+				} finally {
+					await Promise.all([auditServer.close(), world.detail.close()]);
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				}
+			});
+
+			it("IS-9 unknown session models take precedence over an unfinished analyst run in preview and POST", async () => {
+				const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } };
+				const world = makeWorld({ entries: [{ type: "compaction", provider: "openai", usage }] });
+				try {
+					appendDecision(world.paths, {
+						ts: new Date(world.nowMs - 120_000).toISOString(), event: "investigation", fp: "current-fp", jobId: "analyst-current",
+						status: "analyzing", subject: { sessionId: AUDIT_ID }, model: "openai/other-analyst",
+					});
+					const { blocked, planned } = (await world.detail(AUDIT_ID)).audit;
+					assert.deepEqual([blocked, planned], ["models-unknown", null]);
+					assert.deepEqual(await world.startAudit(AUDIT_ID), [409, {
+						error: "models-unknown", reasonKo: "세션이 쓴 모델을 다 확인하지 못해 조사할 수 없습니다",
+					}]);
+					assert.equal(fs.existsSync(requestFileOf(world)), false);
+					assert.equal(fs.existsSync(world.paths.health.auditBudgetFile), false);
 				} finally {
 					await world.detail.close();
 					fs.rmSync(world.dir, { recursive: true, force: true });

@@ -16,16 +16,22 @@ function auditFactsFor(paths, session, tokens) {
 	const usage = readUsageIndex(paths.health.usageIndexFile);
 	const entry = usageEntryOf(usage, session ?? {});
 	// Do not queue against an index row the daemon still has to finish or refresh.
-	if (session?.analystModelsUnknown || !fresh(entry)) return { ...auditModelFacts(entry, null), sessionModelsKnown: false };
+	if (!fresh(entry)) return { ...auditModelFacts(entry, null), sessionModelsKnown: false };
 	return auditModelFacts(entry, readAuditTimeline(entry.file, tokens));
 }
 
+function modelBlockOf(facts, session) {
+	if (!facts.sessionModelsKnown) return "models-unknown";
+	if (session?.analystModelsUnknown) return "analyst-models-unknown";
+	return null;
+}
+
 /** The first refusal, in the order the detail and the POST agree on. */
-function blockedOf({ config, daemon, usedToday, perDay, modelsKnown, planned }) {
+function blockedOf({ config, daemon, usedToday, perDay, modelBlock, planned }) {
 	if (config.audit?.enabled !== true) return "disabled";
 	if (daemon.state !== "running") return "daemon-off";
 	if (Number.isFinite(perDay) && usedToday >= perDay) return "cap";
-	if (!modelsKnown) return "models-unknown";
+	if (modelBlock) return modelBlock;
 	if (!planned) return "no-model";
 	return null;
 }
@@ -39,7 +45,7 @@ export function createDetailOperations({
 	const locator = createSessionFileLocator({ paths, clock: { now: () => at } });
 	const loadRecord = ({ id, row, now }) => load({ paths, id, row, now, locator });
 	const plan = (config, facts, analystModels) =>
-		facts.sessionModelsKnown ? resolveModel(paths, config, { ...facts, analystModels: Array.isArray(analystModels) ? analystModels : [] }) : null;
+		resolveModel(paths, config, { ...facts, analystModels: Array.isArray(analystModels) ? analystModels : [] });
 
 	function preview(id, { session, analystModels }) {
 		// A cached record may predate an exit that didn't generate a decision.
@@ -57,9 +63,10 @@ export function createDetailOperations({
 		const perDay = Number.isFinite(config.audit?.perDay) ? config.audit.perDay : null;
 		const usedToday = today(paths, at);
 		const facts = auditFactsFor(paths, session, config.tokens);
-		const choice = plan(config, facts, analystModels);
+		const modelBlock = modelBlockOf(facts, session);
+		const choice = modelBlock ? null : plan(config, facts, analystModels);
 		const planned = choice && !choice.blocked ? choice : null;
-		const blocked = blockedOf({ config, daemon, usedToday, perDay, modelsKnown: facts.sessionModelsKnown, planned });
+		const blocked = blockedOf({ config, daemon, usedToday, perDay, modelBlock, planned });
 		return { state, planned, blocked, stalled: isAuditActive(state) && daemon.state !== "running", usedToday, perDay };
 	}
 	const previewOf = auditDetail ?? ((record, id) => preview(id, record));
@@ -76,7 +83,8 @@ export function createDetailOperations({
 		const perDay = config.audit.perDay;
 		if (Number.isFinite(perDay) && today(paths, at) >= perDay) return refuse(429, "cap");
 		const facts = auditFactsFor(paths, record.session, config.tokens);
-		if (!facts.sessionModelsKnown) return refuse(409, "models-unknown");
+		const modelBlock = modelBlockOf(facts, record.session);
+		if (modelBlock) return refuse(409, modelBlock);
 		const choice = plan(config, facts, record.analystModels);
 		if (!choice || choice.blocked) return refuse(409, "no-model");
 		const claim = request(paths, canonicalId, at);

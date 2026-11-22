@@ -372,10 +372,10 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		}
 		// The resident index may have learned identities since the worker prepared the evidence.
 		const facts = auditModelFacts(index ? usageEntryOf(index, loaded.session ?? {}) : null, full);
+		if (!facts.sessionModelsKnown) return fail(record, "models-unknown", null, now);
 		const analystModels = launchAnalystModels(paths, investigations, loaded, selectedFps, auditSubjectIds, analystStart);
-		if (!analystModels) return fail(record, "models-unknown", null, now);
+		if (!analystModels) return fail(record, "analyst-models-unknown", null, now);
 		const choice = resolveAuditModel(paths, config, { ...facts, analystModels });
-		if (choice?.blocked === "models-unknown") return fail(record, "models-unknown", null, now);
 		if (!choice) return fail(record, "no-model", null, now);
 
 		let bundle;

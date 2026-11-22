@@ -1565,7 +1565,7 @@ for (const source of ["recorded", "retained", "missing", "late", "late-missing"]
 		await h.prepare(a);
 	}
 	if (source.endsWith("missing")) {
-		assert.deepEqual([h.record("m1").status, h.record("m1").reason, h.runner.starts.length, h.budget()], ["failed", "models-unknown", 0, undefined]);
+		assert.deepEqual([h.record("m1").status, h.record("m1").reason, h.runner.starts.length, h.budget()], ["failed", "analyst-models-unknown", 0, undefined]);
 	} else {
 		assert.equal(h.runner.starts.length, 1);
 		assert.equal(modelOf(h.runner.starts[0]), LANES.architect[0]);
@@ -1595,7 +1595,7 @@ test("IS-9 unfinished analyst run: daemon refuses without charge, then excludes 
 			await h.prepare(a);
 		}
 		assert.deepEqual([h.record("m1").status, h.record("m1").reason, h.runner.starts.length, h.budget()],
-			["failed", "models-unknown", 0, undefined], `analyzing row arrived during preparation: ${duringPreparation}`);
+			["failed", "analyst-models-unknown", 0, undefined], `analyzing row arrived during preparation: ${duringPreparation}`);
 		appendDecision(h.paths, { ...run, status: "verdict", analyst: { verdict: "act" }, usedModels: ["p/a", "p/b"] });
 		const a = h.auditor();
 		h.request("m1");
@@ -1603,6 +1603,19 @@ test("IS-9 unfinished analyst run: daemon refuses without charge, then excludes 
 		assert.deepEqual(h.runner.starts.map(modelOf), ["p/c"]);
 		assert.equal(h.budget().count, 1);
 	}
+});
+
+test("IS-9 unknown session models take precedence over an unfinished analyst run in the daemon", async (t) => {
+	const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } };
+	const h = harness({ entries: [
+		{ type: "compaction", id: "cmp-1", timestamp: new Date(BASE - 60_000).toISOString(), provider: "openai", usage },
+	] });
+	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+	appendDecision(h.paths, { ts: new Date(BASE).toISOString(), event: "investigation", fp: "current-fp", jobId: "analyst-current", status: "analyzing", subject: { sessionId: "m1" }, model: "openai/other-analyst" });
+	h.request("m1");
+	await h.prepare(h.auditor());
+	assert.deepEqual([h.record("m1").status, h.record("m1").reason, h.runner.starts.length, h.budget()],
+		["failed", "models-unknown", 0, undefined]);
 });
 
 test("a decision-only fp's analyzing model is excluded from the daemon's model choice", async () => {

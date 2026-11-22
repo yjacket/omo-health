@@ -23,7 +23,7 @@
 	const AUDIT_ACTIVE = new Set(["queued", "launching", "running"]);
 	const AUDIT_TOKEN_TONE = { normal: "ok", high: "warn", wasteful: "warn" };
 	// Why an audit cannot start now. The detail's audit.blocked carries only the code (src/ui/cli.mjs blockedOf), so the page words it as src/ui/labels.mjs AUDIT_REASON_LABELS does.
-	const AUDIT_BLOCKED_TEXT = { disabled: "설정에서 조사가 꺼져 있습니다", "daemon-off": "감시기가 꺼져 있어 조사할 수 없습니다", cap: "오늘 조사 한도를 다 썼습니다", "models-unknown": "세션이 쓴 모델을 다 확인하지 못해 조사할 수 없습니다", "no-model": "세션과 분석가 모델과 다른 상위 모델이 없습니다" };
+	const AUDIT_BLOCKED_TEXT = { disabled: "설정에서 조사가 꺼져 있습니다", "daemon-off": "감시기가 꺼져 있어 조사할 수 없습니다", cap: "오늘 조사 한도를 다 썼습니다", "models-unknown": "세션이 쓴 모델을 다 확인하지 못해 조사할 수 없습니다", "analyst-models-unknown": "분석가가 쓴 모델을 다 확인하지 못해 조사할 수 없습니다", "no-model": "세션과 분석가 모델과 다른 상위 모델이 없습니다" };
 	const TABS = ["sessions", "ended", "admin"];
 
 	let token = null;
