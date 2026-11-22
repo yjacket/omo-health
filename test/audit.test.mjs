@@ -26,9 +26,27 @@ import { appendEnded } from "../src/session-ledger.mjs";
 import { buildSessionRecord, loadSessionRecord } from "../src/session-record.mjs";
 import { compactUsage, createUsageIndex } from "../src/usage-index.mjs";
 import { tmpDir, iso, writeJsonl } from "./helpers/fixtures.mjs";
+import { relayDecisions } from "./helpers/relay-decisions.mjs";
 
 const T0 = Date.parse("2026-11-20T00:00:00Z");
 const HOUR = 3_600_000;
+
+test("IS-8: the audit bundle allocates one action ref per relay delivery", () => {
+	const root = tmpDir("omoh-audit-relay-");
+	const paths = resolvePaths({ OMO_HEALTH_HOME: path.join(root, "h"), OMO_HEALTH_OMO_HOME: path.join(root, "o"), USERPROFILE: root });
+	const row = { ...emptyRecord().session, taskId: null };
+	const now = T0 + HOUR;
+	appendEnded(paths, row);
+	for (let count = 1; count <= 2; count++) {
+		for (const decision of relayDecisions(T0 + 10 * count, row.sessionId, `s-child-${count}`)) appendDecision(paths, decision);
+		const bundles = [false, true].map((auditRetention) => {
+			const record = loadSessionRecord({ paths, id: row.sessionId, now, auditRetention });
+			return auditBundle(record, null, { config: DEFAULT_CONFIG, now }).omo_health_record.actions.map(({ ref, kind, result, delivered, via }) => [ref, kind, result, delivered, via]);
+		});
+		const expected = Array.from({ length: count }, (_, i) => [`A${i + 1}`, "relay-cancel", "execute", true, "inbox"]);
+		assert.deepEqual(bundles, [expected, expected]);
+	}
+});
 
 function laneBox(categories, providers) {
 	const root = tmpDir("omoh-audit-");

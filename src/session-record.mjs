@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
-import { idFromFileName } from "./collect/sessions.mjs";
+import { idFromFileName, readSessionHeader } from "./collect/sessions.mjs";
 import { senpiTaskStoreDir } from "./collect/tasks.mjs";
+import { DEFAULT_CONFIG } from "./config.mjs";
 import { streamDecisions } from "./decisions.mjs";
 import { streamInvestigations } from "./investigations.mjs";
 import { endedKey, endedSelector, streamEnded } from "./session-ledger.mjs";
@@ -20,8 +21,8 @@ import { redact, truncate } from "./util/text.mjs";
  * descendants; `buildSessionRecord` is pure and does the joining.
  *
  * Selection is by ids and fps only, never by time, so a child that keeps
- * running after its parent ends keeps its actions and verdicts. Only the
- * machine-wide overlap check uses the parent's [startedMs, endedMs] window.
+ * running after its parent ends keeps its actions and verdicts. The machine
+ * overlap check uses the union of the session tree's active intervals.
  */
 
 const DAY_MS = 86_400_000;
@@ -165,8 +166,8 @@ function descendantKey(node, ledgerRow) {
 function collectDescendants(row, ledger, usageEntries) {
 	const nodes = new Map();
 	const all = [];
-	for (const r of ledger) if (isRecord(r)) all.push({ sessionId: r.sessionId ?? null, taskId: r.taskId ?? null, parentSessionId: r.parentSessionId ?? null, title: r.title ?? null, outcome: r.outcome ?? null, endedMs: msOf(r.endedMs), cwd: r.cwd ?? null, ledgerRow: r });
-	for (const e of usageEntries) if (nonEmpty(e?.taskId) || nonEmpty(e?.parentSessionId)) all.push({ sessionId: e.id ?? null, taskId: e.taskId ?? null, parentSessionId: e.parentSessionId, title: null, outcome: null, endedMs: msOf(e.checkedMs), cwd: null });
+	for (const r of ledger) if (isRecord(r)) all.push({ sessionId: r.sessionId ?? null, taskId: r.taskId ?? null, parentSessionId: r.parentSessionId ?? null, title: r.title ?? null, outcome: r.outcome ?? null, startedMs: msOf(r.startedMs), endedMs: msOf(r.endedMs), cwd: r.cwd ?? null, ledgerRow: r });
+	for (const e of usageEntries) if (nonEmpty(e?.taskId) || nonEmpty(e?.parentSessionId)) all.push({ sessionId: e.id ?? null, taskId: e.taskId ?? null, parentSessionId: e.parentSessionId, title: null, outcome: null, startedMs: msOf(e.startedMs), endedMs: msOf(e.checkedMs), cwd: null });
 	const owners = new Map();
 	const sessionIds = new Set();
 	const remember = (link) => {
@@ -202,7 +203,9 @@ function collectDescendants(row, ledger, usageEntries) {
 				parentSessionId: parent,
 				title: n.title,
 				outcome: n.outcome,
+				startedMs: n.startedMs,
 				endedMs: Number.isFinite(n.endedMs) ? n.endedMs : null,
+				indexOnly: !n.ledgerRow,
 				cwd: n.cwd,
 				depth,
 				ledgerRow: n.ledgerRow,
@@ -219,25 +222,53 @@ function trackOwner(owners, taskId, identity) {
 	else if (owners.get(taskId) !== identity) owners.set(taskId, null);
 }
 
-/**
- * Machine-wide incidents (no subject session or task) whose active interval
- * overlaps the session window, and the latest info coverage marker before it.
- * Consume finding rows oldest first. For overlapping intervals, keep the
- * opener, the last severity rise before the window, and rises inside it.
- */
-function scanDecisionHistory(decisions, row, retained) {
-	const startedMs = msOf(row.startedMs);
-	const endedMs = msOf(row.endedMs);
-	const startMs = Number.isFinite(startedMs) ? startedMs : -Infinity;
-	const endMs = Number.isFinite(endedMs) ? endedMs : Number.isFinite(startedMs) ? startedMs : Infinity;
+function activeWindows(row, descendants, now) {
+	const start = msOf(row.startedMs);
+	const endOf = (end, start) => Number.isFinite(end) ? end : now ?? (Number.isFinite(start) ? start : Infinity);
+	const intervals = [[Number.isFinite(start) ? start : -Infinity, endOf(msOf(row.endedMs), start)]];
+	for (const node of descendants) {
+		const startedMs = msOf(node.startedMs);
+		if (!Number.isFinite(startedMs)) continue;
+		intervals.push([startedMs, endOf(node.indexOnly ? NaN : msOf(node.endedMs), startedMs)]);
+	}
+	const windows = [];
+	for (const [from, to] of intervals.sort((a, b) => a[0] - b[0])) {
+		if (to < from) continue;
+		const prev = windows.at(-1);
+		if (prev && from <= prev[1]) prev[1] = Math.max(prev[1], to);
+		else windows.push([from, to]);
+	}
+	return windows;
+}
+
+function overlaps(windows, from, to) {
+	let lo = 0;
+	let hi = windows.length;
+	while (lo < hi) {
+		const mid = (lo + hi) >>> 1;
+		if (windows[mid][1] < from) lo = mid + 1;
+		else hi = mid;
+	}
+	return lo < windows.length && windows[lo][0] <= to;
+}
+
+/** Stream machine incident openers and the severity rises effective in any window. */
+function scanDecisionHistory(decisions, row, windows, retained) {
 	const open = new Map();
 	const matched = retained ? null : [];
 	const keep = (finding) => retained ? retained.add(finding) : matched.push(finding);
-	const keepInterval = ({ opener, priorRise }) => {
-		keep(opener);
-		if (priorRise) keep(priorRise);
+	const keepRise = ({ rise, riseMs }, end) => {
+		if (rise && overlaps(windows, riseMs, end)) keep(rise);
 	};
+	const keepInterval = (interval, end) => {
+		if (!overlaps(windows, interval.openedMs, end)) return;
+		keep(interval.opener);
+		keepRise(interval, end);
+	};
+	const startedMs = msOf(row.startedMs);
+	const endedMs = msOf(row.endedMs);
 	const coverageEnd = Number.isFinite(startedMs) ? startedMs : Number.isFinite(endedMs) ? endedMs : Infinity;
+	const lastEnd = windows.at(-1)?.[1] ?? -Infinity;
 	let coverageMs = -Infinity;
 	for (const entry of decisions) {
 		if (!isRecord(entry)) continue;
@@ -248,20 +279,20 @@ function scanDecisionHistory(decisions, row, retained) {
 		if (!FINDING_EVENTS.has(event) || !nonEmpty(fp)) continue;
 		const interval = open.get(fp);
 		if (event === "resolved") {
-			if (interval && ts >= startMs) keepInterval(interval);
+			if (interval) keepInterval(interval, ts);
 			open.delete(fp);
-		} else if (ts <= endMs && !nonEmpty(subject?.sessionId) && !nonEmpty(subject?.taskId)) {
+		} else if (ts <= lastEnd && !nonEmpty(subject?.sessionId) && !nonEmpty(subject?.taskId)) {
 			if (event === "severity") {
 				if (!interval) continue;
-				const rise = machineRow(entry, fp, ts, Boolean(retained));
-				if (ts < startMs) interval.priorRise = rise;
-				else keep(rise);
+				keepRise(interval, ts);
+				interval.rise = machineRow(entry, fp, ts, Boolean(retained));
+				interval.riseMs = ts;
 			} else if (!interval) {
-				open.set(fp, { opener: machineRow(entry, fp, ts, Boolean(retained)) });
+				open.set(fp, { openedMs: ts, opener: machineRow(entry, fp, ts, Boolean(retained)) });
 			}
 		}
 	}
-	for (const interval of open.values()) keepInterval(interval);
+	for (const interval of open.values()) keepInterval(interval, Infinity);
 	return { machine: matched, infoFindings: Number.isFinite(coverageMs) };
 }
 
@@ -305,7 +336,7 @@ function factsOf(entry) {
 	};
 }
 
-function actionRow(entry, subjectByFp, bounded = false) {
+function actionRow(entry, subjectByFp, bounded = false, acted) {
 	let kind = entry.action?.kind;
 	let result = entry.result;
 	let facts = factsOf(entry);
@@ -329,8 +360,15 @@ function actionRow(entry, subjectByFp, bounded = false) {
 			else if (entry.event !== "park-gated") return null;
 			facts = { ...facts, error: result === "launch-failed" };
 		} else return null;
-	} else if (!bounded) {
-		detail = actionDetail(isRecord(entry.outcome) ? entry.outcome : {}, entry.rule) ?? "";
+	} else {
+		const outcome = isRecord(entry.outcome) ? entry.outcome : {};
+		if (acted && facts.delivered === null && typeof acted.delivered === "boolean") facts.delivered = acted.delivered;
+		if (acted && !Array.isArray(outcome.killed) && Array.isArray(acted.killed)) facts.killed = acted.killed.length;
+		if (!bounded) {
+			detail = actionDetail({ delivered: acted?.delivered, killed: acted?.killed, ...outcome }, entry.rule) ?? "";
+			const actedResult = clean(acted?.result, 120);
+			if (actedResult && actedResult !== result) detail = cleanDetail([`investigation ${actedResult}`, detail].filter(Boolean).join("; "));
+		}
 	}
 	const factsRow = { ts: entry.ts ?? null, detector: clean(entry.detector, 20), kind: clean(kind, 80), result: clean(result, 120), facts };
 	if (bounded) return factsRow;
@@ -344,6 +382,16 @@ function actionRow(entry, subjectByFp, bounded = false) {
 		recipient,
 		subject: cleanValue(subject),
 	};
+}
+
+// The engine writes the acted row during perform(), then the execute row when
+// that request returns (engine.mjs:209,632,1198,1216). It stamps each write
+// separately (:467–469) and stores no tick ID. Require producer order as well
+// as same request/finding and at most one default tick's elapsed time.
+function sameExecution(acted, entry) {
+	const elapsed = timeOf(entry) - timeOf(acted);
+	return entry.result === "execute" && acted.fp === entry.fp && acted.acted.key === entry.action?.key &&
+		acted.acted.kind === entry.action.kind && elapsed >= 0 && elapsed <= DEFAULT_CONFIG.tickMs;
 }
 
 function verdictFacts(entry) {
@@ -485,18 +533,32 @@ function joinSessionDecisions(row, descendants, investigations, decisions, bound
 	// Scan again so an action written before the lifecycle row can still join by fp.
 	const about = [];
 	const delivered = [];
+	const actionEntries = [];
+	let pending;
+	const addAction = (entry, deliveredOnly, acted) => {
+		if (!bounded) actionEntries.push({ entry, deliveredOnly, acted });
+		else {
+			const action = actionRow(entry, null, true, acted);
+			if (action) bounded.actions.add({ ...action, deliveredOnly });
+		}
+	};
 	const histories = new Map(bounded?.investigations.rows.map(({ historyId }) => [historyId, { rows: [], chars: 2 }]));
 	for (const entry of decisions()) {
 		if (!isRecord(entry)) continue;
 		const related = (nonEmpty(entry.fp) && fpSet.has(entry.fp)) || subjectMatches(entry.subject) || (nonEmpty(row.sessionId) && entry.sessionId === row.sessionId);
-		if (!related && !sessionAllowed.has(entry.outcome?.sessionId)) continue;
+		const selected = related || sessionAllowed.has(entry.outcome?.sessionId);
+		const acted = pending && sameExecution(pending.entry, entry) && selected ? pending.entry : undefined;
+		if (pending && !acted) addAction(pending.entry, pending.deliveredOnly);
+		pending = undefined;
+		if (!selected) continue;
+		if (entry.event === "investigation" && nonEmpty(entry.fp) && nonEmpty(entry.acted?.key) && nonEmpty(entry.acted?.kind)) {
+			pending = { entry, deliveredOnly: !related };
+		} else addAction(entry, !related, acted);
 		if (!bounded) {
 			(related ? about : delivered).push(entry);
 			continue;
 		}
 		if (FINDING_EVENTS.has(entry.event)) bounded.findings.add({ ...findingRow(entry, { bounded: true }), deliveredOnly: !related });
-		const action = actionRow(entry, null, true);
-		if (action) bounded.actions.add({ ...action, deliveredOnly: !related });
 		if (related && entry.event === "investigation") {
 			if (fpSet.has(entry.fp)) addModel(entry.model);
 			const history = histories.get(entry.fp);
@@ -510,6 +572,7 @@ function joinSessionDecisions(row, descendants, investigations, decisions, bound
 			else history.rows.push(projected);
 		}
 	}
+	if (pending) addAction(pending.entry, pending.deliveredOnly);
 	if (bounded) {
 		for (const investigation of bounded.investigations.rows) {
 			const { rows } = histories.get(investigation.historyId);
@@ -523,13 +586,13 @@ function joinSessionDecisions(row, descendants, investigations, decisions, bound
 			auditSubjectIds: { sessionIds: sessionAllowed, taskIds, childTasksByParent },
 		};
 	}
-	return { selectedInvestigations, fpSet, about, selected: [...new Set([...about, ...delivered])] };
+	return { selectedInvestigations, fpSet, about, selected: [...new Set([...about, ...delivered])], actionEntries };
 }
 
 function recordHealth(inputs, row, descendants) {
 	if (inputs.auditHealth) return { ...inputs.auditHealth, ...inputs.decisionJoin };
 	const { decisions, investigations, messages: messagesIn } = inputs;
-	const { selectedInvestigations, fpSet, about, selected } = inputs.decisionJoin ?? joinSessionDecisions(row, descendants, () => investigations, () => decisions);
+	const { selectedInvestigations, fpSet, about, selected, actionEntries } = inputs.decisionJoin ?? joinSessionDecisions(row, descendants, () => investigations, () => decisions);
 	const analystModels = new Set();
 	const addModel = (model) => { if (nonEmpty(model)) analystModels.add(model); };
 	for (const record of selectedInvestigations) addModel(record.model);
@@ -537,13 +600,18 @@ function recordHealth(inputs, row, descendants) {
 		if (entry.event === "investigation" && fpSet.has(entry.fp)) addModel(entry.model);
 	}
 	const findings = selected.filter((entry) => FINDING_EVENTS.has(entry.event)).map((entry) => findingRow(entry));
-	const { machine, infoFindings } = inputs.decisionHistory ?? scanDecisionHistory(decisions.filter((entry) => Number.isFinite(timeOf(entry))).sort((a, b) => timeOf(a) - timeOf(b)), row);
+	const { machine, infoFindings } = inputs.decisionHistory ?? scanDecisionHistory(
+		decisions.filter((entry) => Number.isFinite(timeOf(entry))).sort((a, b) => timeOf(a) - timeOf(b)), row, activeWindows(row, descendants, inputs.now),
+	);
 	const allFindings = [...findings, ...machine].sort(byNewest);
 	const subjectByFp = new Map(selectedInvestigations.map(({ id, subject }) => [id, subject]));
 	for (const entry of about) {
 		if (FINDING_EVENTS.has(entry.event) && nonEmpty(entry.fp) && isRecord(entry.subject) && !subjectByFp.has(entry.fp)) subjectByFp.set(entry.fp, entry.subject);
 	}
-	const actions = selected.map((entry) => actionRow(entry, subjectByFp)).filter(Boolean).sort(byNewest);
+	const actions = actionEntries.flatMap(({ entry, deliveredOnly, acted }) => {
+		const action = actionRow(entry, subjectByFp, false, acted);
+		return action ? [{ action, ts: action.ts, deliveredOnly }] : [];
+	}).sort(byDecisionTime).map(({ action }) => action);
 	const investigationRows = selectedInvestigations.map((record) => investigationRow(record, about)).sort(byInvestigationTime);
 	const messages = messagesIn.filter(isRecord).map((message) => ({
 		ms: Number.isFinite(message.ms) ? message.ms : null, kind: auditMessageKind(message.kind), recipient: clean(message.recipient, 200), text: cleanDetail(message.text),
@@ -849,14 +917,14 @@ function recordDescendants(subject, rows, usage) {
 			const matches = map.get(key);
 			const prior = matches.get(identity);
 			if (!prior || (fromLedger && later(node, prior.node))) {
-				const { sessionId, taskId, parentSessionId, title, outcome, endedMs, cwd } = node;
-				matches.set(identity, { node: { sessionId, taskId, parentSessionId, title, outcome, endedMs, cwd }, fromLedger });
+				const { sessionId, taskId, parentSessionId, title, outcome, startedMs, endedMs, cwd } = node;
+				matches.set(identity, { node: { sessionId, taskId, parentSessionId, title, outcome, startedMs, endedMs, cwd }, fromLedger });
 			}
 		};
 		consider(subject, true);
 		for (const row of rows()) consider(row, true);
-		for (const { id, taskId, parentSessionId, checkedMs } of usage.values()) {
-			consider({ sessionId: id, taskId, parentSessionId, endedMs: checkedMs }, false);
+		for (const { id, taskId, parentSessionId, startedMs, checkedMs } of usage.values()) {
+			consider({ sessionId: id, taskId, parentSessionId, startedMs, endedMs: checkedMs }, false);
 		}
 		const matches = direct.get(null) ?? new Map();
 		for (const [alias, candidates] of indirect) {
@@ -877,9 +945,9 @@ function recordDescendants(subject, rows, usage) {
 		}
 		for (const [identity, { node, fromLedger }] of matches) {
 			if (!fromLedger && seen.has(identity)) continue;
-			const { sessionId, taskId, parentSessionId, title, outcome, endedMs, cwd } = node;
+			const { sessionId, taskId, parentSessionId, title, outcome, startedMs, endedMs, cwd } = node;
 			seen.add(identity);
-			const descendant = { sessionId, taskId: taskId ?? null, parentSessionId, title: title ?? null, outcome: outcome ?? null, endedMs: Number.isFinite(msOf(endedMs)) ? msOf(endedMs) : null, cwd, depth };
+			const descendant = { sessionId, taskId: taskId ?? null, parentSessionId, title: title ?? null, outcome: outcome ?? null, startedMs, endedMs: Number.isFinite(msOf(endedMs)) ? msOf(endedMs) : null, cwd, depth, indexOnly: !fromLedger };
 			frontier.push(descendant);
 			nodes.set(identity, descendant);
 		}
@@ -940,7 +1008,15 @@ export function loadSessionRecord({ paths, id, row: selector, now = Date.now(), 
 		investigations: newest(AUDIT_LIST_CAPS.investigations, byInvestigationTime),
 		messages: newest(AUDIT_LIST_CAPS.messages, byMessageTime),
 	} : null;
-	const decisionHistory = scanDecisionHistory(streamDecisions(paths), row, retained?.machine);
+	for (const node of descendants) {
+		if (!node.indexOnly || Number.isFinite(msOf(node.startedMs))) continue;
+		// checkedMs is a usage read time, not a session timestamp.
+		const entry = usage.get(node.sessionId);
+		if (!nonEmpty(entry?.file) || entry.gone) continue;
+		const header = readSessionHeader(entry.file);
+		if (header?.id === node.sessionId) node.startedMs = msOf(header.timestamp);
+	}
+	const decisionHistory = scanDecisionHistory(streamDecisions(paths), row, activeWindows(row, descendants, now), retained?.machine);
 	const decisionJoin = joinSessionDecisions(row, descendants, () => streamInvestigations(paths), () => streamDecisions(paths, sinceMs), retained);
 	const files = findRecordFiles(paths, [row, ...scanned], ancestors, locator);
 

@@ -12,6 +12,7 @@ import * as sessionRecord from "../src/session-record.mjs";
 import { buildSessionView } from "../src/ui/session-view.mjs";
 import { expectedSelector } from "./helpers/ended-selector.mjs";
 import { tmpDir, writeJsonl, writeTask } from "./helpers/fixtures.mjs";
+import { relayDecisions } from "./helpers/relay-decisions.mjs";
 
 const T0 = Date.parse("2026-10-10T00:00:00.000Z");
 const MIN = 60_000;
@@ -135,6 +136,22 @@ let messageSeq = 0;
 const ohealth = (ms, text) => ({ type: "custom_message", customType: "omo-health", id: `oh-${++messageSeq}`, timestamp: iso(ms), content: text, details: { kind: "self-notice" } });
 const mainRow = (extra = {}) => ({ sessionId: "s-main", kind: "main", parentSessionId: null, taskId: null, title: "main", cwd: "C:/work/a", terminal: { kind: "wt" }, omoVersion: "0.8.0", startedMs: T0, endedMs: T0 + 2 * HOUR, childCount: 2, ...extra });
 const childRow = (sessionId, taskId, parentSessionId, extra = {}) => ({ sessionId, kind: "child", parentSessionId, taskId, title: sessionId, cwd: "C:/work/a", terminal: null, omoVersion: null, startedMs: T0 + 10 * MIN, endedMs: T0 + 70 * MIN, ...extra });
+
+test("IS-7: each relay delivery has one action in the record and detail", () => {
+	const row = mainRow();
+	const first = relayDecisions(T0 + MIN, row.sessionId, "s-child-1");
+	const second = relayDecisions(T0 + MIN + 10, row.sessionId, "s-child-2");
+	for (const relays of [[first], [first, second]]) {
+		const record = buildSessionRecord({ row, decisions: relays.flat() });
+		const view = buildSessionView(record);
+		assert.deepEqual([record.health.actions.length, record.health.counts.actions, view.health.actions.length], Array(3).fill(relays.length));
+		for (const [index, action] of view.health.actions.entries()) {
+			assert.deepEqual([action.ts, action.kind, action.result, action.recipient, action.facts.delivered, action.facts.via],
+				[relays.at(-1 - index)[2].ts, "relay-cancel", "execute", row.sessionId, true, "inbox"]);
+			assert.match(action.detail, /advised/);
+		}
+	}
+});
 
 test("IS-7: ancestor detail retains both task-only descendants with the same task id", (t) => {
 	const { root, paths } = setup();
@@ -606,6 +623,49 @@ test("a machine-wide finding inside the window is included with scope machine, o
 	const machine = record.health.findings.filter((item) => item.scope === "machine");
 	assert.deepEqual(machine.map((item) => item.fp), ["fp-machine-in"]);
 	assert.equal(machine[0].ts, iso(T0 + HOUR));
+});
+
+test("IS-7: a parent's machine incidents include the child's active interval, not the gap", () => {
+	const { paths } = setup();
+	const parent = mainRow();
+	const child = childRow("s-late-child", "st_late", parent.sessionId, { startedMs: T0 + 3 * HOUR, endedMs: T0 + 4 * HOUR });
+	const now = T0 + 5 * HOUR;
+	const decisions = [["gap", T0 + 2.5 * HOUR], ["during-child", T0 + 3.5 * HOUR], ["after", T0 + 4.5 * HOUR]].flatMap(([fp, at]) => {
+		const incident = { fp, subject: { key: "machine" }, detector: "D6", kind: "provider-down", severity: "warn" };
+		return [{ ...incident, event: "opened", ts: iso(at) }, { ...incident, event: "resolved", ts: iso(at + MIN) }];
+	});
+	const ledger = [parent, child];
+	writeLedger(paths, ledger);
+	writeDecisions(paths, decisions);
+	for (const row of [child, parent]) {
+		const input = { paths, id: row.sessionId, now };
+		const machine = (record) => record.health.findings.filter(({ scope }) => scope === "machine").map(({ fp }) => fp);
+		const pure = buildSessionRecord({ row, ledger, decisions, now });
+		const full = loadSessionRecord(input);
+		const audit = loadSessionRecord({ ...input, auditRetention: true });
+		assert.deepEqual([machine(pure), machine(buildSessionView(full)), machine(audit)], Array.from({ length: 3 }, () => ["during-child"]), row.sessionId);
+	}
+});
+
+test("IS-7: a live child's transcript start opens a machine overlap window through now", () => {
+	const { root, paths } = setup();
+	const parent = mainRow({ cwd: root });
+	const childId = "s-live-child";
+	const taskId = "st_live";
+	const startedMs = T0 + 3 * HOUR;
+	const now = T0 + 4 * HOUR;
+	const file = childSessionFile(root, taskId, childId, [{ type: "session", id: childId, timestamp: iso(startedMs) }]);
+	const index = new Map([[childId, { id: childId, taskId, parentSessionId: parent.sessionId, file, checkedMs: startedMs + MIN, complete: false }]]);
+	writeLedger(paths, [parent]);
+	const incident = { subject: { key: "machine" }, detector: "D6", kind: "provider-down", severity: "warn" };
+	writeDecisions(paths, [
+		{ ...incident, fp: "gap", event: "opened", ts: iso(startedMs - 2 * MIN) },
+		{ ...incident, fp: "gap", event: "resolved", ts: iso(startedMs - MIN) },
+		{ ...incident, fp: "live", event: "opened", ts: iso(startedMs + 2 * MIN) },
+		{ ...incident, fp: "future", event: "opened", ts: iso(now + MIN) },
+	]);
+	const results = [false, true].map((auditRetention) => loadSessionRecord({ paths, id: parent.sessionId, now, index, auditRetention }).health.findings.map(({ fp }) => fp));
+	assert.deepEqual(results, [["live"], ["live"]]);
 });
 
 test("IS-7: a severity rise is a finding row with its own evidence, not a new incident", () => {

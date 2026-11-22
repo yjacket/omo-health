@@ -158,15 +158,15 @@ export function auditModelFacts(entry, full) {
 	};
 }
 
-function auditFileVersion(file) {
+export function auditFileVersion(file) {
 	const stat = file ? statSafe(file) : null;
 	if (!stat?.isFile()) return null;
 	const { size, mtimeMs, ino, birthtimeMs } = stat;
 	return { size, mtimeMs, ino, birthtimeMs };
 }
 
-function sameAuditVersion(a, b) {
-	return b && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ino === b.ino && a.birthtimeMs === b.birthtimeMs;
+export function sameAuditVersion(a, b) {
+	return a && b && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ino === b.ino && a.birthtimeMs === b.birthtimeMs;
 }
 
 function auditFileVersions(dir, suffix) {
@@ -352,8 +352,9 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		}
 	}
 
-	function launchPrepared(record, now, { loaded, selectedFps, auditSubjectIds, full, warning, timelineSource }, changedVersions, analystStart) {
+	function launchPrepared(record, now, { loaded, selectedFps, auditSubjectIds, full, warning, timelineSource, discoveryTooLarge }, changedVersions, analystStart) {
 		if (config.audit?.enabled !== true) return fail(record, "disabled", null, now);
+		if (discoveryTooLarge) return fail(record, "evidence-too-large", null, now);
 		if (!loaded?.found) return fail(record, "not-found", null, now);
 		if (readBudget(paths, now).count >= config.audit.perDay) return fail(record, "cap", null, now);
 		if (warning) log?.warn?.("audit_timeline_failed", warning);
@@ -444,6 +445,7 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 			// The daemon passes its resident index; an auditor built without one reads the file here, never in the worker.
 			const source = index ?? readUsageIndex(paths.health.usageIndexFile);
 			worker.postMessage({ sessionId: record.sessionId, now, indexEntries: relatedUsageEntries(source, record.sessionId), indexFull: source?.full === true, bounds: {
+				preparationMaxBytes: TIMELINE_MAX_BYTES + MESSAGE_SCAN_TOTAL_BYTES,
 				messageScanMaxBytes: timelineMaxBytes, messageScanTotalBytes: MESSAGE_SCAN_TOTAL_BYTES,
 				descendantScanMax: DESCENDANT_SCAN_MAX, tokens: config.tokens,
 			} });

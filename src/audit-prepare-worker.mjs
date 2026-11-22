@@ -1,25 +1,45 @@
 import { parentPort, workerData } from "node:worker_threads";
-import { readVersionedAuditTimeline } from "./auditor.mjs";
+import { auditFileVersion, readVersionedAuditTimeline, sameAuditVersion } from "./auditor.mjs";
 import { createSessionFileLocator } from "./collect/session-files.mjs";
 import { loadSessionRecord, usageEntryOf } from "./session-record.mjs";
 
+const DISCOVERY_TOO_LARGE = Symbol("discovery-too-large");
+
 /** All retention and transcript reads belong to this thread. Usage arrives from the daemon. */
 export function prepareAudit({ sessionId, now, bounds, indexEntries, indexFull }, { paths, loadRecord = loadSessionRecord, timeline }) {
-	const { tokens, ...scanBounds } = bounds;
+	const { tokens, preparationMaxBytes, ...scanBounds } = bounds;
 	const index = new Map();
 	for (const entry of indexEntries) index.set(entry.id, entry);
 	if (indexFull) Object.defineProperty(index, "full", { value: true });
-	const locator = createSessionFileLocator({ paths, clock: { now: () => now }, indexedFile: (id) => index.get(id)?.file });
-	const record = loadRecord({ paths, id: sessionId, now, ...scanBounds, auditRetention: true, locator, index });
-	if (!record?.found) return { loaded: record };
-	// Launch-only join keys travel separately from the record used to build the reviewer's bundle.
-	const { selectedFps, auditSubjectIds, ...loaded } = record;
-	const session = loaded.session ?? {};
-	const entry = usageEntryOf(index, session);
-	const file = entry?.file ?? (session.taskId ? null : locator.mainFile(session.sessionId));
-	let warning;
-	const report = readVersionedAuditTimeline(file, tokens, { maxFileBytes: bounds.messageScanMaxBytes, timeline, log: { warn: (_event, detail) => { warning = detail; } } });
-	return { loaded, selectedFps, auditSubjectIds, ...report, warning };
+	// loadSessionRecord owns the message allowance. Discovery and the timeline share the rest.
+	let remaining = preparationMaxBytes - scanBounds.messageScanTotalBytes;
+	const { findMainFile, childFile } = createSessionFileLocator({ paths, clock: { now: () => now } });
+	const discovered = new Map();
+	const mainFile = (id) => {
+		const entry = index.get(id);
+		if (entry?.state === "ok" && sameAuditVersion(auditFileVersion(entry.file), entry)) return entry.file;
+		if (discovered.has(id)) return discovered.get(id);
+		const result = findMainFile(id, entry?.file ?? null, { maxBytes: remaining });
+		remaining -= result.bytesRead;
+		if (result.pending) throw DISCOVERY_TOO_LARGE;
+		discovered.set(id, result.file);
+		return result.file;
+	};
+	try {
+		const record = loadRecord({ paths, id: sessionId, now, ...scanBounds, auditRetention: true, locator: { mainFile, childFile }, index });
+		if (!record?.found) return { loaded: record };
+		// Launch-only join keys travel separately from the record used to build the reviewer's bundle.
+		const { selectedFps, auditSubjectIds, ...loaded } = record;
+		const session = loaded.session ?? {};
+		const file = session.taskId ? usageEntryOf(index, session)?.file : mainFile(session.sessionId);
+		let warning;
+		const maxFileBytes = Math.min(scanBounds.messageScanMaxBytes, remaining);
+		const report = readVersionedAuditTimeline(file, tokens, { maxFileBytes, timeline, log: { warn: (_event, detail) => { warning = detail; } } });
+		return { loaded, selectedFps, auditSubjectIds, ...report, warning };
+	} catch (error) {
+		if (error !== DISCOVERY_TOO_LARGE) throw error;
+		return { discoveryTooLarge: true };
+	}
 }
 
 if (parentPort && workerData?.auditPrepareWorker) {

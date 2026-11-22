@@ -1187,7 +1187,7 @@ test("preparing a file above timelineMaxBytes neither scans messages nor reads i
 	await h.prepare(b);
 	assert.equal(scans.length, 1, "under the limit the same spies are called");
 	assert.equal(timelines.length, 1);
-	assert.equal(timelines[0][1].maxFileBytes, 256 * 1024 * 1024);
+	assert.equal(timelines[0][1].maxFileBytes, 256 * 1024 * 1024 - fs.statSync(h.files.m1).size, "the header probe reduces the timeline allowance");
 });
 
 test("a job the runner no longer knows is adopted before it ends no-job; the second waits meanwhile", async () => {
