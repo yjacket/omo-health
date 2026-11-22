@@ -499,6 +499,27 @@ test("a same-length rewrite is no longer fresh, queueLedger requeues it, and the
 	assert.equal(modelOf(h.runner.starts[0]), "google/gemini-3-pro", "gpt-5-5 is excluded after the recount");
 });
 
+test("a same-length rewrite read by a complete timeline excludes the new model before the recount", () => {
+	const mk = (model, input) => E.assistant({ ms: BASE - 120_000, id: "a-m1", model, provider: "openai", usage: { input, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } });
+	const h = harness({ entries: [mk("gpt-5-4", 10)] });
+	const file = h.files.m1;
+	const index = createUsageIndex({ file: h.paths.health.usageIndexFile, clock: h.clock, log: silent });
+	const tracker = createUsageTracker({ paths: h.paths, index, locator: createSessionFileLocator({ paths: h.paths, clock: h.clock }), clock: h.clock, log: silent });
+	tracker.queueLedger(readEnded(h.paths));
+	tracker.tick({});
+	index.save();
+	const before = fs.statSync(file);
+	writeJsonl(file, [mk("gpt-5-5", 20)]);
+	fs.utimesSync(file, new Date(before.atimeMs), new Date(before.mtimeMs + 5000));
+	assert.equal(fresh(index.get("m1")), false, "the index still holds the old read");
+
+	const a = h.auditor();
+	h.request("m1");
+	h.tick(a);
+	assert.equal(h.runner.starts.length, 1, "a complete timeline proves coverage without the recount");
+	assert.equal(modelOf(h.runner.starts[0]), "google/gemini-3-pro", "the rewritten model gpt-5-5 is excluded");
+});
+
 test("evidence-too-large charges nothing and never starts", () => {
 	const h = harness();
 	const a = h.auditor({
