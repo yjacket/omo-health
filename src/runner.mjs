@@ -273,7 +273,8 @@ export function createRunner({ paths, spawnImpl = spawn, clock, env = process.en
 				try {
 					found = findProcess(jobId, meta.args ?? []);
 				} catch (error) {
-					// Not knowing is neither "gone" nor "someone else": keep the job, never kill on a guess, retry next poll.
+					// Audits keep retrying; other jobs release their slot at the deadline without killing an unverified pid.
+					if (timedOut && meta.kind !== "audit") return finish(f, meta, { status: "timeout", reason: "unverified", result: null, exitCode: null });
 					return { status: "running", result: null, exitCode: null, detail: truncate(error.message, 300) };
 				}
 				if (!found || !Number.isFinite(found.ctimeMs) || found.ctimeMs < meta.startedMs - ADOPT_SKEW_MS) return ended(f, meta, exit);

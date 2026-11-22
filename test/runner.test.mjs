@@ -469,6 +469,34 @@ test("poll ends a job whose argv names no process, and stays running when the lo
 	assert.match(running.detail, /CIM timed out/);
 });
 
+test("without an initial identity, failed argv lookups past the deadline keep only the audit running", () => {
+	const lookups = [];
+	const { runner, calls, clock } = setup({
+		isAlive: () => true,
+		identify: () => null,
+		findProcess: (jobId) => {
+			lookups.push(jobId);
+			throw new Error("CIM timed out");
+		},
+	});
+	for (const kind of ["audit", "analyst"]) {
+		runner.start({ ...baseJob, jobId: kind, kind, args: laneArgsFor(kind, `lane-${kind}`) });
+		assert.equal(readMeta(runner, kind).ctimeMs, null);
+		assert.equal(runner.poll(kind).status, "running");
+	}
+
+	clock.advance(baseJob.timeoutMs + 1);
+	const timeout = { status: "timeout", reason: "unverified", result: null, exitCode: null };
+	for (let i = 0; i < 6; i++) {
+		assert.equal(runner.poll("audit").status, "running");
+		assert.deepEqual(runner.poll("analyst"), timeout);
+	}
+	assert.deepEqual(readMeta(runner, "analyst").final, timeout);
+	assert.equal(readMeta(runner, "audit").final, undefined);
+	assert.equal(lookups.filter((id) => id === "audit").length, 7, "every audit poll retries");
+	assert.equal(calls.length, 2, "neither unverified process is killed");
+});
+
 test("adoptJob writes meta.json from the found process, or reports absent", () => {
 	const found = { pid: 72000, ctimeMs: T - 1000, cmdSha1: "job-process" };
 	const args = laneArgsFor("j1", "lane-1");

@@ -170,30 +170,40 @@ export function atEnd(entry) {
 
 /**
  * Own plus descendants' complete totals via `parentSessionId`, or null when no
- * descendant contributes. Cycle-safe, depth-capped at 8, each id counted once;
- * an incomplete child contributes nothing of its own.
+ * descendant contributes. `totals.complete` reports whether any known descendant
+ * was left out, including rows that have not entered the usage index yet.
  */
-export function treeTotals(entries) {
-	const list = entries instanceof Map ? [...entries.values()] : [...(entries ?? [])];
+export function treeTotals(entries, knownRows = []) {
 	const byId = new Map();
 	const childrenByParent = new Map();
-	for (const entry of list) {
-		if (!isObject(entry) || entry.id === undefined) continue;
+	const link = ({ id, parentSessionId }) => {
+		if (parentSessionId == null) return;
+		const siblings = childrenByParent.get(parentSessionId) ?? new Set();
+		siblings.add(id);
+		childrenByParent.set(parentSessionId, siblings);
+	};
+	for (const entry of (entries instanceof Map ? entries.values() : entries ?? [])) {
+		if (!isObject(entry) || entry.id == null) continue;
 		byId.set(entry.id, entry);
-		if (entry.parentSessionId === undefined || entry.parentSessionId === null) continue;
-		const siblings = childrenByParent.get(entry.parentSessionId) ?? [];
-		siblings.push(entry.id);
-		childrenByParent.set(entry.parentSessionId, siblings);
+		link(entry);
+	}
+	for (const row of knownRows) {
+		if (!isObject(row) || row.id == null) continue;
+		if (!byId.has(row.id)) byId.set(row.id, null);
+		link(row);
 	}
 	const totals = new Map();
+	totals.complete = new Map();
 	for (const id of byId.keys()) {
 		if (!childrenByParent.has(id)) {
 			totals.set(id, null);
+			totals.complete.set(id, true);
 			continue;
 		}
 		const own = compactUsage(byId.get(id));
 		let total = own ? own.total : 0;
 		let hasCountedDescendant = false;
+		let complete = true;
 		const seen = new Set([id]);
 		let frontier = [id];
 		for (let depth = 0; depth < TREE_DEPTH && frontier.length; depth += 1) {
@@ -207,13 +217,20 @@ export function treeTotals(entries) {
 					if (childUsage) {
 						total += childUsage.total;
 						hasCountedDescendant = true;
-					}
+					} else complete = false;
 					next.push(childId);
 				}
 			}
 			frontier = next;
 		}
+		// A depth-limited subtotal is partial if a child beyond the cap was skipped.
+		for (const parentId of frontier) {
+			for (const childId of childrenByParent.get(parentId) ?? []) {
+				if (!seen.has(childId)) complete = false;
+			}
+		}
 		totals.set(id, hasCountedDescendant ? total : null);
+		totals.complete.set(id, complete);
 	}
 	return totals;
 }

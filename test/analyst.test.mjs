@@ -12,9 +12,10 @@ import { ANALYST_SCHEMA, bundleDocument, createAnalyst, parseAnalystOutput, unav
 import { assertGuardFlags, laneArgs, laneModels, modelFamily, modelName, resolveLaneModel } from "../src/judge/lane.mjs";
 import { buildBundle } from "../src/judge/triage.mjs";
 import { resolvePaths } from "../src/paths.mjs";
+import { createRunner } from "../src/runner.mjs";
 import { createFakeClock } from "../src/util/time.mjs";
 import { tmpDir } from "./helpers/fixtures.mjs";
-import { createFakeRunner } from "./fakes/runner.mjs";
+import { createFakeRunner, createRecordingSpawn } from "./fakes/runner.mjs";
 
 const T = Date.parse("2026-10-07T12:00:00Z");
 const MODEL = DEFAULT_CONFIG.analyst.fallbackModel;
@@ -286,6 +287,37 @@ test("maxConcurrent queues the rest; a finished job frees the slot for the next"
 	assert.equal(poll(t, first).verdict, "act", "first done");
 	assert.equal(t.runner.starts.length, 2, "the queue advanced when the slot freed");
 	assert.equal(t.runner.starts[1].jobId, second.jobId);
+});
+
+test("failed argv lookups for an unverified analyst free its slot at the deadline", () => {
+	const t = sandbox({ maxConcurrent: 1, perFinding: 5, perHour: 5 });
+	const { spawnImpl, calls } = createRecordingSpawn();
+	const runner = createRunner({
+		paths: t.paths,
+		clock: t.clock,
+		spawnImpl,
+		isAlive: () => true,
+		identify: () => null,
+		findJobProcess: () => {
+			throw new Error("CIM timed out");
+		},
+	});
+	t.analyst = createAnalyst({ ...t, runner, env: {} });
+	const first = ask(t, finding(1));
+	const second = ask(t, finding(2));
+	const secondMeta = path.join(runner.jobDir(second.jobId), "meta.json");
+	assert.equal(second.queued, true);
+	assert.equal(poll(t, first), undefined);
+	assert.equal(poll(t, first), undefined);
+	assert.equal(calls.length, 1);
+	assert.equal(fs.existsSync(secondMeta), false);
+
+	t.clock.advance(t.config.analyst.timeoutMs + 1);
+	const verdict = poll(t, first);
+	assert.equal(fs.existsSync(secondMeta), true, "the queued analyst starts in the freed slot");
+	assert.deepEqual([verdict?.verdict, verdict?.reason, verdict?.failed], ["escalate", "timeout", true]);
+	assert.deepEqual([runner.poll(first.jobId).status, runner.poll(first.jobId).reason], ["timeout", "unverified"]);
+	assert.equal(calls.length, 2, "the only additional spawn is the queued analyst");
 });
 
 test("budgets: perFinding, perHour and perDay stop new jobs and are not spent by a refused start", () => {

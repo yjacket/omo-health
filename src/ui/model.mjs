@@ -164,6 +164,7 @@ function boardTokenFields(row) {
 	return {
 		tokens: boardTokens(row.tokens),
 		treeTokens: num(row.treeTokens),
+		treeTokensComplete: row.treeTokensComplete === true,
 		tokensPending: row.tokensPending === true,
 		...(["full", "overflow"].includes(row.tokensState) ? { tokensState: row.tokensState } : {}),
 		...(row.treeTokensState === "overflow" ? { treeTokensState: "overflow" } : {}),
@@ -278,7 +279,8 @@ export function endedRow(r, childRows = 0, usage = null, trees = null, full = us
 	const sessionId = ledgerUsageSessionId(r);
 	const entry = !sessionId && ambiguous?.has(r.taskId) ? null : usageEntryFor(usage, sessionId, r.taskId);
 	const tokens = compactUsage(entry);
-	const tree = entry && trees instanceof Map ? trees.get(entry.id) ?? null : null;
+	const treeId = entry?.id ?? r.sessionId;
+	const tree = trees?.get(treeId) ?? null;
 	const overflow = tokens !== null && !Number.isFinite(tokens.total);
 	const treeOverflow = tree !== null && !Number.isFinite(tree);
 	return {
@@ -306,6 +308,7 @@ export function endedRow(r, childRows = 0, usage = null, trees = null, full = us
 		tokensState: overflow ? "overflow" : tokens ? "ok" : entry?.state === "missing" ? "missing" : entry?.state === "full" || (!entry && full) ? "full" : "pending",
 		tokensGone: entry?.gone === true,
 		treeTokens: treeOverflow ? null : tree,
+		treeTokensComplete: trees?.complete?.get(treeId) === true,
 		...(treeOverflow ? { treeTokensState: "overflow" } : {}),
 	};
 }
@@ -330,8 +333,12 @@ export function buildEnded(inputs) {
 	const shownChildren = children.slice(0, ENDED_LIMIT);
 	const selected = new Set([...shownMains, ...shownChildren]);
 	const usage = inputs.usage instanceof Map ? inputs.usage : new Map();
-	const trees = treeTotals(usage);
 	const ambiguous = ambiguousLedgerTaskIds(all);
+	const trees = treeTotals(usage, all.map((row) => {
+		const sessionId = ledgerUsageSessionId(row);
+		const id = sessionId || (!ambiguous.has(row.taskId) && usageEntryFor(usage, null, row.taskId)?.id) || row.sessionId;
+		return { id, parentSessionId: row.parentSessionId };
+	}));
 	return {
 		sinceMs: inputs.now - ENDED_WINDOW_MS,
 		limit: ENDED_LIMIT,

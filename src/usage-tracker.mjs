@@ -41,6 +41,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 	const pendingLive = new Set();
 	const liveHeaders = new Map();
 	let searched = new WeakSet();
+	let liveTreeRows = [];
 	let trees;
 	let backlogLogged = false;
 	let fullLogged = false;
@@ -123,6 +124,11 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 		return { indexed, missing };
 	};
 
+	const totals = () => treeTotals(index.entries(), [
+		...[...ledgerRows.values()].map(({ sessionId, parentSessionId }) => ({ id: sessionId, parentSessionId })),
+		...liveTreeRows,
+	]);
+
 	return {
 		/**
 		 * Queue ledger rows that need bytes, newest first: unindexed rows, rows whose
@@ -133,6 +139,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 		 */
 		queueLedger(rows) {
 			searched = new WeakSet();
+			trees = undefined;
 			const cutoff = nowMs() - 30 * DAY_MS;
 			// The daemon passes a stream for the daily window and an array
 			// for live exits. Only sweep the old window on refresh.
@@ -240,7 +247,14 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 					queue.delete(id);
 				}
 			}
-			trees = treeTotals(index.entries());
+			liveTreeRows = [
+				...liveSessions.values(),
+				...(world?.tasks ?? []).map(({ childSessionId, taskId, parentSessionId }) => ({
+					id: childSessionId || index.get(null, taskId)?.id || taskId,
+					parentSessionId,
+				})),
+			];
+			trees = totals();
 			const state = counts();
 			if (index.full && !fullLogged) {
 				fullLogged = true;
@@ -255,21 +269,24 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 		},
 
 		/**
-		 * The board's lookup: `{tokens, treeTokens}` for a complete entry
+		 * The board's lookup: `{tokens, treeTokens, treeTokensComplete}` for a complete entry
 		 * (`treeTokens` is non-null when at least one descendant has a counted total),
 		 * `{pending:true}` while a live header probe or first read is deferred or
 		 * an entry's first full read has not finished, and null when nothing is known.
 		 * A counted descendant can supply a tree total even without an own total.
 		 */
 		tokensOf(sessionId, taskId) {
-			if (pendingLive.has(sessionId)) return { pending: true };
 			const entry = index.get(sessionId, taskId);
-			if (!entry) return null;
-			const treeTokens = (trees ?? treeTotals(index.entries())).get(entry.id) ?? null;
-			const tree = treeTokens === null ? {} : { treeTokens };
+			const id = entry?.id ?? sessionId;
+			trees ??= totals();
+			const treeTokens = trees.get(id) ?? null;
+			const treeTokensComplete = trees.complete.get(id) === true;
+			const tree = treeTokens === null ? {} : { treeTokens, treeTokensComplete };
+			if (pendingLive.has(sessionId)) return { pending: true, ...tree };
+			if (!entry) return treeTokens === null ? null : tree;
 			if (entry.state === "full") return { state: "full", ...tree };
 			const tokens = compactUsage(entry);
-			if (tokens) return { tokens, treeTokens };
+			if (tokens) return { tokens, treeTokens, treeTokensComplete };
 			if (entry.state === "ok" && entry.readError !== true) return { pending: true, ...tree };
 			return treeTokens === null ? null : tree;
 		},

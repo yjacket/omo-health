@@ -73,13 +73,32 @@ function labelledChild(child) {
 	};
 }
 
-function detailTokens(tokens) {
+function detailTokens(tokens, children) {
 	if (!tokens) return tokens;
-	// The record's treeTotal is null when no descendant contributed, not when the sum equals the own total.
+	// The record joins ledger-only descendants as well as index entries in `children`.
+	// Sum that same set so a ledger link missing from the index does not hide a counted child.
+	let treeTotal = tokens.total ?? 0;
+	let counted = false;
+	let treeTokensComplete = true;
+	const seen = new Set();
+	for (const child of children) {
+		const id = child.sessionId ?? child.taskId;
+		if (typeof child.tokens?.total !== "number") {
+			treeTokensComplete = false;
+			continue;
+		}
+		if (id != null && seen.has(id)) continue;
+		if (id != null) seen.add(id);
+		counted = true;
+		treeTotal += child.tokens.total;
+	}
+	if (!counted) treeTotal = tokens.treeTotal ?? null;
 	return {
 		...tokens,
+		treeTotal: overflows(treeTotal) ? null : treeTotal,
+		treeTokensComplete,
 		...(overflows(tokens.total) ? { total: null, tokensState: "overflow" } : {}),
-		...(overflows(tokens.treeTotal) ? { treeTotal: null, treeTokensState: "overflow" } : {}),
+		...(overflows(treeTotal) ? { treeTokensState: "overflow" } : {}),
 	};
 }
 
@@ -124,11 +143,12 @@ export function buildSessionView(record, extras = {}) {
 	const audit = labelledAudit(auditExtra !== undefined ? auditExtra : record.audit ?? null);
 	if (record.found === false) return { ...record, audit, ...rest };
 	const health = isRecord(record.health) ? record.health : {};
+	const children = list(record.children);
 	return {
 		...record,
 		session: labelledSession(record.session),
-		...("tokens" in record ? { tokens: detailTokens(record.tokens) } : {}),
-		children: list(record.children).map(labelledChild),
+		...("tokens" in record ? { tokens: detailTokens(record.tokens, children) } : {}),
+		children: children.map(labelledChild),
 		health: {
 			...health,
 			findings: list(health.findings).map(labelledFinding),

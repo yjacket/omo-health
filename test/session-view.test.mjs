@@ -123,6 +123,33 @@ describe("session view", () => {
 		assert.deepEqual(tokens.map((entry) => endedTokenBlock(entry)?.text), ["자식 포함 10", "자식 포함 7", undefined, undefined]);
 	});
 
+	it("detail tree completeness reflects ledger-only and indexed descendants", () => {
+		const root = tmpDir("session-view-partial-");
+		const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health") });
+		const row = { kind: "main", outcome: "completed", startedMs: T0 - 1000, endedMs: T0 };
+		const ledgerChild = { kind: "child", taskId: "st_pending", parentSessionId: "s-main" };
+		appendEnded(paths, { ...row, sessionId: "s-main" }, { nowMs: T0 });
+		appendEnded(paths, { ...row, ...ledgerChild, sessionId: "pending" }, { nowMs: T0 });
+		const index = createUsageIndex({ file: paths.health.usageIndexFile, clock: { now: () => T0 } });
+		const count = (id, input, meta) => {
+			const file = path.join(root, `${id}.jsonl`);
+			fs.writeFileSync(file, `${JSON.stringify({ type: "usage", provider: "p", model: "m", usage: { input } })}\n`);
+			index.update(id, file, meta);
+		};
+		const total = () => {
+			index.save();
+			const { treeTotal, treeTokensComplete } = buildSessionView(loadSessionRecord({ paths, id: "s-main", now: T0 })).tokens;
+			return [treeTotal, treeTokensComplete];
+		};
+		count("s-main", 100, { kind: "main" });
+		count("counted", 20, { kind: "child", parentSessionId: "s-main" });
+		assert.deepEqual(total(), [120, false]);
+		count("pending", 0, ledgerChild);
+		assert.deepEqual(total(), [120, true]);
+		index.markMissing("missing", { kind: "child", parentSessionId: "s-main" });
+		assert.deepEqual(total(), [120, false]);
+	});
+
 	it("detail overflow survives index reload and JSON, and renders on the token block and child row", () => {
 		const root = tmpDir("session-view-overflow-");
 		const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health") });

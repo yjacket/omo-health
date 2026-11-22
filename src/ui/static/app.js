@@ -213,6 +213,9 @@
 	function treeTokenMark(row, className) {
 		if (row.treeTokensState !== "overflow" && !Number.isFinite(row.treeTokens)) return null;
 		const reading = tokenReading(row.treeTokensState ?? "ok", row.treeTokens);
+		if (row.treeTokensState !== "overflow" && row.treeTokensComplete === false) {
+			return el("span", { class: className, title: "세지 못한 자식이 있어 일부만 더한 값입니다", text: `자식 포함 ${reading.text}+` });
+		}
 		return el("span", { class: className, title: reading.title, text: `자식 포함 ${reading.text}` });
 	}
 
@@ -541,7 +544,7 @@
 	}
 
 	function endedTokenBlock(t) {
-		return block("토큰", endedTokenFacts(t), treeTokenMark({ treeTokens: t?.treeTotal, treeTokensState: t?.treeTokensState }, "ended__meta"));
+		return block("토큰", endedTokenFacts(t), treeTokenMark({ treeTokens: t?.treeTotal, treeTokensComplete: t?.treeTokensComplete, treeTokensState: t?.treeTokensState }, "ended__meta"));
 	}
 
 	function endedChild(c) {
@@ -727,7 +730,7 @@
 	}
 
 	function endedTokenSignature(r) {
-		return JSON.stringify([r.tokensState, r.tokens?.total, r.treeTokens, r.treeTokensState]);
+		return JSON.stringify([r.tokensState, r.tokens?.total, r.treeTokens, r.treeTokensComplete, r.treeTokensState]);
 	}
 
 	function endedDetailSignature(r) {

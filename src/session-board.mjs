@@ -128,8 +128,8 @@ function countChildren(rows) {
  * @param {object[]} findings open findings of this tick
  * @param {object[]} investigations investigation records (createInvestigations().list())
  * @param {number} nowMs
- * @param {{tokensOf?: (sessionId: string | null, taskId: string | null) => ({tokens?: object, treeTokens?: number | null, pending?: boolean, state?: "full"} | null | undefined)}} [options]
- *   tokensOf is the injected token index lookup: `{tokens, treeTokens}` for an indexed session, `{state:"full"}` when the
+ * @param {{tokensOf?: (sessionId: string | null, taskId: string | null) => ({tokens?: object, treeTokens?: number | null, treeTokensComplete?: boolean, pending?: boolean, state?: "full"} | null | undefined)}} [options]
+ *   tokensOf is the injected token index lookup: `{tokens, treeTokens, treeTokensComplete}` for an indexed session, `{state:"full"}` when the
  *   index refused the session, `{pending:true}` while its first read has not reached the end of the file, null when it is
  *   unknown. Task id is a fallback only for an unambiguous visible row without a session id. Rows carry `tokensState: "full"` for refusal
  *   or `tokensState` / `treeTokensState` of `"overflow"` for a non-finite total. A tree total can exist without an own total.
@@ -143,6 +143,7 @@ export function buildSessionSnapshot(world, findings = [], investigations = [], 
 		return {
 			tokens: overflow ? { ...tokens, total: null } : tokens,
 			treeTokens: treeOverflow ? null : tree,
+			treeTokensComplete: entry?.treeTokensComplete === true,
 			tokensPending: entry?.pending === true,
 			...(overflow ? { tokensState: "overflow" } : entry?.state === "full" ? { tokensState: "full" } : {}),
 			...(treeOverflow ? { treeTokensState: "overflow" } : {}),

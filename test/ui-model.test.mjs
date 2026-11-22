@@ -471,6 +471,33 @@ it("(IS-3) history renders a second line for equal and lower tree totals, but no
 	}), [[10, rows[0][2]], [7, rows[1][2]], [null, rows[2][2]]]);
 });
 
+it("history marks a partial tree with the required text and title", () => {
+	const { paths, env } = makeHome();
+	const row = { kind: "main", startedMs: NOW - HOUR, endedMs: NOW, outcome: "completed" };
+	for (const id of ["partial", "complete"]) appendEnded(paths, { ...row, sessionId: id }, { nowMs: NOW });
+	appendEnded(paths, { ...row, kind: "child", sessionId: "pending", taskId: "st_pending", parentSessionId: "partial" }, { nowMs: NOW });
+	overflowIndex(paths, [["partial", "100"], ["counted-p", "20", "partial"], ["complete", "100"], ["counted-c", "20", "complete"]]);
+	const history = new Map(JSON.parse(JSON.stringify(uiState({ paths, env, now: NOW }))).ended.rows.map((row) => [row.sessionId, row]));
+	const { endedTokenCell } = tokenFormatters("endedTokenCell");
+	const actual = ["partial", "complete"].map((id) => {
+		const row = history.get(id);
+		const mark = endedTokenCell(row).children[1];
+		return [mark.text, mark.title, row.treeTokens, row.treeTokensComplete];
+	});
+	assert.deepEqual(actual, [
+		["자식 포함 120+", "세지 못한 자식이 있어 일부만 더한 값입니다", 120, false],
+		["자식 포함 120", "120", 120, true],
+	]);
+});
+
+it("a completeness-only history change refreshes the detail", () => {
+	const { endedTokenSignature } = endedDetailFunctions(["endedTokenSignature"]);
+	assert.notEqual(
+		endedTokenSignature({ ...readyTokens, treeTokensComplete: false }),
+		endedTokenSignature({ ...readyTokens, treeTokensComplete: true }),
+	);
+});
+
 it("(gate 17) the disk-backed full state renders a dash in history, detail, and child rows until recount", () => {
 	const { paths } = makeHome();
 	const file = paths.health.usageIndexFile;

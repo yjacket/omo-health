@@ -975,8 +975,50 @@ test("tokensOf reports a raised tree total for a parent and no tree total for a 
 		s.tracker.queueLedger([row]);
 	}
 	s.tracker.tick(emptyWorld(s.clock));
-	assert.deepEqual(s.tracker.tokensOf("p2"), { tokens: compactUsage(s.index.get("p2")), treeTokens: 16 });
-	assert.deepEqual(s.tracker.tokensOf("c2"), { tokens: compactUsage(s.index.get("c2")), treeTokens: null });
+	assert.deepEqual(s.tracker.tokensOf("p2"), { tokens: compactUsage(s.index.get("p2")), treeTokens: 16, treeTokensComplete: true });
+	assert.deepEqual(s.tracker.tokensOf("c2"), { tokens: compactUsage(s.index.get("c2")), treeTokens: null, treeTokensComplete: true });
+});
+
+test("tree token completeness follows pending siblings and never counts a missing sibling as complete", () => {
+	const s = setup();
+	for (const parent of ["ready", "missing", "live"]) {
+		const file = mainFile(s.paths, parent);
+		const child = `${parent}-counted`;
+		writeJsonl(file, [E.assistant({ ms: T0, usage: usage(100) })]);
+		s.index.update(parent, file, { kind: "main" });
+		const counted = childFile(s.cwd, `st_${child}`, child);
+		writeJsonl(counted, [E.assistant({ ms: T0, usage: usage(20) })]);
+		s.index.update(child, counted, { kind: "child", parentSessionId: parent });
+	}
+	const ready = { sessionId: "ready-sibling", taskId: "st_ready", kind: "child", parentSessionId: "ready", cwd: s.cwd, endedMs: T0 };
+	const missing = { ...ready, sessionId: "missing-sibling", taskId: "st_missing", parentSessionId: "missing" };
+	const transcript = childFile(s.cwd, ready.taskId, ready.sessionId);
+	writeJsonl(transcript, [E.assistant({ ms: T0, usage: usage(5) })]);
+	const world = makeWorld({
+		now: T0,
+		sessions: [
+			sessionState({ id: "ready", startedMs: T0 - 5000 }),
+			sessionState({ id: "live-sibling", kind: "child", parentSessionId: "live", file: null }),
+		],
+		sensors: [{ sessionId: "ready", pid: 100, ts: T0 - 1000, idle: true, executingTools: 0 }],
+		procsFresh: true,
+	});
+	const tree = (id) => {
+		const { treeTokens, treeTokensComplete } = s.tracker.tokensOf(id);
+		return [treeTokens, treeTokensComplete];
+	};
+	s.tracker.queueLedger([ready, missing]);
+	assert.equal(s.index.get(ready.sessionId), undefined);
+	assert.deepEqual(tree("ready"), [120, false], "the queued sibling is known before entering the index");
+	s.tracker.tick(world);
+	assert.deepEqual(tree("ready"), [125, true], "the tree becomes complete after the sibling's read");
+	assert.equal(s.index.get(missing.sessionId).state, "missing");
+	assert.deepEqual(tree("missing"), [120, false]);
+	assert.deepEqual(tree("live"), [120, false], "a live sibling with no index entry still makes the tree partial");
+	s.tracker.tick(world);
+	assert.deepEqual(tree("missing"), [120, false], "later ticks do not make a missing sibling complete");
+	const [row] = buildSessionSnapshot(world, [], [], T0, { tokensOf: s.tracker.tokensOf }).groups[0].sessions;
+	assert.deepEqual([row.treeTokens, row.treeTokensComplete], [125, true]);
 });
 
 test("(IS-2) the board snapshot includes equal and lower tree totals, but not uncounted descendants", (t) => {
