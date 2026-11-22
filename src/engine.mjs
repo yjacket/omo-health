@@ -1236,6 +1236,8 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 			} else if (!record.logged) {
 				decision({ fp: finding.fp, detector: finding.detector, kind: finding.kind, cls: finding.cls, severity: finding.severity, event: "opened", subject: finding.subject, evidence: finding.evidence });
 				record.logged = true;
+			} else if (SEVERITY_RANK[finding.severity] > SEVERITY_RANK[previousSeverity]) {
+				decision({ event: "severity", fp: finding.fp, detector: finding.detector, kind: finding.kind, cls: finding.cls, severity: finding.severity, titleKo: finding.titleKo, subject: finding.subject, evidence: finding.evidence });
 			}
 			if (finding.severity !== "info" && (previousResolvedMs || !record.openedForSupervision)) {
 				opened.push(finding);

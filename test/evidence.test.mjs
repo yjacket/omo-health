@@ -102,8 +102,8 @@ test("an info stall is logged but snapshots only when it first becomes warn", as
 	const s = setup();
 	const clock = createFakeClock(T + 12 * 60_000);
 	const { sessions } = s.world(clock.now());
-	const info = makeFinding({ detector: "D1", kind: "stall", severity: "info", subject: { sessionId: "c1" } });
-	const warn = { ...info, severity: "warn" };
+	const info = makeFinding({ detector: "D1", kind: "stall", severity: "info", subject: { sessionId: "c1" }, evidence: ["count:1"] });
+	const warn = { ...info, severity: "warn", titleKo: "멈춤 경고", evidence: ["count:6"] };
 	const warnOnly = makeFinding({ detector: "D1", kind: "stall", severity: "warn", subject: { sessionId: "c1", key: "warn-only" } });
 	let findings = [info, warnOnly];
 	const makeEngine = () => createEngine({
@@ -124,12 +124,14 @@ test("an info stall is logged but snapshots only when it first becomes warn", as
 		clock.advance(20_000);
 		return result.opened.map((f) => f.fp);
 	};
-	const lifecycle = () => readDecisions(s.paths).filter((d) => d.fp === info.fp).map((d) => d.event);
+	const decisions = () => readDecisions(s.paths).filter((d) => d.fp === info.fp);
+	const lifecycle = () => decisions().map((d) => d.event);
 	const snapshots = (fp) => listDirSafe(s.dir).filter((name) => name.endsWith(`-${fp.slice(0, 8)}.json`))
 		.map((name) => JSON.parse(fs.readFileSync(path.join(s.dir, name), "utf8")));
 
 	const opened = await tick();
 	assert.deepEqual(lifecycle(), ["opened"]);
+	assert.deepEqual([decisions()[0].severity, decisions()[0].evidence], ["info", info.evidence]);
 	assert.deepEqual(snapshots(info.fp).map((snap) => snap.reason.severity), [], "info writes no snapshot");
 	assert.deepEqual(opened, [warnOnly.fp]);
 	assert.deepEqual(snapshots(warnOnly.fp).map((snap) => snap.reason.severity), ["warn"]);
@@ -148,13 +150,22 @@ test("an info stall is logged but snapshots only when it first becomes warn", as
 	findings = [warn, warnOnly];
 	const promotedMs = clock.now();
 	assert.deepEqual(await tick(), [info.fp], "promotion opens for snapshots without reopening the decision");
+	const afterPromotion = decisions();
+	assert.equal(snapshots(info.fp).length, 1, "the promotion tick writes exactly one snapshot");
 	assert.deepEqual(await tick(), [], "remaining at warn does not open again");
 	const [snapshot] = snapshots(info.fp);
 	assert.deepEqual([snapshot.reason.fp, snapshot.reason.severity, snapshot.atMs], [info.fp, "warn", promotedMs]);
 	assert.equal(snapshot.outputs.find((o) => o.file === s.file).samples.length, 2, "only the warning capture is followed");
 	assert.equal(snapshots(info.fp).length, 1);
 	assert.equal(snapshots(warnOnly.fp).length, 1);
-	assert.deepEqual(lifecycle(), ["opened", "resolved", "reopened"]);
+	assert.deepEqual(lifecycle(), ["opened", "resolved", "reopened", "severity"]);
+	assert.deepEqual(decisions(), afterPromotion, "remaining at warn writes no decision");
+	const { event, fp, detector, kind, severity, titleKo, subject, evidence: recordedEvidence, ts } = afterPromotion.at(-1);
+	assert.deepEqual({ event, fp, detector, kind, severity, titleKo, subject, evidence: recordedEvidence, ts }, {
+		event: "severity", fp: info.fp, detector: warn.detector, kind: warn.kind, severity: warn.severity,
+		titleKo: warn.titleKo, subject: warn.subject, evidence: warn.evidence, ts: iso(promotedMs),
+	});
+	assert.equal(engine.snapshotState().records.find((r) => r.fp === info.fp).firstSeenMs, saved.records.find((r) => r.fp === info.fp).firstSeenMs);
 });
 
 test("a restarted daemon does not snapshot a finding again within ten minutes (#82)", () => {

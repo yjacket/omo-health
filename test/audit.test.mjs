@@ -258,6 +258,31 @@ test("the bundle carries no seeded secret text but keeps the numeric metric coun
 	assert.equal(bundle.omo_health_record.findings[0].droppedEvidence, 2);
 });
 
+test("IS-8: the audit bundle keeps warning severity and structured evidence from a severity decision", (t) => {
+	const root = tmpDir("omoh-audit-severity-");
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "h") });
+	const row = { sessionId: "s1", kind: "main", startedMs: T0, endedMs: T0 + HOUR };
+	appendEnded(paths, row);
+	const subject = { sessionId: row.sessionId };
+	const base = { fp: "fp-rise", detector: "D1", kind: "stall", subject };
+	const ts = iso(T0 + 60_000);
+	appendDecision(paths, { ...base, event: "opened", severity: "info", ts: iso(T0), evidence: ["count:1"] });
+	appendDecision(paths, { ...base, event: "severity", severity: "warn", ts, titleKo: "QA-PRIVATE-TITLE", evidence: ["count:6", "QA-PRIVATE-EVIDENCE"] });
+	const record = loadSessionRecord({ paths, id: row.sessionId, now: row.endedMs, auditRetention: true });
+	const bundle = auditBundle(record, null, { config: DEFAULT_CONFIG, now: row.endedMs });
+	const findings = bundle.omo_health_record.findings;
+	assert.deepEqual(findings.map(({ event, severity, metrics }) => [event, severity, metrics]), [
+		["severity", "warn", { count: "6" }],
+		["opened", "info", { count: "1" }],
+	]);
+	assert.deepEqual(findings[0], {
+		ref: "F1", ts, event: "severity", detector: "D1", kind: "stall", severity: "warn", scope: "session",
+		subject: { sessionId: "s1", taskId: null }, metrics: { count: "6" }, droppedEvidence: 1,
+	});
+	assert.doesNotMatch(JSON.stringify(bundle), /QA-PRIVATE/);
+});
+
 test("(plan 37) the audit bundle omits the final sentence retained in the local record", () => {
 	const row = { sessionId: "s1", kind: "main", startedMs: T0, endedMs: T0 + HOUR };
 	const finalSentence = "This final sentence is for the owner only.";

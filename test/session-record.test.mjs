@@ -136,6 +136,48 @@ const ohealth = (ms, text) => ({ type: "custom_message", customType: "omo-health
 const mainRow = (extra = {}) => ({ sessionId: "s-main", kind: "main", parentSessionId: null, taskId: null, title: "main", cwd: "C:/work/a", terminal: { kind: "wt" }, omoVersion: "0.8.0", startedMs: T0, endedMs: T0 + 2 * HOUR, childCount: 2, ...extra });
 const childRow = (sessionId, taskId, parentSessionId, extra = {}) => ({ sessionId, kind: "child", parentSessionId, taskId, title: sessionId, cwd: "C:/work/a", terminal: null, omoVersion: null, startedMs: T0 + 10 * MIN, endedMs: T0 + 70 * MIN, ...extra });
 
+test("IS-7: ancestor detail retains both task-only descendants with the same task id", (t) => {
+	const { root, paths } = setup();
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const main = mainRow({ cwd: root });
+	const taskId = "st_x";
+	const parents = [1, 2].map((i) => childRow(`s-parent-${i}`, `st_parent_${i}`, main.sessionId, { cwd: path.join(root, `project-${i}`) }));
+	const children = parents.map(({ sessionId, cwd }) => childRow(taskId, taskId, sessionId, { cwd }));
+	const messages = children.map(({ cwd }, i) => {
+		const message = ohealth(T0 + (i + 1) * MIN, `notice from project ${i + 1}`);
+		childSessionFile(cwd, taskId, `s-transcript-${i + 1}`, [message]);
+		return message;
+	});
+	writeLedger(paths, [main, ...parents, ...children]);
+	const fallback = { id: "s-transcript-1", taskId, state: "ok", published: { total: 42 } };
+	const index = new Map([
+		...parents.map(({ sessionId, taskId, parentSessionId }) => [sessionId, { id: sessionId, taskId, parentSessionId }]),
+		[fallback.id, fallback],
+	]);
+	assert.equal(sessionRecord.usageEntryOf(index, children[0])?.published.total, 42);
+	const options = { paths, id: main.sessionId, now: main.endedMs, index };
+	const full = buildSessionView(loadSessionRecord(options));
+	const bounded = loadSessionRecord({ ...options, auditRetention: true });
+	const pure = buildSessionRecord({ row: main, ledger: [main, ...parents, ...children], usage: index });
+	const childDetails = (record) => record.children
+		.map(({ sessionId, parentSessionId, tokens }) => [sessionId, parentSessionId, tokens])
+		.sort();
+	const expectedChildren = [...parents, ...children].map(({ sessionId, parentSessionId }) => [sessionId, parentSessionId, null]).sort();
+	assert.deepEqual({
+		children: childDetails(full),
+		messages: full.health.messages.map(({ recipient, text }) => [recipient, text]),
+		boundedCount: bounded.health.counts.messages,
+		boundedMessages: bounded.health.messages.map(({ ms, kind }) => [ms, kind]),
+		pureChildren: childDetails(pure),
+	}, {
+		children: expectedChildren,
+		messages: messages.toReversed().map(({ content }) => [taskId, content]),
+		boundedCount: 2,
+		boundedMessages: messages.toReversed().map(({ timestamp, details }) => [Date.parse(timestamp), details.kind]),
+		pureChildren: expectedChildren,
+	});
+});
+
 for (const auditRetention of [false, true]) {
 	test(`IS-8: the ${auditRetention ? "bounded" : "full"} record keeps only valid delivered message kinds`, () => {
 		const { paths } = setup();
@@ -564,6 +606,25 @@ test("a machine-wide finding inside the window is included with scope machine, o
 	const machine = record.health.findings.filter((item) => item.scope === "machine");
 	assert.deepEqual(machine.map((item) => item.fp), ["fp-machine-in"]);
 	assert.equal(machine[0].ts, iso(T0 + HOUR));
+});
+
+test("IS-7: a severity rise is a finding row with its own evidence, not a new incident", () => {
+	const row = mainRow();
+	const cases = [
+		{ subject: { sessionId: row.sessionId }, scope: "session" },
+		{ subject: { key: "machine" }, scope: "machine" },
+	];
+	for (const { subject, scope } of cases) {
+		const base = { fp: "fp-rise", detector: "D1", kind: "stall", subject };
+		const opened = { ...base, event: "opened", severity: "info", ts: iso(T0 - MIN), titleKo: "관찰", evidence: ["count:1"] };
+		const promoted = { ...base, event: "severity", severity: "warn", ts: iso(T0 + MIN), titleKo: "멈춤 경고", evidence: ["count:6", "The stall persisted."] };
+		const resolved = { ...base, event: "resolved", ts: iso(T0 + 2 * MIN) };
+		const { findings } = buildSessionRecord({ row, decisions: [opened, promoted, resolved] }).health;
+		assert.deepEqual(findings.filter((f) => f.event !== "resolved"), [
+			{ ...promoted, scope },
+			{ ...opened, scope },
+		], scope);
+	}
 });
 
 test("a machine outage opened before the session and resolved during it is included; one resolved before the start is not", () => {
