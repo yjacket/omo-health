@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import { deflateRawSync, inflateRawSync } from "node:zlib";
 import { safeSubjectId } from "./session-id.mjs";
+import { readJsonSafe } from "./util/fsx.mjs";
 
 // Adjacent ledger rows often share a cwd (including large audit families).
 // Bound the memo to one path so walking unrelated projects does not intern them for life.
@@ -31,6 +32,26 @@ export function subjectOf(row, parent) {
 		projectKey: row?.projectKey ?? projectKeyOf(row?.cwd) ?? parent?.projectKey ?? null,
 		sessionId: row?.sessionId ?? row?.id ?? null,
 	};
+}
+
+/** Read exact identities, not the dashboard's redacted display paths. */
+export function boardLiveOwners(paths) {
+	const snapshot = readJsonSafe(paths.health.sessionsSnapshotFile);
+	const owners = new Map();
+	const walk = (rows, parent, depth = 0) => {
+		if (!Array.isArray(rows) || depth > 8) return;
+		for (const row of rows) {
+			if (!row) continue;
+			const owner = subjectOf(row, parent);
+			const active = !depth || (row.endedMs == null && ["running", "queued", "pending", "starting", "spawning"].includes(row.status));
+			if (active && owner.projectKey && typeof owner.sessionId === "string" && owner.sessionId) owners.set(subjectKey(owner), owner);
+			walk(row.children, owner, depth + 1);
+		}
+	};
+	if (snapshot?.v === 1 && Array.isArray(snapshot.groups)) {
+		for (const group of snapshot.groups) walk(group?.sessions);
+	}
+	return [...owners.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([, owner]) => owner);
 }
 
 export function subjectKey(subject) {

@@ -7,7 +7,7 @@ import { createInvestigations } from "./investigations.mjs";
 import { auditBundle, auditDocument, detectorFindingRefs, firedDetectors, hasDetectorCoverage, resolveAuditModel, validateAudit } from "./judge/audit.mjs";
 import { ANALYST_POLL_MS, parseAnalystOutput, unavailableReason } from "./judge/analyst.mjs";
 import { laneArgs } from "./judge/lane.mjs";
-import { auditFileKey, subjectKey, subjectOf } from "./session-subject.mjs";
+import { auditFileKey, boardLiveOwners, subjectKey, subjectOf } from "./session-subject.mjs";
 import { collectAnalystDecisionModels, configDecisionFact, recoverPendingAnalystModels, usageEntryOf } from "./session-record.mjs";
 import { auditReasonLabel } from "./ui/labels.mjs";
 import { fresh, isSpillModelKey, readUsageIndex, relatedUsageEntries } from "./usage-index.mjs";
@@ -516,6 +516,7 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		}
 	}
 
+	let liveOwners;
 	function startPreparation(record, now, changedVersions = 0) {
 		if (config.audit?.enabled !== true) return fail(record, "disabled", null, now);
 		pending = { record, changedVersions, ...Promise.withResolvers() };
@@ -543,7 +544,9 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 			const source = index ?? readUsageIndex(paths.health.usageIndexFile);
 			// The record loader checks scoped ownership at each edge. A unique parent may
 			// have a child whose cwd is in another project, so preserve its candidate entries.
-			worker.postMessage({ subject: subjectOf(record), now, indexEntries: relatedUsageEntries(source, record.sessionId), indexFull: source?.full === true, bounds: {
+			// The daemon publishes its live board before ticking the auditor.
+			const owners = liveOwners ?? boardLiveOwners(paths);
+			worker.postMessage({ subject: subjectOf(record), now, liveOwners: owners, indexEntries: relatedUsageEntries(source, record.sessionId), indexFull: source?.full === true, bounds: {
 				preparationMaxBytes: TIMELINE_MAX_BYTES + MESSAGE_SCAN_TOTAL_BYTES,
 				messageScanMaxBytes: timelineMaxBytes, messageScanTotalBytes: MESSAGE_SCAN_TOTAL_BYTES,
 				descendantScanMax: DESCENDANT_SCAN_MAX, tokens: config.tokens,
@@ -693,7 +696,8 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 			pending = undefined;
 			return owner?.terminate();
 		},
-		tick(now) {
+		tick(now, owners) {
+			liveOwners = owners;
 			intake(now);
 			startNext(now);
 			poll(now);

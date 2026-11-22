@@ -1191,9 +1191,12 @@ describe("ui server", { timeout: 20_000 }, () => {
 				const world = makeWorld({ sessionId, total: 17 });
 				const { paths, env, now } = world;
 				const ui = createUiServer({ paths, token: TOKEN, getState: () => uiState({ paths, env, now: now() }),
-					sessionDetail: world.detail, startAudit: world.startAudit, now });
+					sessionDetail: world.detail, startAudit: world.startAudit, diagnose: () => assert.fail("ambiguous ID reached diagnosis"), now });
+				const starts = [];
+				const auditor = createAuditor({ paths, env, clock: { now }, config: loadConfig({ paths, env }).config,
+					runner: { start(job) { starts.push(job); return { jobId: job.jobId, pid: 5000 }; } } });
 				t.after(async () => {
-					await Promise.all([ui.close(), world.detail.close()]);
+					await Promise.all([ui.close(), world.detail.close(), auditor.close()]);
 					fs.rmSync(world.dir, { recursive: true, force: true });
 				});
 				const oldCwd = path.join(world.dir, "old-project");
@@ -1217,9 +1220,15 @@ describe("ui server", { timeout: 20_000 }, () => {
 				const urlOf = runInNewContext(`(${app.match(/function endedDetailUrl\([^]*?\n\t\}/)[0]})`);
 				const url = urlOf(row);
 				const bareUrl = `/api/session?id=${sessionId}`;
-				const bare = await getAt(port, bareUrl);
-				// The server also resolves IDs within 30 days; the older twin is not ambiguous.
-				assert.deepEqual([bare.status, bare.body.tokens?.total], [200, 17]);
+				for (const { status, body } of [
+					await getAt(port, bareUrl),
+					await getAt(port, `/api/diagnose?id=${sessionId}`),
+					await postAt(port, "/api/audit", { sessionId }),
+				]) assert.deepEqual([status, body.error], [409, "ambiguous-session"]);
+				auditor.tick(now());
+				assert.equal(starts.length, 0);
+				assert.equal(fs.existsSync(paths.health.auditRequestsDir), false);
+				assert.equal(fs.existsSync(paths.health.auditBudgetFile), false);
 				const { status, body } = await getAt(port, url);
 				assert.deepEqual([status, body.tokens?.total, body.counts?.children, body.children?.length], [200, 17, 51, 50]);
 				const selector = expectedSelector({ sessionId, cwd: world.dir, endedMs: now() });
@@ -1230,6 +1239,12 @@ describe("ui server", { timeout: 20_000 }, () => {
 				const posted = await postAt(port, "/api/audit", { sessionId, row: row.rowSelector });
 				assert.deepEqual([posted.status, posted.body.audit?.status], [202, "queued"]);
 				assert.ok(fs.existsSync(path.join(paths.health.auditRequestsDir, `${auditFileKey(sub(sessionId, world.dir))}.json`)));
+				auditor.tick(now());
+				await auditor.preparing();
+				auditor.tick(now());
+				assert.equal(starts.length, 1, JSON.stringify(readAuditState(paths, sub(sessionId, world.dir))));
+				assert.equal(readAuditState(paths, sub(sessionId, world.dir)).status, "running");
+				assert.equal(readAuditState(paths, sub(sessionId, oldCwd)), null);
 
 				// A twin inside the server's lookup window still makes a bare ID ambiguous.
 				assert.equal(appendEnded(paths, { sessionId, cwd: oldCwd, kind: "main",
@@ -1238,6 +1253,44 @@ describe("ui server", { timeout: 20_000 }, () => {
 				assert.deepEqual([ambiguous.status, ambiguous.body.error], [409, "ambiguous-session"]);
 				const bareAudit = await postAt(port, "/api/audit", { sessionId });
 				assert.deepEqual([bareAudit.status, bareAudit.body.error], [409, "ambiguous-session"]);
+			});
+
+			it("plan92: a live twin's finding is withheld in cached detail and the daemon audit bundle before it ends", async (t) => {
+				const sessionId = "review.1";
+				const world = makeWorld({ sessionId, total: 17 });
+				const { paths, env, now, nowMs, dir } = world;
+				const starts = [];
+				const auditor = createAuditor({ paths, env, clock: { now }, config: loadConfig({ paths, env }).config,
+					runner: { start(job) { starts.push(job); return { jobId: job.jobId, pid: 5000 }; } } });
+				const ui = createUiServer({ paths, token: TOKEN, getState: () => STATE, sessionDetail: world.detail, startAudit: world.startAudit, now });
+				t.after(async () => {
+					await Promise.all([ui.close(), auditor.close()]);
+					fs.rmSync(dir, { recursive: true, force: true });
+				});
+				appendDecision(paths, { ts: new Date(nowMs).toISOString(), event: "opened", detector: "D1", severity: "warn",
+					fp: "live-twin-finding", subject: { sessionId } });
+				const { port } = await ui.listen();
+				const row = expectedSelector({ sessionId, cwd: dir, endedMs: nowMs });
+				const detail = () => getAt(port, `/api/session?id=${sessionId}&row=${row}`);
+				assert.deepEqual((await detail()).body.health.findings.map(({ fp }) => fp), ["live-twin-finding"]);
+
+				const cwd = path.join(dir, "live-project");
+				writeJson(paths.health.sessionsSnapshotFile, { v: 1, ts: nowMs, groups: [{ sessions: [{ sessionId, cwd }] }] });
+				assert.equal(readEnded(paths).filter((entry) => entry.sessionId === sessionId).length, 1);
+				const { status, body } = await detail();
+				const withheld = { findings: 1, actions: 0, verdicts: 0, investigations: 0 };
+				assert.equal(status, 200);
+				assert.deepEqual(body.health.findings, []);
+				assert.deepEqual(body.truncated.unattributedHealth, withheld);
+				assert.equal((await postAt(port, "/api/audit", { sessionId, row })).status, 202);
+				auditor.tick(now());
+				await auditor.preparing();
+				auditor.tick(now());
+				assert.equal(starts.length, 1, JSON.stringify(readAuditState(paths, sub(sessionId, dir))));
+				const bundle = JSON.parse(fs.readFileSync(path.join(starts[0].cwd, "bundle.md"), "utf8").split("\n").find((line) => line.startsWith('{"session":')));
+				assert.deepEqual(bundle.omo_health_record.findings, []);
+				assert.equal(bundle.truncated.findings, true);
+				assert.deepEqual(bundle.truncated.unattributedHealth, withheld);
 			});
 
 			it("plan87: same-ID projects get separate transcript bundles and audit results after restart", async (t) => {

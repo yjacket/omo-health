@@ -8,7 +8,7 @@ import { usageEntryFor } from "./usage-index.mjs";
 const DISCOVERY_TOO_LARGE = Symbol("discovery-too-large");
 
 /** All retention and transcript reads belong to this thread. Usage arrives from the daemon. */
-export function prepareAudit({ subject, now, bounds, indexEntries, indexFull }, { paths, loadRecord = loadSessionRecord, timeline }) {
+export function prepareAudit({ subject, now, bounds, indexEntries, indexFull, liveOwners }, { paths, loadRecord = loadSessionRecord, timeline }) {
 	const { tokens, preparationMaxBytes, ...scanBounds } = bounds;
 	const index = new Map();
 	for (const entry of indexEntries) index.set(subjectKey(subjectOf(entry)), entry);
@@ -33,7 +33,7 @@ export function prepareAudit({ subject, now, bounds, indexEntries, indexFull }, 
 		return file;
 	};
 	try {
-		const record = loadRecord({ paths, subject, now, ...scanBounds, auditRetention: true, locator: { mainFile, childFile }, index });
+		const record = loadRecord({ paths, subject, now, ...scanBounds, auditRetention: true, locator: { mainFile, childFile }, index, liveOwners });
 		if (!record?.found) return { loaded: record };
 		// Launch-only join keys travel separately from the record used to build the reviewer's bundle.
 		const { selectedFps, auditSubjectIds, ...loaded } = record;

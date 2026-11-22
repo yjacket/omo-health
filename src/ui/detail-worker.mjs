@@ -8,7 +8,7 @@ import { fresh, readUsageIndex } from "../usage-index.mjs";
 import { AUDIT_TERMINATION_UNCONFIRMED_LABEL, auditReasonLabel, auditStatusLabel } from "./labels.mjs";
 import { daemonStatus, loadDaemonInputs, recordsStamp } from "./model.mjs";
 import { sessionRecordPage } from "./session-view.mjs";
-import { subjectOf } from "../session-subject.mjs";
+import { boardLiveOwners, subjectOf } from "../session-subject.mjs";
 
 const SESSION_CACHE_MAX = 20;
 const ACTIVE_AUDIT_STATUSES = new Set(["requested", "queued", "launching", "running"]);
@@ -52,7 +52,7 @@ export function createDetailOperations({
 	let at;
 	const cache = new Map();
 	const locator = createSessionFileLocator({ paths, clock: { now: () => at }, probeHeaders: false });
-	const loadRecord = ({ id, row, now }) => load({ paths, id, row, now, locator });
+	const loadRecord = ({ id, row, now, liveOwners }) => load({ paths, id, row, now, locator, liveOwners });
 	const plan = (config, facts, analystModels) =>
 		resolveModel(paths, config, { ...facts, analystModels: Array.isArray(analystModels) ? analystModels : [] });
 
@@ -114,7 +114,7 @@ export function createDetailOperations({
 
 	function readHistory(job) {
 		const loaded = loadRecord(job);
-		if (loaded?.found !== true) return { record: loaded, files: [], signature: detailSignature(paths, []) };
+		if (loaded?.found !== true) return { record: loaded, files: [], signature: detailSignature(paths, []), owners: job.owners };
 		// Keep dependency paths out of the record sent through the client view.
 		const { transcriptFiles, ...record } = loaded;
 		const session = record.session;
@@ -124,14 +124,14 @@ export function createDetailOperations({
 			? locator.childFile({ taskId, sessionId, cwds: session.cwd ? [session.cwd] : [] })
 			: locator.mainFile(subjectOfRecord(record, job.id)));
 		const files = transcriptFiles ?? (file ? [file] : []);
-		return { record, files, signature: detailSignature(paths, files) };
+		return { record, files, signature: detailSignature(paths, files), owners: job.owners };
 	}
 
 	function cachedHistory(job) {
 		const key = JSON.stringify([job.id, job.row ?? null]);
 		let entry = cache.get(key);
 		cache.delete(key);
-		if (!entry || detailSignature(paths, entry.files) !== entry.signature) entry = readHistory(job);
+		if (!entry || entry.owners !== job.owners || detailSignature(paths, entry.files) !== entry.signature) entry = readHistory(job);
 		if (maxEntries > 0) {
 			cache.set(key, entry);
 			while (cache.size > maxEntries) cache.delete(cache.keys().next().value);
@@ -143,6 +143,8 @@ export function createDetailOperations({
 		const { kind, id, now, pagination } = job;
 		at = now;
 		if (kind === "preview") return previewOf(job.record, id);
+		const liveOwners = boardLiveOwners(paths);
+		job = { ...job, liveOwners, owners: JSON.stringify(liveOwners) };
 		if (kind === "audit") return startAudit(loadRecord(job), id);
 		if (!pagination) {
 			const history = readHistory(job);

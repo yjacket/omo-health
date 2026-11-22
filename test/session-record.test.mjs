@@ -200,6 +200,32 @@ test("IS-1/7/8 shared session IDs withhold health rows in detail and mark audit 
 	}
 });
 
+test("IS-10 health collision scan finds an older cwd-less child through its retained ancestors", (t) => {
+	const { root, paths } = setup();
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const selected = mainRow({ sessionId: "selected" });
+	const old = T0 - 40 * 24 * HOUR;
+	writeLedger(paths, [
+		selected,
+		childRow("shared", "st_selected", selected.sessionId),
+		childRow("unique", "st_unique", selected.sessionId),
+		childRow("shared", "st_other", "other-parent", { cwd: null, startedMs: old, endedMs: old + HOUR }),
+		childRow("other-parent", "st_parent", "other-root", { cwd: null, startedMs: old, endedMs: old + 2 * HOUR }),
+		mainRow({ sessionId: "other-root", cwd: "C:/work/b", startedMs: old, endedMs: old + 3 * HOUR }),
+	]);
+	writeDecisions(paths, ["shared", "unique"].map((sessionId) => ({
+		fp: sessionId, event: "opened", detector: "D1", severity: "warn", subject: { sessionId },
+	})));
+	const now = T0 + 3 * HOUR;
+	for (const auditRetention of [false, true]) {
+		const record = loadSessionRecord({ paths, subject: subjectOf(selected), now, auditRetention });
+		assert.deepEqual(record.children.map(({ sessionId }) => sessionId).sort(), ["shared", "unique"]);
+		assert.deepEqual(record.health.findings.map(({ fp }) => fp), ["unique"]);
+		assert.deepEqual(record.truncated.unattributedHealth, { findings: 1, actions: 0, verdicts: 0, investigations: 0 });
+		assert.equal(auditBundle(record, null, { config: DEFAULT_CONFIG, now }).truncated.findings, true);
+	}
+});
+
 test("IS-8 audit worker still excludes both projects' analysts for either shared session", (t) => {
 	const { paths, now, rows, models } = sharedHealthFixture(t);
 	fs.mkdirSync(path.dirname(paths.authFile), { recursive: true });

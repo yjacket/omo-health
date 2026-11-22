@@ -290,7 +290,7 @@ if (operation === "all-sources") {
 			const state = readAuditState(paths, sub("seed"));
 			if (shape === "family") {
 				assert.equal(starts, 0);
-				assert.equal(state?.reason, "evidence-too-large");
+				assert.equal(state?.reason, "evidence-too-large", JSON.stringify(state));
 			} else {
 				assert.equal(starts, 1, JSON.stringify(state));
 				assert.equal(state?.status, "running");
