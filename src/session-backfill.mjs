@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { entryMs, idFromFileName } from "./collect/sessions.mjs";
 import { normalizeTask, senpiTaskStoreDir, taskStoreDir } from "./collect/tasks.mjs";
+import { pathKey } from "./paths.mjs";
 import { appendEndedBatch, endedKey, streamEnded } from "./session-ledger.mjs";
 import { projectKeyOf, subjectKey, subjectOf } from "./session-subject.mjs";
 import { atomicWriteJson, ensureDir, listDirSafe, readJsonSafe, readTextSafe, statSafe } from "./util/fsx.mjs";
@@ -142,22 +143,53 @@ function readReleases(paths, sinceMs, errors) {
 	return byId;
 }
 
-function readTasks(cwd, errors, agentDir) {
-	const storeDir = agentDir ? senpiTaskStoreDir(cwd, agentDir) : taskStoreDir(cwd);
+/** Read new traversal edges within the tick's allowance, with no open fd across ticks. */
+function* readTaskRecord(file, budget) {
+	const stat = fs.statSync(file);
+	if (!stat.isFile()) throw new Error("not a regular file");
+	const chunks = [];
+	let offset = 0;
+	while (offset < stat.size) {
+		while (budget.remaining < 1) yield;
+		const fd = fs.openSync(file, "r");
+		try {
+			while (offset < stat.size && budget.remaining >= 1) {
+				const chunk = Buffer.allocUnsafe(Math.min(stat.size - offset, budget.remaining, HEAD_BYTES));
+				const n = fs.readSync(fd, chunk, 0, chunk.length, offset);
+				if (!n) throw new Error("incomplete task record");
+				budget.remaining -= n;
+				offset += n;
+				chunks.push(chunk.subarray(0, n));
+			}
+		} finally {
+			fs.closeSync(fd);
+		}
+	}
+	return Buffer.concat(chunks, offset).toString("utf8");
+}
+
+function* taskStep(budget) {
+	while (budget.remaining < 1 || budget.taskSteps === 0) yield;
+	budget.taskSteps--;
+}
+
+function* readTasks(cwd, storeDir, errors, budget) {
 	const tasksDir = path.join(storeDir, "tasks");
-	const out = [];
+	const parentProjectKey = projectKeyOf(cwd);
+	const tasks = [];
 	for (const name of listDirSafe(tasksDir).filter((n) => n.endsWith(".json"))) {
+		if (budget) yield* taskStep(budget);
 		const file = path.join(tasksDir, name);
 		try {
-			const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+			const raw = JSON.parse(budget ? yield* readTaskRecord(file, budget) : fs.readFileSync(file, "utf8"));
 			if (!raw || typeof raw.task_id !== "string") throw new Error("no task_id");
 			const task = normalizeTask(raw, storeDir);
-			out.push({ ...task, cwd: typeof task.spawnCwd === "string" ? task.spawnCwd : cwd, parentProjectKey: projectKeyOf(cwd) });
+			tasks.push({ ...task, cwd: typeof task.spawnCwd === "string" ? task.spawnCwd : cwd, parentProjectKey });
 		} catch (error) {
 			errors.push(`task ${file}: ${error.message}`);
 		}
 	}
-	return out;
+	return tasks;
 }
 
 function childOutcome(task, releases) {
@@ -211,7 +243,8 @@ function emptyCounts() {
 
 /**
  * Reconcile only missing project-scoped rows. Pass the same `progress` object
- * across ticks, with a fresh `maxBytes` transcript allowance each time. The
+ * across ticks, with a fresh `maxBytes` allowance for transcripts and
+ * records in newly discovered task stores each time. The
  * scan is only in memory; an interrupted append is retried against the ledger.
  */
 export function backfillOnce(paths, nowMs, { days = 30, maxBytes = Infinity, progress = {} } = {}) {
@@ -223,7 +256,9 @@ export function backfillOnce(paths, nowMs, { days = 30, maxBytes = Infinity, pro
 	}
 	const scan = progress.scan;
 	const { files, indexes, mains, errors } = scan;
-	const budget = { remaining: maxBytes };
+	const budget = scan.budget ??= {};
+	budget.remaining = maxBytes;
+	budget.taskSteps = Number.isFinite(maxBytes) ? MAX_SESSION_FILES : Infinity;
 	// A child transcript in an early batch can belong to a task store discovered
 	// in a later batch. For multi-batch upgrades, discover all task-store cwd
 	// values from the heads before classifying any transcript. This pass shares
@@ -259,7 +294,13 @@ export function backfillOnce(paths, nowMs, { days = 30, maxBytes = Infinity, pro
 				errors.push(`session ${item.file}: ${error.message}`);
 			}
 		}
-		scan.related ??= readRelated(paths, scan);
+		if (!scan.related) {
+			scan.relatedScan ??= readRelated(paths, scan, budget);
+			const step = scan.relatedScan.next();
+			if (!step.done) return { pending: true };
+			scan.related = step.value;
+			delete scan.relatedScan;
+		}
 		const lastBatch = batchEnd === files.length;
 		const batch = writeBatch(paths, nowMs, scan, lastBatch);
 		if (batch.pending) return { ...scanSummary(scan, [...errors, ...batch.errors]), pending: true };
@@ -295,18 +336,33 @@ function scanSummary({ sinceMs, sessionFiles, sessionDirs, counts, reportedError
 		errors: [...reportedErrors, ...extraErrors.slice(0, MAX_REPORTED_ERRORS - reportedErrors.length).map((e) => clean(e, 300))] };
 }
 
-function readRelated(paths, { cwds, sinceMs, errors }) {
+function* readRelated(paths, { cwds, sinceMs, errors }, budget) {
 	const tasks = [];
-	for (const cwd of cwds.values()) for (const task of readTasks(cwd, errors, paths.agentDir)) tasks.push(task);
 	const childSubjects = new Set();
 	const childCount = new Map();
-	for (const t of tasks) {
+	const visited = new Set();
+	const queue = new Set(cwds.values());
+	function remember(t) {
+		tasks.push(t);
+		if (typeof t.spawnCwd === "string" && t.spawnCwd) queue.add(t.spawnCwd);
 		if (t.childSessionId) childSubjects.add(subjectKey({ projectKey: projectKeyOf(t.cwd), sessionId: t.childSessionId }));
 		// Parent IDs refer to sessions in the task store's project, not the child's spawn cwd.
 		if (t.parentSessionId) {
 			const key = subjectKey({ projectKey: t.parentProjectKey, sessionId: t.parentSessionId });
 			childCount.set(key, (childCount.get(key) ?? 0) + 1);
 		}
+	}
+	// Process the transcript seed stores first, as before. Extra store visits
+	// share the transcript byte allowance and a per-tick metadata step cap.
+	let seedCount = queue.size;
+	for (const cwd of queue) {
+		const taskBudget = seedCount-- > 0 ? undefined : budget;
+		if (taskBudget) yield* taskStep(taskBudget);
+		const storeDir = paths.agentDir ? senpiTaskStoreDir(cwd, paths.agentDir) : taskStoreDir(cwd);
+		const key = pathKey(storeDir);
+		if (visited.has(key)) continue;
+		visited.add(key);
+		for (const task of yield* readTasks(cwd, storeDir, errors, taskBudget)) remember(task);
 	}
 
 	return { tasks, childSubjects, childCount, crashes: readCrashes(paths, sinceMs, errors), releases: readReleases(paths, sinceMs, errors) };

@@ -1,7 +1,7 @@
 import path from "node:path";
 import { probeSessionHeader } from "./collect/session-files.mjs";
 import { idFromFileName } from "./collect/sessions.mjs";
-import { childSubjectOf, ledgerParentSubject, PACKED_PROJECT, packScopedText, parseSubjectKey, sessionSubjects, SubjectMap, subjectKey, subjectOf, unpackScopedText } from "./session-subject.mjs";
+import { childSubjectOf, ledgerParentSubject, PACKED_PROJECT, packScopedText, parseSubjectKey, sessionSubjects, SubjectMap, subjectKey, subjectOf, taskParentResolver, unpackScopedText } from "./session-subject.mjs";
 import { isInside, pathKey } from "./paths.mjs";
 import { boardTaskLinks } from "./session-board.mjs";
 import { ENDED_LOCATION, locateEndedRows, readEndedCwd, streamEnded } from "./session-ledger.mjs";
@@ -94,6 +94,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 				return resolveLiveCwdParent?.(sessionId) ?? parent;
 			}
 			if (row?.id && !liveIdentities.has(row)) return parentSubject(row);
+			if (identity?.parentKey === "") return null;
 		}
 		return parseSubjectKey(identity?.[`${field}Key`]) ??
 			(sessionId ? { projectKey: subjectOf(identity).projectKey, sessionId } : null);
@@ -315,6 +316,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			const sessions = [...(world?.sessions?.values?.() ?? [])];
 			const resolve = sessionSubjects([...sessions, ...ledgerRows.values()], world);
 			const liveSubject = sessionSubjects(sessions, world);
+			const taskParent = taskParentResolver(world, paths?.agentDir);
 			resolveLiveCwdParent = (id) => {
 				const row = world?.sessions?.get(id) ?? ledgerRows.getForSubject({ sessionId: id });
 				if (!row) return null;
@@ -323,10 +325,18 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			const liveSessions = packedMap(true);
 			for (const session of sessions) {
 				if (!isNonEmptyString(session?.id)) continue;
-				const subject = liveSubject(session);
+				const hasSpawningStore = session.kind === "child" && session.task?.storeDir;
+				const spawningParent = hasSpawningStore && taskParent(session.task);
+				const subject = hasSpawningStore
+					? childSubjectOf({ sessionId: session.id, task: session.task, world, parent: spawningParent })
+					: liveSubject(session);
 				const parent = world?.sessions?.get?.(session.parentSessionId);
 				const root = world?.sessions?.get?.(session.rootSessionId);
 				for (const [field, relative] of [["parent", parent], ["root", root]]) {
+					if (field === "parent" && hasSpawningStore) {
+						subject.parentKey = subjectKey(spawningParent) ?? "";
+						continue;
+					}
 					if (!relative) continue;
 					const linked = liveSubject(relative);
 					if (linked.projectKey !== subject.projectKey || linked.sessionId !== session[`${field}SessionId`]) {
@@ -485,9 +495,9 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 				...[...liveSessions.values()].map((row) => ({ key: identityOf(row), parentKey: linkedSubject(row, "parent") })),
 				...(world?.tasks ?? []).filter((task) => task.childSessionId).map((task) => {
 					const { childSessionId, parentSessionId } = task;
-					const parent = liveSubject(world.sessions?.get(parentSessionId));
+					const parent = taskParent(task, task.storeDir ? null : liveSubject(world.sessions?.get(parentSessionId)));
 					const child = childSubjectOf({ sessionId: childSessionId, task, world, parent });
-					return { key: child, parentKey: parentSessionId ? { ...parent, sessionId: parentSessionId } : null };
+					return { key: child, parentKey: parent };
 				}),
 				...board.rows.filter((row) => !row.sessionId).map((row) => usageTreeLink(index, row, board.ambiguous)),
 			];

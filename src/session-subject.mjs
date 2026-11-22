@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { deflateRawSync, inflateRawSync } from "node:zlib";
+import { projectStoreName } from "./collect/tasks.mjs";
 import { safeSubjectId } from "./session-id.mjs";
 import { readJsonSafe } from "./util/fsx.mjs";
 
@@ -40,6 +41,39 @@ export function childSubjectOf({ sessionId, task, world, parent }) {
 	return {
 		projectKey: projectKeyOf(live?.cwd) ?? projectKeyOf((task ?? live?.task)?.spawnCwd) ?? parent?.projectKey ?? null,
 		sessionId: sessionId ?? null,
+	};
+}
+
+/** Resolve a task's parent from its spawning store, not the child's spawn cwd. */
+export function taskParentResolver(world, agentDir = world?.paths?.agentDir) {
+	let userStores;
+	const userStoreProject = (storeDir) => {
+		if (!agentDir || path.dirname(path.dirname(storeDir)) !== path.resolve(agentDir, "projects")) return null;
+		if (!userStores) {
+			userStores = new Map();
+			// The per-user directory name is a hash. Reverse it only against known projects.
+			const cwds = new Set(world?.config?.extraProjects ?? []);
+			for (const row of world?.sessions?.values?.() ?? []) if (row.cwd) cwds.add(row.cwd);
+			for (const sensor of world?.sensors?.values?.() ?? []) if (sensor.cwd) cwds.add(sensor.cwd);
+			for (const task of world?.tasks ?? []) if (task.spawnCwd) cwds.add(task.spawnCwd);
+			for (const cwd of cwds) {
+				const store = path.resolve(agentDir, "projects", projectStoreName(cwd), "senpi-task");
+				const key = projectKeyOf(cwd);
+				userStores.set(store, !userStores.has(store) || userStores.get(store) === key ? key : null);
+			}
+		}
+		return userStores.get(storeDir) ?? null;
+	};
+	return (task, legacyParent) => {
+		const sessionId = task?.parentSessionId;
+		if (!sessionId) return null;
+		// Store-less callers have no provenance; only these may use the old fallback.
+		if (!task.storeDir) return { sessionId, projectKey: legacyParent?.projectKey ?? null };
+		const storeDir = path.resolve(task.storeDir);
+		if (path.basename(storeDir) !== "senpi-task") return null;
+		const dir = path.dirname(storeDir);
+		const projectKey = path.basename(dir) === ".omo" ? projectKeyOf(path.dirname(dir)) : userStoreProject(storeDir);
+		return projectKey ? { sessionId, projectKey } : null;
 	};
 }
 

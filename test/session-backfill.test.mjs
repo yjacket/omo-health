@@ -328,6 +328,59 @@ test("cold backfill links a cross-project child only to the same-named parent in
 	});
 });
 
+test("cold backfill follows a child into a project with no main transcript", (t) => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "backfill-nested-"));
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health"), OMO_HEALTH_OMO_HOME: path.join(root, ".omo") });
+	const now = Date.now();
+	const startedMs = now - 2 * HOUR;
+	const endedMs = now - HOUR;
+	const a = path.join(root, "a");
+	const b = path.join(root, "b");
+	const assistant = (input) => E.assistant({ ms: endedMs, usage: { input, output: 0, cacheRead: 0, cacheWrite: 0 } });
+	const mainFile = writeSession(paths, projectKeyOf(a), "main", a, startedMs, endedMs, [assistant(10)]);
+	const spawn = (cwd, parentId, childId, spawnCwd, input) => {
+		const taskId = `st_${childId}`;
+		const store = senpiTaskStoreDir(cwd, paths.agentDir);
+		writeTask(cwd, {
+			task_id: taskId, parent_session_id: parentId, child_session_id: childId,
+			spawn_spec: { cwd: spawnCwd }, status: "completed", final_response: "done",
+			created_at: iso(startedMs), terminal_at: iso(endedMs),
+		}, store);
+		writeJsonl(path.join(store, "children", taskId, "sessions", taskId,
+			`${iso(startedMs).replace(/[:.]/g, "-")}_${childId}.jsonl`), [assistant(input)]);
+		return path.join(store, "tasks", `${taskId}.json`);
+	};
+	spawn(a, "main", "child", b, 6);
+	const nestedTask = spawn(b, "child", "grandchild", a, 4); // Back to A: don't scan the same store again.
+
+	const progress = {};
+	const first = backfillOnce(paths, now, { progress, maxBytes: fs.statSync(mainFile).size });
+	const second = backfillOnce(paths, now, { progress, maxBytes: fs.statSync(nestedTask).size - 1 });
+	const markedEarly = fs.existsSync(path.join(paths.health.sessionsDir, BACKFILL_MARKER));
+	const summary = backfillOnce(paths, now, { progress });
+	assert.deepEqual(summary.errors, []);
+	const rows = readEnded(paths);
+	assert.deepEqual(rows.filter(({ kind }) => kind === "child")
+		.map(({ sessionId, cwd, parentSessionId, parentProjectKey }) => [sessionId, cwd, parentSessionId, parentProjectKey]), [
+		["child", b, "main", projectKeyOf(a)],
+		["grandchild", a, "child", projectKeyOf(b)],
+	], "history includes the grandchild with the spawning store's project");
+	assert.equal(first.pending, true, "the main transcript exhausts the first tick");
+	assert.equal(second.pending, true, "the nested record cannot complete with one byte less than its size");
+	assert.equal(markedEarly, false, "the v3 marker waits for store discovery");
+	assert.equal(summary.counts.child, 2, "back edges do not rescan a visited store");
+	const child = rows.find(({ sessionId }) => sessionId === "child");
+	const main = rows.find(({ sessionId }) => sessionId === "main");
+	assert.equal(child.childCount, 1);
+	const readDetail = createDetailOperations({ paths, auditDetail: () => null });
+	const { record } = readDetail({ kind: "detail", id: child.sessionId, row: expectedSelector(child), now });
+	assert.deepEqual(record.children.map(({ sessionId }) => sessionId), ["grandchild"]);
+	const tracker = processBackfilledRows(paths, now);
+	assert.equal(tracker.tokensOf(subjectOf(child))?.treeTokens, 10);
+	assert.equal(tracker.tokensOf(subjectOf(main))?.treeTokens, 20);
+});
+
 function setup() {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "backfill-"));
 	const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, ".omo-health"), OMO_HEALTH_OMO_HOME: path.join(root, ".omo") });

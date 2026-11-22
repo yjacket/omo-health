@@ -1,4 +1,4 @@
-import { childSubjectOf, subjectKey, subjectOf, worldLiveOwners } from "./session-subject.mjs";
+import { childSubjectOf, subjectKey, subjectOf, taskParentResolver, worldLiveOwners } from "./session-subject.mjs";
 import path from "node:path";
 import { endedKey } from "./session-ledger.mjs";
 import { ambiguousLedgerTaskIds } from "./session-record.mjs";
@@ -157,12 +157,12 @@ export function buildSessionSnapshot(world, findings = [], investigations = [], 
 		return healthOf((findings ?? []).filter((f) => own(f.subject)), openInvestigations.filter((inv) => own(inv.subject)));
 	};
 
-	const { byParent, ambiguous } = boardTaskLinks(world, nowMs);
+	const { tasksOf, ambiguous } = boardTaskLinks(world, nowMs);
 	const childrenOf = (parent, depth, trail) => {
-		const parentId = parent.sessionId;
-		if (depth > 8 || trail.has(parentId)) return [];
-		const next = new Set(trail).add(parentId);
-		return (byParent.get(parentId) ?? [])
+		const parentKey = subjectKey(parent);
+		if (depth > 8 || trail.has(parentKey)) return [];
+		const next = new Set(trail).add(parentKey);
+		return tasksOf(parent)
 			.map((task) => {
 				const sessionId = task.childSessionId || null;
 				const taskId = task.taskId ?? null;
@@ -227,24 +227,32 @@ export function buildSessionSnapshot(world, findings = [], investigations = [], 
 export function boardTaskLinks(world, nowMs = world?.now) {
 	const byParent = new Map();
 	const seen = new Set();
+	const taskParent = taskParentResolver(world);
 	for (const task of world?.tasks ?? []) {
 		const key = task.uid ?? task.taskId;
 		if (!task.parentSessionId || seen.has(key)) continue;
 		const recent = TERMINAL_STATUSES.has(task.status) && nowMs - (task.terminalAtMs ?? task.updatedAtMs ?? 0) <= RECENT_END_MS;
 		if (!ACTIVE_STATUSES.has(task.status) && !recent) continue;
 		seen.add(key);
-		if (!byParent.has(task.parentSessionId)) byParent.set(task.parentSessionId, []);
-		byParent.get(task.parentSessionId).push(task);
+		const parentKey = subjectKey(taskParent(task));
+		if (!parentKey) continue;
+		if (!byParent.has(parentKey)) byParent.set(parentKey, []);
+		byParent.get(parentKey).push(task);
 	}
+	const tasksOf = (parent) => {
+		const scoped = byParent.get(subjectKey(parent)) ?? [];
+		const legacy = parent.projectKey == null ? null : byParent.get(subjectKey({ sessionId: parent.sessionId }));
+		return legacy ? [...scoped, ...legacy] : scoped;
+	};
 	const rows = [];
 	const visit = (parent, depth, trail) => {
-		const parentId = parent.sessionId;
-		if (depth > 8 || trail.has(parentId)) return;
-		const next = new Set(trail).add(parentId);
-		for (const task of byParent.get(parentId) ?? []) {
+		const parentKey = subjectKey(parent);
+		if (depth > 8 || trail.has(parentKey)) return;
+		const next = new Set(trail).add(parentKey);
+		for (const task of tasksOf(parent)) {
 			const sessionId = task.childSessionId || null;
 			const subject = childSubjectOf({ sessionId, task, world, parent });
-			rows.push({ ...subject, taskId: task.taskId, parentSessionId: parentId, parentKey: subjectKey(parent) });
+			rows.push({ ...subject, taskId: task.taskId, parentSessionId: parent.sessionId, parentKey });
 			if (sessionId) visit(subject, depth + 1, next);
 		}
 	};
@@ -253,7 +261,7 @@ export function boardTaskLinks(world, nowMs = world?.now) {
 	}
 	// The board already has authoritative child session IDs, even when one equals a task ID.
 	const ambiguous = ambiguousLedgerTaskIds(rows.filter((row) => !row.sessionId), { scoped: true });
-	return { byParent, rows, ambiguous };
+	return { tasksOf, rows, ambiguous };
 }
 
 /** Executed release decisions of the last two decision files, keyed by task and session id. */

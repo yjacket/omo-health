@@ -15,6 +15,7 @@ import { boardLiveOwners, subjectOf } from "../src/session-subject.mjs";
 import { createDetailOperations } from "../src/ui/detail-worker.mjs";
 import { buildEnded, loadUiInputs } from "../src/ui/model.mjs";
 import { createSessionFileLocator } from "../src/collect/session-files.mjs";
+import { normalizeTask, projectStoreName, taskStoreDir } from "../src/collect/tasks.mjs";
 import { createUsageIndex } from "../src/usage-index.mjs";
 import { createUsageTracker } from "../src/usage-tracker.mjs";
 import { expectedSelector } from "./helpers/ended-selector.mjs";
@@ -141,6 +142,66 @@ test("plan94 a same-named main enters history only for the project that ended", 
 	const history = buildEnded(loadUiInputs({ paths, now, env: {} }));
 	assert.deepEqual(history.rows.map(({ sessionId, cwd }) => [sessionId, cwd]), [["review.1", a]]);
 	assert.deepEqual(current.groups.flatMap(({ sessions }) => sessions.map(({ sessionId, cwd }) => [sessionId, cwd])), [["review.1", b]]);
+});
+
+test("plan98 recent child stays with the ended project when a live main reuses its parent ID", async (t) => {
+	for (const store of ["local", "per-user"]) await t.test(store, (t) => {
+		const { paths, a, b } = setup(t);
+		const parentId = "review.1";
+		const childId = "review.child";
+		const taskId = "st_recent";
+		const storeDir = store === "local" ? taskStoreDir(a) : path.join(paths.agentDir, "projects", projectStoreName(a), "senpi-task");
+		const task = normalizeTask({
+			task_id: taskId, parent_session_id: parentId, child_session_id: childId,
+			status: "running", spawn_spec: { cwd: b },
+		}, storeDir);
+		const file = path.join(storeDir, "children", taskId, "sessions", taskId, `2026-10-10T12-00-00-000Z_${childId}.jsonl`);
+		const child = { id: childId, file, cwd: b, kind: "child", taskId, parentSessionId: parentId, task };
+		writeUsage(file, 6);
+		const liveMain = (cwd, tokens) => {
+			const file = path.join(paths.sessionsDir, subjectOf({ cwd }).projectKey, `2026-10-10T12-00-00-000Z_${parentId}.jsonl`);
+			writeUsage(file, tokens);
+			return { id: parentId, cwd, file, kind: "main" };
+		};
+		const alice = liveMain(a, 10);
+		const bob = liveMain(b, 20);
+		const world = (now, sessions) => ({
+			now, paths, tasks: [task], sessions: new Map(sessions.map((row) => [row.id, row])),
+			isSessionLive: () => true,
+		});
+		const index = createUsageIndex({ file: paths.health.usageIndexFile, clock });
+		const tracker = createUsageTracker({ paths, clock, index, locator: createSessionFileLocator({ paths, clock }) });
+		const snapshot = (state) => {
+			tracker.tick(state);
+			return buildSessionSnapshot(state, [], [], state.now, { tokensOf: tracker.tokensOf });
+		};
+		const before = snapshot(world(now - 1, [alice, child]));
+		const prior = before.groups[0].sessions[0];
+		assert.deepEqual([prior.children.map(({ sessionId }) => sessionId), prior.treeTokens], [[childId], 16]);
+
+		Object.assign(task, { status: "completed", active: false, terminal: true, terminalAtMs: now });
+		const current = world(now, [bob, child]);
+		const after = snapshot(current);
+		const records = detectEnded(before, after, current, now);
+		assert.equal(appendEndedBatch(paths, records, { nowMs: now }).filter(({ appended }) => appended).length, 2);
+		tracker.queueLedger(streamEnded(paths, { withLocation: true }));
+		const withoutChildRegistry = snapshot(world(now, [bob]));
+		index.save();
+		const history = buildEnded(loadUiInputs({ paths, now, env: {} }));
+		const endedAlice = history.rows.find((row) => row.kind === "main");
+		const liveFacts = ({ groups: [{ sessions: [row] }] }) => ({
+			cwd: row.cwd, own: row.tokens.total, children: row.children.map(({ sessionId }) => sessionId), tree: row.treeTokens,
+		});
+		assert.deepEqual({
+			withRegistryChild: liveFacts(after),
+			withoutRegistryChild: liveFacts(withoutChildRegistry),
+			ended: { cwd: endedAlice.cwd, tree: endedAlice.treeTokens, children: readDetail(paths, endedAlice).children.map(({ sessionId }) => sessionId) },
+		}, {
+			withRegistryChild: { cwd: b, own: 20, children: [], tree: null },
+			withoutRegistryChild: { cwd: b, own: 20, children: [], tree: null },
+			ended: { cwd: a, tree: 16, children: [childId] },
+		});
+	});
 });
 
 test("plan93 cross-project child belongs only to its actual parent after rebuilding the index", (t) => {

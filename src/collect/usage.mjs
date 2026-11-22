@@ -870,7 +870,7 @@ function consumeScannerRecord(totals, scanner, fragment = false) {
 	return entry;
 }
 
-function readRange(fd, position, length) {
+function readRange(fd, position, length, onRead) {
 	if (length <= 0) return Buffer.alloc(0);
 	const buffer = Buffer.allocUnsafe(length);
 	let got = 0;
@@ -878,6 +878,7 @@ function readRange(fd, position, length) {
 		const n = fs.readSync(fd, buffer, got, length - got, position + got);
 		if (n === 0) break;
 		got += n;
+		onRead?.(n);
 	}
 	return got === length ? buffer : buffer.subarray(0, got);
 }
@@ -887,8 +888,10 @@ function readRange(fd, position, length) {
  * Returns null for a missing file; read errors throw. `offset` is the end of the
  * last complete record, `scanOffset`/`partial` an in-memory record in progress,
  * and `effective` = committed `usage` + the valid EOF `overlay`.
+ * `onScanBytes` reports each successful budgeted read, even if a later read
+ * throws. Bounded fingerprint reads are not part of the scan budget.
  */
-export function readUsage(file, from, { maxBytes = Infinity } = {}) {
+export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {}) {
 	let fd;
 	try {
 		fd = fs.openSync(file, "r");
@@ -961,10 +964,13 @@ export function readUsage(file, from, { maxBytes = Infinity } = {}) {
 		let position = scanOffset;
 		let bytesRead = 0;
 		let acc = partial;
+		const charge = (n) => {
+			bytesRead += n;
+			onScanBytes?.(n);
+		};
 		const reread = (start, len) => {
 			if (len > maxBytes - bytesRead) return undefined;
-			const bytes = readRange(fd, start, len);
-			bytesRead += bytes.length;
+			const bytes = readRange(fd, start, len, charge);
 			if (bytes.length !== len) return undefined;
 			return appendBytes(newAccumulator(start), bytes, true);
 		};
@@ -978,11 +984,10 @@ export function readUsage(file, from, { maxBytes = Infinity } = {}) {
 		}
 		scan: while (acc?.kind !== "reread" && position < size && bytesRead < maxBytes) {
 			const want = Math.min(READ_CHUNK, size - position, maxBytes - bytesRead);
-			const chunk = readRange(fd, position, want);
+			const chunk = readRange(fd, position, want, charge);
 			if (!chunk.length) break;
 			const chunkStart = position;
 			position += chunk.length;
-			bytesRead += chunk.length;
 			if (!acc) acc = newAccumulator(chunkStart);
 			let index = 0;
 			for (;;) {

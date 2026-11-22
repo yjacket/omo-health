@@ -21,6 +21,7 @@ import {
 	readUsageIndex,
 	treeTotals,
 } from "../src/usage-index.mjs";
+import { createUsageTracker } from "../src/usage-tracker.mjs";
 
 const MiB = 1024 * 1024;
 const DAY = 24 * 3600_000;
@@ -1520,6 +1521,65 @@ test("(IS-1) a negative total and cost save and reload through the index", (t) =
 	assert.equal(compactUsage(reloaded.get(key("s1"))).total, 8);
 	assert.equal(reloaded.save(), true);
 	assert.equal(compactUsage(indexOf().get(key("s1"))).total, 8);
+});
+
+test("(IS-4, IS-12) a failed usage read still spends the tick's scan budget", (t) => {
+	const { clock, fileOf, indexOf } = setup(t);
+	const files = new Map([["broken", fileOf("broken.jsonl")], ["next", fileOf("next.jsonl")]]);
+	const record = `${line()}\n`;
+	for (const file of files.values()) writeText(file, record);
+	const index = indexOf();
+	const tracker = createUsageTracker({
+		index, clock, locator: {
+			findMainFile({ sessionId }) { return { file: files.get(sessionId), bytesRead: 0 }; },
+		},
+	});
+	assert.equal(tracker.queueLedger([
+		{ sessionId: "broken", kind: "main", endedMs: T0 - 1 },
+		{ sessionId: "next", kind: "main", endedMs: T0 - 2 },
+	]), 2);
+
+	// Extend both tiny fixtures virtually, counting scan traffic independently
+	// of the bounded head/tail fingerprint reads.
+	const scanBytes = new Map([["broken", 0], ["next", 0]]);
+	const descriptors = new Map();
+	const { openSync, fstatSync, readSync } = fs;
+	t.mock.method(fs, "openSync", (file, ...args) => {
+		const fd = openSync(file, ...args);
+		descriptors.set(fd, file === files.get("broken") ? "broken" : file === files.get("next") ? "next" : undefined);
+		return fd;
+	});
+	t.mock.method(fs, "fstatSync", (fd, ...args) => {
+		const stat = fstatSync(fd, ...args);
+		return descriptors.get(fd) ? { ...stat, size: USAGE_TICK_BYTES } : stat;
+	});
+	let brokenScanReads = 0;
+	t.mock.method(fs, "readSync", (fd, buffer, offset, length, position) => {
+		const id = descriptors.get(fd);
+		if (!id || length <= 4096) return readSync(fd, buffer, offset, length, position);
+		if (id === "broken" && ++brokenScanReads === 4) {
+			throw Object.assign(new Error("injected read failure"), { code: "EIO" });
+		}
+		// Two whole scan chunks, then a short successful read in the range
+		// whose next underlying read throws.
+		const n = id === "broken" && brokenScanReads === 3 ? 17 : length;
+		buffer.fill(0x20, offset, offset + n);
+		if (position === 0) readSync(fd, buffer, offset, Buffer.byteLength(record), 0);
+		buffer[offset + n - 1] = 0x0a;
+		scanBytes.set(id, scanBytes.get(id) + n);
+		return n;
+	});
+
+	const tick = tracker.tick({});
+	const failed = index.get(key("broken"));
+	assert.equal(brokenScanReads, 4);
+	assert.equal(failed.readError, true);
+	assert.equal(failed.published, null);
+	assert.equal(compactUsage(failed), null);
+	assert.ok(scanBytes.get("next") > 0, "the second queued file used the remaining budget");
+	const actual = scanBytes.get("broken") + scanBytes.get("next");
+	assert.ok(actual <= USAGE_TICK_BYTES, `scanned ${actual} bytes with a ${USAGE_TICK_BYTES}-byte tick budget`);
+	assert.equal(tick.bytesRead, actual);
 });
 
 test("usage_read_failed is logged once for a directory path and the next successful read clears it", (t) => {

@@ -626,9 +626,10 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			return this.recordOwnership(id, isSoleChildSessionFile(entry?.file));
 		},
 		/**
-		 * Read up to `maxBytes` more bytes of `file`. Returns bytesRead; a missing
-		 * file marks the entry missing (or, after a complete read, gone) and a read
-		 * error keeps the saved totals while `readError` hides them from the board.
+		 * Read up to `maxBytes` more bytes of `file`. Returns bytesRead, including
+		 * bytes spent before a read error. A missing file marks the entry missing
+		 * (or, after a complete read, gone); a read error keeps the saved totals
+		 * while `readError` hides them from the board.
 		 */
 		update(subject, path, meta = {}, { maxBytes = Infinity, ownershipUnique } = {}) {
 			const id = subject;
@@ -651,6 +652,7 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			const canResume = !isTaskOnlyEntry(entry) || (sameFile && !entry.gone);
 			const from = canResume && hasNumericCursor(entry) ? entry : undefined;
 			let result;
+			let bytesRead = 0;
 			try {
 				// Windows reports a directory as a zero-byte stream, so readUsage would succeed on one; a session file is never a directory.
 				if (statSafe(path)?.isDirectory()) {
@@ -658,14 +660,14 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 					error.code = "EISDIR";
 					throw error;
 				}
-				result = read(path, from, { maxBytes });
+				result = read(path, from, { maxBytes, onScanBytes: (n) => { bytesRead += n; } });
 			} catch (error) {
 				if (entry.readError !== true) {
 					log?.error?.("usage_read_failed", { file: basename(String(path)), error: String(error?.message ?? error) });
 				}
 				entry.readError = true;
 				admit(entry, previousSlots);
-				return 0;
+				return bytesRead;
 			}
 			entry.readError = false;
 			if (result === null) {
