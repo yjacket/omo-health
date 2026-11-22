@@ -7,7 +7,7 @@ import { streamInvestigations } from "./investigations.mjs";
 import { streamEnded } from "./session-ledger.mjs";
 import { compactUsage, readUsageIndex, treeTotals, usageEntryFor } from "./usage-index.mjs";
 import { reasonCode } from "./audit-codes.mjs";
-import { AUDIT_CHECK_MAX, AUDIT_DETECTOR_ID, AUDIT_LIST_CAPS, BUNDLE_MAX_CHARS, auditEvidence, auditHistoryRow } from "./judge/audit.mjs";
+import { AUDIT_CHECK_MAX, AUDIT_DETECTOR_ID, AUDIT_LIST_CAPS, BUNDLE_MAX_CHARS, auditEvidence, auditHistoryRow, auditMessageKind } from "./judge/audit.mjs";
 import { statSafe } from "./util/fsx.mjs";
 import { redact, truncate } from "./util/text.mjs";
 
@@ -521,7 +521,7 @@ function recordHealth(inputs, row, descendants) {
 	const actions = selected.map((entry) => actionRow(entry, subjectByFp)).filter(Boolean).sort(byNewest);
 	const investigationRows = selectedInvestigations.map((record) => investigationRow(record, about)).sort(byInvestigationTime);
 	const messages = messagesIn.filter(isRecord).map((message) => ({
-		ms: Number.isFinite(message.ms) ? message.ms : null, recipient: clean(message.recipient, 200), text: cleanDetail(message.text),
+		ms: Number.isFinite(message.ms) ? message.ms : null, kind: auditMessageKind(message.kind), recipient: clean(message.recipient, 200), text: cleanDetail(message.text),
 	})).sort(byMessageTime);
 	return {
 		infoFindings,
@@ -664,7 +664,7 @@ function* streamOmoHealthMessages(file, bounded = false) {
 		}
 		if (!isRecord(entry) || (entry.type !== "custom_message" && entry.type !== "custom") || entry.customType !== "omo-health") return;
 		const ms = msOf(entry.timestamp);
-		const message = { ms: Number.isFinite(ms) ? ms : null };
+		const message = { ms: Number.isFinite(ms) ? ms : null, kind: auditMessageKind(entry.details?.kind) };
 		if (bounded) return message;
 		const text = typeof entry.content === "string" ? entry.content : isRecord(entry.content) ? JSON.stringify(entry.content) : "";
 		return { ...message, text: cleanDetail(text) };
@@ -924,7 +924,7 @@ export function loadSessionRecord({ paths, id, endedMs, now = Date.now(), messag
 		scannedBytes += stat.size;
 		for (const message of (scanMessages ? scanMessages(file) : streamOmoHealthMessages(file, auditRetention)) ?? []) {
 			if (!retained) messages.push({ ...message, recipient: sessionId });
-			else if (isRecord(message)) retained.messages.add({ ms: Number.isFinite(message.ms) ? message.ms : null });
+			else if (isRecord(message)) retained.messages.add({ ms: Number.isFinite(message.ms) ? message.ms : null, kind: auditMessageKind(message.kind) });
 		}
 	}
 

@@ -135,6 +135,20 @@ const ohealth = (ms, text) => ({ type: "custom_message", customType: "omo-health
 const mainRow = (extra = {}) => ({ sessionId: "s-main", kind: "main", parentSessionId: null, taskId: null, title: "main", cwd: "C:/work/a", terminal: { kind: "wt" }, omoVersion: "0.8.0", startedMs: T0, endedMs: T0 + 2 * HOUR, childCount: 2, ...extra });
 const childRow = (sessionId, taskId, parentSessionId, extra = {}) => ({ sessionId, kind: "child", parentSessionId, taskId, title: sessionId, cwd: "C:/work/a", terminal: null, omoVersion: null, startedMs: T0 + 10 * MIN, endedMs: T0 + 70 * MIN, ...extra });
 
+for (const auditRetention of [false, true]) {
+	test(`IS-8: the ${auditRetention ? "bounded" : "full"} record keeps only valid delivered message kinds`, () => {
+		const { paths } = setup();
+		const row = mainRow();
+		writeLedger(paths, [row]);
+		mainSessionFile(paths, row.sessionId, [
+			{ ...ohealth(T0 + MIN, "SECRET-TEXT"), details: { kind: "scope-check", reason: "SECRET-DETAIL" } },
+			{ ...ohealth(T0, "invalid kind"), details: { kind: "a".repeat(42) } },
+		]);
+		const record = loadSessionRecord({ paths, id: row.sessionId, now: row.endedMs, auditRetention });
+		assert.deepEqual(record.health.messages.map(({ kind }) => kind), ["scope-check", null]);
+	});
+}
+
 test("IS-10: bounded normal session produces the same bundle without dashboard prose", () => {
 	const { paths } = setup();
 	const subject = { sessionId: "s-main" };
@@ -821,7 +835,7 @@ test("an omo-health message line that straddles the 4 MiB read boundary is found
 	const message = ohealth(T0 + MIN, "across the boundary");
 	fs.writeFileSync(file, Buffer.concat([prefix, Buffer.from(jsonl([message, { type: "session", id: "s-edge" }]))]));
 	assert.ok(Buffer.from(jsonl([message])).length > 24, "the message line crosses the boundary");
-	assert.deepEqual(scanOmoHealthMessages(file), [{ ms: T0 + MIN, text: "across the boundary" }]);
+	assert.deepEqual(scanOmoHealthMessages(file), [{ ms: T0 + MIN, kind: "self-notice", text: "across the boundary" }]);
 });
 
 test("a 70 MiB file with 3 omo-health messages scans under a 96 MiB heap in a child node process", (t) => {
@@ -830,9 +844,9 @@ test("a 70 MiB file with 3 omo-health messages scans under a 96 MiB heap in a ch
 	const file = scanFile(dir, "big-session.jsonl");
 	const messages = [ohealth(T0 + MIN, "first"), ohealth(T0 + 2 * MIN, "second"), ohealth(T0 + 3 * MIN, "third")];
 	const expected = [
-		{ ms: T0 + MIN, text: "first" },
-		{ ms: T0 + 2 * MIN, text: "second" },
-		{ ms: T0 + 3 * MIN, text: "third" },
+		{ ms: T0 + MIN, kind: "self-notice", text: "first" },
+		{ ms: T0 + 2 * MIN, kind: "self-notice", text: "second" },
+		{ ms: T0 + 3 * MIN, kind: "self-notice", text: "third" },
 	];
 	const fd = fs.openSync(file, "w");
 	try {
@@ -868,7 +882,7 @@ test("a 2 MiB tool-result line quoting the marker is dropped and the next messag
 	const message = ohealth(T0 + MIN, "after the giant line");
 	fs.writeFileSync(file, jsonl([{ type: "session", id: "s-big-line" }, toolResult, message]));
 	assert.ok(fs.statSync(file).size > 2 * MIB);
-	assert.deepEqual(scanOmoHealthMessages(file), [{ ms: T0 + MIN, text: "after the giant line" }]);
+	assert.deepEqual(scanOmoHealthMessages(file), [{ ms: T0 + MIN, kind: "self-notice", text: "after the giant line" }]);
 });
 
 test("CRLF lines and a final line without a newline are both read", (t) => {
@@ -879,7 +893,7 @@ test("CRLF lines and a final line without a newline are both read", (t) => {
 	const last = ohealth(T0 + 2 * MIN, "no trailing newline");
 	fs.writeFileSync(file, `${JSON.stringify(first)}\r\n${JSON.stringify(last)}`);
 	assert.deepEqual(scanOmoHealthMessages(file), [
-		{ ms: T0 + MIN, text: "crlf line" },
-		{ ms: T0 + 2 * MIN, text: "no trailing newline" },
+		{ ms: T0 + MIN, kind: "self-notice", text: "crlf line" },
+		{ ms: T0 + 2 * MIN, kind: "self-notice", text: "no trailing newline" },
 	]);
 });

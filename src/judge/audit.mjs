@@ -317,11 +317,15 @@ function investigationsOf(list) {
 	});
 }
 
+export function auditMessageKind(value) {
+	return typeof value === "string" && /^[a-z][a-z0-9-]{0,40}$/.test(value) ? value : null;
+}
+
 function messagesOf(list) {
 	return (Array.isArray(list) ? list : []).map((message, index) => ({
 		ref: `M${index + 1}`,
 		ms: numOf(message?.ms),
-		kind: textOf(message?.kind ?? message?.details?.kind),
+		kind: auditMessageKind(message?.kind),
 	}));
 }
 

@@ -90,7 +90,7 @@ if (operation === "all-sources") {
 	assert.equal(result.tokens.total, 42);
 	assert.deepEqual(result.health.findings.map(({ fp }) => fp), ["related"]);
 	assert.deepEqual(result.health.investigations.map(({ id }) => id), ["related"]);
-	assert.deepEqual(result.health.messages, [{ ms: Date.parse(ts), recipient: childId, text: "related notice" }]);
+	assert.deepEqual(result.health.messages, [{ ms: Date.parse(ts), recipient: childId, kind: null, text: "related notice" }]);
 	console.log("all source matches found");
 } else if (operation === "audit-own-decisions") {
 	const sessionId = "seed";

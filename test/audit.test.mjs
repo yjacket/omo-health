@@ -25,7 +25,7 @@ import { resolvePaths } from "../src/paths.mjs";
 import { appendEnded } from "../src/session-ledger.mjs";
 import { buildSessionRecord, loadSessionRecord } from "../src/session-record.mjs";
 import { compactUsage, createUsageIndex } from "../src/usage-index.mjs";
-import { tmpDir, iso } from "./helpers/fixtures.mjs";
+import { tmpDir, iso, writeJsonl } from "./helpers/fixtures.mjs";
 
 const T0 = Date.parse("2026-11-20T00:00:00Z");
 const HOUR = 3_600_000;
@@ -221,6 +221,25 @@ test("(IS-8) the audit bundle and prompt distinguish incomplete statistics from 
 });
 
 /* ---------------------------------------------------------------- allowlist */
+
+test("IS-11: the audit bundle keeps delivered message kinds without text or other details", () => {
+	const root = tmpDir("omoh-audit-message-kind-");
+	const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health"), OMO_HEALTH_OMO_HOME: path.join(root, "omo") });
+	const row = { sessionId: "s1", kind: "main", startedMs: T0, endedMs: T0 + HOUR, outcome: "answered" };
+	appendEnded(paths, row, { nowMs: row.endedMs });
+	const entry = { type: "custom_message", customType: "omo-health", id: "notice-1", timestamp: iso(T0 + 1), content: "SECRET-TEXT", details: { kind: "scope-check", reason: "SECRET-DETAIL" } };
+	writeJsonl(path.join(paths.sessionsDir, "slug", `2026-10-10T00-00-00-000Z_${row.sessionId}.jsonl`), [
+		entry,
+		{ ...entry, id: "notice-2", timestamp: iso(T0), details: { kind: "SECRET-DETAIL" } },
+	]);
+	const record = loadSessionRecord({ paths, id: row.sessionId, now: row.endedMs });
+	const bundle = auditBundle(record, null, { config: DEFAULT_CONFIG, now: row.endedMs });
+	assert.doesNotMatch(JSON.stringify(bundle), /SECRET-TEXT|SECRET-DETAIL/);
+	assert.deepEqual(bundle.omo_health_record.messages, [
+		{ ref: "M1", ms: T0 + 1, kind: "scope-check" },
+		{ ref: "M2", ms: T0, kind: null },
+	]);
+});
 
 test("the bundle carries no seeded secret text but keeps the numeric metric count:6", () => {
 	const row = { sessionId: "s1", taskId: "st_s1", kind: "main", startedMs: T0, endedMs: T0 + HOUR, outcome: "answered", title: "QA-SECRET-TITLE", reason: "QA-SECRET-REASON" };
