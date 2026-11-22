@@ -521,17 +521,21 @@ test("the cap trims top turns after hours", () => {
 	assert.equal(bundle.truncated.topTurns, true);
 });
 
-test("the cap then trims findings, actions and messages to the newest 50 each", () => {
+test("list caps can avoid trimming hours and top turns", () => {
+	const hours = Array.from({ length: 49 }, (_, i) => ({ hourMs: T0 + i * HOUR, tokens: 1, turns: 1 }));
+	const topTurns = Array.from({ length: 6 }, () => ({ key: "fake/fake-strong", ms: T0, total: 4 }));
 	const record = emptyRecord({
 		health: {
-			findings: Array.from({ length: 300 }, (_, i) => finding(i, 20)),
-			actions: Array.from({ length: 300 }, (_, i) => action(i)),
-			messages: Array.from({ length: 300 }, (_, i) => message(i)),
-			investigations: Array.from({ length: 5 }, (_, i) => investigation(i)),
+			findings: Array.from({ length: 300 }, (_, i) => finding(i, 20, { ts: iso(T0 - i) })),
+			actions: Array.from({ length: 300 }, (_, i) => action(-i)),
+			messages: Array.from({ length: 300 }, (_, i) => message(-i)),
+			investigations: Array.from({ length: 5 }, (_, i) => investigation(-i)),
 		},
 	});
-	const bundle = auditBundle(record, timelineShell(), { config: DEFAULT_CONFIG, now: T0 });
+	const bundle = auditBundle(record, timelineShell({ hours, topTurns }), { config: DEFAULT_CONFIG, now: T0 });
 	assert.ok(JSON.stringify(bundle).length <= 100_000);
+	assert.deepEqual([bundle.tokens.hours.length, bundle.tokens.topTurns.length], [49, 6]);
+	assert.deepEqual([bundle.truncated.hours, bundle.truncated.topTurns], [false, false]);
 	assert.equal(bundle.omo_health_record.findings.length, 50);
 	assert.equal(bundle.omo_health_record.actions.length, 50);
 	assert.equal(bundle.omo_health_record.messages.length, 50);
@@ -539,12 +543,20 @@ test("the cap then trims findings, actions and messages to the newest 50 each", 
 	assert.equal(bundle.omo_health_record.investigations.length, 5);
 });
 
-test("the cap trims investigations last", () => {
-	const record = emptyRecord({ health: { investigations: Array.from({ length: 300 }, (_, i) => investigation(i)) } });
+test("small bundles still cap actions, messages and investigations to the newest rows", () => {
+	const record = emptyRecord({ health: {
+		actions: Array.from({ length: 51 }, (_, i) => action(-i)),
+		messages: Array.from({ length: 51 }, (_, i) => message(-i)),
+		investigations: Array.from({ length: 31 }, (_, i) => investigation(-i)),
+	} });
 	const bundle = auditBundle(record, timelineShell(), { config: DEFAULT_CONFIG, now: T0 });
 	assert.ok(JSON.stringify(bundle).length <= 100_000);
+	assert.deepEqual([bundle.omo_health_record.actions.length, bundle.omo_health_record.messages.length], [50, 50]);
 	assert.equal(bundle.omo_health_record.investigations.length, 30);
-	assert.equal(bundle.truncated.investigations, true);
+	assert.deepEqual(bundle.truncated, { messagesSkipped: 0, hours: false, topTurns: false, findings: false, actions: true, messages: true, investigations: true });
+	assert.equal(bundle.omo_health_record.actions.at(-1).ts, iso(T0 - 49));
+	assert.equal(bundle.omo_health_record.messages.at(-1).ms, T0 - 49);
+	assert.equal(bundle.omo_health_record.investigations.at(-1).openedMs, T0 - 29);
 });
 
 test("a fired detector whose only finding is the 60th keeps a representative row, stays in the prompt and leaves an answer that ignores it uncovered", () => {

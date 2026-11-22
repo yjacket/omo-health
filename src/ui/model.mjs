@@ -55,7 +55,35 @@ export function loadDaemonInputs({ paths, env, now }) {
 	};
 }
 
+export function fileStamp(file) {
+	const stat = statSafe(file);
+	return stat?.isFile() ? { size: stat.size, mtimeMs: stat.mtimeMs } : null;
+}
+
+/** A file can change without changing its directory's mtime. */
+function newestFileMs(dir) {
+	let newest = null;
+	for (const name of listDirSafe(dir)) {
+		const stamp = fileStamp(path.join(dir, name));
+		if (stamp && (newest === null || stamp.mtimeMs > newest)) newest = stamp.mtimeMs;
+	}
+	return newest;
+}
+
+/** Shared by state polling and the detail cache; no record contents are read. */
+export function recordsStamp({ health }) {
+	const investigations = statSafe(health.investigationsDir);
+	return JSON.stringify([
+		newestFileMs(health.decisionsDir),
+		investigations?.isDirectory() ? investigations.mtimeMs : null,
+		newestFileMs(health.investigationsDir),
+		newestFileMs(health.sessionsDir),
+		fileStamp(health.usageIndexFile)?.mtimeMs ?? null,
+	]);
+}
+
 export function loadUiInputs({ paths, env, now = Date.now() }) {
+	const stamp = recordsStamp(paths);
 	const { heartbeat, stopped, pidAlive: alive, loaded } = loadDaemonInputs({ paths, env, now });
 	let decisions;
 	let decisionsReadMs = null;
@@ -81,6 +109,7 @@ export function loadUiInputs({ paths, env, now = Date.now() }) {
 	return {
 		now,
 		version: VERSION,
+		recordsStamp: stamp,
 		paths,
 		heartbeat,
 		// Read-only: the daemon writes the board snapshot each tick and the ledger when a session ends.
@@ -477,6 +506,7 @@ export function buildUiState(inputs) {
 	return {
 		generatedMs: inputs.now,
 		version: inputs.version,
+		recordsStamp: inputs.recordsStamp,
 		sessions: section(() => buildSessions(inputs)),
 		ended: section(() => buildEnded(inputs)),
 		overview: section(() => buildOverview(inputs)),

@@ -1157,7 +1157,7 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 
 		// Finding lifecycle + policy + actions.
 		const stoppedMonitors = new Map();
-		// Findings logged opened or reopened this tick: the daemon snapshots their evidence before it fades.
+		// Supervision openings this tick: the daemon snapshots eligible findings before their evidence fades.
 		const opened = [];
 		const seen = new Set();
 		const results = [];
@@ -1229,15 +1229,17 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 			const previousResolvedMs = record.resolvedMs;
 			record.finding = finding;
 			record.lastSeenMs = now;
-			// `logged`: an opened/reopened line exists, so the matching `resolved` may be written (G33).
+			// Decision history includes info; it is independent of supervision openings.
 			if (!isNew && previousResolvedMs) {
 				decision({ event: "reopened", fp: finding.fp, detector: finding.detector, kind: finding.kind, cls: finding.cls, severity: finding.severity, subject: finding.subject, evidence: finding.evidence, afterMs: now - previousResolvedMs });
 				record.logged = true;
-				opened.push(finding);
 			} else if (!record.logged) {
 				decision({ fp: finding.fp, detector: finding.detector, kind: finding.kind, cls: finding.cls, severity: finding.severity, event: "opened", subject: finding.subject, evidence: finding.evidence });
 				record.logged = true;
+			}
+			if (finding.severity !== "info" && (previousResolvedMs || !record.openedForSupervision)) {
 				opened.push(finding);
+				record.openedForSupervision = true;
 			}
 			record.resolvedMs = undefined;
 			if (finding.severity === "crit" && (isNew || previousSeverity !== "crit")) writeReport(paths, finding, record, now);
@@ -1460,6 +1462,7 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 				...(runningJob(r) ? { analyst: runningJob(r) } : {}),
 				...(r.invOpenedMs ? { invOpenedMs: r.invOpenedMs, invStatus: r.invStatus, holdToasted: Boolean(r.holdToasted) } : {}),
 				loggedOpen: Boolean(r.logged),
+				openedForSupervision: Boolean(r.openedForSupervision),
 				history: r.history.slice(-10),
 				finding: r.finding && { fp: r.finding.fp, detector: r.finding.detector, kind: r.finding.kind, cls: r.finding.cls, severity: r.finding.severity, subject: r.finding.subject, titleKo: r.finding.titleKo },
 			}));
@@ -1495,6 +1498,8 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 					analyst: r.analyst?.jobId ? restoredJob(r.analyst) : undefined,
 					...(r.invOpenedMs ? { invOpenedMs: r.invOpenedMs, invStatus: r.invStatus, holdToasted: Boolean(r.holdToasted) } : {}),
 					logged: Boolean(r.loggedOpen),
+					// Older state did not distinguish decision logging from supervision.
+					openedForSupervision: r.openedForSupervision ?? (Boolean(r.loggedOpen) && r.finding.severity !== "info"),
 					history: Array.isArray(r.history) ? r.history.slice(-10) : [],
 					finding: r.finding,
 				});

@@ -50,8 +50,7 @@ export const AUDIT_DETECTOR_ID = /^D\d+$/;
 /** The answer's check limit and the most fired detectors one answer can require. */
 export const AUDIT_CHECK_MAX = 40;
 /** The bundle's finding slots before truncation. */
-const FINDING_SLOTS = 50;
-const MACHINE_FINDING_SLOTS = 20;
+export const AUDIT_LIST_CAPS = Object.freeze({ findings: 50, machineFindings: 20, actions: 50, messages: 50, investigations: 30 });
 
 /** The fixed question the reviewer answers; it is the only free prose in the bundle. */
 export const AUDIT_QUESTION = "Review whether omo-health's findings, actions and token accounting for this session were right.";
@@ -224,8 +223,9 @@ function firedDetectorIds(findings) {
  * machine-only detectors require machine slots.
  */
 function selectFindings(findings, fired) {
-	if (fired.length > AUDIT_CHECK_MAX || fired.length > FINDING_SLOTS) throw new Error("evidence-too-large");
-	if (findings.length <= FINDING_SLOTS && findings.filter(({ scope }) => scope === "machine").length <= MACHINE_FINDING_SLOTS) return findings;
+	const { findings: limit, machineFindings: machineLimit } = AUDIT_LIST_CAPS;
+	if (fired.length > AUDIT_CHECK_MAX || fired.length > limit) throw new Error("evidence-too-large");
+	if (findings.length <= limit && findings.filter(({ scope }) => scope === "machine").length <= machineLimit) return findings;
 	const representatives = new Map(fired.map((detector) => [detector, null]));
 	for (const finding of findings) {
 		const current = representatives.get(finding.detector);
@@ -233,12 +233,12 @@ function selectFindings(findings, fired) {
 	}
 	const chosen = new Set(representatives.values());
 	let machine = [...chosen].filter(({ scope }) => scope === "machine").length;
-	if (machine > MACHINE_FINDING_SLOTS) throw new Error("evidence-too-large");
+	if (machine > machineLimit) throw new Error("evidence-too-large");
 	for (const finding of findings) {
-		if (chosen.size === FINDING_SLOTS) break;
+		if (chosen.size === limit) break;
 		if (chosen.has(finding)) continue;
 		if (finding.scope === "machine") {
-			if (machine === MACHINE_FINDING_SLOTS) continue;
+			if (machine === machineLimit) continue;
 			machine += 1;
 		}
 		chosen.add(finding);
@@ -415,10 +415,15 @@ export function auditBundle(record, timeline, { config, now } = {}) {
 	const fired = health.firedDetectors ?? firedDetectorIds(allFindings);
 	const findings = selectFindings(allFindings, fired);
 	truncated.findings = findings.length < Math.max(health.counts?.findings ?? 0, allFindings.length);
-	for (const key of ["actions", "messages", "investigations"]) {
-		truncated[key] = health.counts?.[key] > (health[key]?.length ?? 0);
-	}
-	if (Array.isArray(health.investigations) && health.investigations.some((row) => row?.verdictHistoryTooLarge)) throw new Error("evidence-too-large");
+	// The record supplies newest-first lists and (when retained) their original counts.
+	const capped = (key) => {
+		const list = Array.isArray(health[key]) ? health[key] : [];
+		const rows = list.slice(0, AUDIT_LIST_CAPS[key]);
+		truncated[key] = rows.length < Math.max(health.counts?.[key] ?? 0, list.length);
+		return rows;
+	};
+	const investigations = capped("investigations");
+	if (investigations.some((row) => row?.verdictHistoryTooLarge)) throw new Error("evidence-too-large");
 	const bundle = {
 		session: {
 			sessionId: textOf(session.sessionId),
@@ -446,10 +451,10 @@ export function auditBundle(record, timeline, { config, now } = {}) {
 			tokensState: textOf(child?.tokensState),
 		})),
 		omo_health_record: {
-			findings: allFindings,
-			actions: actionsOf(health.actions),
-			investigations: investigationsOf(health.investigations),
-			messages: messagesOf(health.messages),
+			findings,
+			actions: actionsOf(capped("actions")),
+			investigations: investigationsOf(investigations),
+			messages: messagesOf(capped("messages")),
 		},
 		checks_omo_health_runs: DETECTOR_CHECKS,
 		thresholds: thresholdsOf(config),
@@ -466,25 +471,8 @@ export function auditBundle(record, timeline, { config, now } = {}) {
 			bundle.tokens.topTurns = bundle.tokens.topTurns.slice(0, 5);
 			truncated.topTurns = true;
 		}
-		if (sizeOf(bundle) > BUNDLE_MAX_CHARS) {
-			bundle.omo_health_record.findings = findings;
-			if (bundle.omo_health_record.actions.length > 50) {
-				bundle.omo_health_record.actions = bundle.omo_health_record.actions.slice(0, 50);
-				truncated.actions = true;
-			}
-			if (bundle.omo_health_record.messages.length > 50) {
-				bundle.omo_health_record.messages = bundle.omo_health_record.messages.slice(0, 50);
-				truncated.messages = true;
-			}
-		}
-		if (sizeOf(bundle) > BUNDLE_MAX_CHARS && bundle.omo_health_record.investigations.length > 30) {
-			bundle.omo_health_record.investigations = bundle.omo_health_record.investigations.slice(0, 30);
-			truncated.investigations = true;
-		}
 		if (sizeOf(bundle) > BUNDLE_MAX_CHARS) throw new Error("evidence-too-large");
 	}
-	// The finding caps apply even when the byte budget did not require trimming.
-	bundle.omo_health_record.findings = findings;
 	assertBundleText(bundle);
 	// `now` is accepted so callers and tests use the same clock seam as the rest of the record path.
 	void now;

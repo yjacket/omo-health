@@ -77,11 +77,11 @@ it("(plan 35) browser history toggles and requests each row independently", asyn
 		tag, ...attrs, children: children.flat(), classList: { toggle() {} }, setAttribute() {},
 	});
 	const { endedItem, loadEndedPage } = runInNewContext(
-		["endedDetailId", "endedDetailUrl", "endedTokenSignature", "endedItem", "loadEndedDetail", "loadEndedPage"]
+		["endedDetailId", "endedDetailUrl", "endedTokenSignature", "endedDetailSignature", "endedItem", "loadEndedDetail", "loadEndedPage"]
 			.map((name) => app.match(new RegExp(`(?:async )?function ${name}\\([^]*?\\n\\t\\}`))?.[0]).join("\n") +
 			"\n({ endedItem, loadEndedPage })",
 		{
-			el, openEnded, endedDetails, drawEndedDetail() {}, ENDED_COLUMNS: Array(6).fill("column"), cellClass() {},
+			el, openEnded, endedDetails, lastState: null, drawEndedDetail() {}, ENDED_COLUMNS: Array(6).fill("column"), cellClass() {},
 			when() {}, endedSessionCell() {}, outcomeMark() {}, endedTokenCell() {}, show() {},
 			append: (body, children) => Object.assign(body, { children }),
 			getJson: (url) => { urls.push(url); return { messages: [], counts: { messages: 1 } }; },
@@ -151,16 +151,22 @@ for (const [label, previous, next, changed] of [
 	});
 }
 
-function endedRefreshHarness() {
+function endedRefreshHarness(recordsStamp) {
 	const openEnded = new Set();
 	const endedDetails = new Map();
 	const requests = [];
 	const redraws = [];
 	const globals = {
 		openEnded, endedDetails, hideChildren: false, AUDIT_ACTIVE: new Set(["running"]), errors: new Map(),
-		seq: 0, timer: null, gone: false, token: "test", clearTimeout() {}, schedule() {}, render() {},
+		seq: 0, timer: null, gone: false, token: "test", clearTimeout() {}, schedule() {},
+		lastState: { recordsStamp },
+		render(state) { globals.lastState = state; },
 		document: { querySelectorAll: () => [] }, // The old audit poll has no active audit to read.
-		fetch: async () => ({ ok: true, json: async () => ({ ended: { rows: globals.rows } }) }),
+		fetch: async () => ({ ok: true, json: async () => ({ recordsStamp, ended: { rows: globals.rows } }) }),
+		el: (tag, attrs, ...children) => ({ tag, ...attrs, children, classList: { toggle() {} }, setAttribute() {} }),
+		ENDED_COLUMNS: Array(6).fill("column"), cellClass() {},
+		when() {}, endedSessionCell() {}, outcomeMark() {}, endedTokenCell() {}, show() {}, endedDetailView() {},
+		append: (body, children) => Object.assign(body, { children }),
 		drawEndedDetail: (id) => redraws.push(id),
 		getJson: (url, headers) => {
 			const result = BrowserPromise.withResolvers();
@@ -169,11 +175,12 @@ function endedRefreshHarness() {
 		},
 	};
 	// A promise from the extracted functions' realm resumes their await on the next microtask.
-	const { refresh, loadEndedDetail, Promise: BrowserPromise } = endedDetailFunctions([
-		"refresh", "pollAudits", "refreshEndedDetails", "endedDetailId", "endedDetailUrl", "endedTokenSignature", "loadEndedDetail", "Promise",
+	const { refresh, loadEndedDetail, endedItem, Promise: BrowserPromise } = endedDetailFunctions([
+		"refresh", "pollAudits", "refreshEndedDetails", "endedDetailId", "endedDetailUrl", "endedTokenSignature", "endedDetailSignature", "loadEndedDetail", "endedItem", "Promise",
 	], globals);
 	return {
-		openEnded, endedDetails, requests, redraws,
+		openEnded, endedDetails, requests, redraws, endedItem,
+		setRecordsStamp(next) { recordsStamp = next; },
 		async seed(row, data) {
 			const loaded = loadEndedDetail(row);
 			requests.pop().resolve(data);
@@ -213,6 +220,63 @@ it("(plan 36) state refresh re-reads a changed open detail and only drops a chan
 	assert.deepEqual(h.redraws, [openId]);
 	await h.tick({ ...openRow, ...readyTokens });
 	assert.equal(h.requests.length, 1, "a successful refresh caches the new signature");
+});
+
+it("(plan 40) a changed records stamp refreshes an open panel without changed tokens or an active audit", async () => {
+	const h = endedRefreshHarness("before");
+	const row = { sessionId: "open", ...readyTokens };
+	const old = { health: { investigations: [] } };
+	h.openEnded.add(row.sessionId);
+	await h.seed(row, old);
+	await h.tick(row);
+	assert.equal(h.requests.length, 0, "an unchanged stamp does not refetch");
+
+	h.setRecordsStamp("after");
+	await h.tick(row);
+	assert.deepEqual(h.requests.map(({ url }) => url), ["/api/session?id=open"]);
+	assert.equal(h.requests[0].headers["x-omo-health-auto"], "1");
+	assert.equal(h.endedDetails.get(row.sessionId).data, old);
+	assert.deepEqual(h.redraws, [], "keep the panel in place until its replacement is ready");
+
+	const updated = { health: { investigations: [{ status: "answered" }] } };
+	h.requests[0].resolve(updated);
+	await Promise.resolve();
+	assert.equal(h.endedDetails.get(row.sessionId).data, updated);
+	assert.equal(h.openEnded.has(row.sessionId), true);
+	assert.deepEqual(h.redraws, [row.sessionId]);
+	await h.tick(row);
+	assert.equal(h.requests.length, 1, "the new stamp is cached");
+});
+
+it("(plan 40) a changed records stamp drops closed cache entries, including rows absent from the poll", async () => {
+	const h = endedRefreshHarness("before");
+	const row = { sessionId: "closed", ...readyTokens };
+	const absent = { ...row, sessionId: "absent" };
+	await h.seed(row, {});
+	await h.seed(absent, {});
+	await h.tick(row);
+	assert.equal(h.endedDetails.size, 2, "an unchanged stamp keeps closed cache entries");
+
+	h.setRecordsStamp("after");
+	await h.tick(row);
+	assert.equal(h.endedDetails.size, 0, "a changed stamp drops closed cache entries");
+	assert.equal(h.requests.length, 0, "closed rows do not refetch in the background");
+	h.endedItem(row).children[0].onclick();
+	assert.deepEqual(h.requests.map(({ url }) => url), ["/api/session?id=closed"]);
+});
+
+it("(plan 40) reopening revalidates a cached detail before the next poll", async () => {
+	const h = endedRefreshHarness("before");
+	const row = { sessionId: "reopened", ...readyTokens };
+	const old = { health: { investigations: [] } };
+	h.openEnded.add(row.sessionId);
+	await h.seed(row, old);
+	const { children: [toggle] } = h.endedItem(row);
+	toggle.onclick(); // Close.
+	toggle.onclick(); // Reopen while the last polled stamp is still unchanged.
+	assert.deepEqual(h.requests.map(({ url }) => url), ["/api/session?id=reopened"]);
+	assert.equal(h.endedDetails.get(row.sessionId).data, old);
+	assert.equal(h.openEnded.has(row.sessionId), true);
 });
 
 it("(plan 36) a failed token refetch keeps the open panel and retries on the next state refresh", async () => {
@@ -416,7 +480,7 @@ describe("ui model", () => {
 	it("returns every section without throwing for an empty home", () => {
 		const home = makeHome();
 		const state = uiState({ paths: home.paths, env: home.env, now: NOW });
-		assert.deepEqual(Object.keys(state), ["generatedMs", "version", "sessions", "ended", "overview", "investigations", "history", "settings", "prefs"]);
+		assert.deepEqual(Object.keys(state), ["generatedMs", "version", "recordsStamp", "sessions", "ended", "overview", "investigations", "history", "settings", "prefs"]);
 		for (const key of ["sessions", "ended", "overview", "investigations", "history", "settings"]) assert.equal(state[key].error, undefined, key);
 		assert.equal(state.history.total, 0);
 		assert.deepEqual(state.investigations.rows, []);
@@ -428,6 +492,33 @@ describe("ui model", () => {
 		assert.deepEqual(state.prefs, { hideChildren: false });
 		assert.deepEqual(state.ended.counts.map((c) => [c.outcome, c.count]), Object.keys(OUTCOME_LABELS).map((outcome) => [outcome, 0]));
 	});
+
+	for (const [type, dir, name, contents] of [
+		["decision", "decisionsDir", "2026-09-29.jsonl", "{}\n"],
+		["investigation", "investigationsDir", "child-review.json", '{"id":"child-review"}'],
+	]) {
+		it(`(plan 40) recordsStamp changes only with record metadata: ${type} file`, () => {
+			const home = makeHome();
+			const file = path.join(home.paths.health[dir], name);
+			const stamp = (now = NOW) => uiState({ ...home, now }).recordsStamp;
+			const before = stamp();
+			write(file, contents);
+			fs.utimesSync(file, new Date(NOW), new Date(NOW));
+			const created = stamp();
+			assert.notEqual(created, before, "a new record changes the stamp");
+
+			const parent = path.dirname(file);
+			fs.utimesSync(parent, new Date(NOW), new Date(NOW));
+			const beforeEdit = stamp();
+			fs.appendFileSync(file, "\n");
+			fs.utimesSync(file, new Date(NOW + HOUR), new Date(NOW + HOUR));
+			fs.utimesSync(parent, new Date(NOW), new Date(NOW));
+			const afterEdit = stamp();
+			assert.notEqual(afterEdit, beforeEdit, "an existing record changes even if the directory mtime does not");
+			write(home.paths.health.sessionsSnapshotFile, { ts: NOW });
+			assert.equal(stamp(NOW + DAY), afterEdit, "a clock tick and unrelated file do not change the stamp");
+		});
+	}
 
 	describe("session board from the daemon's snapshot file", () => {
 		const MAIN = "01a11561-1048-74da-b7b2-c4ac83217a7c";

@@ -152,11 +152,43 @@ test("IS-10: bounded normal session produces the same bundle without dashboard p
 	const full = loadSessionRecord(options);
 	const bounded = loadSessionRecord({ ...options, auditRetention: true });
 	const bundle = (record) => auditBundle(record, null, { config: DEFAULT_CONFIG, now: options.now });
-	assert.deepEqual(bundle(bounded), bundle(full));
+	const unrestricted = bundle(full);
+	assert.deepEqual(bundle(bounded), unrestricted);
+	assert.deepEqual(Object.fromEntries(Object.entries(unrestricted.omo_health_record).map(([key, rows]) => [key, rows.length])), full.health.counts);
+	assert.deepEqual(unrestricted.truncated, { messagesSkipped: 0, hours: false, topTurns: false, findings: false, actions: false, messages: false, investigations: false });
 	assert.deepEqual(bounded.health.counts, { findings: 2, actions: 2, investigations: 1, messages: 1 });
 	assert.deepEqual(bounded.analystModels, ["p/current", "p/old"]);
 	assert.doesNotMatch(JSON.stringify(bounded.health), /private|machine prose/);
 	assert.match(JSON.stringify(full.health), /private message/);
+});
+
+test("IS-8/IS-10: QA-3's 56 messages yield the same 50 audit refs and flags on both paths", () => {
+	const { paths } = setup();
+	const rows = baseRows().filter(({ sessionId }) => ["s-main", "s-child", "s-grand"].includes(sessionId))
+		.map((row) => ({ ...row, cwd: paths.repoRoot }));
+	const [main, child, grandchild] = rows;
+	writeLedger(paths, rows);
+	const mainMessages = Array.from({ length: 55 }, (_, i) => ohealth(T0 + (i + 1) * 2 * MIN, `QA-MSG-${i + 1}`));
+	const grandchildMessage = ohealth(T0 + 51 * MIN, "QA-MSG-grandchild");
+	mainSessionFile(paths, main.sessionId, mainMessages);
+	childSessionFile(child.cwd, child.taskId, child.sessionId);
+	childSessionFile(grandchild.cwd, grandchild.taskId, grandchild.sessionId, [grandchildMessage]);
+	const options = { paths, id: main.sessionId, now: main.endedMs };
+	const full = loadSessionRecord(options);
+	const bounded = loadSessionRecord({ ...options, auditRetention: true });
+	assert.equal(full.health.messages.length, 56);
+	assert.equal(bounded.health.counts.messages, 56);
+	const bundle = (record) => auditBundle(record, null, { config: DEFAULT_CONFIG, now: options.now });
+	const retainedBundle = bundle(bounded);
+	const unrestricted = bundle(full);
+	assert.deepEqual(
+		{ count: unrestricted.omo_health_record.messages.length, truncated: unrestricted.truncated.messages },
+		{ count: 50, truncated: true },
+	);
+	assert.deepEqual(retainedBundle, unrestricted);
+	const newest = [...mainMessages, grandchildMessage].map(({ timestamp }) => Date.parse(timestamp)).sort((a, b) => b - a).slice(0, 50);
+	assert.deepEqual(retainedBundle.omo_health_record.messages.map(({ ref, ms }) => [ref, ms]), newest.map((ms, i) => [`M${i + 1}`, ms]));
+	assert.deepEqual(retainedBundle.truncated, { messagesSkipped: 0, hours: false, topTurns: false, findings: false, actions: false, messages: true, investigations: false });
 });
 
 test("IS-10: bounded scan keeps oldest detector representatives and exact history counts", () => {

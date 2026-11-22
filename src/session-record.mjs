@@ -7,7 +7,7 @@ import { streamInvestigations } from "./investigations.mjs";
 import { streamEnded } from "./session-ledger.mjs";
 import { compactUsage, readUsageIndex, treeTotals, usageEntryFor } from "./usage-index.mjs";
 import { reasonCode } from "./audit-codes.mjs";
-import { AUDIT_CHECK_MAX, AUDIT_DETECTOR_ID, BUNDLE_MAX_CHARS, auditEvidence, auditHistoryRow } from "./judge/audit.mjs";
+import { AUDIT_CHECK_MAX, AUDIT_DETECTOR_ID, AUDIT_LIST_CAPS, BUNDLE_MAX_CHARS, auditEvidence, auditHistoryRow } from "./judge/audit.mjs";
 import { statSafe } from "./util/fsx.mjs";
 import { redact, truncate } from "./util/text.mjs";
 
@@ -901,11 +901,11 @@ export function loadSessionRecord({ paths, id, endedMs, now = Date.now(), messag
 	const startedMs = msOf(row.startedMs);
 	const sinceMs = (Number.isFinite(startedMs) ? startedMs : now) - 30 * DAY_MS;
 	const retained = auditRetention ? {
-		findings: auditFindings(50, byDecisionTime),
-		machine: auditFindings(20, byNewest),
-		actions: newest(50, byDecisionTime),
-		investigations: newest(30, byInvestigationTime),
-		messages: newest(50, byMessageTime),
+		findings: auditFindings(AUDIT_LIST_CAPS.findings, byDecisionTime),
+		machine: auditFindings(AUDIT_LIST_CAPS.machineFindings, byNewest),
+		actions: newest(AUDIT_LIST_CAPS.actions, byDecisionTime),
+		investigations: newest(AUDIT_LIST_CAPS.investigations, byInvestigationTime),
+		messages: newest(AUDIT_LIST_CAPS.messages, byMessageTime),
 	} : null;
 	const decisionHistory = scanDecisionHistory(streamDecisions(paths), row, retained?.machine);
 	const decisionJoin = joinSessionDecisions(row, descendants, () => streamInvestigations(paths), () => streamDecisions(paths, sinceMs), retained);

@@ -38,7 +38,7 @@
 	const openInvestigations = new Set();
 	// Ids of the session cards the user expanded: they stay open across the 10 s re-render too.
 	const openSessions = new Set();
-	// Ids of the expanded history rows, and the details tagged with the row's token signature at fetch time.
+	// Ids of the expanded history rows, and the details tagged with tokens and the records stamp at fetch time.
 	const openEnded = new Set();
 	const endedDetails = new Map();
 	// The last rendered state: the history filter redraws from it at once, before the server has stored the choice.
@@ -730,6 +730,10 @@
 		return JSON.stringify([r.tokensState, r.tokens?.total, r.treeTokens, r.treeTokensState]);
 	}
 
+	function endedDetailSignature(r) {
+		return JSON.stringify([endedTokenSignature(r), lastState?.recordsStamp]);
+	}
+
 	/** Everything omo-health recorded about one ended session, as GET /api/session returns it. */
 	function endedRecord(r, d) {
 		const id = endedDetailId(r);
@@ -799,10 +803,10 @@
 		if (window.scrollX !== scrollX || window.scrollY !== scrollY) window.scrollTo({ left: scrollX, top: scrollY, behavior: "instant" });
 	}
 
-	/** Fetches the record, leaving any old panel in place during a token refresh. Only the latest request can update the cache. */
+	/** Fetches the record, optionally leaving the old panel in place. Only the latest request can update the cache. */
 	async function loadEndedDetail(r, headers, preserve = false) {
 		const id = endedDetailId(r);
-		const signature = endedTokenSignature(r);
+		const signature = endedDetailSignature(r);
 		const entry = endedDetails.get(id) ?? { state: "loading", data: null, error: null, signature };
 		if (entry.request?.signature === signature) return;
 		const request = { signature };
@@ -891,7 +895,7 @@
 			const id = endedDetailId(r);
 			const entry = endedDetails.get(id);
 			if (!entry) continue;
-			const signature = endedTokenSignature(r);
+			const signature = endedDetailSignature(r);
 			const changed = entry.signature !== signature || (entry.request && entry.request.signature !== signature);
 			if (!openEnded.has(id)) {
 				if (changed) endedDetails.delete(id);
@@ -931,10 +935,9 @@
 					detail.hidden = !next;
 					if (!next) return;
 					const entry = endedDetails.get(id);
-					if (entry) {
-						drawEndedDetail(id);
-						if (entry.signature !== endedTokenSignature(r)) void loadEndedDetail(r, undefined, true);
-					} else void loadEndedDetail(r);
+					if (entry) drawEndedDetail(id);
+					// Revalidate even before the next state poll reports a changed stamp.
+					void loadEndedDetail(r, undefined, Boolean(entry?.data));
 				},
 			},
 			cells.map((cell, i) => el(i === 0 ? "th" : "td", { scope: i === 0 ? "row" : undefined, class: cellClass(ENDED_COLUMNS[i]) }, cell)),
@@ -1508,6 +1511,9 @@
 		}
 		if (mine !== seq) return;
 		gone = false;
+		if (lastState?.recordsStamp !== state.recordsStamp) {
+			for (const id of endedDetails.keys()) if (!openEnded.has(id)) endedDetails.delete(id);
+		}
 		render(state);
 		schedule();
 		refreshEndedDetails(state.ended?.rows ?? [], auto);

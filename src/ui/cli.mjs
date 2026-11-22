@@ -6,9 +6,8 @@ import { Worker } from "node:worker_threads";
 import { loadConfig } from "../config.mjs";
 import { listSubjectsNow, runDiagnose } from "../diagnose.mjs";
 import { createLogger } from "../log.mjs";
-import { listDirSafe, statSafe } from "../util/fsx.mjs";
 import { createDetailOperations } from "./detail-worker.mjs";
-import { uiState } from "./model.mjs";
+import { fileStamp, recordsStamp, uiState } from "./model.mjs";
 import { createUiServer } from "./server.mjs";
 import { buildSessionView } from "./session-view.mjs";
 
@@ -95,26 +94,6 @@ export function createStartAudit({ paths, env = process.env, now = Date.now, wor
 	}, detailWorker);
 }
 
-const fileStamp = (file) => {
-	const stat = statSafe(file);
-	return stat?.isFile() ? { size: stat.size, mtimeMs: stat.mtimeMs } : null;
-};
-
-const dirMtime = (dir) => {
-	const stat = statSafe(dir);
-	return stat?.isDirectory() ? stat.mtimeMs : null;
-};
-
-/** Newest mtime among a directory's files: an append to an existing file changes it, unlike the directory's own mtime. */
-function newestFileMs(dir) {
-	let newest = null;
-	for (const name of listDirSafe(dir)) {
-		const stamp = fileStamp(path.join(dir, name));
-		if (stamp && (newest === null || stamp.mtimeMs > newest)) newest = stamp.mtimeMs;
-	}
-	return newest;
-}
-
 /**
  * The dashboard's memoized `sessionDetail` (plan todo 8): it caches the
  * historical record only, keyed by every file the reader consumes, and rebuilds
@@ -126,14 +105,7 @@ export function createSessionDetail({ paths, env = process.env, now = Date.now, 
 	const detailWorker = worker ?? (local ? null : createDetailWorker({ paths, env }));
 	const cache = new Map();
 
-	const signatureOf = (file) =>
-		JSON.stringify({
-			file: fileStamp(file),
-			decisions: newestFileMs(paths.health.decisionsDir),
-			investigations: dirMtime(paths.health.investigationsDir),
-			ledger: newestFileMs(paths.health.sessionsDir),
-			usage: fileStamp(paths.health.usageIndexFile)?.mtimeMs ?? null,
-		});
+	const signatureOf = (file) => JSON.stringify([fileStamp(file), recordsStamp(paths)]);
 
 	function sessionDetail(id, endedMs) {
 		const key = endedMs === undefined ? id : `${id}:${endedMs}`;
