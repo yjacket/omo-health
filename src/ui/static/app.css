@@ -1556,6 +1556,68 @@ a:hover {
 	font-weight: 500;
 }
 
+/* 상위 모델 조사: the verdict facts, 항목별, 권고 and the way to start one, spaced like the lists of the record above it. */
+.audit {
+	display: flex;
+	flex-direction: column;
+	gap: var(--s-4);
+	min-inline-size: 0;
+}
+
+/* One row per check. The rows share the chip column, so the judgments read down one edge. */
+.audit__checks {
+	display: grid;
+	grid-template-columns: auto minmax(0, 1fr);
+	column-gap: var(--s-3);
+}
+
+.audit__check {
+	display: grid;
+	grid-column: 1 / -1;
+	grid-template-columns: subgrid;
+	align-items: baseline;
+	padding-block: var(--s-2);
+	border-block-start: 1px solid var(--hairline);
+}
+
+.audit__check:first-child {
+	padding-block-start: 0;
+	border-block-start: none;
+}
+
+.audit__check > .chip {
+	justify-self: start;
+}
+
+.audit__what {
+	display: flex;
+	flex-direction: column;
+	gap: var(--s-1);
+	color: var(--ink-2);
+	min-inline-size: 0;
+	overflow-wrap: anywhere;
+}
+
+.audit__item {
+	color: var(--ink);
+	font-weight: 500;
+}
+
+.audit__recs {
+	padding-inline-start: var(--s-5);
+	list-style: decimal;
+	color: var(--ink-2);
+}
+
+.audit__recs li + li {
+	margin-block-start: var(--s-1);
+}
+
+.audit__recs li::marker {
+	color: var(--ink-3);
+	font-variant-numeric: tabular-nums;
+}
+
 @media (max-width: 600px) {
 	.main {
 		gap: var(--s-4);
@@ -1579,15 +1641,17 @@ a:hover {
 		padding: var(--s-3);
 	}
 
-	/* The fact labels of a card and of a history detail are short, so the two columns survive a phone width. */
+	/* The fact labels of a card, of a history detail and of its audit are short, so the two columns survive a phone width. */
 	.sess__body .facts,
-	.ended__body > .split .facts {
+	.ended__body > .split .facts,
+	.audit .facts {
 		grid-template-columns: minmax(4.5rem, auto) 1fr;
 		gap: var(--s-2) var(--s-3);
 	}
 
 	.sess__body .facts dd,
-	.ended__body > .split .facts dd {
+	.ended__body > .split .facts dd,
+	.audit .facts dd {
 		margin-block-end: 0;
 	}
 

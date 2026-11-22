@@ -19,6 +19,11 @@
 	const LEVEL_RANK = { ok: 0, info: 1, warn: 2, crit: 3 };
 	const OUTCOME_TONE = { "goal-complete": "ok", answered: "ok", crash: "crit", failed: "crit", cancelled: "warn", released: "warn", closed: "idle", unknown: "idle" };
 	const ENDED_COLUMNS = [{ label: "끝난 시각", cls: "col-time" }, { label: "세션" }, { label: "결말", cls: "col-outcome" }, { label: "토큰", num: true }, { label: "이유" }, { label: "자식 · 시간 · omo", cls: "col-wide" }];
+	// 상위 모델 조사 (an audit of one session): the statuses an open detail follows on the 10 s refresh, and the token judgment as a chip tone.
+	const AUDIT_ACTIVE = new Set(["queued", "launching", "running"]);
+	const AUDIT_TOKEN_TONE = { normal: "ok", high: "warn", wasteful: "warn" };
+	// Why an audit cannot start now. The detail's audit.blocked carries only the code (src/ui/cli.mjs blockedOf), so the page words it as src/ui/labels.mjs AUDIT_REASON_LABELS does.
+	const AUDIT_BLOCKED_TEXT = { disabled: "설정에서 조사가 꺼져 있습니다", "daemon-off": "감시기가 꺼져 있어 조사할 수 없습니다", cap: "오늘 조사 한도를 다 썼습니다", "models-unknown": "세션이 쓴 모델을 다 확인하지 못해 조사할 수 없습니다", "no-model": "세션과 분석가 모델과 다른 상위 모델이 없습니다" };
 	const TABS = ["sessions", "ended", "admin"];
 
 	let token = null;
@@ -115,9 +120,10 @@
 		);
 	}
 
-	function button(label, { group, key, primary = false, mode = false, pressed, onclick }) {
+	/** A server action: off while its group is busy and once the server is gone. `disabled` holds it off for a reason of its own (an audit that cannot start now). */
+	function button(label, { group, key, primary = false, mode = false, pressed, disabled = false, onclick }) {
 		const cls = ["btn", primary ? "btn--primary" : null, mode ? "btn--mode" : null].filter(Boolean).join(" ");
-		return el("button", { type: "button", class: cls, "data-group": group, "data-key": key, "aria-pressed": pressed === undefined ? undefined : String(pressed), disabled: gone || busy.has(group), onclick }, label);
+		return el("button", { type: "button", class: cls, "data-group": group, "data-key": key, "aria-pressed": pressed === undefined ? undefined : String(pressed), disabled: disabled || gone || busy.has(group), onclick }, label);
 	}
 
 	const errorSlot = (group) => el("p", { class: "note note--crit", role: "status", "aria-live": "polite", text: errors.get(group) ?? "" });
@@ -601,6 +607,79 @@
 		);
 	}
 
+	/** An audit verdict as a chip tone: sound is fine, every other finding warns, and an unverifiable check stays neutral. */
+	const auditTone = (judgment) => (judgment === "sound" ? "ok" : judgment === "unverifiable" ? undefined : "warn");
+
+	/** How to start an audit: the model it would use and today's count, why it cannot start now, then 조사 (다시 조사 after a result). */
+	function auditStart(id, a, label, primary = false) {
+		const group = `audit:${id}`;
+		const blocked = a.blocked ? (AUDIT_BLOCKED_TEXT[a.blocked] ?? a.blocked) : null;
+		return el(
+			"div",
+			{ class: "block" },
+			note(`조사 모델 ${show(a.planned?.model)} · 오늘 ${show(a.usedToday)}/${show(a.perDay)}`),
+			blocked ? note(`${blocked}.`, "warn") : null,
+			el("div", { class: "wrap-row" }, button(label, { group, key: group, primary, disabled: Boolean(a.blocked), onclick: () => void startAudit(id) })),
+		);
+	}
+
+	/** A queued or running audit: its status with the model and since when, and a note when the daemon that runs it is off. */
+	function auditProgress(a) {
+		const s = a.state;
+		// A queued audit has no model of its own until the daemon starts it, with the one the detail plans.
+		const line = s.status === "queued" ? [show(a.planned?.model), `요청 ${when(s.requestedMs)}`] : [show(s.model), `시작 ${when(s.startedMs ?? s.launchMs)}`];
+		return el(
+			"div",
+			{ class: "block" },
+			el("div", { class: "wrap-row" }, chip(s.statusKo, "info"), el("span", { class: "meta", text: line.join(" · ") })),
+			a.stalled ? note("감시기가 꺼져 있어 진행이 멈춰 있습니다.", "warn") : null,
+		);
+	}
+
+	/** One check of the reviewer: its judgment, what it judged and why, and the record lines it cites. */
+	function auditCheck(c) {
+		return el(
+			"li",
+			{ class: "audit__check" },
+			chip(c.judgmentKo, auditTone(c.judgment)),
+			el("div", { class: "audit__what" }, el("p", { class: "audit__item", text: c.item }), c.explanation ? el("p", { text: c.explanation }) : null, c.evidence.length ? evidenceList(c.evidence) : null),
+		);
+	}
+
+	/** The reviewer's answer: the verdict as facts, one row per check, then what it recommends. */
+	function auditResult(s) {
+		const r = s.result;
+		return [
+			facts([
+				["종합", chip(r.overallKo, auditTone(r.overall))],
+				["요약", plain(r.summary)],
+				["토큰", chip(r.tokens.judgmentKo, AUDIT_TOKEN_TONE[r.tokens.judgment]), r.tokens.explanation ? plain(r.tokens.explanation) : null],
+				["확신", plain(`${Math.round(r.confidence * 100)}%`)],
+				["모델", el("span", {}, mono(s.model), s.independence === "family" ? " · 다른 계열" : null)],
+				["조사 시각", plain(when(s.finishedMs))],
+			]),
+			subBlock("항목별", r.checks.length ? el("ul", { class: "audit__checks" }, r.checks.map(auditCheck)) : empty("검토 항목이 없습니다")),
+			subBlock("권고", r.recommendations.length ? el("ol", { class: "audit__recs" }, r.recommendations.map((line) => el("li", { text: line }))) : empty("권고가 없습니다")),
+		];
+	}
+
+	/** A failed audit: why, in Korean; then the model, the time and the stored code; then the stored detail (redacted, at most 300 characters). */
+	function auditFailure(s) {
+		const meta = [s.model, Number.isFinite(s.finishedMs) ? when(s.finishedMs) : null, s.reason].filter(Boolean).join(" · ");
+		return el("div", { class: "block" }, note(`조사하지 못했습니다: ${show(s.reasonKo)}`, "crit"), meta ? el("p", { class: "meta", text: meta }) : null, s.detail ? evidenceList([s.detail]) : null);
+	}
+
+	/** 상위 모델 조사: start an audit of the session, follow it while it is queued or running, then show the verdict or why there is none. */
+	function auditBlock(id, a) {
+		const status = a.state?.status;
+		let parts;
+		if (AUDIT_ACTIVE.has(status)) parts = auditProgress(a);
+		else if (status === "done") parts = [auditResult(a.state), auditStart(id, a, "다시 조사")];
+		else if (status === "failed") parts = [auditFailure(a.state), auditStart(id, a, "다시 조사")];
+		else parts = auditStart(id, a, "조사", true);
+		return block("상위 모델 조사", el("div", { class: "audit" }, parts, errorSlot(`audit:${id}`), errorSlot(`audit-read:${id}`)));
+	}
+
 	/** Everything omo-health recorded about one ended session, as GET /api/session returns it. */
 	function endedRecord(r, d) {
 		const id = r.sessionId;
@@ -631,6 +710,7 @@
 					subBlock("보낸 메시지", paged("messages", samples((m) => endedMessage(m, d.session.sessionId)), "보낸 메시지가 없습니다")),
 				),
 			),
+			auditBlock(id, d.audit),
 		];
 	}
 
@@ -694,6 +774,41 @@
 		}
 		busy.delete(group);
 		drawEndedDetail(id);
+	}
+
+	/** Asks the daemon for an audit of the session, then re-reads the row's audit block before 조사 can be pressed again. */
+	function startAudit(id) {
+		return post("/api/audit", { sessionId: id }, `audit:${id}`, () => loadAudit(id));
+	}
+
+	/**
+	 * Re-reads one open row's audit block. The rest of the record stays as first fetched, with every page 더 보기 appended to it.
+	 * `headers` marks the 10 s re-read as automatic, so following an audit does not keep the server alive.
+	 */
+	async function loadAudit(id, headers) {
+		const entry = endedDetails.get(id);
+		if (entry?.state !== "ready") return;
+		const slot = `audit-read:${id}`;
+		try {
+			const data = await getJson(`/api/session?id=${encodeURIComponent(id)}`, headers);
+			if (data) {
+				// A refusal shown while the audit ran (이미 조사 중입니다) is moot once it ends.
+				if (AUDIT_ACTIVE.has(entry.data.audit?.state?.status) && !AUDIT_ACTIVE.has(data.audit?.state?.status)) errors.delete(`audit:${id}`);
+				entry.data.audit = data.audit;
+				errors.delete(slot);
+			}
+		} catch (error) {
+			errors.set(slot, `조사 상태를 읽지 못했습니다: ${error?.message ?? error}`);
+		}
+		drawEndedDetail(id);
+	}
+
+	/** On the 10 s refresh, re-reads the audit of every open row whose audit is queued or running. A closed row or a finished audit is never polled. */
+	function pollAudits() {
+		for (const cell of document.querySelectorAll("td[data-ended]")) {
+			const id = cell.dataset.ended;
+			if (openEnded.has(id) && AUDIT_ACTIVE.has(endedDetails.get(id)?.data?.audit?.state?.status)) void loadAudit(id, { "x-omo-health-auto": "1" });
+		}
 	}
 
 	/** One ended session: its six-column row, and the detail row it expands into. The row is the click target; the button is the keyboard one. */
@@ -1290,9 +1405,12 @@
 		gone = false;
 		render(state);
 		schedule();
+		if (auto) pollAudits();
 	}
 
 	function failureText(status, data) {
+		// A refusal that names its reason (POST /api/audit) says it in Korean.
+		if (data?.reasonKo) return `${data.reasonKo}.`;
 		switch (data?.error) {
 			case "unreadable":
 				return `config.json을 읽을 수 없어 바꾸지 않았습니다${data.message ? `: ${data.message}` : "."}`;
@@ -1305,7 +1423,8 @@
 		}
 	}
 
-	async function post(path, body, group) {
+	/** POSTs one control action, then redraws. `after` first re-reads what the action changed outside the state (an open detail's audit), so its button stays off until then. */
+	async function post(path, body, group, after) {
 		if (gone || busy.has(group)) return;
 		errors.delete(group);
 		busy.add(group);
@@ -1317,9 +1436,13 @@
 			busy.delete(group);
 			return showServerGone();
 		}
-		busy.delete(group);
-		if (res.status === 401) return showTokenProblem(false);
+		if (res.status === 401) {
+			busy.delete(group);
+			return showTokenProblem(false);
+		}
 		if (!res.ok) errors.set(group, failureText(res.status, await res.json().catch(() => ({}))));
+		await after?.();
+		busy.delete(group);
 		await refresh(false);
 	}
 
