@@ -196,6 +196,7 @@ body::before {
 h1,
 h2,
 h3,
+h4,
 p,
 dl,
 dd,
@@ -352,6 +353,13 @@ a:hover {
 	font-weight: 600;
 }
 
+/* The title of a block inside a block: one level down, so smaller and quieter. */
+.block__subtitle {
+	color: var(--ink-2);
+	font-size: var(--t-caption);
+	font-weight: 600;
+}
+
 .split {
 	display: grid;
 	gap: var(--s-5) var(--s-6);
@@ -401,6 +409,14 @@ a:hover {
 .facts__v .meta,
 .facts__v .mono {
 	color: var(--ink-3);
+}
+
+/* A second line under a fact's value: what a token count is made of, what a cost is measured in. */
+.facts__sub {
+	flex-basis: 100%;
+	color: var(--ink-3);
+	font-size: var(--t-caption);
+	font-variant-numeric: tabular-nums;
 }
 
 /* ---------- count band ---------- */
@@ -871,23 +887,33 @@ a:hover {
 	color: var(--ink-3);
 }
 
-/* ---------- investigation list: one tbody per investigation, a summary row and the detail row it expands into ---------- */
+/* Evidence lines under a sample's text sit in the sample's own well. */
+.sample__d > .evidence {
+	margin-block-start: var(--s-1);
+	padding: 0;
+}
+
+/* ---------- expandable table rows (investigation list, session history): one tbody per item, a summary row and the detail row it expands into ---------- */
 
 .table--inv {
 	min-inline-size: 32rem;
 }
 
-.inv__row {
+.inv__row,
+.ended__row {
 	cursor: pointer;
 	transition: background-color var(--m-micro) var(--ease);
 }
 
 .inv__row:hover,
-.inv--open .inv__row {
+.inv--open .inv__row,
+.ended__row:hover,
+.ended__item--open > .ended__row {
 	background-color: var(--wash-1);
 }
 
-.inv__toggle {
+.inv__toggle,
+.ended__toggle {
 	appearance: none;
 	display: inline-flex;
 	align-items: baseline;
@@ -902,7 +928,8 @@ a:hover {
 	white-space: nowrap;
 }
 
-.inv__toggle[aria-expanded="true"] .row__chevron {
+.inv__toggle[aria-expanded="true"] .row__chevron,
+.ended__toggle[aria-expanded="true"] .row__chevron {
 	transform: rotate(90deg);
 }
 
@@ -926,8 +953,9 @@ a:hover {
 	font-variant-numeric: tabular-nums;
 }
 
-/* Each investigation ends with a hairline, except the last; an open summary row merges into its detail. */
-.table--inv tbody tr.inv__detail td {
+/* Each item ends with a hairline, except the last; an open summary row merges into its detail. The history's detail holds tables of its own, so its selectors stop at the row's own cells. */
+.table--inv tbody tr.inv__detail td,
+.table--ended > tbody > tr.ended__detail > td {
 	padding-block: var(--s-3) var(--s-4);
 	border-block-end: 1px solid var(--hairline);
 }
@@ -936,7 +964,12 @@ a:hover {
 .table--inv tbody.inv--open tr.inv__row td,
 .table--inv tbody:last-child tr.inv__row th,
 .table--inv tbody:last-child tr.inv__row td,
-.table--inv tbody:last-child tr.inv__detail td {
+.table--inv tbody:last-child tr.inv__detail td,
+.table--ended > tbody.ended__item--open > tr.ended__row > th,
+.table--ended > tbody.ended__item--open > tr.ended__row > td,
+.table--ended > tbody:last-child > tr.ended__row > th,
+.table--ended > tbody:last-child > tr.ended__row > td,
+.table--ended > tbody:last-child > tr.ended__detail > td {
 	border-block-end: none;
 }
 
@@ -1398,9 +1431,19 @@ a:hover {
 	overflow-wrap: anywhere;
 }
 
-/* ---------- ended sessions: the 30-day ledger as one table ---------- */
+/* ---------- ended sessions: the 30-day ledger as one table; a row expands into everything omo-health recorded about that session ---------- */
 
-.ended .tablewrap {
+/* The summary and the 자식 숨기기 switch share a line; the switch drops under the summary when both do not fit. */
+.ended__bar {
+	justify-content: space-between;
+	gap: var(--s-2) var(--s-4);
+}
+
+.ended__bar > .meta {
+	flex: 1 1 16rem;
+}
+
+.ended > .tablewrap {
 	background-color: var(--surface);
 	box-shadow: var(--shadow-card);
 }
@@ -1424,11 +1467,21 @@ a:hover {
 	white-space: nowrap;
 }
 
-.ended__session {
+.ended__session,
+.ended__tokens {
 	display: flex;
 	flex-direction: column;
 	gap: 0.125rem;
 	min-inline-size: 0;
+}
+
+.ended__tokens {
+	align-items: flex-end;
+}
+
+/* 계산 중 and -: a row without a number reads quieter than one with it. */
+.ended__none {
+	color: var(--ink-3);
 }
 
 .ended__session--child {
@@ -1465,6 +1518,44 @@ a:hover {
 	color: var(--ink-3);
 }
 
+/* The detail under an open row. */
+.ended__body {
+	display: flex;
+	flex-direction: column;
+	gap: var(--s-5);
+	min-inline-size: 0;
+}
+
+/* omo-health 기록: the four lists of the record, each under its own small title. */
+.ended__log {
+	display: flex;
+	flex-direction: column;
+	gap: var(--s-4);
+	min-inline-size: 0;
+}
+
+.ended__log .samples {
+	margin-block-start: 0;
+}
+
+/* One investigation about the session: its summary line, the list's own detail, then every analyst answer. */
+.ended__inv {
+	display: flex;
+	flex-direction: column;
+	gap: var(--s-3);
+	padding: var(--s-3);
+	border-radius: var(--r-md);
+	box-shadow: var(--shadow-ring);
+	min-inline-size: 0;
+}
+
+/* Inside an investigation the list's own block titles (근거, 판정 기록) sit one level under 조사. */
+.ended__inv .block__title {
+	color: var(--ink-3);
+	font-size: var(--t-caption);
+	font-weight: 500;
+}
+
 @media (max-width: 600px) {
 	.main {
 		gap: var(--s-4);
@@ -1488,28 +1579,36 @@ a:hover {
 		padding: var(--s-3);
 	}
 
-	/* The card's fact labels are short, so the two columns survive a phone width. */
-	.sess__body .facts {
+	/* The fact labels of a card and of a history detail are short, so the two columns survive a phone width. */
+	.sess__body .facts,
+	.ended__body > .split .facts {
 		grid-template-columns: minmax(4.5rem, auto) 1fr;
 		gap: var(--s-2) var(--s-3);
 	}
 
-	.sess__body .facts dd {
+	.sess__body .facts dd,
+	.ended__body > .split .facts dd {
 		margin-block-end: 0;
 	}
 
-	/* The ended table becomes a list: line one is the time and the outcome, line two the session, line three the reason. */
-	.table--ended thead,
-	.table--ended .col-wide {
+	/*
+	 * The ended table becomes a list: line one is the time, with the outcome and the tokens stacked at its end; line two is
+	 * the session, line three the reason. The detail row is a full-width block. Every selector stops at the row's own cells:
+	 * the detail holds tables of its own.
+	 */
+	.table--ended > thead,
+	.table--ended .ended__row > .col-wide {
 		display: none;
 	}
 
 	.table--ended,
-	.table--ended tbody {
+	.table--ended > tbody,
+	.table--ended > tbody > tr.ended__detail,
+	.table--ended > tbody > tr.ended__detail > td {
 		display: block;
 	}
 
-	.table--ended tr {
+	.table--ended .ended__row {
 		display: grid;
 		grid-template-columns: minmax(0, 1fr) auto;
 		gap: var(--s-1) var(--s-2);
@@ -1517,34 +1616,51 @@ a:hover {
 		border-block-end: 1px solid var(--hairline);
 	}
 
-	.table--ended tr:last-child {
+	.table--ended > tbody.ended__item--open > .ended__row,
+	.table--ended > tbody:last-child > .ended__row {
 		border-block-end: none;
 	}
 
-	.table--ended th,
-	.table--ended td {
+	.table--ended .ended__row > th,
+	.table--ended .ended__row > td {
 		display: block;
 		padding: 0;
 		border-block-end: none;
 		min-inline-size: 0;
 	}
 
-	.table--ended tbody .col-time {
+	.table--ended .ended__row > .col-time {
 		grid-area: 1 / 1;
 		color: var(--ink-3);
 	}
 
-	.table--ended .col-outcome {
+	/* The outcome and the tokens share one grid cell. The outcome is one line that never wraps, so a line height of margin puts the tokens right under it. */
+	.table--ended .ended__row > .col-outcome {
 		grid-area: 1 / 2;
+		align-self: start;
 		text-align: end;
 	}
 
-	.table--ended td:nth-child(2) {
+	.table--ended .ended__row > td:nth-child(4) {
+		grid-area: 1 / 2;
+		margin-block-start: calc(1lh + var(--s-1));
+	}
+
+	.table--ended .ended__row > td:nth-child(2) {
 		grid-area: 2 / 1 / 3 / 3;
 	}
 
-	.table--ended td:nth-child(4) {
+	.table--ended .ended__row > td:nth-child(5) {
 		grid-area: 3 / 1 / 4 / 3;
 		color: var(--ink-2);
+	}
+
+	.table--ended > tbody > tr.ended__detail > td {
+		padding: var(--s-2) var(--s-3) var(--s-3);
+	}
+
+	/* The detail's model table has three short columns: on a phone its key wraps rather than scrolling the table. */
+	.ended__body .table--rows {
+		min-inline-size: 0;
 	}
 }

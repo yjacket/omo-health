@@ -18,7 +18,7 @@
 	const TASK_TONE = { running: "ok", starting: "ok", spawning: "ok", completed: "ok", queued: "idle", pending: "idle", cancelled: "idle", interrupted: "warn", error: "crit", failed: "crit", killed: "crit", lost: "crit" };
 	const LEVEL_RANK = { ok: 0, info: 1, warn: 2, crit: 3 };
 	const OUTCOME_TONE = { "goal-complete": "ok", answered: "ok", crash: "crit", failed: "crit", cancelled: "warn", released: "warn", closed: "idle", unknown: "idle" };
-	const ENDED_COLUMNS = [{ label: "끝난 시각", cls: "col-time" }, { label: "세션" }, { label: "결말", cls: "col-outcome" }, { label: "이유" }, { label: "자식 · 시간 · omo", cls: "col-wide" }];
+	const ENDED_COLUMNS = [{ label: "끝난 시각", cls: "col-time" }, { label: "세션" }, { label: "결말", cls: "col-outcome" }, { label: "토큰", num: true }, { label: "이유" }, { label: "자식 · 시간 · omo", cls: "col-wide" }];
 	const TABS = ["sessions", "ended", "admin"];
 
 	let token = null;
@@ -33,6 +33,13 @@
 	const openInvestigations = new Set();
 	// Ids of the session cards the user expanded: they stay open across the 10 s re-render too.
 	const openSessions = new Set();
+	// Ids of the history rows the user expanded, and each one's detail as fetched ({state, data, error}): both outlive the 10 s re-render.
+	const openEnded = new Set();
+	const endedDetails = new Map();
+	// The last rendered state: the history filter redraws from it at once, before the server has stored the choice.
+	let lastState = null;
+	// 자식 숨기기. The stored preference seeds it once; from then on this page's own choice rules, so a refresh already in flight cannot flip it back.
+	let hideChildren = null;
 	// The server's clock at the last state: relative times on the board are measured from it, not from the browser.
 	let nowMs = Date.now();
 	let tab = "sessions";
@@ -69,6 +76,8 @@
 	const mono = (v) => el("span", { class: "mono", text: show(v) });
 	const plain = (v) => el("span", { text: show(v) });
 	const block = (title, ...children) => el("div", { class: "block" }, el("h3", { class: "block__title", text: title }), children);
+	/** A block inside a block: one level down, with the smaller title. */
+	const subBlock = (title, ...children) => el("div", { class: "block" }, el("h4", { class: "block__subtitle", text: title }), children);
 
 	function facts(rows) {
 		return el(
@@ -81,6 +90,8 @@
 	/** A column's cell class: `num` right-aligns, `cls` is the column's own class (hidden on narrow screens, nowrap). */
 	const cellClass = (h) => [h?.num ? "col-n" : null, h?.cls].filter(Boolean).join(" ") || undefined;
 
+	const tableHead = (head) => el("thead", {}, el("tr", {}, head.map((h) => el("th", { scope: "col", class: cellClass(h), text: h.label }))));
+
 	function table(cls, head, rows) {
 		return el(
 			"div",
@@ -88,7 +99,7 @@
 			el(
 				"table",
 				{ class: `table ${cls}` },
-				el("thead", {}, el("tr", {}, head.map((h) => el("th", { scope: "col", class: cellClass(h), text: h.label })))),
+				tableHead(head),
 				el(
 					"tbody",
 					{},
@@ -110,6 +121,13 @@
 	}
 
 	const errorSlot = (group) => el("p", { class: "note note--crit", role: "status", "aria-live": "polite", text: errors.get(group) ?? "" });
+
+	/** Puts keyboard focus back on the control with this key after a redraw replaced its node; false when the redraw removed it. */
+	function focusByKey(key) {
+		const node = [...document.querySelectorAll("[data-key]")].find((n) => n.dataset.key === key);
+		node?.focus({ preventScroll: true });
+		return Boolean(node);
+	}
 
 	const pad = (n) => String(n).padStart(2, "0");
 	const kstDate = (ms) => new Date(ms + 9 * 3600_000);
@@ -152,6 +170,36 @@
 		if (!Number.isFinite(ms)) return "-";
 		const d = kstDate(ms);
 		return `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+	}
+
+	/** A decision's `ts` (ISO text) or a stored millisecond stamp, as milliseconds. */
+	const toMs = (v) => (typeof v === "string" ? Date.parse(v) : v);
+
+	/** A token count as the board and the history show it: whole under 1000, then one decimal of K, M or B with a trailing .0 dropped. */
+	function compactCount(n) {
+		if (!Number.isFinite(n)) return "-";
+		if (n < 1000) return String(n);
+		let unit = n < 1e6 ? 0 : n < 1e9 ? 1 : 2;
+		let scaled = (n / 1000 ** (unit + 1)).toFixed(1);
+		// 999,950 would read 1000K: it is 1M.
+		if (scaled === "1000.0" && unit < 2) [unit, scaled] = [unit + 1, "1.0"];
+		return `${scaled.replace(/\.0$/, "")}${"KMB"[unit]}`;
+	}
+
+	/** The exact count, for a tooltip and for the detail. */
+	const fullCount = (n) => (Number.isFinite(n) ? n.toLocaleString("ko-KR") : "-");
+
+	/** A cost in dollars at API prices; `unknown` says some turns had no price. */
+	const costText = (cost, unknown) => `${Number.isFinite(cost) ? `$${cost.toFixed(3)}` : "-"}${unknown ? " + 가격 모름" : ""}`;
+
+	/**
+	 * A session's own total by what the token index knows of it: the compact count, 계산 중 until its file is read to the end,
+	 * - when no file was found. `title` is the tooltip: the exact count, or why there is no number.
+	 */
+	function tokenReading(stateKey, total) {
+		if (stateKey === "ok") return { text: compactCount(total), title: fullCount(total) };
+		if (stateKey === "missing") return { text: "-", title: "세션 기록 파일을 찾지 못했습니다" };
+		return { text: "계산 중", title: lastState.overview?.daemon?.state === "running" ? "감시기가 세션 파일을 읽는 중입니다." : "감시기가 꺼져 있어 아직 계산하지 못했습니다." };
 	}
 
 	function pauseSentence(p) {
@@ -207,7 +255,7 @@
 
 	/** Controls that act on the server go dark; tabs and accordion toggles keep working on the last state. */
 	function disableAll() {
-		for (const node of document.querySelectorAll("main button:not(.inv__toggle):not(.tab):not(.sess__head), main input")) node.disabled = true;
+		for (const node of document.querySelectorAll("main button:not(.inv__toggle):not(.ended__toggle):not(.tab):not(.sess__head), main input:not(.ended__filter)")) node.disabled = true;
 	}
 
 	/* ---------- tabs ---------- */
@@ -278,7 +326,7 @@
 	function childMeta(c) {
 		const elapsed = Number.isFinite(c.startedMs) ? elapsedText((Number.isFinite(c.endedMs) ? c.endedMs : nowMs) - c.startedMs) : null;
 		const inv = c.health.investigations[0];
-		return [c.category, c.statusKo, elapsed, c.health.open[0]?.titleKo, inv ? `조사 ${inv.statusKo}` : null].filter(Boolean).join(" · ");
+		return [c.category, c.statusKo, elapsed, c.health.open[0]?.titleKo, inv ? `조사 ${inv.statusKo}` : null, c.tokens ? `토큰 ${compactCount(c.tokens.total)}` : c.tokensPending ? "토큰 계산 중" : null].filter(Boolean).join(" · ");
 	}
 
 	function tree(children, depth = 0) {
@@ -295,7 +343,7 @@
 						el("span", { class: `dot dot--${childTone(c)}`, "aria-hidden": "true" }),
 						depth ? el("span", { class: "tree__branch", "aria-hidden": "true", text: "└" }) : null,
 						el("span", { class: "tree__name", text: c.name }),
-						el("span", { class: "tree__meta", text: childMeta(c) }),
+						el("span", { class: "tree__meta", title: c.tokens ? `토큰 ${fullCount(c.tokens.total)}` : undefined, text: childMeta(c) }),
 					),
 					c.children.length ? tree(c.children, depth + 1) : null,
 				),
@@ -314,6 +362,13 @@
 			["마지막 입력", plain(Number.isFinite(s.lastInputMs) ? sinceText(nowMs - s.lastInputMs) : "-")],
 			["이번 턴", plain(turn || "-")],
 		]);
+	}
+
+	/** A live session's token marks: its own total (계산 중 until its file is read to the end), then the tree total when its children add to it. */
+	function boardTokenMarks(s) {
+		if (!s.tokens && !s.tokensPending) return null;
+		const own = tokenReading(s.tokens ? "ok" : "pending", s.tokens?.total);
+		return [el("span", { title: own.title, text: `토큰 ${own.text}` }), Number.isFinite(s.treeTokens) ? el("span", { title: fullCount(s.treeTokens), text: `자식 포함 ${compactCount(s.treeTokens)}` }) : null];
 	}
 
 	/** One main session: the head row is the accordion toggle; the body shows details, the child tree and the health rows. */
@@ -359,6 +414,7 @@
 					s.terminal ? chip(s.terminal.labelKo, TERMINAL_TONE[s.terminal.kind]) : null,
 					el("span", { text: `자식 ${s.childCount}` }),
 					el("span", { text: when(s.startedMs) }),
+					boardTokenMarks(s),
 				),
 			),
 			el(
@@ -404,20 +460,323 @@
 		);
 	}
 
+	const outcomeMark = (o) => el("span", { class: `outcome outcome--${OUTCOME_TONE[o.outcome] ?? "idle"}`, text: o.estimated ? `${o.outcomeKo} (추정)` : o.outcomeKo });
+
+	/** The 토큰 cell: the session's own total, and under it the tree total when its children add to it. */
+	function endedTokenCell(r) {
+		const own = tokenReading(r.tokensState, r.tokens?.total);
+		return el(
+			"span",
+			{ class: "ended__tokens" },
+			el("span", { class: r.tokensState === "ok" ? undefined : "ended__none", title: r.tokensGone ? `${own.title} (파일 삭제됨)` : own.title, text: own.text }),
+			r.tokensState === "ok" && Number.isFinite(r.treeTokens) ? el("span", { class: "ended__meta", title: fullCount(r.treeTokens), text: `자식 포함 ${compactCount(r.treeTokens)}` }) : null,
+		);
+	}
+
+	/** One list of a session's record, wherever GET /api/session keeps it: `children` on the record, the rest under `health`. */
+	const detailList = (d, name) => (name === "children" ? d.children : d.health[name]);
+
+	/** The session as the ledger recorded it. The folder is the row's short form, with the whole path on hover. */
+	function endedFacts(r, s) {
+		return facts([
+			["세션 id", mono(s.sessionId)],
+			["작업 id", mono(s.taskId)],
+			["제목", plain(s.title || r.title)],
+			["폴더", el("span", { title: r.cwd, text: show(r.cwdShort) })],
+			["터미널", plain(s.terminalLabel)],
+			["omo", plain(s.omoVersion)],
+			["시작", plain(when(s.startedMs))],
+			["끝", plain(when(s.endedMs))],
+			["걸린 시간", plain(Number.isFinite(s.durationMs) ? span(s.durationMs) : "-")],
+			["결말", outcomeMark(s), s.reason ? plain(s.reason) : null],
+		]);
+	}
+
+	/** The session's tokens, split the way omo's own /session splits them: input is the whole prompt, and the cache served part of it. */
+	function endedTokenFacts(t) {
+		if (!Number.isFinite(t?.total)) {
+			const missing = t?.state === "missing";
+			const reading = tokenReading(missing ? "missing" : "pending");
+			return missing ? empty(reading.title) : [empty(reading.text), note(reading.title)];
+		}
+		const promptTokens = t.input + t.cacheRead + t.cacheWrite;
+		const hit = promptTokens > 0 ? ` (${((t.cacheRead / promptTokens) * 100).toFixed(1)}%)` : "";
+		const count = (n) => el("span", { class: "num", text: fullCount(n) });
+		const sub = (text) => el("span", { class: "facts__sub", text });
+		return facts([
+			["입력", count(promptTokens), sub(`캐시 읽기 ${fullCount(t.cacheRead)}${hit}`)],
+			["캐시 안 됨", count(t.input + t.cacheWrite), sub(`캐시 쓰기 ${fullCount(t.cacheWrite)}`)],
+			["출력", count(t.output)],
+			["합계", count(t.total), t.gone ? el("span", { class: "meta", text: "파일 삭제됨" }) : null],
+			["턴 수", count(t.turns)],
+			["비용", plain(costText(t.cost, t.costUnknown)), sub("API 가격 환산")],
+		]);
+	}
+
+	function endedModels(models) {
+		if (!models?.length) return empty("모델 기록이 없습니다");
+		return table(
+			"table--rows",
+			[{ label: "모델" }, { label: "토큰", num: true }, { label: "비용", num: true }],
+			models.map((m) => ({ cells: [mono(m.key), fullCount(m.tokens), costText(m.cost)] })),
+		);
+	}
+
+	function endedChild(c) {
+		const own = tokenReading(c.tokensState, c.tokens?.total);
+		return el(
+			"li",
+			{ class: "tree__item" },
+			el(
+				"div",
+				{ class: "tree__node" },
+				el("span", { class: `dot dot--${OUTCOME_TONE[c.outcome] ?? "idle"}`, "aria-hidden": "true" }),
+				el("span", { class: "tree__name", text: c.title ?? c.taskId ?? show(c.sessionId) }),
+				el("span", { class: "tree__meta" }, `${c.outcomeKo} · `, el("span", { title: own.title, text: `토큰 ${own.text}` })),
+			),
+		);
+	}
+
+	/** One lifecycle row of a finding: detected (with its severity), detected again, or resolved. `(전체)` marks a machine-wide one. */
+	function endedFinding(f) {
+		return el(
+			"div",
+			{ class: "sample" },
+			el("span", { class: "sample__t", text: when(toMs(f.ts)) }),
+			el(
+				"span",
+				{ class: "sample__d" },
+				f.event === "resolved" ? chip("해결", "ok") : chip(f.severityKo || show(f.severity), SEVERITY_TONE[f.severity]),
+				` ${f.titleKo}${f.scope === "machine" ? " (전체)" : ""} `,
+				el("span", { class: "meta", text: [f.detector, f.event === "reopened" ? "다시 감지" : null].filter(Boolean).join(" · ") }),
+				f.evidence.length ? evidenceList(f.evidence) : null,
+			),
+		);
+	}
+
+	function endedAction(a) {
+		return el(
+			"div",
+			{ class: "sample" },
+			el("span", { class: "sample__t", text: when(toMs(a.ts)) }),
+			el("span", { class: "sample__d" }, `${a.actionKo} `, chip(a.resultKo, resultTone(a.result)), a.detail ? [" ", mono(a.detail)] : null),
+		);
+	}
+
+	/** One analyst answer in an investigation's history; a failed look shows its reason in place of a diagnosis. */
+	function endedVerdict(v) {
+		return el(
+			"div",
+			{ class: "sample" },
+			el("span", { class: "sample__t", text: when(toMs(v.ts)) }),
+			el(
+				"span",
+				{ class: "sample__d" },
+				v.failed ? chip("실패", "crit") : chip(v.verdictKo, analystTone(v)),
+				Number.isFinite(v.confidence) ? [" ", el("span", { class: "meta", text: `확신 ${Math.round(v.confidence * 100)}%` })] : null,
+				" ",
+				v.failed ? mono(v.reason) : show(v.diagnosis),
+			),
+		);
+	}
+
+	/** One investigation about the session: what its list row says, the list's own detail, then every analyst answer in order. */
+	function endedInvestigation(inv) {
+		return el(
+			"div",
+			{ class: "ended__inv" },
+			el("div", { class: "wrap-row" }, mono(when(inv.openedMs)), investigationSubject(inv), plain(inv.triggerKo), verdictChip(inv), investigationState(inv)),
+			investigationDetail(inv),
+			block("판정 기록", inv.verdictHistory.length ? el("div", { class: "samples" }, inv.verdictHistory.map(endedVerdict)) : empty("판정 기록이 없습니다")),
+		);
+	}
+
+	/** One message omo-health delivered; `sessionId` is the session the detail is about, so a descendant's message names who got it. */
+	function endedMessage(m, sessionId) {
+		return el(
+			"div",
+			{ class: "sample" },
+			el("span", { class: "sample__t", text: when(m.ms) }),
+			el("span", { class: "sample__d" }, show(m.text), m.recipient && m.recipient !== sessionId ? [" ", el("span", { class: "mono", text: `받은 세션 ${m.recipient.slice(0, 8)}` })] : null),
+		);
+	}
+
+	/** Everything omo-health recorded about one ended session, as GET /api/session returns it. */
+	function endedRecord(r, d) {
+		const id = r.sessionId;
+		/** One list of the record or its empty state, then 더 보기 while the server holds more of it than the page has. */
+		const paged = (name, wrap, none) => {
+			const items = detailList(d, name);
+			const group = `more:${id}:${name}`;
+			return [
+				items.length ? wrap(items) : empty(none),
+				items.length < d.counts[name] ? el("div", { class: "wrap-row" }, button(`더 보기 (${items.length}/${d.counts[name]})`, { group, key: group, onclick: () => void loadEndedPage(id, name) })) : null,
+				errorSlot(group),
+			];
+		};
+		const samples = (row) => (items) => el("div", { class: "samples" }, items.map(row));
+		return [
+			el("div", { class: "split" }, block("상세", endedFacts(r, d.session)), block("토큰", endedTokenFacts(d.tokens))),
+			block("모델별", endedModels(d.tokens?.models)),
+			block("자식 세션", paged("children", (items) => el("ul", { class: "tree" }, items.map(endedChild)), "자식 세션이 없습니다")),
+			block(
+				"omo-health 기록",
+				el(
+					"div",
+					{ class: "ended__log" },
+					// Info-level findings are logged only since a daemon recorded a coverage event before the session started.
+					subBlock("감지", d.coverage.infoFindings ? null : note("이 기간에는 정보 수준 감지를 기록하지 않았습니다."), paged("findings", samples(endedFinding), "감지 기록이 없습니다")),
+					subBlock("조치", paged("actions", samples(endedAction), "조치 기록이 없습니다")),
+					subBlock("조사", paged("investigations", (items) => items.map(endedInvestigation), "조사 기록이 없습니다")),
+					subBlock("보낸 메시지", paged("messages", samples((m) => endedMessage(m, d.session.sessionId)), "보낸 메시지가 없습니다")),
+				),
+			),
+		];
+	}
+
+	/** What an open row shows under it: the fetch in progress, its failure with a way to retry, or the session's record. */
+	function endedDetailView(r) {
+		const id = r.sessionId;
+		const entry = endedDetails.get(id);
+		const body = (...children) => el("div", { class: "ended__body" }, children);
+		if (entry.state === "loading") return body(note("불러오는 중"));
+		if (entry.state === "error") return body(note(`상세를 읽지 못했습니다: ${entry.error}`, "crit"), el("div", { class: "wrap-row" }, button("다시 읽기", { key: `ended-retry:${id}`, onclick: () => void loadEndedDetail(id) })));
+		// A stored record of an unexpected shape costs its own cell, not the whole table.
+		try {
+			return body(endedRecord(r, entry.data));
+		} catch (error) {
+			return body(note(`상세를 그리지 못했습니다: ${error?.message ?? error}`, "crit"));
+		}
+	}
+
+	/** Redraws one open row's detail cell from the map, so a finished fetch touches nothing else on the page. */
+	function drawEndedDetail(id) {
+		const cell = [...document.querySelectorAll("td[data-ended]")].find((n) => n.dataset.ended === id);
+		if (!cell || !openEnded.has(id)) return;
+		const held = cell.contains(document.activeElement) ? document.activeElement.dataset.key : null;
+		cell.replaceChildren(endedDetailView(lastState.ended.rows.find((r) => r.sessionId === id)));
+		// A control the redraw removed (다시 읽기, the last 더 보기) hands its focus to the row's own toggle.
+		if (held && !focusByKey(held)) focusByKey(`ended:${id}`);
+	}
+
+	/** Fetches a session's record for its open row. Once per page: a later open and every re-render read the map. */
+	async function loadEndedDetail(id) {
+		const entry = { state: "loading", data: null, error: null };
+		endedDetails.set(id, entry);
+		drawEndedDetail(id);
+		try {
+			const data = await getJson(`/api/session?id=${encodeURIComponent(id)}`);
+			// No data means a 401: the masthead already says the token is wrong.
+			Object.assign(entry, data ? { state: "ready", data } : { state: "error", error: "토큰이 맞지 않습니다" });
+		} catch (error) {
+			Object.assign(entry, { state: "error", error: String(error?.message ?? error) });
+		}
+		drawEndedDetail(id);
+	}
+
+	/** Fetches the next page of one list and appends it to the stored record, so the items survive every redraw. */
+	async function loadEndedPage(id, name) {
+		const group = `more:${id}:${name}`;
+		if (gone || busy.has(group)) return;
+		const d = endedDetails.get(id).data;
+		const items = detailList(d, name);
+		busy.add(group);
+		errors.delete(group);
+		try {
+			const page = await getJson(`/api/session?id=${encodeURIComponent(id)}&list=${name}&offset=${items.length}`);
+			if (page) {
+				items.push(...page.items);
+				// An empty page means the list ends here, whatever the count said.
+				d.counts[name] = page.items.length ? page.total : items.length;
+			}
+		} catch (error) {
+			errors.set(group, `더 읽지 못했습니다: ${error?.message ?? error}`);
+		}
+		busy.delete(group);
+		drawEndedDetail(id);
+	}
+
+	/** One ended session: its six-column row, and the detail row it expands into. The row is the click target; the button is the keyboard one. */
+	function endedItem(r) {
+		const id = r.sessionId;
+		const open = openEnded.has(id);
+		const toggle = el("button", { type: "button", class: "ended__toggle", "data-key": `ended:${id}`, "aria-expanded": String(open) }, el("span", { class: "row__chevron", "aria-hidden": "true" }), when(r.endedMs));
+		const detail = el("tr", { class: "ended__detail", hidden: !open }, el("td", { colspan: String(ENDED_COLUMNS.length), "data-ended": id }, open ? endedDetailView(r) : null));
+		const body = el("tbody", { class: open ? "ended__item ended__item--open" : "ended__item" });
+		const cells = [
+			toggle,
+			endedSessionCell(r),
+			outcomeMark(r),
+			endedTokenCell(r),
+			show(r.reason),
+			`${r.childCount} · ${Number.isFinite(r.durationMs) ? span(r.durationMs) : "-"} · ${show(r.omoVersion)}`,
+		];
+		const row = el(
+			"tr",
+			{
+				class: r.kind === "child" ? "ended__row ended__row--child" : "ended__row",
+				onclick: () => {
+					const next = !openEnded.has(id);
+					if (next) openEnded.add(id);
+					else openEnded.delete(id);
+					body.classList.toggle("ended__item--open", next);
+					toggle.setAttribute("aria-expanded", String(next));
+					detail.hidden = !next;
+					if (!next) return;
+					if (endedDetails.has(id)) drawEndedDetail(id);
+					else void loadEndedDetail(id);
+				},
+			},
+			cells.map((cell, i) => el(i === 0 ? "th" : "td", { scope: i === 0 ? "row" : undefined, class: cellClass(ENDED_COLUMNS[i]) }, cell)),
+		);
+		return append(body, [row, detail]);
+	}
+
+	/** Draws the history again from the last state: the filter applies at once, before the server has stored it. */
+	function redrawEnded() {
+		const focusKey = document.activeElement?.dataset?.key;
+		section("ended", lastState.ended, renderEnded);
+		if (focusKey) focusByKey(focusKey);
+	}
+
+	/** Stores the 자식 숨기기 choice. The switch is never disabled, so a choice made while a save is in flight is sent when that save ends. */
+	async function saveHideChildren() {
+		if (gone || busy.has("prefs")) return;
+		const sent = hideChildren;
+		await post("/api/prefs", { hideChildren: sent }, "prefs");
+		if (hideChildren !== sent) void saveHideChildren();
+	}
+
 	function renderEnded(e) {
 		if (!e.rows.length) return el("p", { class: "empty empty--panel", text: "끝난 세션 기록이 없습니다" });
-		const summary = ["최근 30일", `끝난 세션 ${e.total}`, ...e.counts.filter((c) => c.count).map((c) => `${c.outcomeKo} ${c.count}`)].join(" · ");
-		const rows = e.rows.map((r) => ({
-			class: r.kind === "child" ? "ended__row ended__row--child" : "ended__row",
-			cells: [
-				when(r.endedMs),
-				endedSessionCell(r),
-				el("span", { class: `outcome outcome--${OUTCOME_TONE[r.outcome] ?? "idle"}`, text: r.estimated ? `${r.outcomeKo} (추정)` : r.outcomeKo }),
-				show(r.reason),
-				`${r.childCount} · ${Number.isFinite(r.durationMs) ? span(r.durationMs) : "-"} · ${show(r.omoVersion)}`,
-			],
-		}));
-		return [el("p", { class: "meta", text: summary }), table("table--ended", ENDED_COLUMNS, rows), e.total > e.rows.length ? note(`최근 ${e.limit}건까지만 보입니다.`) : null];
+		const hide = hideChildren === true;
+		const rows = hide ? e.rows.filter((r) => r.kind !== "child") : e.rows;
+		const summary = ["최근 30일", `끝난 세션 ${e.total}`, ...e.counts.filter((c) => c.count).map((c) => `${c.outcomeKo} ${c.count}`), hide ? `자식 ${e.totals.child} 숨김` : null].filter(Boolean).join(" · ");
+		// The filter only reads the last state, so it carries no group: it keeps working while a save is in flight and after the server is gone.
+		const filter = el(
+			"label",
+			{ class: "switch" },
+			el("input", {
+				type: "checkbox",
+				class: "switch__input ended__filter",
+				checked: hide,
+				"data-key": "prefs",
+				onchange: (event) => {
+					hideChildren = event.currentTarget.checked;
+					redrawEnded();
+					void saveHideChildren();
+				},
+			}),
+			el("span", { class: "switch__text", text: "자식 숨기기" }),
+		);
+		return [
+			el("div", { class: "wrap-row ended__bar" }, el("p", { class: "meta", text: summary }), filter),
+			errorSlot("prefs"),
+			rows.length
+				? el("div", { class: "tablewrap" }, el("table", { class: "table table--ended" }, tableHead(ENDED_COLUMNS), rows.map(endedItem)))
+				: el("p", { class: "empty empty--panel", text: "메인 세션 기록이 없습니다" }),
+			e.totals.main > e.limits.main || e.totals.child > e.limits.child ? note(`최근 메인 ${e.limits.main}건 · 자식 ${e.limits.child}건까지만 보입니다.`) : null,
+		];
 	}
 
 	function renderMasthead(state) {
@@ -618,6 +977,11 @@
 		);
 	}
 
+	// The marks an investigation shows in its list row and, for the same record, in a session detail.
+	const investigationSubject = (r) => el("span", { class: "inv__subject" }, mono(r.subject.id), chip(r.subject.kindKo, r.subject.kind === "main" ? "info" : undefined));
+	const verdictChip = (r) => (r.verdict && !r.verdict.failed ? chip(r.verdictKo, analystTone(r.verdict)) : null);
+	const investigationState = (r) => el("span", { class: "inv__state" }, chip(r.statusKo, INVESTIGATION_TONE[r.status]), Number.isFinite(r.retryAtMs) ? el("span", { class: "inv__retry", text: `다시 시도 ${when(r.retryAtMs)}` }) : null);
+
 	/** One investigation: its six-column row, and the detail row it expands into. The row is the click target; the button is the keyboard one. */
 	function investigationBody(r) {
 		const open = openInvestigations.has(r.id);
@@ -638,11 +1002,11 @@
 				},
 			},
 			el("th", { scope: "row" }, toggle),
-			el("td", {}, el("span", { class: "inv__subject" }, mono(r.subject.id), chip(r.subject.kindKo, r.subject.kind === "main" ? "info" : undefined))),
+			el("td", {}, investigationSubject(r)),
 			el("td", { text: r.triggerKo }),
-			el("td", {}, r.verdict && !r.verdict.failed ? chip(r.verdictKo, analystTone(r.verdict)) : "-"),
+			el("td", {}, verdictChip(r) ?? "-"),
 			el("td", { text: r.action ? r.action.kindKo : "-" }),
-			el("td", {}, el("span", { class: "inv__state" }, chip(r.statusKo, INVESTIGATION_TONE[r.status]), Number.isFinite(r.retryAtMs) ? el("span", { class: "inv__retry", text: `다시 시도 ${when(r.retryAtMs)}` }) : null)),
+			el("td", {}, investigationState(r)),
 		);
 		return append(body, [row, detail]);
 	}
@@ -730,8 +1094,9 @@
 		return [header, warnings, el("div", { class: "switchlist" }, s.switches.map(switchRow)), others];
 	}
 
-	async function getJson(path) {
-		const res = await fetch(path, { headers: { "x-omo-health-token": token }, cache: "no-store" });
+	/** GETs a JSON route with the page token. `headers` adds to it: x-omo-health-auto marks a fetch the user did not ask for, so it does not keep the server alive. */
+	async function getJson(path, headers = {}) {
+		const res = await fetch(path, { headers: { "x-omo-health-token": token, ...headers }, cache: "no-store" });
 		if (res.status === 401) {
 			showTokenProblem(false);
 			return null;
@@ -864,6 +1229,8 @@
 		const openKeys = new Set([...document.querySelectorAll("details[data-open]")].filter((d) => d.open).map((d) => d.dataset.open));
 		const focusKey = document.activeElement?.dataset?.key;
 		nowMs = Number.isFinite(state.generatedMs) ? state.generatedMs : Date.now();
+		lastState = state;
+		if (hideChildren === null && typeof state.prefs?.hideChildren === "boolean") hideChildren = state.prefs.hideChildren;
 		renderMasthead(state);
 		section("board", state.sessions, renderSessions);
 		section("ended", state.ended, renderEnded);
@@ -873,7 +1240,7 @@
 		section("history", state.history, renderHistory);
 		section("settings", state.settings, renderSettings);
 		for (const d of document.querySelectorAll("details[data-open]")) if (openKeys.has(d.dataset.open)) d.open = true;
-		if (focusKey) [...document.querySelectorAll("[data-key]")].find((n) => n.dataset.key === focusKey)?.focus({ preventScroll: true });
+		if (focusKey) focusByKey(focusKey);
 	}
 
 	function showServerGone() {
