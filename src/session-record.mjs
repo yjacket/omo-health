@@ -1054,9 +1054,14 @@ const later = (a, b) => !b || Number(a.endedMs) > Number(b.endedMs);
 const parentLookupKey = (row) => subjectKey({ sessionId: row.parentSessionId, projectKey: row.parentProjectKey });
 
 /** Resolve an ended ID (or unique task alias) without retaining unrelated rows. */
-export function resolveLedgerSubject(paths, id, { row: selector, subject, usage } = {}) {
+export function resolveLedgerSubject(paths, id, { row: selector, subject, usage, liveOwners = [] } = {}) {
 	const rows = () => streamEnded(paths);
-	return resolveLedgerSubjects(new Set([id]), rows, rows, { selector, subject, usage, allowAliases: true }).get(id) ?? {};
+	const selected = resolveLedgerSubjects(new Set([id]), rows, rows, { selector, subject, usage, allowAliases: true }).get(id) ?? {};
+	if (selector === undefined && !subject && selected.row &&
+		liveOwners.some((owner) => owner.sessionId === id && owner.projectKey !== selected.subject.projectKey)) {
+		return { error: "ambiguous-session" };
+	}
+	return selected;
 }
 
 // Shared with the bare-ID 409 route.
@@ -1341,7 +1346,7 @@ function recordLedger(subject, rows, usage, descendantScanMax) {
 export function loadSessionRecord({ paths, subject, id = subject?.sessionId, row: selector, now = Date.now(), messageScanMaxBytes = Infinity, messageScanTotalBytes = Infinity, descendantScanMax = Infinity, scanMessages, auditRetention = false, locator, index, liveOwners } = {}) {
 	if (!nonEmpty(id)) return { found: false, id };
 	const usage = index ?? readUsageIndex(paths.health.usageIndexFile);
-	const selected = resolveLedgerSubject(paths, id, { row: selector, subject, usage });
+	const selected = resolveLedgerSubject(paths, id, { row: selector, subject, usage, liveOwners });
 	if (!selected.row) return { found: false, id, ...(selected.error ? { error: selected.error } : {}) };
 	const joined = recordLedger(selected.row, () => streamEnded(paths), usage, descendantScanMax);
 	const { row, descendants, ancestors, scanned, descendantsSkipped, ambiguous } = joined;

@@ -20,7 +20,7 @@ const RELEASE_KINDS = new Set(["kill-pids", "release-shell"]);
 const FAILED_STATUSES = new Set(["error", "failed"]);
 
 export const BACKFILL_MARKER = ".backfilled";
-export const BACKFILL_VERSION = 2;
+export const BACKFILL_VERSION = 3;
 
 function clean(value, max) {
 	return truncate(redact(String(value ?? "")).replace(/\s+/g, " ").trim(), max);
@@ -170,7 +170,8 @@ function childOutcome(task, releases) {
 /**
  * One-time reconstruction of the last `days` of ended sessions into the ended-session ledger (estimated:true,
  * source:"backfill"). A `.backfilled` marker with v >= BACKFILL_VERSION makes every later call a no-op; a missing,
- * unreadable or older marker re-runs the backfill, and the ledger's existing duplicate check keeps prior entries.
+ * unreadable or older marker runs the same scan. V3 reconciles sessions omitted by raw-ID deduplication by
+ * appending only missing project-scoped keys, leaving existing entries untouched.
  * Never throws on a bad source file: problems are collected into the returned summary.
  */
 export function backfillOnce(paths, nowMs, { days = 30 } = {}) {
@@ -235,6 +236,7 @@ export function backfillOnce(paths, nowMs, { days = 30 } = {}) {
 
 	const crashes = readCrashes(paths, sinceMs, errors);
 	const releases = readReleases(paths, sinceMs, errors);
+	// Keep only keys from the retained window, not ledger rows.
 	const recorded = new Set();
 	for (const row of streamEnded(paths, { sinceMs })) recorded.add(endedKey(row));
 
@@ -303,6 +305,7 @@ export function backfillOnce(paths, nowMs, { days = 30 } = {}) {
 			sessionId: t.childSessionId || t.taskId,
 			kind: "child",
 			parentSessionId: t.parentSessionId ?? null,
+			...(t.parentProjectKey ? { parentProjectKey: t.parentProjectKey } : {}),
 			taskId: t.taskId,
 			title: clean(t.name ?? t.summary ?? t.taskId, TITLE_MAX) || t.taskId,
 			cwd: t.cwd,

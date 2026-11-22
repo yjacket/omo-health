@@ -1255,6 +1255,54 @@ describe("ui server", { timeout: 20_000 }, () => {
 				assert.deepEqual([bareAudit.status, bareAudit.body.error], [409, "ambiguous-session"]);
 			});
 
+			it("plan95: a live twin makes every bare-ID route ambiguous before it ends", async (t) => {
+				const sessionId = "review.1";
+				const { dir, paths, now, nowMs, detail, startAudit } = makeWorld({ sessionId, total: 17 });
+				const ended = sub(sessionId, dir);
+				const liveTwin = sub(sessionId, path.join(dir, "live-project"));
+				let diagnoses = 0;
+				const ui = createUiServer({ paths, token: TOKEN, getState: () => STATE, sessionDetail: detail, startAudit,
+					diagnose: (id) => { diagnoses++; return { id }; }, now });
+				t.after(async () => {
+					await ui.close();
+					fs.rmSync(dir, { recursive: true, force: true });
+				});
+				const setOwner = (owner) => writeJson(paths.health.sessionsSnapshotFile,
+					{ v: 1, ts: nowMs, groups: [], liveOwners: [owner] });
+				const { port } = await ui.listen();
+				const bareUrl = `/api/session?id=${sessionId}`;
+				const diagnoseUrl = `/api/diagnose?id=${sessionId}`;
+
+				setOwner(ended);
+				const sameOwner = await getAt(port, bareUrl);
+				assert.deepEqual([sameOwner.status, sameOwner.body.tokens?.total], [200, 17]);
+				assert.deepEqual(await getAt(port, diagnoseUrl), { status: 200, body: { id: sessionId } });
+
+				// Only the live-owner list changes; the ended ledger and cached detail key do not.
+				setOwner(liveTwin);
+				assert.deepEqual(readEnded(paths).filter((row) => row.sessionId === sessionId).map(subjectOf), [ended]);
+				const replies = {
+					detail: await getAt(port, bareUrl),
+					diagnose: await getAt(port, diagnoseUrl),
+					audit: await postAt(port, "/api/audit", { sessionId }),
+				};
+				assert.deepEqual(Object.fromEntries(Object.entries(replies).map(([route, { status, body }]) => [route, [status, body.error]])), {
+					detail: [409, "ambiguous-session"], diagnose: [409, "ambiguous-session"], audit: [409, "ambiguous-session"],
+				});
+				assert.equal(diagnoses, 1);
+				assert.equal(fs.existsSync(paths.health.auditRequestsDir), false);
+				assert.equal(fs.existsSync(paths.health.auditBudgetFile), false);
+
+				const row = expectedSelector({ sessionId, cwd: dir, endedMs: nowMs });
+				const selected = await getAt(port, `${bareUrl}&row=${row}`);
+				assert.deepEqual([selected.status, selected.body.tokens?.total], [200, 17]);
+				const posted = await postAt(port, "/api/audit", { sessionId, row });
+				assert.deepEqual([posted.status, posted.body.audit?.status], [202, "queued"]);
+				const requests = fs.readdirSync(paths.health.auditRequestsDir);
+				assert.deepEqual(requests, [`${auditFileKey(ended)}.json`]);
+				assert.deepEqual(subjectOf(JSON.parse(fs.readFileSync(path.join(paths.health.auditRequestsDir, requests[0]), "utf8"))), ended);
+			});
+
 			it("plan92: a live twin's finding is withheld in cached detail and the daemon audit bundle before it ends", async (t) => {
 				const sessionId = "review.1";
 				const world = makeWorld({ sessionId, total: 17 });

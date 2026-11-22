@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { clearPause, setSwitch, writePause } from "../control.mjs";
 import { safeSubjectId } from "../session-id.mjs";
 import { resolveLedgerSubject } from "../session-record.mjs";
+import { boardLiveOwners } from "../session-subject.mjs";
 import { writeUiPrefs } from "./prefs.mjs";
 import { SESSION_LISTS } from "./session-view.mjs";
 import { auditReasonLabel } from "./labels.mjs";
@@ -156,7 +157,7 @@ export function createUiServer({ paths, token, getState, diagnose, sessionDetail
 		if (id !== null && safeSubjectId(id) === null) throw new HttpFailure(422, { error: "invalid" });
 		if (!diagnose) throw new HttpFailure(404, { error: "not-found" });
 		if (id !== null && paths?.health?.sessionsDir &&
-			resolveLedgerSubject(paths, id, { now: now() }).error === "ambiguous-session") throw ambiguousSession();
+			resolveLedgerSubject(paths, id, { liveOwners: boardLiveOwners(paths) }).error === "ambiguous-session") throw ambiguousSession();
 		const result = await diagnose(id ?? undefined);
 		if (result?.error === "ambiguous-session") throw ambiguousSession();
 		send(res, 200, result);

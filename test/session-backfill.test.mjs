@@ -4,10 +4,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { createSessionFileLocator } from "../src/collect/session-files.mjs";
 import { senpiTaskStoreDir } from "../src/collect/tasks.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 import { BACKFILL_MARKER, backfillOnce } from "../src/session-backfill.mjs";
-import { readEnded } from "../src/session-ledger.mjs";
+import { appendEnded, readEnded, streamEnded } from "../src/session-ledger.mjs";
+import { projectKeyOf, subjectOf } from "../src/session-subject.mjs";
+import { createDetailOperations } from "../src/ui/detail-worker.mjs";
+import { createUsageIndex } from "../src/usage-index.mjs";
+import { createUsageTracker } from "../src/usage-tracker.mjs";
+import { expectedSelector } from "./helpers/ended-selector.mjs";
+import { E } from "./helpers/fixtures.mjs";
 
 test("eight backfill appends read the seed day only for the window and shared dedupe", (t) => {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "backfill-batch-"));
@@ -78,6 +85,91 @@ function writeTask(cwd, raw, storeDir) {
 	fs.mkdirSync(path.dirname(file), { recursive: true });
 	fs.writeFileSync(file, JSON.stringify(raw));
 }
+
+function setupProjectPair(t) {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "backfill-project-pair-"));
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health"), OMO_HEALTH_OMO_HOME: path.join(root, ".omo") });
+	const now = Date.now();
+	const startedMs = now - 2 * HOUR;
+	const endedMs = now - HOUR;
+	const sessionId = "review.1";
+	const a = path.join(root, "a");
+	const b = path.join(root, "b");
+	const assistant = (input) => E.assistant({ ms: endedMs, usage: { input, output: 0, cacheRead: 0, cacheWrite: 0 } });
+	for (const [cwd, input] of [[a, 10], [b, 20]]) {
+		writeSession(paths, projectKeyOf(cwd), sessionId, cwd, startedMs, endedMs, [assistant(input)]);
+	}
+	return { paths, now, startedMs, endedMs, sessionId, a, b, assistant };
+}
+
+function processBackfilledRows(paths, now) {
+	const clock = { now: () => now };
+	const index = createUsageIndex({ file: paths.health.usageIndexFile, clock });
+	const tracker = createUsageTracker({ paths, clock, index, locator: createSessionFileLocator({ paths, clock }) });
+	tracker.queueLedger(streamEnded(paths, { withLocation: true }));
+	tracker.tick({ now, sessions: new Map(), tasks: [] });
+	return tracker;
+}
+
+test("a v2 upgrade restores the missing project for an ended ID and never rewrites the original", (t) => {
+	const { paths, now, startedMs, endedMs, sessionId, a, b } = setupProjectPair(t);
+	const original = { sessionId, kind: "main", cwd: a, startedMs, endedMs, outcome: "closed", reason: "original row" };
+	assert.ok(appendEnded(paths, original, { nowMs: now }));
+	const markerFile = path.join(paths.health.sessionsDir, BACKFILL_MARKER);
+	fs.writeFileSync(markerFile, JSON.stringify({ v: 2, ts: now - HOUR, days: 30, counts: { written: 1 } }));
+	const ledgerFile = path.join(paths.health.sessionsDir, `ended-${iso(endedMs).slice(0, 10)}.jsonl`);
+	const originalBytes = fs.readFileSync(ledgerFile);
+
+	backfillOnce(paths, now);
+	const rows = readEnded(paths);
+	assert.deepEqual(rows.map((row) => [row.sessionId, row.cwd]), [[sessionId, a], [sessionId, b]]);
+	const tracker = processBackfilledRows(paths, now);
+	assert.deepEqual(rows.map((row) => tracker.tokensOf(subjectOf(row))?.tokens.total), [10, 20]);
+	assert.equal(JSON.parse(fs.readFileSync(markerFile, "utf8")).v, 3);
+	const reconciledBytes = fs.readFileSync(ledgerFile);
+	assert.deepEqual(reconciledBytes.subarray(0, originalBytes.length), originalBytes);
+	assert.deepEqual(backfillOnce(paths, now), { skipped: true });
+	assert.deepEqual(fs.readFileSync(ledgerFile), reconciledBytes);
+});
+
+test("cold backfill links a cross-project child only to the same-named parent in its spawning project", (t) => {
+	const { paths, now, startedMs, endedMs, sessionId, a, b, assistant } = setupProjectPair(t);
+	const taskId = "st_cross";
+	const childId = "review.child";
+	writeTask(a, {
+		task_id: taskId, parent_session_id: sessionId, child_session_id: childId,
+		spawn_spec: { cwd: b }, status: "completed", final_response: "done",
+		created_at: iso(startedMs), terminal_at: iso(endedMs),
+	});
+	writeJsonl(path.join(a, ".omo", "senpi-task", "children", taskId, "sessions", taskId,
+		`${iso(startedMs).replace(/[:.]/g, "-")}_${childId}.jsonl`), [assistant(6)]);
+
+	const summary = backfillOnce(paths, now);
+	assert.deepEqual(summary.errors, []);
+	assert.equal(summary.counts.written, 3);
+	const rows = readEnded(paths);
+	const child = rows.find((row) => row.sessionId === childId);
+	const tracker = processBackfilledRows(paths, now);
+	const readDetail = createDetailOperations({ paths, auditDetail: () => null });
+	const parentResult = (cwd) => {
+		const row = rows.find((entry) => entry.sessionId === sessionId && entry.cwd === cwd);
+		const record = readDetail({ kind: "detail", id: sessionId, row: expectedSelector(row), now }).record;
+		const usage = tracker.tokensOf(subjectOf(row));
+		return { total: usage?.tokens.total, tree: usage?.treeTokens, children: record.children.map(({ sessionId }) => sessionId) };
+	};
+	assert.deepEqual({
+		childCwd: child.cwd,
+		parentProjectKey: child.parentProjectKey,
+		a: parentResult(a),
+		b: parentResult(b),
+	}, {
+		childCwd: b,
+		parentProjectKey: projectKeyOf(a),
+		a: { total: 10, tree: 16, children: [childId] },
+		b: { total: 20, tree: null, children: [] },
+	});
+});
 
 function setup() {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "backfill-"));
@@ -201,7 +293,7 @@ test("an install with a v1 marker runs the backfill once more and picks up child
 	const by = Object.fromEntries(readEnded(paths, { sinceMs: now - 31 * 86_400_000 }).map((row) => [row.sessionId, row]));
 	assert.equal(by["child-v1"].kind, "child");
 	assert.equal(by["child-v1"].parentSessionId, "sess-parent");
-	assert.equal(JSON.parse(fs.readFileSync(markerFile, "utf8")).v, 2);
+	assert.equal(JSON.parse(fs.readFileSync(markerFile, "utf8")).v, 3);
 });
 
 test("a second run writes no duplicate ledger entries", () => {
@@ -218,11 +310,12 @@ test("a second run writes no duplicate ledger entries", () => {
 	assert.equal(readEnded(paths, { sinceMs: now - 31 * 86_400_000 }).length, before.length);
 });
 
-test("a v2 marker skips", () => {
-	const root = fs.mkdtempSync(path.join(os.tmpdir(), "backfill-v2-"));
+test("a v3 marker skips", (t) => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "backfill-v3-"));
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
 	const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, ".omo-health"), OMO_HEALTH_OMO_HOME: path.join(root, ".omo") });
 	fs.mkdirSync(paths.health.sessionsDir, { recursive: true });
-	fs.writeFileSync(path.join(paths.health.sessionsDir, BACKFILL_MARKER), JSON.stringify({ v: 2 }));
+	fs.writeFileSync(path.join(paths.health.sessionsDir, BACKFILL_MARKER), JSON.stringify({ v: 3 }));
 	assert.deepEqual(backfillOnce(paths, Date.now()), { skipped: true });
 	assert.equal(readEnded(paths, { sinceMs: Date.now() - 31 * 86_400_000 }).length, 0);
 });
