@@ -383,9 +383,12 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 			}
 			record.status = "running";
 			record.startedMs = record.launchMs ?? clock.now();
+			clearUnconfirmedTermination(record);
 			save(record);
 		} catch (error) {
 			log?.warn?.("audit_recover_pending", { sessionId: record.sessionId, jobId: record.jobId, error: error.message });
+			const deadlineMs = record.launchMs + config.audit.timeoutMs;
+			if (clock.now() > deadlineMs) markUnconfirmedTermination(record, deadlineMs);
 		}
 	}
 

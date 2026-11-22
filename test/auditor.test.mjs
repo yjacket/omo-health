@@ -1931,6 +1931,56 @@ test("IS-9: audit fallback stderr rejects a valid verdict without refunding the 
 	assert.equal(h.budget().refunded, undefined);
 });
 
+test("IS-10 launching: overdue adoption failures warn without killing or releasing the slot", async () => {
+	const h = harness({ sessions: ["m1", "m2"] });
+	h.config.audit.timeoutMs = 60_000;
+	const recording = createRecordingSpawn();
+	const identity = { ctimeMs: BASE, cmdSha1: "audit-job" };
+	let lookupFails = true;
+	let lookups = 0;
+	const runner = createRunner({
+		paths: h.paths, clock: h.clock, env: {}, spawnImpl: recording.spawnImpl,
+		isAlive: () => true,
+		identify: () => identity,
+		findJobProcess() {
+			lookups++;
+			if (lookupFails) throw new Error("cim down");
+			return { pid: 70000, ...identity };
+		},
+	});
+	const initial = h.auditor({ runner, afterStart() { throw new Error("crash"); } });
+	h.request("m1");
+	await assert.rejects(h.prepare(initial), /crash/);
+	await initial.close();
+	const { jobId, launchMs } = h.record("m1");
+	const metaFile = path.join(runner.jobDir(jobId), "meta.json");
+	fs.unlinkSync(metaFile); // Model the crash window where no runner metadata survived.
+	const deadlineMs = launchMs + h.config.audit.timeoutMs;
+	const restarted = h.auditor({ runner });
+	h.request("m2");
+	h.tick(restarted, deadlineMs - h.state.now);
+	assert.equal(h.record("m1").terminationUnconfirmed, undefined, "not overdue at the deadline");
+	for (let i = 0; i < 3; i++) {
+		h.tick(restarted, POLL);
+		assert.equal(h.record("m1").status, "launching");
+		assert.equal(h.record("m2").status, "queued");
+		assert.equal(fs.existsSync(metaFile), false);
+		assert.equal(recording.calls.length, 1, "only the original launch; no taskkill or second start");
+	}
+	assert.equal(lookups, 5, "startup and each tick retry adoption");
+	assert.deepEqual([h.record("m1").terminationUnconfirmed, h.record("m1").deadlineMs], [true, deadlineMs]);
+
+	await restarted.close();
+	lookupFails = false;
+	const recovered = h.auditor({ runner });
+	assert.deepEqual([h.record("m1").status, h.record("m1").terminationUnconfirmed, h.record("m1").deadlineMs],
+		["running", undefined, undefined], "successful adoption clears the launching warning before the next poll");
+	h.tick(recovered);
+	assert.deepEqual(recording.calls.slice(1).map(({ command, args }) => [command, args]),
+		[["taskkill", ["/F", "/T", "/PID", "70000"]]], "normal timeout handling only kills once identity is verified");
+	assert.equal(h.record("m2").status, "queued");
+});
+
 test("IS-10 unconfirmed: overdue identity failures are recorded while the next audit waits", async () => {
 	const h = harness({ sessions: ["m1", "m2"] });
 	h.config.audit.timeoutMs = 60_000;

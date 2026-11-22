@@ -1157,6 +1157,41 @@ describe("ui server", { timeout: 20_000 }, () => {
 				}
 			});
 
+			it("IS-10 launching: HTTP detail warns after repeated overdue adoption failures", async () => {
+				const world = makeWorld();
+				const { config } = loadConfig({ paths: world.paths, env: world.env });
+				const deadlineMs = world.nowMs - 1;
+				writeJson(path.join(world.paths.health.auditsDir, `${AUDIT_ID}.json`), {
+					v: 1, sessionId: AUDIT_ID, status: "launching", launchMs: deadlineMs - config.audit.timeoutMs,
+					jobId: "audit-interrupted-launch", model: "openai/gpt-review:high", laneSessionId: "audit-lane",
+				});
+				let lookups = 0;
+				const auditor = createAuditor({
+					paths: world.paths, config, clock: { now: world.now }, env: world.env,
+					runner: { adoptJob: async () => { lookups++; throw new Error("cim down"); } },
+				});
+				const ui = createUiServer({ paths: world.paths, token: TOKEN, getState: () => STATE, sessionDetail: world.detail, now: world.now });
+				try {
+					for (let i = 0; i < 3; i++) {
+						await Promise.resolve();
+						auditor.tick(world.now());
+					}
+					assert.equal(lookups, 2);
+					const { port } = await ui.listen();
+					const { status, body } = await getAt(port, `/api/session?id=${AUDIT_ID}`);
+					assert.equal(status, 200);
+					assert.equal(body.audit.state.status, "launching");
+					assert.equal(body.audit.terminationUnconfirmedKo, "제한 시간이 지났지만 종료를 확인하지 못했습니다");
+					assert.equal(body.audit.state.terminationUnconfirmed, true);
+					assert.equal(body.audit.state.deadlineMs, deadlineMs);
+				} finally {
+					await auditor.close();
+					await ui.close();
+					await world.detail.close();
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				}
+			});
+
 			it("plans around every analyst model a selected investigation used, not only the latest", async () => {
 				const world = makeWorld({ lanes: { ultrabrain: ["openai/alpha-review"], architect: ["openai/beta-review"], "deep-high": ["openai/gamma-review"] } });
 				try {
