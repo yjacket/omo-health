@@ -107,9 +107,9 @@ function harness({ providers = ["anthropic-subscription", "openai", "google", "x
 		auditor.tick(state.now);
 	};
 	h.request = (id) => {
-		const request = requestAudit(paths, id, state.now);
+		const claim = requestAudit(paths, id, state.now);
 		state.now += 1;
-		return request;
+		return claim;
 	};
 	h.record = (id) => readJsonSafe(path.join(paths.health.auditsDir, `${id}.json`));
 	h.budget = () => readJsonSafe(paths.health.auditBudgetFile);
@@ -729,6 +729,16 @@ for (const incomplete of ["timeline", "index"]) {
 	});
 }
 
+test("the auditor passes a 64 MiB total message scan budget", (t) => {
+	const h = harness();
+	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+	const calls = [];
+	const a = h.auditor({ loadRecord: (options) => calls.push(options) && { found: false } });
+	h.request("m1");
+	h.tick(a);
+	assert.deepEqual(calls.map((options) => options.messageScanTotalBytes), [64 * 1024 * 1024]);
+});
+
 test("preparing a file above timelineMaxBytes neither scans messages nor reads it through usageTimeline", () => {
 	const h = harness();
 	const scans = [];
@@ -1044,6 +1054,20 @@ test("finished records older than history.retentionDays are pruned once a day", 
 	assert.equal(h.record("m1").status, "done", "inside the retention window");
 	h.tick(a, 31 * DAY);
 	assert.equal(h.record("m1"), undefined);
+});
+
+test("a duplicate audit request cannot replace the first claim", (t) => {
+	const h = harness();
+	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+	const dir = h.paths.health.auditRequestsDir;
+	const file = path.join(dir, "m1.json");
+	const first = requestAudit(h.paths, "m1", BASE);
+	const before = fs.readFileSync(file);
+	const second = requestAudit(h.paths, "m1", BASE + 1);
+	assert.deepEqual(fs.readFileSync(file), before, "the second call must leave the first claim unchanged");
+	assert.deepEqual(first, { created: true, request: { v: 1, sessionId: "m1", requestedMs: BASE } });
+	assert.deepEqual(second, { created: false });
+	assert.deepEqual(fs.readdirSync(dir), ["m1.json"]);
 });
 
 test("request helpers: safeAuditId, the atomic request file and the state a request, a running record and a finished record show", () => {

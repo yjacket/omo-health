@@ -71,8 +71,8 @@ export function createDetailOperations({
 		if (!facts.sessionModelsKnown) return refuse(409, "models-unknown");
 		const choice = plan(config, facts, record.analystModels);
 		if (!choice || choice.blocked) return refuse(409, "no-model");
-		// Keep checks and the request-file write in the same work item: the next POST sees it.
-		request(paths, canonicalId, at);
+		// Other dashboards can pass the active-state check before this claim.
+		if (!request(paths, canonicalId, at).created) return refuse(409, "running");
 		return [202, { ok: true, audit: { sessionId: canonicalId, status: "queued", statusKo: auditStatusLabel("queued"), planned: choice } }];
 	}
 

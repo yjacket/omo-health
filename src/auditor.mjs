@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
 import { createSessionFileLocator } from "./collect/session-files.mjs";
 import { usageTimeline } from "./collect/usage.mjs";
@@ -24,6 +25,7 @@ import { redact, truncate } from "./util/text.mjs";
 const MIN = 60_000;
 const DAY_MS = 24 * 60 * MIN;
 export const REQUEST_TTL_MS = 10 * MIN;
+export const MESSAGE_SCAN_TOTAL_BYTES = 64 * 1024 * 1024;
 const DESCENDANT_SCAN_MAX = 50;
 const TIMELINE_MAX_BYTES = 256 * 1024 * 1024;
 const SAFE_ID = /^[A-Za-z0-9][\w.-]{0,127}$/;
@@ -46,13 +48,26 @@ function readBudget(paths, now) {
 	return { day, count: 0, jobs: [] };
 }
 
-/** The dashboard's only write for an audit: one atomic request file carrying nothing but the id. */
+/** Publish a complete request without replacing an existing claim for the id. */
 export function requestAudit(paths, sessionId, nowMs) {
 	const id = safeAuditId(sessionId);
 	if (!id) throw new Error("invalid session id");
 	const request = { v: 1, sessionId: id, requestedMs: nowMs };
-	atomicWriteJson(path.join(paths.health.auditRequestsDir, `${id}.json`), request);
-	return request;
+	const dir = ensureDir(paths.health.auditRequestsDir);
+	const file = path.join(dir, `${id}.json`);
+	const temp = path.join(dir, `.${crypto.randomUUID()}.tmp`);
+	try {
+		fs.writeFileSync(temp, `${JSON.stringify(request, null, 2)}\n`, { flag: "wx" });
+		try {
+			fs.linkSync(temp, file);
+		} catch (error) {
+			if (error.code === "EEXIST") return { created: false };
+			throw error;
+		}
+		return { created: true, request };
+	} finally {
+		removeSafe(temp);
+	}
 }
 
 /** The session's audit record; an active one wins, else a waiting request, else the last finished record, else null. */
@@ -240,7 +255,7 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 	function prepare(record, now) {
 		if (config.audit?.enabled !== true) return fail(record, "disabled", null, now);
 		const usage = index ?? readUsageIndex(paths.health.usageIndexFile);
-		const loaded = loadRecord({ paths, id: record.sessionId, now, messageScanMaxBytes: timelineMaxBytes, descendantScanMax: DESCENDANT_SCAN_MAX, locator, index: usage });
+		const loaded = loadRecord({ paths, id: record.sessionId, now, messageScanMaxBytes: timelineMaxBytes, messageScanTotalBytes: MESSAGE_SCAN_TOTAL_BYTES, descendantScanMax: DESCENDANT_SCAN_MAX, locator, index: usage });
 		if (!loaded?.found) return fail(record, "not-found", null, now);
 		if (readBudget(paths, now).count >= config.audit.perDay) return fail(record, "cap", null, now);
 

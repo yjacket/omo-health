@@ -556,12 +556,11 @@ function recordLedger(rows, id, usage, descendantScanMax) {
 }
 
 /**
- * Read everything the record needs and join it. Message scanning is bounded
- * per file: a file larger than `messageScanMaxBytes` is never opened for
- * messages and is listed in `truncated.messagesSkipped`; the dashboard default
- * is Infinity, only the daemon's audit preparation passes a limit.
+ * Read everything the record needs and join it. A file that exceeds the
+ * per-file limit or the remaining total message scan budget is skipped and
+ * listed in `truncated.messagesSkipped`. The dashboard defaults to no limits.
  */
-export function loadSessionRecord({ paths, id, now = Date.now(), messageScanMaxBytes = Infinity, descendantScanMax = Infinity, scanMessages = scanOmoHealthMessages, locator, index } = {}) {
+export function loadSessionRecord({ paths, id, now = Date.now(), messageScanMaxBytes = Infinity, messageScanTotalBytes = Infinity, descendantScanMax = Infinity, scanMessages = scanOmoHealthMessages, locator, index } = {}) {
 	if (!nonEmpty(id)) return { found: false, id };
 	const usage = index ?? readUsageIndex(paths.health.usageIndexFile);
 	const joined = recordLedger(() => streamEnded(paths, { sinceMs: now - 30 * DAY_MS }), id, usage, descendantScanMax);
@@ -584,13 +583,15 @@ export function loadSessionRecord({ paths, id, now = Date.now(), messageScanMaxB
 
 	const messages = [];
 	const skipped = [];
+	let scannedBytes = 0;
 	for (const { sessionId, file } of files) {
 		const stat = statSafe(file);
 		if (!stat?.isFile()) continue;
-		if (stat.size > messageScanMaxBytes) {
+		if (stat.size > messageScanMaxBytes || scannedBytes + stat.size > messageScanTotalBytes) {
 			skipped.push(file);
 			continue;
 		}
+		scannedBytes += stat.size;
 		for (const message of scanMessages(file) ?? []) messages.push({ ...message, recipient: sessionId });
 	}
 

@@ -356,6 +356,36 @@ test("a session file larger than messageScanMaxBytes is never scanned and is lis
 	assert.equal(record.health.counts.messages, 0);
 });
 
+test("the total message scan budget admits the own file and only the newest descendant", (t) => {
+	const { root, paths } = setup();
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const mib = 1024 * 1024;
+	const budget = 64 * mib;
+	const own = mainSessionFile(paths, "s-main", [ohealth(T0, "own")]);
+	fs.truncateSync(own, 40 * mib);
+	const children = [1, 2, 3].map((n) => childRow(`s-${n}`, `st_${n}`, "s-main", { cwd: root, endedMs: T0 + n * MIN }));
+	const files = children.map(({ sessionId, taskId }) => {
+		const file = childSessionFile(root, taskId, sessionId, [ohealth(T0, sessionId)]);
+		fs.truncateSync(file, 20 * mib);
+		return file;
+	});
+	writeLedger(paths, [mainRow({ cwd: root }), ...children]);
+
+	const calls = [];
+	let bytes = 0;
+	const record = loadSessionRecord({
+		paths, id: "s-main", now: T0 + 24 * HOUR, messageScanTotalBytes: budget,
+		scanMessages(file) {
+			calls.push(file);
+			bytes += fs.statSync(file).size;
+			return [];
+		},
+	});
+	assert.deepEqual(calls, [own, files[2]]);
+	assert.deepEqual(record.truncated.messagesSkipped, [files[1], files[0]]);
+	assert.ok(bytes <= budget);
+});
+
 test("action facts carry the structured outcome and a reason code", () => {
 	const fixture = corpus();
 	fixture.decisions.push({

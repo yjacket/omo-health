@@ -6,6 +6,8 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { after, before, beforeEach, describe, it } from "node:test";
+import { createAuditor, readAuditState } from "../src/auditor.mjs";
+import { loadConfig } from "../src/config.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 import { emptyUsage } from "../src/collect/usage.mjs";
 import { createDetailWorker, createSessionDetail, createStartAudit } from "../src/ui/cli.mjs";
@@ -882,6 +884,51 @@ describe("ui server", { timeout: 20_000 }, () => {
 					await auditServer.close();
 					fs.rmSync(world.dir, { recursive: true, force: true });
 				}
+			});
+
+			it("two dashboards racing for one audit return 202 and 409, then the daemon launches and charges once", async (t) => {
+				const world = makeWorld();
+				const { paths, env, now, nowMs } = world;
+				const servers = [];
+				t.after(async () => {
+					await Promise.all(servers.map((server) => server.close()));
+					await world.detail.close();
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				});
+				const gate = Promise.withResolvers();
+				let arrived = 0;
+				const ports = await Promise.all([0, 1].map(async () => {
+					// Both dashboards observe the state before either publishes. Inject
+					// that read into their independent synchronous detail operations.
+					let observed;
+					const startAudit = createStartAudit({ paths, env, now, readState: () => observed });
+					const dashboard = createUiServer({
+						paths, token: TOKEN, getState: () => STATE, now,
+						startAudit: async (id) => {
+							observed = readAuditState(paths, id);
+							if (++arrived === 2) gate.resolve();
+							await gate.promise;
+							return startAudit(id);
+						},
+					});
+					servers.push(dashboard);
+					return (await dashboard.listen()).port;
+				}));
+				const replies = await Promise.all(ports.map((port) => postAt(port, "/api/audit", { sessionId: AUDIT_ID })));
+				assert.deepEqual(replies.map((reply) => reply.status).sort(), [202, 409]);
+				assert.deepEqual(replies.find((reply) => reply.status === 409).body, { error: "running", reasonKo: "이미 조사 중입니다" });
+				assert.equal(replies.find((reply) => reply.status === 202).body.audit.sessionId, AUDIT_ID);
+
+				const starts = [];
+				const { config } = loadConfig({ paths, env });
+				const auditor = createAuditor({ paths, env, config, clock: { now }, runner: { start: (job) => starts.push(job) } });
+				auditor.tick(nowMs);
+				assert.equal(starts.length, 1);
+				assert.equal(readAuditState(paths, AUDIT_ID).status, "running");
+				assert.equal(fs.existsSync(requestFileOf(world)), false);
+				assert.deepEqual(JSON.parse(fs.readFileSync(paths.health.auditBudgetFile, "utf8")), {
+					day: "2026-11-22", count: 1, jobs: [starts[0].jobId],
+				});
 			});
 
 			it("treats a file that grew after the index read as models-unknown for a POST and never plans a model", async () => {
