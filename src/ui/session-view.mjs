@@ -1,4 +1,4 @@
-import { actionLabel, analystVerdictLabel, causeLabel, findingLabel, outcomeLabel, resultLabel, severityLabel, terminalLabel } from "./labels.mjs";
+import { actionLabel, analystVerdictLabel, auditJudgmentLabel, auditOverallLabel, auditReasonLabel, auditStatusLabel, auditTokenLabel, causeLabel, findingLabel, outcomeLabel, resultLabel, severityLabel, terminalLabel } from "./labels.mjs";
 import { investigationRow } from "./model.mjs";
 
 /**
@@ -45,6 +45,36 @@ function labelledChild(child) {
 	return { ...child, outcomeKo: outcomeLabel(child.outcome) };
 }
 
+function labelledAuditResult(result) {
+	if (!isRecord(result)) return result ?? null;
+	const tokens = isRecord(result.tokens) ? result.tokens : null;
+	return {
+		...result,
+		overallKo: auditOverallLabel(result.overall),
+		tokens: tokens ? { ...tokens, judgmentKo: auditTokenLabel(tokens.judgment) } : tokens,
+		checks: list(result.checks).map((check) => ({ ...check, judgmentKo: auditJudgmentLabel(check.judgment) })),
+	};
+}
+
+/** Todo 13's audit block: the raw state plus Korean labels; the cli supplies `planned`, `blocked` and friends. */
+function labelledAudit(audit) {
+	if (!isRecord(audit)) return audit ?? null;
+	const state = isRecord(audit.state) ? audit.state : null;
+	if (!state) return audit;
+	const status = state.status === "requested" ? "queued" : state.status;
+	return {
+		...audit,
+		state: {
+			...state,
+			status,
+			statusKo: auditStatusLabel(status),
+			reasonKo: state.reason ? auditReasonLabel(state.reason) : null,
+			result: labelledAuditResult(state.result),
+		},
+		statusKo: auditStatusLabel(status),
+	};
+}
+
 /**
  * Add the Korean labels to one session record. `extras` overrides the result
  * (todo 13 passes the audit block and live daemon status here); `audit` stays
@@ -52,7 +82,9 @@ function labelledChild(child) {
  */
 export function buildSessionView(record, extras = {}) {
 	if (!isRecord(record)) return record;
-	if (record.found === false) return { ...record, audit: null, ...extras };
+	const { audit: auditExtra, ...rest } = extras;
+	const audit = labelledAudit(auditExtra !== undefined ? auditExtra : record.audit ?? null);
+	if (record.found === false) return { ...record, audit, ...rest };
 	const health = isRecord(record.health) ? record.health : {};
 	return {
 		...record,
@@ -65,7 +97,7 @@ export function buildSessionView(record, extras = {}) {
 			investigations: list(health.investigations).map(labelledInvestigation),
 			messages: list(health.messages),
 		},
-		audit: record.audit ?? null,
-		...extras,
+		audit,
+		...rest,
 	};
 }

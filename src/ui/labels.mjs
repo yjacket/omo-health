@@ -174,6 +174,42 @@ export const OUTCOME_LABELS = Object.freeze({ "goal-complete": "목표 완료", 
 /** The terminal a main session runs in (SessionRow.terminal.kind), as the board's chip names it. */
 export const TERMINAL_LABELS = Object.freeze({ orca: "Orca", herdr: "herdr", other: "기타" });
 
+/** An audit's overall verdict (src/judge/audit.mjs AUDIT_OVERALL). */
+export const AUDIT_OVERALL_LABELS = Object.freeze({ sound: "적절", exaggerated: "과장", overreach: "무리한 판단", missed: "놓침", mixed: "일부 문제" });
+
+/** One check's judgment (AUDIT_JUDGMENTS): the overall vocabulary plus `unverifiable`. */
+export const AUDIT_JUDGMENT_LABELS = Object.freeze({ ...AUDIT_OVERALL_LABELS, unverifiable: "확인 불가" });
+
+/** The reviewer's token judgment (AUDIT_TOKEN_JUDGMENTS). */
+export const AUDIT_TOKEN_LABELS = Object.freeze({ normal: "정상", high: "많음", wasteful: "낭비", unclear: "판단 어려움" });
+
+/** An audit record's status (src/auditor.mjs). A request the daemon has not taken yet is `requested`, shown as queued. */
+export const AUDIT_STATUS_LABELS = Object.freeze({ queued: "대기 중", launching: "조사 중", running: "조사 중", done: "완료", failed: "실패" });
+
+/** An audit failure or refusal reason, keyed by the prefix before `:`. */
+export const AUDIT_REASON_LABELS = Object.freeze({
+	expired: "요청이 오래되어 시작하지 않았습니다",
+	disabled: "설정에서 조사가 꺼져 있습니다",
+	"not-found": "세션 기록을 찾지 못했습니다",
+	"no-model": "세션과 분석가 모델과 다른 상위 모델이 없습니다",
+	"models-unknown": "세션이 쓴 모델을 다 확인하지 못해 조사할 수 없습니다",
+	timeout: "제한 시간 안에 답하지 않았습니다",
+	"bad-output": "쓸 수 없는 답을 받았습니다",
+	unavailable: "모델을 쓸 수 없습니다",
+	"spawn-error": "조사를 실행하지 못했습니다",
+	"evidence-too-large": "기록이 너무 커서 조사할 수 없습니다",
+	"no-job": "실행 기록을 찾지 못했습니다",
+	"launch-uncertain": "실행 여부를 확인할 수 없어 다시 시작하지 않았습니다",
+	"prepare-error": "조사 자료를 만들지 못했습니다",
+	exit: "조사 실행이 오류로 끝났습니다",
+	"no-result": "모델이 답을 남기지 않고 끝났습니다",
+	"pid-reused": "조사 프로세스를 더 확인할 수 없습니다",
+	failed: "조사를 마치지 못했습니다",
+	"daemon-off": "감시기가 꺼져 있어 조사할 수 없습니다",
+	cap: "오늘 조사 한도를 다 썼습니다",
+	running: "이미 조사 중입니다",
+});
+
 /** A child task's status (src/collect/tasks.mjs ACTIVE_TASK_STATUSES / TERMINAL_TASK_STATUSES). */
 export const TASK_STATUS_LABELS = Object.freeze({ running: "실행 중", queued: "대기열", pending: "대기", starting: "시작 중", spawning: "시작 중", completed: "완료", error: "오류", failed: "실패", cancelled: "취소됨", interrupted: "중단됨", lost: "유실", killed: "강제 종료" });
 
@@ -259,4 +295,31 @@ export function taskStatusLabel(status) {
 
 export function goalStatusLabel(status) {
 	return label(GOAL_STATUS_LABELS, status, String(status ?? "-"));
+}
+
+/** A request file is a queued audit; every other status maps directly. */
+export function auditStatusLabel(status) {
+	const key = status === "requested" ? "queued" : status;
+	return label(AUDIT_STATUS_LABELS, key, String(key ?? "-"));
+}
+
+/** The reason before its first `:`, so `unavailable:no-key` still has Korean text. */
+export function auditReasonLabel(reason) {
+	if (typeof reason !== "string" || !reason) return "-";
+	const head = reason.split(":")[0];
+	// The runner reports a non-zero exit as `exit-<code>`.
+	const prefix = /^exit-\d+$/.test(head) ? "exit" : head;
+	return label(AUDIT_REASON_LABELS, prefix, reason);
+}
+
+export function auditOverallLabel(overall) {
+	return label(AUDIT_OVERALL_LABELS, overall, String(overall ?? "-"));
+}
+
+export function auditJudgmentLabel(judgment) {
+	return label(AUDIT_JUDGMENT_LABELS, judgment, String(judgment ?? "-"));
+}
+
+export function auditTokenLabel(judgment) {
+	return label(AUDIT_TOKEN_LABELS, judgment, String(judgment ?? "-"));
 }

@@ -135,4 +135,43 @@ describe("session view", () => {
 		assert.deepEqual(buildSessionView(missing), { found: false, id: "s-missing", audit: null });
 		assert.deepEqual(buildSessionView(missing, { audit: { state: "done" } }), { found: false, id: "s-missing", audit: { state: "done" } });
 	});
+
+	it("labels the audit state, its reason and its verdict enums", () => {
+		const audit = {
+			state: {
+				status: "failed",
+				reason: "timeout:900s",
+				result: {
+					overall: "exaggerated",
+					summary: "요약입니다",
+					tokens: { judgment: "wasteful", explanation: "많이 썼습니다" },
+					checks: [{ item: "D1", judgment: "overreach", explanation: "과합니다", evidence: ["F1"] }],
+				},
+			},
+			planned: { model: "openai/gpt-review", lane: "architect", independence: "family" },
+			blocked: null,
+			stalled: false,
+			usedToday: 1,
+			perDay: 20,
+		};
+		const view = buildSessionView(record(), { audit });
+		assert.equal(view.audit.state.statusKo, "실패");
+		assert.equal(view.audit.state.reasonKo, "제한 시간 안에 답하지 않았습니다");
+		assert.equal(view.audit.state.result.overallKo, "과장");
+		assert.equal(view.audit.state.result.tokens.judgmentKo, "낭비");
+		assert.equal(view.audit.state.result.checks[0].judgmentKo, "무리한 판단");
+		assert.deepEqual(view.audit.planned, { model: "openai/gpt-review", lane: "architect", independence: "family" });
+		assert.equal(view.audit.blocked, null);
+		assert.equal(view.audit.usedToday, 1);
+		assert.equal(view.audit.perDay, 20);
+		assert.equal(audit.state.statusKo, undefined, "the input is not mutated");
+	});
+
+	it("shows a request the daemon has not taken as queued", () => {
+		const view = buildSessionView(record(), { audit: { state: { status: "requested" }, planned: null, blocked: null, stalled: false, usedToday: 0, perDay: 20 } });
+		assert.equal(view.audit.state.status, "queued");
+		assert.equal(view.audit.state.statusKo, "대기 중");
+		assert.equal(view.audit.statusKo, "대기 중");
+		assert.equal(view.audit.state.reasonKo, null);
+	});
 });

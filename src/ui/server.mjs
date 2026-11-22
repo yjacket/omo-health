@@ -34,10 +34,13 @@ const API_ROUTES = Object.freeze({
 	"/api/switch": "POST",
 	"/api/diagnose": "GET",
 	"/api/session": "GET",
+	"/api/audit": "POST",
 	"/api/prefs": "POST",
 });
 /** A task id or session id, as `omo-health diagnose` takes it. */
 const SUBJECT_ID = /^[A-Za-z0-9_-]{4,80}$/;
+/** Windows device names cannot be file names under audits/ even though they look like ids. */
+const RESERVED_ID = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$/i;
 /** The session detail lists, as the record names them; `children` lives on the record, the rest under `health`. */
 const SESSION_LISTS = Object.freeze(["children", "findings", "actions", "investigations", "messages"]);
 const SESSION_QUERY_KEYS = Object.freeze(new Set(["id", "list", "offset"]));
@@ -62,9 +65,14 @@ class HttpFailure extends Error {
 const SWITCH_STATUS = Object.freeze({ "unknown-key": 422, "invalid-value": 422, unreadable: 409 });
 
 /** Validates a parsed POST body for its route and runs the control action: returns [status, body]. */
-function runAction(paths, route, body, nowMs) {
+function runAction(paths, route, body, nowMs, startAudit) {
 	const invalid = new HttpFailure(422, { error: "invalid" });
 	switch (route) {
+		case "/api/audit": {
+			if (!hasExactKeys(body, ["sessionId"]) || typeof body.sessionId !== "string" || !SUBJECT_ID.test(body.sessionId) || RESERVED_ID.test(body.sessionId)) throw invalid;
+			if (!startAudit) throw new HttpFailure(404, { error: "not-found" });
+			return startAudit(body.sessionId);
+		}
 		case "/api/pause": {
 			if (!hasExactKeys(body, ["minutes"]) || ![15, 60, null].includes(body.minutes)) throw invalid;
 			return [200, { ok: true, pause: writePause(paths, { minutes: body.minutes ?? undefined, now: nowMs }) }];
@@ -110,7 +118,7 @@ function readBody(req) {
 	});
 }
 
-export function createUiServer({ paths, token, getState, diagnose, sessionDetail, idleMs = 30 * 60_000, now = Date.now, staticDir = DEFAULT_STATIC_DIR, log = () => {} }) {
+export function createUiServer({ paths, token, getState, diagnose, sessionDetail, startAudit, idleMs = 30 * 60_000, now = Date.now, staticDir = DEFAULT_STATIC_DIR, log = () => {} }) {
 	const expectedDigest = digest(token);
 	let lastRequestMs = now();
 	let port = 0;
@@ -135,7 +143,7 @@ export function createUiServer({ paths, token, getState, diagnose, sessionDetail
 			throw error;
 		}
 		if (!isPlainObject(body)) throw new HttpFailure(400, { error: "bad-json" });
-		const [status, payload] = runAction(paths, route, body, now());
+		const [status, payload] = runAction(paths, route, body, now(), startAudit);
 		send(res, status, payload);
 	}
 

@@ -4,11 +4,15 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig } from "../config.mjs";
 import { createSessionFileLocator } from "../collect/session-files.mjs";
+import { auditsToday, readAuditState, requestAudit } from "../auditor.mjs";
 import { listSubjectsNow, runDiagnose } from "../diagnose.mjs";
+import { resolveAuditModel } from "../judge/audit.mjs";
 import { createLogger } from "../log.mjs";
 import { loadSessionRecord } from "../session-record.mjs";
+import { atEnd, readUsageIndex } from "../usage-index.mjs";
 import { listDirSafe, statSafe } from "../util/fsx.mjs";
-import { uiState } from "./model.mjs";
+import { daemonStatus, loadDaemonInputs, uiState } from "./model.mjs";
+import { auditReasonLabel, auditStatusLabel } from "./labels.mjs";
 import { createUiServer } from "./server.mjs";
 import { buildSessionView } from "./session-view.mjs";
 
@@ -17,6 +21,80 @@ const DEFAULT_IDLE_MINUTES = 30;
 const SANDBOX_MARKERS = new Set(["OMO_HEALTH_HOME", "OMO_HEALTH_OMO_HOME", "OMO_HEALTH_CLAUDE_HOME", "NODE_TEST_CONTEXT"]);
 const DEFAULT_BIN_PATH = fileURLToPath(new URL("../../bin/omo-health.mjs", import.meta.url));
 const SESSION_CACHE_MAX = 20;
+const ACTIVE_AUDIT_STATUSES = new Set(["requested", "queued", "launching", "running"]);
+
+const isAuditActive = (state) => Boolean(state && (ACTIVE_AUDIT_STATUSES.has(state.status) || state.holdUntilExit === true));
+
+/** The session's own index entry, by session id, then task id, then the requested id. */
+function usageEntryFor(usage, record, id) {
+	if (!(usage instanceof Map)) return null;
+	const session = record?.session ?? {};
+	return usage.get(session.sessionId) ?? (session.taskId ? usage.get(session.taskId) : undefined) ?? usage.get(id) ?? null;
+}
+
+/** The model list is known only when the whole file was read and nothing was incomplete. */
+function modelsKnownOf(entry) {
+	return Boolean(entry && entry.state === "ok" && entry.complete === true && atEnd(entry) && entry.published?.modelsIncomplete !== true);
+}
+
+const sessionModelsOf = (entry) => Object.keys(entry?.published?.usedModels ?? {});
+const analystModelsOf = (record) => (record?.health?.investigations ?? []).map((investigation) => investigation?.model).filter((model) => typeof model === "string" && model);
+
+/** The first refusal, in the order the detail and the POST agree on: disabled, daemon-off, cap, models-unknown, no-model. */
+function blockedOf({ config, daemon, usedToday, perDay, modelsKnown, planned }) {
+	if (config.audit?.enabled !== true) return "disabled";
+	if (daemon.state !== "running") return "daemon-off";
+	if (Number.isFinite(perDay) && usedToday >= perDay) return "cap";
+	if (!modelsKnown) return "models-unknown";
+	if (!planned) return "no-model";
+	return null;
+}
+
+/** Reads the audit block fresh on every detail GET: the record cache never freezes it. */
+export function createAuditDetail({ paths, env = process.env, now = Date.now, resolveModel = resolveAuditModel, readState = readAuditState, today = auditsToday, daemonInputs = loadDaemonInputs } = {}) {
+	return function auditDetail(record, id) {
+		const at = now();
+		const { config } = loadConfig({ env, paths });
+		const daemon = daemonStatus(daemonInputs({ paths, env, now: at }));
+		const state = readState(paths, id);
+		const perDay = Number.isFinite(config.audit?.perDay) ? config.audit.perDay : null;
+		const usedToday = today(paths, at);
+		const entry = usageEntryFor(readUsageIndex(paths.health.usageIndexFile), record, id);
+		const modelsKnown = modelsKnownOf(entry);
+		const choice = modelsKnown ? resolveModel(paths, config, { sessionModels: sessionModelsOf(entry), sessionModelsKnown: true, analystModels: analystModelsOf(record) }) : null;
+		const planned = choice && !choice.blocked ? choice : null;
+		const blocked = blockedOf({ config, daemon, usedToday, perDay, modelsKnown, planned });
+		return { state, planned, blocked, stalled: isAuditActive(state) && daemon.state !== "running", usedToday, perDay };
+	};
+}
+
+/**
+ * The POST /api/audit action: validate against the stored record, then drop the
+ * request file the daemon takes. It never spawns or writes anything else.
+ * Returns `[status, body]` for the server.
+ */
+export function createStartAudit({ paths, env = process.env, now = Date.now, load = loadSessionRecord, resolveModel = resolveAuditModel, readState = readAuditState, today = auditsToday, request = requestAudit, daemonInputs = loadDaemonInputs } = {}) {
+	const refuse = (status, reason) => [status, { error: reason, reasonKo: auditReasonLabel(reason) }];
+	return function startAudit(sessionId) {
+		const at = now();
+		const record = load({ paths, id: sessionId, now: at });
+		if (!record?.found) return refuse(404, "not-found");
+		const { config } = loadConfig({ env, paths });
+		if (config.audit?.enabled !== true) return refuse(409, "disabled");
+		const daemon = daemonStatus(daemonInputs({ paths, env, now: at }));
+		if (daemon.state !== "running") return refuse(409, "daemon-off");
+		const state = readState(paths, sessionId);
+		if (isAuditActive(state)) return refuse(409, "running");
+		const perDay = config.audit.perDay;
+		if (Number.isFinite(perDay) && today(paths, at) >= perDay) return refuse(429, "cap");
+		const entry = usageEntryFor(readUsageIndex(paths.health.usageIndexFile), record, sessionId);
+		if (!modelsKnownOf(entry)) return refuse(409, "models-unknown");
+		const choice = resolveModel(paths, config, { sessionModels: sessionModelsOf(entry), sessionModelsKnown: true, analystModels: analystModelsOf(record) });
+		if (!choice || choice.blocked) return refuse(409, "no-model");
+		request(paths, sessionId, at);
+		return [202, { ok: true, audit: { sessionId, status: "queued", statusKo: auditStatusLabel("queued"), planned: choice } }];
+	};
+}
 
 const fileStamp = (file) => {
 	const stat = statSafe(file);
@@ -45,9 +123,11 @@ function newestFileMs(dir) {
  * the labels with `buildSessionView` on every call so the audit block and daemon
  * status (todo 13) are always read fresh. The cache holds at most 20 ids.
  */
-export function createSessionDetail({ paths, now = Date.now, load = loadSessionRecord, maxEntries = SESSION_CACHE_MAX } = {}) {
+export function createSessionDetail({ paths, env = process.env, now = Date.now, load = loadSessionRecord, maxEntries = SESSION_CACHE_MAX, auditDetail = createAuditDetail({ paths, env, now }) } = {}) {
 	const locator = createSessionFileLocator({ paths, clock: { now } });
 	const cache = new Map();
+
+	const viewOf = (record, id) => buildSessionView(record, { audit: record?.found === true ? auditDetail(record, id) : null });
 
 	const sessionFileOf = (record) => {
 		const session = record?.session;
@@ -70,14 +150,14 @@ export function createSessionDetail({ paths, now = Date.now, load = loadSessionR
 		if (cached && signatureOf(cached.file) === cached.signature) {
 			cache.delete(id);
 			cache.set(id, cached);
-			return buildSessionView(cached.record, { audit: null });
+			return viewOf(cached.record, id);
 		}
 		if (cached) cache.delete(id);
 		const record = load({ paths, id, now: now(), locator });
 		const file = record?.found === true ? sessionFileOf(record) : undefined;
 		cache.set(id, { record, file, signature: signatureOf(file) });
 		while (cache.size > maxEntries) cache.delete(cache.keys().next().value);
-		return buildSessionView(record, { audit: null });
+		return viewOf(record, id);
 	};
 }
 
@@ -171,7 +251,7 @@ async function runServer(options, { paths, env, proc }) {
 		const { config } = loadConfig({ env, paths });
 		return id ? runDiagnose({ paths, config, id }) : listSubjectsNow({ paths, config });
 	};
-	const server = createUiServer({ paths, token, idleMs, getState: () => uiState({ paths, env, now: Date.now() }), diagnose, sessionDetail: createSessionDetail({ paths }), log: (event, data) => logger.error(event, data) });
+	const server = createUiServer({ paths, token, idleMs, getState: () => uiState({ paths, env, now: Date.now() }), diagnose, sessionDetail: createSessionDetail({ paths, env }), startAudit: createStartAudit({ paths, env }), log: (event, data) => logger.error(event, data) });
 	const { port } = await server.listen();
 	proc.send?.({ type: "listening", port }, () => proc.disconnect?.());
 	return new Promise((resolve) => {

@@ -7,7 +7,8 @@ import os from "node:os";
 import path from "node:path";
 import { after, before, beforeEach, describe, it } from "node:test";
 import { resolvePaths } from "../src/paths.mjs";
-import { createSessionDetail } from "../src/ui/cli.mjs";
+import { createSessionDetail, createStartAudit } from "../src/ui/cli.mjs";
+import { daemonStatus, loadDaemonInputs } from "../src/ui/model.mjs";
 import { createUiServer } from "../src/ui/server.mjs";
 
 const TOKEN = "test-token-abc_123";
@@ -38,6 +39,35 @@ let paths;
 let server;
 let port;
 let clock;
+let auditImpl;
+let auditCalls;
+
+/** One JSON POST against an arbitrary port; the main server's helpers use the module-level `port`. */
+function postAt(targetPort, target, value, extra = {}) {
+	return new Promise((resolve, reject) => {
+		const body = JSON.stringify(value);
+		const req = http.request(
+			{ host: "127.0.0.1", port: targetPort, method: "POST", path: target, headers: { "x-omo-health-token": TOKEN, "content-type": "application/json", ...extra }, agent: false },
+			(res) => {
+				const chunks = [];
+				res.on("data", (c) => chunks.push(c));
+				res.on("end", () => {
+					const text = Buffer.concat(chunks).toString("utf8");
+					let parsed = text;
+					try {
+						parsed = JSON.parse(text);
+					} catch {
+						// keep text
+					}
+					resolve({ status: res.statusCode, body: parsed });
+				});
+			},
+		);
+		req.on("error", reject);
+		req.write(body);
+		req.end();
+	});
+}
 
 before(async () => {
 	root = fs.mkdtempSync(path.join(os.tmpdir(), "omoh-ui-server-"));
@@ -48,8 +78,12 @@ before(async () => {
 	fs.writeFileSync(path.join(staticDir, "app.js"), "export {};\n");
 	fs.writeFileSync(path.join(staticDir, "app.css"), "body{}\n");
 	clock = 1_000_000;
+	auditImpl = (id) => {
+		auditCalls.push(id);
+		return [202, { ok: true, audit: { sessionId: id, status: "queued" } }];
+	};
 	const diagnose = async (id) => (id ? { found: true, id } : { subjects: [{ id: "st_c" }] });
-	server = createUiServer({ paths, token: TOKEN, getState: () => STATE, diagnose, sessionDetail, idleMs: IDLE_MS, now: () => clock, staticDir });
+	server = createUiServer({ paths, token: TOKEN, getState: () => STATE, diagnose, sessionDetail, startAudit: (id) => auditImpl(id), idleMs: IDLE_MS, now: () => clock, staticDir });
 	({ port } = await server.listen());
 });
 
@@ -59,6 +93,11 @@ after(async () => {
 });
 
 beforeEach(() => {
+	auditCalls = [];
+	auditImpl = (id) => {
+		auditCalls.push(id);
+		return [202, { ok: true, audit: { sessionId: id, status: "queued" } }];
+	};
 	fs.rmSync(paths.health.configFile, { force: true });
 	fs.rmSync(paths.health.pauseFile, { force: true });
 	fs.rmSync(paths.health.uiPrefsFile, { force: true });
@@ -496,6 +535,243 @@ describe("ui server", { timeout: 20_000 }, () => {
 			fs.appendFileSync(file, "{\"type\":\"session\"}\n");
 			detail("grow01");
 			assert.equal(calls, 2);
+		});
+	});
+
+	describe("audit", () => {
+		it("rejects extra keys, a non-string id, a malformed id and a reserved device name with 422", async () => {
+			assert.equal((await postJson("/api/audit", { sessionId: KNOWN_ID, extra: 1 })).status, 422);
+			assert.equal((await postJson("/api/audit", { sessionId: 12345 })).status, 422);
+			assert.equal((await postJson("/api/audit", { sessionId: "..%2Fx" })).status, 422);
+			assert.equal((await postJson("/api/audit", { sessionId: "COM1" })).status, 422);
+			assert.equal((await postJson("/api/audit", {})).status, 422);
+			assert.deepEqual(auditCalls, []);
+		});
+
+		it("rejects a foreign origin with 403 and a non-JSON body with 415", async () => {
+			const foreign = await postJson("/api/audit", { sessionId: KNOWN_ID }, { origin: "http://evil.com" });
+			assert.deepEqual([foreign.status, foreign.body], [403, { error: "forbidden-origin" }]);
+			const media = await request({ method: "POST", path: "/api/audit", headers: { "content-type": "text/plain" }, body: JSON.stringify({ sessionId: KNOWN_ID }) });
+			assert.equal(media.status, 415);
+			assert.deepEqual(auditCalls, []);
+		});
+
+		it("returns the injected [status, body] and passes a refusal with its reasonKo", async () => {
+			const accepted = await postJson("/api/audit", { sessionId: KNOWN_ID });
+			assert.equal(accepted.status, 202);
+			assert.deepEqual(accepted.body, { ok: true, audit: { sessionId: KNOWN_ID, status: "queued" } });
+			auditImpl = (id) => {
+				auditCalls.push(id);
+				return [409, { error: "running", reasonKo: "이미 조사 중입니다" }];
+			};
+			const refused = await postJson("/api/audit", { sessionId: KNOWN_ID });
+			assert.deepEqual([refused.status, refused.body], [409, { error: "running", reasonKo: "이미 조사 중입니다" }]);
+			assert.deepEqual(auditCalls, [KNOWN_ID, KNOWN_ID]);
+		});
+
+		it("answers 404 when no startAudit callback is injected", async () => {
+			const bare = createUiServer({ paths, token: TOKEN, getState: () => STATE });
+			const { port: barePort } = await bare.listen();
+			try {
+				assert.equal((await postAt(barePort, "/api/audit", { sessionId: KNOWN_ID })).status, 404);
+			} finally {
+				await bare.close();
+			}
+		});
+
+		describe("real startAudit and detail", () => {
+			const AUDIT_ID = "s_audit01";
+
+			function writeJson(file, value) {
+				fs.mkdirSync(path.dirname(file), { recursive: true });
+				fs.writeFileSync(file, JSON.stringify(value));
+			}
+
+			function makeWorld({ daemon = "running", enabled = true, usedModels = { "anthropic/claude-used": true }, lanes = { ultrabrain: ["anthropic/claude-used"], architect: ["openai/gpt-review:high"] }, growFile = false, budgetCount = null } = {}) {
+				const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omoh-audit-ui-"));
+				const env = { USERPROFILE: dir, OMO_HEALTH_HOME: path.join(dir, "health") };
+				const worldPaths = resolvePaths(env);
+				const nowMs = Date.parse("2026-11-22T00:00:00.000Z");
+				const now = () => nowMs;
+				const sessionFile = path.join(worldPaths.sessionsDir, "slug", "2026-11-22T00-00-00-000Z_s_audit01.jsonl");
+				fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+				fs.writeFileSync(sessionFile, `${JSON.stringify({ type: "session", id: AUDIT_ID })}\n`);
+				const stat = fs.statSync(sessionFile);
+				fs.mkdirSync(worldPaths.health.sessionsDir, { recursive: true });
+				fs.writeFileSync(
+					path.join(worldPaths.health.sessionsDir, "ended-2026-11-22.jsonl"),
+					`${JSON.stringify({ v: 1, sessionId: AUDIT_ID, taskId: null, kind: "main", outcome: "answered", startedMs: nowMs - 1_000, endedMs: nowMs })}\n`,
+				);
+				writeJson(worldPaths.health.usageIndexFile, {
+					v: 1,
+					entries: {
+						[AUDIT_ID]: {
+							id: AUDIT_ID,
+							file: sessionFile,
+							kind: "main",
+							state: "ok",
+							complete: true,
+							gone: false,
+							size: stat.size,
+							mtimeMs: stat.mtimeMs,
+							offset: stat.size,
+							ino: 1,
+							birthtimeMs: 0,
+							head: "",
+							headLen: 0,
+							tail: "",
+							evaluatedTo: stat.size,
+							checkedMs: nowMs,
+							published: { total: 10, input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0, costUnknown: false, turns: 1, models: {}, usedModels },
+						},
+					},
+				});
+				writeJson(worldPaths.omoJsonc, { "[native]": { categories: Object.fromEntries(Object.entries(lanes).map(([lane, models]) => [lane, { models }])) } });
+				writeJson(worldPaths.authFile, { anthropic: {}, openai: {} });
+				if (daemon === "running") writeJson(worldPaths.health.daemonJson, { ts: nowMs, pid: process.pid, mode: "auto", version: "test" });
+				if (daemon === "stale") writeJson(worldPaths.health.daemonJson, { ts: nowMs - 120_000, pid: process.pid, mode: "auto", version: "test" });
+				if (enabled !== true) writeJson(worldPaths.health.configFile, { audit: { enabled: false } });
+				if (budgetCount !== null) writeJson(worldPaths.health.auditBudgetFile, { day: "2026-11-22", count: budgetCount, jobs: [] });
+				if (growFile) fs.appendFileSync(sessionFile, `${JSON.stringify({ type: "message", role: "assistant" })}\n`);
+				return {
+					dir,
+					env,
+					paths: worldPaths,
+					now,
+					nowMs,
+					sessionFile,
+					detail: createSessionDetail({ paths: worldPaths, env, now }),
+					startAudit: createStartAudit({ paths: worldPaths, env, now }),
+				};
+			}
+
+			function requestFileOf(world) {
+				return path.join(world.paths.health.auditRequestsDir, `${AUDIT_ID}.json`);
+			}
+
+			it("shows a request as queued, stalls on a stale heartbeat and shows the finished record as done", () => {
+				const world = makeWorld();
+				try {
+					writeJson(requestFileOf(world), { v: 1, sessionId: AUDIT_ID, requestedMs: world.nowMs });
+					const queued = world.detail(AUDIT_ID).audit;
+					assert.equal(queued.state.status, "queued");
+					assert.equal(queued.state.statusKo, "대기 중");
+					assert.equal(queued.stalled, false);
+					assert.equal(queued.blocked, null);
+					assert.equal(queued.planned.model, "openai/gpt-review:high");
+
+					writeJson(world.paths.health.daemonJson, { ts: world.nowMs - 120_000, pid: process.pid, mode: "auto", version: "test" });
+					const stalled = world.detail(AUDIT_ID).audit;
+					assert.equal(stalled.state.status, "queued");
+					assert.equal(stalled.stalled, true);
+
+					fs.rmSync(requestFileOf(world), { force: true });
+					writeJson(path.join(world.paths.health.auditsDir, `${AUDIT_ID}.json`), {
+						v: 1,
+						sessionId: AUDIT_ID,
+						status: "done",
+						requestedMs: world.nowMs - 60_000,
+						finishedMs: world.nowMs,
+						model: "openai/gpt-review:high",
+						result: { overall: "sound", summary: "조사 결과입니다", tokens: { judgment: "normal", explanation: "적절합니다" }, checks: [{ item: "D1", judgment: "sound", explanation: "근거가 있습니다", evidence: ["F1"] }], recommendations: [], confidence: 0.8 },
+					});
+					const done = world.detail(AUDIT_ID).audit;
+					assert.equal(done.state.status, "done");
+					assert.equal(done.state.statusKo, "완료");
+					assert.equal(done.state.result.overallKo, "적절");
+					assert.equal(done.stalled, false);
+				} finally {
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				}
+			});
+
+			it("POST returns 202 through the real daemon status path and writes only the request file", async () => {
+				const world = makeWorld();
+				const auditServer = createUiServer({ paths: world.paths, token: TOKEN, getState: () => STATE, sessionDetail: world.detail, startAudit: world.startAudit, now: world.now });
+				const { port: auditPort } = await auditServer.listen();
+				try {
+					assert.equal(daemonStatus(loadDaemonInputs({ paths: world.paths, env: world.env, now: world.nowMs })).state, "running");
+					const accepted = await postAt(auditPort, "/api/audit", { sessionId: AUDIT_ID });
+					assert.equal(accepted.status, 202);
+					assert.equal(accepted.body.ok, true);
+					assert.equal(accepted.body.audit.status, "queued");
+					assert.equal(accepted.body.audit.planned.model, "openai/gpt-review:high");
+					assert.deepEqual(JSON.parse(fs.readFileSync(requestFileOf(world), "utf8")), { v: 1, sessionId: AUDIT_ID, requestedMs: world.nowMs });
+					const again = await postAt(auditPort, "/api/audit", { sessionId: AUDIT_ID });
+					assert.deepEqual([again.status, again.body.error], [409, "running"]);
+					assert.deepEqual(fs.readdirSync(world.paths.health.auditRequestsDir), [`${AUDIT_ID}.json`]);
+				} finally {
+					await auditServer.close();
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				}
+			});
+
+			it("treats a file that grew after the index read as models-unknown for a POST and never plans a model", async () => {
+				const world = makeWorld({ growFile: true });
+				const auditServer = createUiServer({ paths: world.paths, token: TOKEN, getState: () => STATE, sessionDetail: world.detail, startAudit: world.startAudit, now: world.now });
+				const { port: auditPort } = await auditServer.listen();
+				try {
+					const detail = world.detail(AUDIT_ID).audit;
+					assert.equal(detail.blocked, "models-unknown");
+					assert.equal(detail.planned, null);
+					const posted = await postAt(auditPort, "/api/audit", { sessionId: AUDIT_ID });
+					assert.deepEqual([posted.status, posted.body], [409, { error: "models-unknown", reasonKo: "세션이 쓴 모델을 다 확인하지 못해 조사할 수 없습니다" }]);
+					assert.equal(fs.existsSync(requestFileOf(world)), false);
+				} finally {
+					await auditServer.close();
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				}
+			});
+
+			it("refuses a launching audit with 409 running and writes no request", async () => {
+				const world = makeWorld();
+				const auditServer = createUiServer({ paths: world.paths, token: TOKEN, getState: () => STATE, startAudit: world.startAudit, now: world.now });
+				const { port: auditPort } = await auditServer.listen();
+				try {
+					writeJson(path.join(world.paths.health.auditsDir, `${AUDIT_ID}.json`), { v: 1, sessionId: AUDIT_ID, status: "launching", requestedMs: world.nowMs - 1_000, jobId: "audit-1", model: "openai/gpt-review:high" });
+					const posted = await postAt(auditPort, "/api/audit", { sessionId: AUDIT_ID });
+					assert.deepEqual([posted.status, posted.body], [409, { error: "running", reasonKo: "이미 조사 중입니다" }]);
+					assert.equal(fs.existsSync(requestFileOf(world)), false);
+				} finally {
+					await auditServer.close();
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				}
+			});
+
+			it("never plans a model the session used only for prewarming", () => {
+				const world = makeWorld({
+					usedModels: { "anthropic/claude-prewarm": true },
+					lanes: { ultrabrain: ["anthropic/claude-prewarm"], architect: ["openai/gpt-review:high"] },
+				});
+				try {
+					const planned = world.detail(AUDIT_ID).audit.planned;
+					assert.equal(planned.model, "openai/gpt-review:high");
+					assert.equal(planned.independence, "family");
+					assert.notEqual(planned.model, "anthropic/claude-prewarm");
+					assert.equal(world.startAudit(AUDIT_ID)[0], 202);
+				} finally {
+					fs.rmSync(world.dir, { recursive: true, force: true });
+				}
+			});
+
+			it("reports the first block in order: disabled, daemon-off, cap, then no-model", () => {
+				const disabled = makeWorld({ daemon: "off", enabled: false });
+				const daemonOff = makeWorld({ daemon: "off" });
+				const capped = makeWorld({ budgetCount: 20 });
+				const noModel = makeWorld({ lanes: {} });
+				try {
+					assert.equal(disabled.detail(AUDIT_ID).audit.blocked, "disabled");
+					assert.equal(daemonOff.detail(AUDIT_ID).audit.blocked, "daemon-off");
+					assert.equal(daemonOff.detail(AUDIT_ID).audit.planned.model, "openai/gpt-review:high");
+					assert.equal(capped.detail(AUDIT_ID).audit.blocked, "cap");
+					assert.equal(capped.detail(AUDIT_ID).audit.usedToday, 20);
+					assert.equal(noModel.detail(AUDIT_ID).audit.blocked, "no-model");
+					assert.equal(noModel.detail(AUDIT_ID).audit.planned, null);
+					assert.equal(noModel.startAudit(AUDIT_ID)[0], 409);
+				} finally {
+					for (const world of [disabled, daemonOff, capped, noModel]) fs.rmSync(world.dir, { recursive: true, force: true });
+				}
+			});
 		});
 	});
 
