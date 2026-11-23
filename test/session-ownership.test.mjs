@@ -4,16 +4,19 @@ import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
 import { prepareAudit } from "../src/audit-prepare-worker.mjs";
-import { auditModelFacts, createAuditor, requestAudit } from "../src/auditor.mjs";
+import { auditModelFacts, createAuditor } from "../src/auditor.mjs";
 import { DEFAULT_CONFIG } from "../src/config.mjs";
 import { auditBundle, resolveAuditModel } from "../src/judge/audit.mjs";
 import { resolvePaths } from "../src/paths.mjs";
+import { backfillOnce } from "../src/session-backfill.mjs";
 import { buildSessionSnapshot, detectEnded } from "../src/session-board.mjs";
 import { appendEnded, appendEndedBatch, streamEnded } from "../src/session-ledger.mjs";
 import { loadSessionRecord, usageEntryOf } from "../src/session-record.mjs";
-import { boardLiveOwners, subjectOf } from "../src/session-subject.mjs";
+import { auditFileKey, boardLiveOwners, subjectOf } from "../src/session-subject.mjs";
 import { createDetailOperations } from "../src/ui/detail-worker.mjs";
+import { createSessionDetail, createStartAudit } from "../src/ui/cli.mjs";
 import { buildEnded, loadUiInputs } from "../src/ui/model.mjs";
+import { createUiServer } from "../src/ui/server.mjs";
 import { createSessionFileLocator } from "../src/collect/session-files.mjs";
 import { SessionRegistry } from "../src/collect/sessions.mjs";
 import { normalizeTask, projectStoreName, taskStoreDir } from "../src/collect/tasks.mjs";
@@ -209,10 +212,40 @@ test("plan109 a main and task transcript with the same project and ID keep their
 	const boot = () => createAuditor({ paths, clock: auditClock, config: DEFAULT_CONFIG, env: {}, runner });
 	let auditor = boot();
 	t.after(() => auditor.close());
+	fs.writeFileSync(paths.health.daemonJson, JSON.stringify({ ts: now, pid: process.pid }));
+	let diagnoses = 0;
+	const token = "test-plan111";
+	const ui = createUiServer({
+		paths, token, now: auditClock.now,
+		sessionDetail: createSessionDetail({ paths, env: {}, now: auditClock.now, load: loadSessionRecord }),
+		startAudit: createStartAudit({ paths, env: {}, now: auditClock.now, load: loadSessionRecord }),
+		diagnose: () => { diagnoses++; return {}; },
+	});
+	t.after(() => ui.close());
+	const { port } = await ui.listen();
+	const api = async (endpoint, body) => {
+		const headers = { "x-omo-health-token": token };
+		const options = body ? { method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify(body) } : { headers };
+		const response = await fetch(`http://127.0.0.1:${port}${endpoint}`, options);
+		return [response.status, await response.json()];
+	};
+	const sessionId = later.sessionId;
+	const detailUrl = `/api/session?id=${sessionId}`;
+	for (const [status, body] of [
+		await api(detailUrl), await api(`/api/diagnose?id=${sessionId}`), await api("/api/audit", { sessionId }),
+	]) assert.deepEqual([status, body.error], [409, "ambiguous-session"]);
+	assert.equal(diagnoses, 0);
+	assert.equal(fs.existsSync(paths.health.auditRequestsDir), false);
+	assert.equal(fs.existsSync(paths.health.auditBudgetFile), false);
 	for (const [i, row] of [later, earlier].entries()) {
-		const claim = requestAudit(paths, subjectOf(row), now + i);
-		assert.equal(claim.created, true);
-		assert.equal(claim.request.taskId, row.taskId ?? null);
+		at = now + i;
+		const selector = expectedSelector(row);
+		const [opened, detail] = await api(`${detailUrl}&row=${selector}`);
+		assert.deepEqual([opened, detail.tokens?.total], [200, i === 0 ? 43 : 17]);
+		const [status, body] = await api("/api/audit", { sessionId, row: selector });
+		assert.deepEqual([status, body.audit?.status], [202, "queued"]);
+		const requestFile = path.join(paths.health.auditRequestsDir, `${auditFileKey(subjectOf(row))}.json`);
+		assert.deepEqual(subjectOf(JSON.parse(fs.readFileSync(requestFile, "utf8"))), subjectOf(row));
 	}
 	for (let i = 0; i < 2; i++) {
 		at += 31_000;
@@ -274,6 +307,59 @@ test("plan110 a persisted grandchild belongs only to its task parent when a main
 		[23, 17, 23, [[grandchild.sessionId, grandchild.taskId]]],
 		[null, 43, null, []],
 	]);
+});
+
+test("plan111 cold backfill links a grandchild only to its task parent when a later main reuses its ID", (t) => {
+	const { paths, a } = setup(t);
+	const projectKey = subjectOf({ cwd: a }).projectKey;
+	const before = now - 2 * 3_600_000;
+	const later = now - 3_600_000;
+	const usage = (ms, input) => E.assistant({ ms, usage: { input, output: 0, cacheRead: 0, cacheWrite: 0 } });
+	for (const [sessionId, ms, tokens] of [["review.root", before, 10], ["review.shared", later, 43]]) {
+		const file = path.join(paths.sessionsDir, projectKey, `2026-10-10T12-00-00-000Z_${sessionId}.jsonl`);
+		writeJsonl(file, [E.header(sessionId, a, ms - 1000), usage(ms, tokens)]);
+		fs.utimesSync(file, now / 1000, now / 1000);
+	}
+	for (const [taskId, sessionId, parentId, tokens] of [
+		["st_parent", "review.shared", "review.root", 17],
+		["st_grandchild", "review.grandchild", "review.shared", 6],
+	]) writeTask(a, {
+		task_id: taskId, child_session_id: sessionId, parent_session_id: parentId,
+		status: "completed", final_response: "done",
+		created_at: new Date(before - 1000).toISOString(), terminal_at: new Date(before).toISOString(),
+	}, [usage(before, tokens)]);
+	assert.deepEqual([...streamEnded(paths)], []);
+	const summary = backfillOnce(paths, now);
+	assert.deepEqual(summary.errors, []);
+	assert.equal(summary.counts.written, 4);
+	const rows = [...streamEnded(paths, { withLocation: true })];
+	const parent = rows.find((row) => row.taskId === "st_parent");
+	const twin = rows.find((row) => row.kind === "main" && row.sessionId === parent.sessionId);
+	const grandchild = rows.find((row) => row.taskId === "st_grandchild");
+	assert.ok(twin.endedMs > parent.endedMs);
+	assert.deepEqual([parent.childCount, twin.childCount], [1, 0]);
+
+	const index = createUsageIndex({ file: paths.health.usageIndexFile, clock });
+	const tracker = createUsageTracker({ paths, clock, index, locator: createSessionFileLocator({ paths, clock }) });
+	tracker.queueLedger(rows);
+	tracker.tick({ now, paths, sessions: new Map(), tasks: [] });
+	index.save();
+	const history = buildEnded(loadUiInputs({ paths, now, env: {} }));
+	assert.deepEqual({
+		ledgerParent: [grandchild.parentProjectKey, grandchild.parentSessionId, grandchild.parentTaskId],
+		indexParent: parentSubject(readUsageIndex(paths.health.usageIndexFile).getForSubject(subjectOf(grandchild))),
+		sessions: [parent, twin].map((row) => {
+			const shown = history.rows.find(({ rowSelector }) => rowSelector === expectedSelector(row));
+			const detail = readDetail(paths, row);
+			assert.equal(detail.found, true);
+			return [tracker.tokensOf(subjectOf(row))?.treeTokens, shown?.tokens?.total, shown?.treeTokens,
+				detail.children.map(({ sessionId, taskId }) => [sessionId, taskId])];
+		}),
+	}, {
+		ledgerParent: [projectKey, parent.sessionId, parent.taskId],
+		indexParent: subjectOf(parent),
+		sessions: [[23, 17, 23, [[grandchild.sessionId, grandchild.taskId]]], [null, 43, null, []]],
+	});
 });
 
 test("plan99 a fresh heartbeat owns the live file despite a raw-ID registry collision", async (t) => {

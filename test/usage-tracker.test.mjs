@@ -1909,7 +1909,8 @@ test("sparse children queued once use only positioned ledger reads after the fir
 		assert.equal(tick.bytesRead, i < 4 ? USAGE_TICK_BYTES : 0);
 		ledgerReads.push([...reads]);
 	}
-	assert.deepEqual(rows.slice(0, 4).map(({ sessionId }, i) => tracker.tokensOf(sub(s, sessionId, path.join(s.cwd, `proj-${i}`)))?.tokens?.total), [42, 42, 42, 42]);
+	assert.deepEqual(rows.slice(0, 4).map(({ sessionId, taskId }, i) =>
+		tracker.tokensOf(sub(s, sessionId, path.join(s.cwd, `proj-${i}`), taskId))?.tokens?.total), [42, 42, 42, 42]);
 	assert.deepEqual(ledgerReads.map((reads) => reads.filter(({ position }) => position === null).reduce((n, read) => n + read.n, 0)),
 		[ledgerSize, 0, 0, 0, 0]);
 	for (let i = 1; i < 4; i++) {

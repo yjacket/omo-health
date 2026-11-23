@@ -378,6 +378,7 @@ function* readRelated(paths, { cwds, sinceMs, errors }, budget) {
 	const { childCandidate } = createSessionFileLocator({ paths });
 	const childPaths = new Set();
 	const childIdentities = new Set();
+	const childOwners = new Map();
 	const childCount = new Map();
 	const visited = new Set();
 	const queue = new Set(cwds.values());
@@ -390,10 +391,10 @@ function* readRelated(paths, { cwds, sinceMs, errors }, budget) {
 			const identity = fileIdentity(file);
 			if (identity) childIdentities.add(identity);
 		}
-		// Parent IDs refer to sessions in the task store's project, not the child's spawn cwd.
-		if (t.parentSessionId) {
-			const key = subjectKey({ projectKey: t.parentProjectKey, sessionId: t.parentSessionId });
-			childCount.set(key, (childCount.get(key) ?? 0) + 1);
+		const projectKey = projectKeyOf(t.cwd);
+		if (projectKey && typeof t.childSessionId === "string" && t.childSessionId && t.taskId) {
+			const key = subjectKey({ projectKey, sessionId: t.childSessionId });
+			childOwners.set(key, childOwners.has(key) ? null : t);
 		}
 	}
 	// Process the transcript seed stores first, as before. Extra store visits
@@ -409,11 +410,33 @@ function* readRelated(paths, { cwds, sinceMs, errors }, budget) {
 		for (const task of yield* readTasks(cwd, storeDir, errors, taskBudget)) remember(task);
 	}
 
-	return { tasks, childPaths, childIdentities, childCount, crashes: readCrashes(paths, sinceMs, errors), releases: readReleases(paths, sinceMs, errors, tasks) };
+	const parents = new Map();
+	for (const t of tasks) {
+		if (!t.parentSessionId) continue;
+		// The spawning store supplies the parent's project; the candidate
+		// parent's own spawn cwd must match it, even across stores.
+		const parent = { projectKey: t.parentProjectKey, sessionId: t.parentSessionId };
+		const key = subjectKey(parent);
+		const task = childOwners.get(key);
+		const mainParent = t.depth === 1 || t.rootSessionId === t.parentSessionId;
+		const nested = t.depth > 1 || Boolean(t.rootSessionId && t.rootSessionId !== t.parentSessionId);
+		if (!mainParent && task && task !== t &&
+			(!t.rootSessionId || !task.rootSessionId || t.rootSessionId === task.rootSessionId)) {
+			parent.taskId = task.taskId;
+		} else if (!mainParent && (nested || childOwners.has(key))) {
+			// A partial project + ID link could be read as a main parent.
+			continue;
+		}
+		parents.set(t, parent);
+		const parentKey = subjectKey(parent);
+		childCount.set(parentKey, (childCount.get(parentKey) ?? 0) + 1);
+	}
+
+	return { tasks, childPaths, childIdentities, parents, childCount, crashes: readCrashes(paths, sinceMs, errors), releases: readReleases(paths, sinceMs, errors, tasks) };
 }
 
 function writeBatch(paths, nowMs, { sinceMs, liveCutMs, mains, related }, lastBatch) {
-	const { tasks, childPaths, childIdentities, childCount, crashes, releases } = related;
+	const { tasks, childPaths, childIdentities, parents, childCount, crashes, releases } = related;
 	const errors = [];
 	const counts = emptyCounts();
 	const pending = [];
@@ -477,12 +500,15 @@ function writeBatch(paths, nowMs, { sinceMs, liveCutMs, mains, related }, lastBa
 			continue;
 		}
 		const { outcome, reason } = childOutcome(t, releases);
+		const parent = parents.get(t);
 		write({
 			v: 1,
 			sessionId: t.childSessionId || t.taskId,
 			kind: "child",
-			parentSessionId: t.parentSessionId ?? null,
-			...(t.parentProjectKey ? { parentProjectKey: t.parentProjectKey } : {}),
+			parentSessionId: parent?.sessionId ?? null,
+			...(parent?.projectKey ? { parentProjectKey: parent.projectKey } : {}),
+			...(parent?.taskId ? { parentTaskId: parent.taskId } : {}),
+			...(!parent && t.parentSessionId ? { storeDir: t.storeDir } : {}),
 			taskId: t.taskId,
 			title: clean(t.name ?? t.summary ?? t.taskId, TITLE_MAX) || t.taskId,
 			cwd: t.cwd,
@@ -492,7 +518,7 @@ function writeBatch(paths, nowMs, { sinceMs, liveCutMs, mains, related }, lastBa
 			endedMs,
 			outcome,
 			reason,
-			childCount: childCount.get(subjectKey({ projectKey: projectKeyOf(t.cwd), sessionId: t.childSessionId })) ?? 0,
+			childCount: childCount.get(subjectKey({ projectKey: projectKeyOf(t.cwd), sessionId: t.childSessionId, taskId: t.taskId })) ?? 0,
 			estimated: true,
 			source: "backfill",
 		});

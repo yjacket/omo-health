@@ -399,6 +399,41 @@ test("cold backfill links a cross-project child only to the same-named parent in
 	});
 });
 
+test("plan111 cold backfill leaves a nested link unresolved without a unique task parent", (t) => {
+	const { paths, now, a } = setupProjectPair(t);
+	const startedMs = now - 2 * HOUR;
+	const endedMs = now - HOUR;
+	for (const id of ["review.shared", "review.missing"]) {
+		const file = writeSession(paths, projectKeyOf(a), id, a, startedMs, endedMs);
+		fs.utimesSync(file, now / 1000, now / 1000);
+	}
+	// Nonterminal records still make the task parent ambiguous. Neither one
+	// will have a ledger row, so fallback to the only ended row would guess.
+	for (const taskId of ["st_candidate1", "st_candidate2"]) writeTask(a, {
+		task_id: taskId, child_session_id: "review.shared", parent_session_id: "review.root", status: "running",
+	});
+	for (const parentId of ["review.shared", "review.missing"]) writeTask(a, {
+		task_id: `st_${parentId}`, child_session_id: `${parentId}.child`, parent_session_id: parentId,
+		root_session_id: "review.root", depth: 2, status: "completed", final_response: "done",
+		created_at: iso(startedMs), terminal_at: iso(endedMs),
+	});
+	const summary = backfillOnce(paths, now);
+	assert.deepEqual(summary.errors, []);
+	assert.equal(summary.counts.written, 6);
+	const rows = readEnded(paths);
+	const detail = createDetailOperations({ paths, auditDetail: () => null });
+	for (const row of rows) {
+		if (row.kind === "child") {
+			assert.equal(Object.hasOwn(row, "parentTaskId"), false);
+			assert.equal(row.parentSessionId, null);
+		} else {
+			assert.equal(row.childCount, 0);
+			const { record } = detail({ kind: "detail", id: row.sessionId, row: expectedSelector(row), now });
+			assert.deepEqual(record.children, []);
+		}
+	}
+});
+
 test("cold backfill follows a child into a project with no main transcript", (t) => {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "backfill-nested-"));
 	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
