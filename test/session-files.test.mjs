@@ -143,6 +143,13 @@ test("(plan 41) mainFile uses a saved custom path only while its first line matc
 
 	fs.writeFileSync(file, '{"type":"session","id":"replacement"}\n');
 	assert.equal(locator.mainFile(sub(id, proj)), undefined, "a stale persisted path must not open a different session");
+
+	const replacement = `${file}.new`;
+	fs.writeFileSync(replacement, JSON.stringify({ type: "session", id }) + "\n");
+	fs.renameSync(replacement, file);
+	assert.equal(locator.mainFile(sub(id, proj)), undefined, "a replacement with the same ID but no cwd has no project proof");
+	fs.writeFileSync(file, JSON.stringify({ type: "session", id, cwd: proj }) + "\n");
+	assert.equal(locator.mainFile(sub(id, proj)), file, "a replacement with the matching ID and project is accepted");
 });
 
 test("mainFile finds a file created after a miss only once the fake clock passes rescanMs", (t) => {

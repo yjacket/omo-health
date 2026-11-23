@@ -13,7 +13,7 @@ import { afterEach, test } from "node:test";
 import { AUDIT_CONTRACT, REQUEST_TTL_MS, auditsToday, createAuditor, readAuditState, requestAudit } from "../src/auditor.mjs";
 import { safeSubjectId } from "../src/session-id.mjs";
 import { createSessionFileLocator } from "../src/collect/session-files.mjs";
-import { usageTimeline } from "../src/collect/usage.mjs";
+import { readUsageFileStamp, sameFileIdentity, usageTimeline } from "../src/collect/usage.mjs";
 import { DEFAULT_CONFIG } from "../src/config.mjs";
 import { detectorThresholdsHash } from "../src/config-reload.mjs";
 import { appendDecision } from "../src/decisions.mjs";
@@ -24,6 +24,7 @@ import { resolvePaths } from "../src/paths.mjs";
 import { appendEnded, readEnded } from "../src/session-ledger.mjs";
 import { createRunner } from "../src/runner.mjs";
 import { createDetailOperations } from "../src/ui/detail-worker.mjs";
+import { endedRow } from "../src/ui/model.mjs";
 import { createUiServer } from "../src/ui/server.mjs";
 import { createUsageIndex, fresh } from "../src/usage-index.mjs";
 import { createUsageTracker } from "../src/usage-tracker.mjs";
@@ -968,6 +969,68 @@ test("a same-length rewrite is no longer fresh, queueLedger requeues it, and the
 	h.request("m1");
 	await h.prepare(a);
 	assert.equal(modelOf(h.runner.starts[0]), "google/gemini-3-pro", "gpt-5-5 is excluded after the recount");
+});
+
+test("(plan 116) reload does not count or audit a different project's replacement at a saved path", async (t) => {
+	const h = harness({ sessions: [] });
+	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+	const id = "review.1";
+	const aCwd = path.join(h.root, "alpha");
+	const bCwd = path.join(h.root, "beta");
+	const file = path.join(h.root, "shared", "review.jsonl");
+	const ms = BASE - 120_000;
+	const row = (cwd) => ({ sessionId: id, kind: "main", cwd, startedMs: ms - 5000, endedMs: ms + 1000, outcome: "completed" });
+	const transcript = (cwd, model, input) => [
+		E.header(id, cwd, ms - 5000),
+		E.assistant({ ms, provider: "openai", model, usage: { input, output: 2, cacheRead: 0, cacheWrite: 0 } }),
+	];
+	const indexFile = h.paths.health.usageIndexFile;
+	const openIndex = () => createUsageIndex({ file: indexFile, clock: h.clock, log: silent });
+	const history = (cwd, index) => {
+		const { tokens, tokensGone } = endedRow(row(cwd), 0, index);
+		return [tokens?.total, tokens?.models.map(({ key }) => key), tokensGone];
+	};
+	writeJsonl(file, transcript(aCwd, "gpt-5-4", 40));
+	appendEnded(h.paths, row(aCwd), { nowMs: BASE });
+	const original = openIndex();
+	original.update(sub(id, aCwd), file, { kind: "main" });
+	original.save();
+	assert.deepEqual(history(aCwd, original), [42, ["openai/gpt-5-4"], false]);
+
+	const before = readUsageFileStamp(file);
+	const replacement = `${file}.new`;
+	writeJsonl(replacement, [
+		...transcript(bCwd, "gpt-5-5", 90),
+		E.custom("omo-health", ms, { kind: "self-notice" }),
+	]);
+	fs.renameSync(replacement, file);
+	assert.equal(sameFileIdentity(before, readUsageFileStamp(file)), false, "the shared path has a different file identity");
+	appendEnded(h.paths, row(bCwd), { nowMs: BASE });
+	const index = openIndex();
+	// As with a live sensor read, B establishes its own external path.
+	index.update(sub(id, bCwd), file, { kind: "main" });
+	const tracker = createUsageTracker({ paths: h.paths, index, locator: createSessionFileLocator({ paths: h.paths, clock: h.clock }), clock: h.clock, log: silent });
+	tracker.queueLedger(readEnded(h.paths));
+	tracker.tick({});
+	assert.deepEqual(history(aCwd, index), [42, ["openai/gpt-5-4"], true], "A keeps its last publication, not B's transcript");
+	assert.equal(fresh(index.get(key(id, aCwd))), false);
+	assert.deepEqual(history(bCwd, index), [92, ["openai/gpt-5-5"], false]);
+	assert.equal(fresh(index.get(key(id, bCwd))), true);
+
+	const auditor = h.auditor({ index });
+	h.request(id, aCwd);
+	await h.prepare(auditor);
+	assert.deepEqual([h.record(id, aCwd).status, h.record(id, aCwd).reason, h.runner.starts.length, h.budget()],
+		["failed", "models-unknown", 0, undefined]);
+	h.request(id, bCwd);
+	await h.prepare(auditor);
+	assert.equal(h.record(id, bCwd).status, "running");
+	assert.equal(h.runner.starts.length, 1);
+	assert.equal(modelOf(h.runner.starts[0]), "google/gemini-3-pro", "B's own gpt-5-5 is excluded");
+	const document = fs.readFileSync(path.join(h.runner.starts[0].cwd, "bundle.md"), "utf8");
+	const bundle = JSON.parse(document.split("\n").find((line) => line.startsWith('{"session":')));
+	assert.equal(bundle.tokens.total, 92);
+	assert.deepEqual(bundle.omo_health_record.messages, [{ ref: "M1", ms, kind: "self-notice" }]);
 });
 
 test("a same-length rewrite read by a complete timeline excludes the new model before the recount", async () => {
