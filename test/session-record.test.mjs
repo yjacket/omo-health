@@ -1424,7 +1424,7 @@ test("IS-7: an oversized senpi health notice appears once in detail and audit co
 	const { record } = detail({ kind: "detail", id: row.sessionId, now: options.now });
 	const { health } = buildSessionView(record);
 	assert.deepEqual(health.messages, [
-		{ ms, kind: null, recipient: row.sessionId, text: content },
+		{ ms, kind: "self-notice", recipient: row.sessionId, text: content },
 		{ ms: T0 + MIN, kind: "self-notice", recipient: row.sessionId, text: small.content },
 	]);
 	assert.equal(health.counts.messages, 2);
@@ -1433,7 +1433,7 @@ test("IS-7: an oversized senpi health notice appears once in detail and audit co
 	const bundleOf = (source) => auditBundle(source, null, { config: DEFAULT_CONFIG, now: options.now });
 	const bundle = bundleOf(retained);
 	assert.deepEqual(bundle.omo_health_record.messages, [
-		{ ref: "M1", ms, kind: null }, { ref: "M2", ms: T0 + MIN, kind: "self-notice" },
+		{ ref: "M1", ms, kind: "self-notice" }, { ref: "M2", ms: T0 + MIN, kind: "self-notice" },
 	]);
 	assert.deepEqual(bundle, bundleOf(record));
 	assert.doesNotMatch(JSON.stringify(bundle), /Private oversized notice|private-oversized-details|nested decoy|normal notice/);
@@ -1446,7 +1446,7 @@ test("IS-7: an oversized final line retains only the existing 20,000-unit displa
 	const prefix = '"\\\n\u0001확'.repeat(3_999) + "abcd";
 	const msg = { ...ohealth(T0, `${prefix}🙂${"z".repeat(MIB)}`), display: true };
 	fs.writeFileSync(file, JSON.stringify(msg));
-	assert.deepEqual(scanOmoHealthMessages(file), [{ ms: T0, kind: null, text: `${prefix}…` }]);
+	assert.deepEqual(scanOmoHealthMessages(file), [{ ms: T0, kind: "self-notice", text: `${prefix}…` }]);
 });
 
 test("an omo-health message line that straddles the 4 MiB read boundary is found", (t) => {

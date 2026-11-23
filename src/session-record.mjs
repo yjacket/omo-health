@@ -915,8 +915,7 @@ const SCAN_NEWLINE = 0x0a;
 const SCAN_MARKER = Buffer.from('"customType":"omo-health"', "utf8");
 
 // The usage scanner has a fixed projection that omits content and display.
-// For oversized JSON.stringify records, walk the top-level members instead:
-// nested values (including details) only affect quote/escape state and depth.
+// Walk top-level members and details.kind; skip other nested values by depth.
 function oversizedMessageScanner(bounded) {
 	const fields = Object.create(null);
 	// At most six encoded bytes per UTF-16 unit. The lookahead also leaves
@@ -924,6 +923,7 @@ function oversizedMessageScanner(bounded) {
 	const raw = Buffer.allocUnsafe(bounded ? 6 * 128 : 6 * (DETAIL_TEXT_MAX + 1));
 	let state = "root";
 	let key;
+	let inDetails = false;
 	let depth = 0;
 	let quoted = false;
 	let escape = 0;
@@ -939,7 +939,10 @@ function oversizedMessageScanner(bounded) {
 	const wanted = () => key === "type" || key === "customType" || key === "timestamp" ||
 		key === "display" || (!bounded && key === "content");
 	const assign = (value) => {
-		if (wanted()) fields[key] = value;
+		if (inDetails) {
+			if (key === "kind") fields.details.kind = value;
+		} else if (wanted()) fields[key] = value;
+		else if (key === "details") fields.details = undefined;
 		state = "after";
 	};
 
@@ -948,7 +951,7 @@ function oversizedMessageScanner(bounded) {
 			if (byte === 0x22 && escape === 0) {
 				quoted = false;
 				if (depth !== 0) return;
-				const value = limit && (units <= limit || key === "content" && state === "value") ? parse(true) : undefined;
+				const value = limit && (units <= limit || !inDetails && key === "content" && state === "value") ? parse(true) : undefined;
 				if (state === "value") assign(value);
 				else {
 					key = value;
@@ -983,21 +986,28 @@ function oversizedMessageScanner(bounded) {
 		}
 		if (space) return;
 		if (state === "root" && byte === 0x7b) state = "first";
-		else if ((state === "first" || state === "after") && byte === 0x7d) state = "end";
-		else if ((state === "first" || state === "key") && byte === 0x22) {
-			reset(32);
+		else if ((state === "first" || state === "after") && byte === 0x7d) {
+			state = inDetails ? "after" : "end";
+			inDetails = false;
+		} else if ((state === "first" || state === "key") && byte === 0x22) {
+			reset(inDetails ? 4 : 32);
 			quoted = true;
 		} else if (state === "colon" && byte === 0x3a) state = "value";
 		else if (state === "after" && byte === 0x2c) state = "key";
 		else if (state === "value") {
 			if (byte === 0x22) {
-				reset(wanted() ? key === "content" ? DETAIL_TEXT_MAX + 1 : 128 : 0);
+				if (inDetails) reset(key === "kind" ? 41 : 0); // auditMessageKind's maximum length
+				else reset(wanted() ? key === "content" ? DETAIL_TEXT_MAX + 1 : 128 : 0);
 				quoted = true;
+			} else if (!inDetails && key === "details" && byte === 0x7b) {
+				fields.details = Object.create(null);
+				inDetails = true;
+				state = "first";
 			} else if (byte === 0x7b || byte === 0x5b) {
 				reset(0);
 				depth = 1;
 			} else if (byte === 0x2d || (byte >= 0x30 && byte <= 0x39) || byte === 0x74 || byte === 0x66 || byte === 0x6e) {
-				reset(key === "timestamp" || key === "display" ? 128 : 0);
+				reset(!inDetails && (key === "timestamp" || key === "display") ? 128 : 0);
 				if (limit) raw[length++] = byte;
 				state = "scalar";
 			} else state = "invalid";
@@ -1021,7 +1031,7 @@ function oversizedMessageScanner(bounded) {
  * Only lines naming the `omo-health` custom type are parsed; the rest of the
  * transcript is never decoded as content. The file is read in 4 MiB chunks so
  * a session file larger than the daemon heap (96 MiB) cannot exhaust it, and a
- * line over 1 MiB switches to the bounded top-level scanner.
+ * line over 1 MiB switches to the bounded message scanner.
  */
 export function scanOmoHealthMessages(file) {
 	return [...streamOmoHealthMessages(file)];
