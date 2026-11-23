@@ -1390,6 +1390,22 @@ test("(gate 6) a 2 MiB counter rounds like JSON.parse even when a distant digit 
 	assert.equal(assertLargeRecordParity(t, line).input, 1 + Number.EPSILON);
 });
 
+test("(IS-1) nesting beyond the scanner depth cap is an ignored malformed record", (t) => {
+	const { file } = setup(t);
+	const limit = 4_194_304;
+	const record = (depth) => `{"type":"usage","provider":"p","model":"m","usage":{"input":7,"costUnknown":true},"unused":${"[".repeat(depth - 1)}0${"]".repeat(depth - 1)}}\n`;
+	fs.writeFileSync(file(), record(limit + 1));
+	fs.appendFileSync(file(), '{"type":"usage","provider":"p","model":"m","usage":{"input":3}}\n');
+	for (const totals of [readUsage(file()).effective, usageTimeline(file()).totals]) {
+		assert.equal(totals.total, 3);
+		assert.equal(totals.costUnknown, false);
+		assert.equal(totals.modelsIncomplete, false);
+		assert.deepEqual(totals.diagnostics, { badLines: 1, skippedLines: 0 });
+	}
+	fs.writeFileSync(file(), record(limit));
+	assert.equal(readUsage(file()).effective.total, 7, "the cap itself is inclusive");
+});
+
 test("(gate 6) an escaped duplicate role is compared after unescaping", (t) => {
 	const line = `{${gate6Gap}"type":"message","message":${JSON.stringify(gate6Message).slice(0, -1)},"\\u0072ole":"user"}}`;
 	assert.equal(assertLargeRecordParity(t, line).total, 0);

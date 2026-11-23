@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { addModelCounters, emptyModelBilling, emptyUsage, isExactInode, MODEL_KEY_LENGTH, MODEL_KEY_LIMIT, readUsage, readUsageFileStamp, retainedFragmentBytes, sameFileStamp } from "./collect/usage.mjs";
+import { addModelCounters, compactFragmentBuffer, emptyModelBilling, emptyUsage, FRAGMENT_RESERVE_BYTES, isExactInode, MODEL_KEY_LENGTH, MODEL_KEY_LIMIT, readUsage, readUsageFileStamp, retainedFragmentBytes, sameFileStamp } from "./collect/usage.mjs";
 import { pathKey } from "./paths.mjs";
 import { parseSubjectKey, SubjectMap, subjectKey, subjectOf, uniqueMatch } from "./session-subject.mjs";
 import { atomicWriteChunks, statSafe } from "./util/fsx.mjs";
@@ -27,6 +27,7 @@ export const INDEX_ENTRY_OVERHEAD = 1840; // Includes ordered slots and worst-ca
 const MODEL_COUNTER_BYTES = 4 * 8;
 // The index must fit in the delta between the 80 MiB control and the 96 MiB daemon.
 export const INDEX_BYTE_BUDGET = 16 * 1024 * 1024;
+export const INDEX_FRAGMENT_RESERVE_BYTES = FRAGMENT_RESERVE_BYTES;
 // Separate from resident rows: only one serialized/decoded line is processed at a time.
 const INDEX_LINE_BYTE_BUDGET = 8 * 1024 * 1024;
 /** Per-tick byte budget for live appends, first reads and the backlog. */
@@ -530,6 +531,18 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 	const { entries, weights } = loaded;
 	let { named, bytes, full } = loaded;
 	let dirty = loaded.truncated;
+	let reserveOwner;
+	let reserveBytes = 0;
+	const waiting = new Set();
+	const oldestWaiting = () => waiting.values().next().value;
+	const fragmentBlocked = (entry, path) => waiting.has(entry) &&
+		(reserveOwner !== undefined || oldestWaiting() !== entry) &&
+		(path === undefined || pathKey(entry.file) === pathKey(path));
+	const release = (entry) => {
+		if (reserveOwner !== entry) return;
+		reserveOwner = undefined;
+		reserveBytes = 0;
+	};
 
 	const unweigh = (id) => {
 		const weight = weights.get(id);
@@ -542,25 +555,49 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 	const admit = (entry, slots, deferPublication) => {
 		const key = entry;
 		let line = serializeEntry(entry);
-		let size = entryBytes(entry, line) + fragmentBytes(entry.partial);
-		if (entry.partial && bytes + size > INDEX_BYTE_BUDGET) {
-			// Keep the committed cursor; the next read charges the rescan to its
-			// tick allowance. Do not let a provisional EOF replace the publication.
-			entry.partial = undefined;
-			entry.scanOffset = entry.offset;
-			entry.evaluatedTo = entry.offset;
-			entry.overlay = emptyUsage();
-			entry.pending = true;
-			deferPublication?.();
+		let size = entryBytes(entry, line);
+		let fragment = fragmentBytes(entry.partial);
+		if (entry.partial && (reserveOwner === entry || bytes + size + fragment > INDEX_BYTE_BUDGET)) {
+			// A provisional EOF must not replace the publication while this
+			// out-of-budget record is still open.
+			if (deferPublication) {
+				deferPublication();
+				entry.evaluatedTo = entry.offset;
+				entry.overlay = emptyUsage();
+				entry.pending = true;
+			}
+			if (!reserveOwner && (!waiting.size || oldestWaiting() === entry)) {
+				reserveOwner = entry;
+			}
+			if (reserveOwner === entry) {
+				if (fragment > INDEX_FRAGMENT_RESERVE_BYTES) {
+					compactFragmentBuffer(entry.partial);
+					fragment = fragmentBytes(entry.partial);
+				}
+				reserveBytes = fragment;
+			} else {
+				waiting.add(entry);
+				entry.partial = undefined;
+				entry.scanOffset = entry.offset;
+				entry.evaluatedTo = entry.offset;
+				entry.overlay = emptyUsage();
+				entry.pending = true;
+			}
 			slots = boundedModels(entry, USAGE_INDEX_MODEL_BUDGET - named, true);
 			line = serializeEntry(entry);
 			size = entryBytes(entry, line);
+		} else {
+			release(entry);
+			size += fragment;
 		}
 		if (bytes + size > INDEX_BYTE_BUDGET || !fitsIndexLine(line)) {
+			release(entry);
+			waiting.delete(entry);
 			if (entries.delete(key) || !full) dirty = true;
 			full = true;
 			return FULL_ENTRY;
 		}
+		if (entry.partial || !entry.pending) waiting.delete(entry);
 		dirty = true;
 		entry.projectKey = entries.canonicalProject(entry.projectKey);
 		entries.set(key, entry);
@@ -571,6 +608,8 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 	};
 
 	const dropCursor = (entry) => {
+		release(entry);
+		waiting.delete(entry);
 		Object.assign(entry, newEntry(subjectOf(entry)), persistedMeta(entry), { checkedMs: entry.checkedMs });
 		delete entry.ownershipUnique;
 		entry.partial = undefined;
@@ -580,6 +619,9 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 
 	return {
 		file,
+		get residentBytes() { return bytes + reserveBytes; },
+		get fragmentPriority() { return reserveOwner ?? oldestWaiting(); },
+		fragmentBlocked,
 		recordParentLink(subject, meta) {
 			const entry = entries.get(subject);
 			if (!entry || !Object.hasOwn(entry, "parentKey")) return false;
@@ -638,13 +680,18 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			const id = subject;
 			const stored = entries.get(id);
 			const entry = stored && Object.hasOwn(stored, "file") ? stored : newEntry(subject);
+			const sameFile = entry.file && pathKey(entry.file) === pathKey(path);
+			if (fragmentBlocked(entry, path)) return 0;
+			if (!sameFile) {
+				waiting.delete(entry);
+				release(entry);
+			}
 			if (stored && entry !== stored) {
 				entry.state = "ok";
 				entry.offset = 0;
 			}
 			const previousSlots = weights.get(id)?.slots ?? null;
 			unweigh(id);
-			const sameFile = entry.file && pathKey(entry.file) === pathKey(path);
 			entry.file = path;
 			applyMeta(entry, meta);
 			if (entry.kind === "child" && entry.taskId && ownershipUnique !== null) {
@@ -663,7 +710,7 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 					error.code = "EISDIR";
 					throw error;
 				}
-				result = read(path, from, { maxBytes, onScanBytes: (n) => { bytesRead += n; } });
+				result = read(path, sameFile ? from : undefined, { maxBytes, onScanBytes: (n) => { bytesRead += n; } });
 			} catch (error) {
 				if (entry.readError !== true) {
 					log?.error?.("usage_read_failed", { file: basename(String(path)), error: String(error?.message ?? error) });
@@ -674,8 +721,12 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			}
 			entry.readError = false;
 			if (result === null) {
+				release(entry);
+				waiting.delete(entry);
 				if (entry.complete === true) {
 					entry.gone = true;
+					entry.partial = undefined;
+					entry.scanOffset = undefined;
 				} else {
 					dropCursor(entry);
 				}
@@ -684,6 +735,7 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			}
 			entry.state = "ok";
 			entry.gone = false;
+			if (result.rewound || result.offset !== entry.offset) release(entry);
 			const { complete, published } = entry;
 			// The cursor may restart without withdrawing the last publication.
 			entry.complete = result.done === true || complete === true;
@@ -720,12 +772,16 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			const entry = entries.get(id) ?? newEntry(subject);
 			const previousSlots = weights.get(id)?.slots ?? null;
 			unweigh(id);
+			release(entry);
+			waiting.delete(entry);
 			applyMeta(entry, meta);
 			if (meta?.file) entry.file = meta.file;
 			const taskOnly = isTaskOnlyEntry(entry);
 			const deleted = !taskOnly || (!withdraw && entry.file && soleChildSessionFile(dirname(entry.file)) === undefined);
 			if (entry.state === "ok" && entry.complete === true && deleted) {
 				entry.gone = true;
+				entry.partial = undefined;
+				entry.scanOffset = undefined;
 				// Zero candidates leaves a previously counted file's ownership unchallenged.
 				if (taskOnly) entry.ownershipUnique = true;
 				else delete entry.ownershipUnique;
@@ -760,6 +816,8 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 				const checked = Number.isFinite(entry.checkedMs) ? entry.checkedMs : 0;
 				if (checked < cutoff && entries.delete(id)) {
 					unweigh(id);
+					release(entry);
+					waiting.delete(entry);
 					removed += 1;
 				}
 			}

@@ -56,12 +56,21 @@ const ZERO = 0x30;
 const NINE = 0x39;
 const VALUE_RAW_LIMIT = 64 * 1024;
 const KEY_RAW_LIMIT = 128;
+export const MAX_SCAN_DEPTH = 4_194_304;
+// 30 capture slots in ROOT_FIELDS; each owns at most VALUE_RAW_LIMIT bytes.
+// The extra 8 KiB covers projected object/key and capture wrapper overhead.
+const CAPTURED_VALUES_BYTES = 30 * VALUE_RAW_LIMIT + 8192;
+// Buffer payload plus room for read chunks' bookkeeping, scanner scratch,
+// fingerprints and up to 32 torn-backup names (255 UTF-16 code units each).
+const KEPT_FRAGMENT_BYTES = USAGE_BUFFER_LIMIT + 128 * 1024;
+export const FRAGMENT_RESERVE_BYTES = KEPT_FRAGMENT_BYTES + CAPTURED_VALUES_BYTES + MAX_SCAN_DEPTH / 8;
 const MODEL_ID_TOO_LONG = "(model id too long)";
 const MODEL_ID_UNREADABLE = "(model id unreadable)";
 const OTHER_MODELS = "(other models)";
 const modelMapSizes = new WeakMap();
 const TRUNCATED_STRING_ID = Symbol("truncatedStringIdentity");
 const TRUNCATED_VALUE = Object.freeze({});
+const CAPTURED_RAW = Symbol("capturedRaw");
 const RECORD_ACCUMULATOR = Symbol("recordAccumulator");
 
 const STATE_VALUE = 0;
@@ -466,9 +475,27 @@ function capturedStringBytes(text) {
 	return text.length * (/[^\x00-\xff]/.test(text) ? 2 : 1);
 }
 
-// A selected value can be an arbitrary JSON subtree, including deeply nested
-// invalid counters. Walk it iteratively and weigh the decoded values, not the
-// raw bytes that produced them. Headers and slots use conservative allowances.
+// Keep captures encoded until used: a 64 KiB JSON subtree can decode to far
+// more than 64 KiB of arrays and object slots. Do not retain that expansion.
+function capturedRaw(bytes, start, end, prefixPlan) {
+	const raw = Buffer.allocUnsafeSlow(end - start);
+	bytes.copy(raw, 0, start, end);
+	return { [CAPTURED_RAW]: raw, prefixPlan };
+}
+
+function decodeProjection(value) {
+	if (!value || typeof value !== "object" || value === TRUNCATED_VALUE || value === TRUNCATED_NONSTRING_ID) return value;
+	const raw = value[CAPTURED_RAW];
+	if (raw) {
+		if (!value.prefixPlan) return JSON.parse(raw.toString("utf8"));
+		const prefix = JSON.parse('"' + new StringDecoder("utf8").write(raw) + '"');
+		return value.prefixPlan === "identity" ? truncatedIdentity(prefix) : prefix;
+	}
+	const decoded = {};
+	for (const key of Object.keys(value)) decoded[key] = decodeProjection(value[key]);
+	return decoded;
+}
+
 function projectedBytes(entry) {
 	const pending = [entry];
 	let bytes = 0;
@@ -477,11 +504,8 @@ function projectedBytes(entry) {
 		if (typeof value === "string") bytes += 32 + capturedStringBytes(value);
 		else if (value && typeof value === "object" && value !== TRUNCATED_VALUE && value !== TRUNCATED_NONSTRING_ID) {
 			bytes += 64;
-			if (Array.isArray(value)) {
-				bytes += 8 * value.length;
-				for (const item of value) if (typeof item === "string" || (item && typeof item === "object")) pending.push(item);
-			} else if (value[TRUNCATED_STRING_ID] !== undefined) {
-				pending.push(value[TRUNCATED_STRING_ID]);
+			if (value[CAPTURED_RAW]) {
+				bytes += value[CAPTURED_RAW].byteLength;
 			} else {
 				for (const key of Object.keys(value)) {
 					bytes += 40 + capturedStringBytes(key);
@@ -519,27 +543,31 @@ export function createRecordScanner() {
 	const raw = Buffer.allocUnsafe(VALUE_RAW_LIMIT + 2);
 
 	function openContainer(object) {
-		const index = Math.floor(depth / 8);
+		if (depth === MAX_SCAN_DEPTH) {
+			malformed = true;
+			return false;
+		}
+		const index = depth >>> 3;
 		if (index === containers.length) {
 			const grown = new Uint8Array(containers.length * 2);
 			grown.set(containers);
 			containers = grown;
 		}
-		const mask = 1 << (depth % 8);
+		const mask = 1 << (depth & 7);
 		if (object) containers[index] |= mask;
 		else containers[index] &= ~mask;
 		depth += 1;
 		state = object ? STATE_FIRST_KEY : STATE_FIRST_ELEMENT;
+		return true;
 	}
 
 	function currentObject() {
 		const index = depth - 1;
-		return (containers[Math.floor(index / 8)] & (1 << (index % 8))) !== 0;
+		return (containers[index >>> 3] & (1 << (index & 7))) !== 0;
 	}
 
 	function beginObject(plan, value) {
-		openContainer(true);
-		projected.push({ depth, plan, value });
+		if (openContainer(true)) projected.push({ depth, plan, value });
 	}
 
 	function keep(byte) {
@@ -550,7 +578,7 @@ export function createRecordScanner() {
 		if (capture?.depth === depth) {
 			const { frame, key, plan, kind, length, decimal, prefixEnd } = capture;
 			if (length <= VALUE_RAW_LIMIT) {
-				frame.value[key] = JSON.parse(raw.toString("utf8", 0, length));
+				frame.value[key] = capturedRaw(raw, 0, length);
 			} else if (decimal) {
 				frame.value[key] = roundedDecimal(decimal);
 			} else if (plan === "usage") {
@@ -561,11 +589,8 @@ export function createRecordScanner() {
 				// A clipped string can parse as a different date. Never use its prefix.
 				delete frame.value[key];
 			} else {
-				const prefix = kind === QUOTE
-					? JSON.parse('"' + new StringDecoder("utf8").write(raw.subarray(1, prefixEnd)) + '"')
-					: undefined;
-				if (plan === "identity") frame.value[key] = prefix === undefined ? TRUNCATED_NONSTRING_ID : truncatedIdentity(prefix);
-				else frame.value[key] = prefix ?? TRUNCATED_VALUE;
+				frame.value[key] = kind === QUOTE ? capturedRaw(raw, 1, prefixEnd, plan) :
+					plan === "identity" ? TRUNCATED_NONSTRING_ID : TRUNCATED_VALUE;
 			}
 			capture = undefined;
 		}
@@ -749,12 +774,12 @@ export function createRecordScanner() {
 				if (state === STATE_NUMBER && numberCanEnd()) finishValue();
 				if (string || state !== STATE_END || depth !== 0) malformed = true;
 			}
-			return malformed ? undefined : entry;
+			return malformed ? undefined : decodeProjection(entry);
 		},
 		// Only an object can contribute usage, and its closing brace already
 		// completes it. Do not finalize a torn object at a provisional EOF.
 		preview() {
-			return !malformed && state === STATE_END ? entry : undefined;
+			return !malformed && state === STATE_END ? decodeProjection(entry) : undefined;
 		},
 		get malformed() {
 			return malformed;
@@ -785,6 +810,13 @@ export function retainedFragmentBytes(partial) {
 		bytes += buffer.byteLength;
 	}
 	return bytes;
+}
+
+/** Bound bookkeeping if many tiny budget slices produced a fragmented buffer. */
+export function compactFragmentBuffer(partial) {
+	if (partial?.[RECORD_ACCUMULATOR] === true && partial.kind === "buffer") {
+		partial.parts = [Buffer.concat(partial.parts, partial.len)];
+	}
 }
 
 function newAccumulator(start) {
@@ -1235,6 +1267,7 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 			effective,
 			done: evaluatedTo === size,
 			pending,
+			rewound: hasFragment && (restart || rewound),
 			evaluatedTo,
 			bytesRead,
 		};

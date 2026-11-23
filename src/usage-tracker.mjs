@@ -380,6 +380,8 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			};
 			const liveAppends = [];
 			const liveFirstReads = [];
+			const priority = index.fragmentPriority;
+			let priorityLive;
 			pendingLive.clear();
 			for (const [id, { file }] of liveHeaders.subjects()) {
 				const session = liveSessions.get(id);
@@ -387,14 +389,68 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			}
 			for (const session of liveSessions.values()) {
 				const entry = exactEntry(keyOf(identityOf(session)));
+				if (priority && entry === priority) {
+					priorityLive = { session, entry };
+					continue;
+				}
 				const reads = entry?.state === "ok" && entry.complete === true ? liveAppends : liveFirstReads;
 				reads.push({ session, entry });
 			}
+			const checkedFiles = packedMap();
+			const readBacklog = (queuedKey, row) => {
+				if (index.fragmentBlocked?.(exactEntry(keyOf(row)))) return;
+				if (row[PACKED_PROJECT] === null) {
+					const cwd = cwdOf(row);
+					compactProject(row, resolve({ ...row, cwd }).projectKey);
+					if (cwd !== undefined) resolvedCwds.set(row, cwd);
+				}
+				const id = keyOf(row);
+				if (queuedKey[PACKED_PROJECT] !== row[PACKED_PROJECT]) {
+					ledgerRows.delete(queuedKey);
+					ledgerRows.set(row, row);
+				}
+				const { file: rowFile, pending, bytesRead = 0 } = checkedFiles.has(row)
+					? { file: checkedFiles.get(row) }
+					: locate(row, liveSessions, cwdOf, budget);
+				resolvedCwds.delete(row);
+				budget -= bytesRead;
+				if (pending) return false;
+				if (!rowFile) {
+					// Don't turn an uncounted row into a negative-cache hit at capacity.
+					// Existing rows still need missing/gone and ownership updates.
+					if (!index.full || exactEntry(id)?.state !== "full") {
+						index.markMissing(subjectOf(row), metaOf(row), { withdraw: rowFile === null });
+					}
+					queue.delete(queuedKey);
+					return;
+				}
+				const taskOnly = row.kind === "child" && !ledgerUsageSessionId(row);
+				if (taskOnly) taskOnlyChecks.set(row, row);
+				if (budget <= 0) return false;
+				budget = Math.max(0, budget - index.update(subjectOf(row), rowFile, metaOf(row), {
+					maxBytes: budget, ownershipUnique: taskOnly ? true : null,
+				}));
+				const entry = exactEntry(id);
+				// Missing/gone files are retried by queueLedger, not every tick.
+				if (entry.readError === true) return;
+				if (entry.state === "missing" || entry.state === "full" || entry.gone === true ||
+					(entry.state === "ok" && entry.complete === true && entry.evaluatedTo === entry.size)) {
+					queue.delete(queuedKey);
+				}
+			};
+			// Give the reserve owner (or oldest waiter) the first chance to
+			// progress even if it moved from the live set into the backlog.
+			const priorityBacklog = !priorityLive && priority ? queue.get(priority) : undefined;
+			const backlogReady = !priorityBacklog || budget <= 0 || readBacklog({
+				sessionId: priorityBacklog.sessionId, [PACKED_PROJECT]: priorityBacklog[PACKED_PROJECT],
+			}, priorityBacklog) !== false;
+			if (priorityLive) liveAppends.unshift(priorityLive);
 			// (a) live appends, then (b) first/incomplete live reads. A previous
 			// publication sets priority, not whether a file has unread bytes.
 			for (const { session, entry } of [...liveAppends, ...liveFirstReads]) {
 				const subject = identityOf(session);
 				let file = session.file;
+				if (session.kind === "main" && file && index.fragmentBlocked?.(entry, file)) continue;
 				// The raw-ID registry can attach a different project’s default-store file.
 				if (session.kind === "main" && !sensorSessions.has(session) && subject.projectKey && file && paths?.sessionsDir &&
 					isInside(file, paths.sessionsDir) &&
@@ -423,7 +479,6 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			}
 			// Ownership checks cost no transcript bytes and must run even when live
 			// reads exhaust the budget. A different path or a veto invalidates the old claim.
-			const checkedFiles = packedMap();
 			for (const [key, row] of taskOnlyChecks.subjects()) {
 				const id = subjectKey(key);
 				const { file } = locate(row, liveSessions, cwdOf, 0);
@@ -443,48 +498,9 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			}
 			// (c) the ended-session backlog, newest first
 			for (const [queuedKey, row] of queue.subjects()) {
-				if (budget <= 0) break;
-				if (row[PACKED_PROJECT] === null) {
-					const cwd = cwdOf(row);
-					compactProject(row, resolve({ ...row, cwd }).projectKey);
-					if (cwd !== undefined) {
-						// This tick already read the position to establish the subject.
-						resolvedCwds.set(row, cwd);
-					}
-				}
-				const id = keyOf(row);
-				if (queuedKey[PACKED_PROJECT] !== row[PACKED_PROJECT]) {
-					ledgerRows.delete(queuedKey);
-					ledgerRows.set(row, row);
-				}
-				const { file: rowFile, pending, bytesRead = 0 } = checkedFiles.has(row)
-					? { file: checkedFiles.get(row) }
-					: locate(row, liveSessions, cwdOf, budget);
-				resolvedCwds.delete(row);
-				budget -= bytesRead;
-				if (pending) break;
-				if (!rowFile) {
-					// Don't turn an uncounted row into a negative-cache hit at capacity.
-					// Existing rows still need missing/gone and ownership updates.
-					if (!index.full || exactEntry(id)?.state !== "full") {
-						index.markMissing(subjectOf(row), metaOf(row), { withdraw: rowFile === null });
-					}
-					queue.delete(queuedKey);
-					continue;
-				}
-				const taskOnly = row.kind === "child" && !ledgerUsageSessionId(row);
-				if (taskOnly) taskOnlyChecks.set(row, row);
-				if (budget <= 0) break;
-				budget = Math.max(0, budget - index.update(subjectOf(row), rowFile, metaOf(row), {
-					maxBytes: budget, ownershipUnique: taskOnly ? true : null,
-				}));
-				const entry = exactEntry(id);
-				// Missing/gone files are retried by queueLedger, not every tick.
-				if (entry.readError === true) continue;
-				if (entry.state === "missing" || entry.state === "full" || entry.gone === true ||
-					(entry.state === "ok" && entry.complete === true && entry.evaluatedTo === entry.size)) {
-					queue.delete(queuedKey);
-				}
+				if (!backlogReady || budget <= 0) break;
+				if (row === priorityBacklog) continue;
+				if (readBacklog(queuedKey, row) === false) break;
 			}
 			// An exact-session child can also be the alias of a task-only history row.
 			// Refresh only aliases history can use; exact-ID rows need no directory check.

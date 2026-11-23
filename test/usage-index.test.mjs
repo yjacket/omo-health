@@ -9,6 +9,7 @@ import path from "node:path";
 import { test } from "node:test";
 import { tmpDir } from "./helpers/fixtures.mjs";
 import { readUsage, RECORD_STRUCTURE_LIMIT, usageTimeline } from "../src/collect/usage.mjs";
+import * as indexLimits from "../src/usage-index.mjs";
 import { DAEMON_NODE_ARGS } from "../src/launch.mjs";
 import { createFakeClock, iso } from "../src/util/time.mjs";
 import {
@@ -74,6 +75,111 @@ function setup(t) {
 }
 
 const writeText = (file, text) => fs.writeFileSync(file, text);
+
+function saturate(index) {
+	for (let i = 0; !index.full; i++) {
+		index.markMissing(sub(`padding-${i}`), { file: "x".repeat(32 * 1024) });
+	}
+}
+
+function appendLarge(file) {
+	const chunk = "x".repeat(MiB);
+	fs.appendFileSync(file, '{"type":"usage","provider":"p","model":"m","usage":{"input":30},"unused":"');
+	for (let i = 0; i < 40; i++) fs.appendFileSync(file, chunk);
+	fs.appendFileSync(file, '"}\n');
+}
+
+test("(IS-1, IS-2, IS-12) a saturated index finishes a 40 MiB append and reads backlog in two ticks", (t) => {
+	const { clock, fileOf, indexOf } = setup(t);
+	const index = indexOf();
+	const live = { id: "abcdef01", kind: "main", file: fileOf("2026-09-28T12-00-00-000Z_abcdef01.jsonl") };
+	const ended = { sessionId: "abcdef02", kind: "main", endedMs: clock.now() };
+	const backlog = fileOf("backlog.jsonl");
+	const tracker = createUsageTracker({ clock, index, locator: { findMainFile: () => ({ file: backlog, bytesRead: 0 }) } });
+	const world = { sessions: new Map([[live.id, live]]) };
+	writeText(live.file, `${line()}\n`);
+	writeText(backlog, `${line()}\n`);
+	index.update(sub(live.id), live.file, { kind: "main" });
+	index.update(sub(ended.sessionId), backlog, { kind: "main" });
+	saturate(index);
+	const capacity = index.entries().length;
+	appendLarge(live.file);
+	fs.appendFileSync(backlog, `${line()}\n`);
+	assert.equal(tracker.queueLedger([ended]), 1);
+	const first = tracker.tick(world);
+	assert.ok(first.bytesRead <= USAGE_TICK_BYTES);
+	const firstResident = index.residentBytes;
+	assert.equal(index.get(key(live.id)).published.total, 10, "never publish the partial append");
+	assert.equal(index.get(key(ended.sessionId)).published.total, 10, "the live append used the first tick");
+	const second = tracker.tick(world);
+	assert.ok(second.bytesRead <= USAGE_TICK_BYTES);
+	assert.equal(index.get(key(live.id)).published.total, 40, "the second tick must finish the append");
+	assert.equal(index.get(key(ended.sessionId)).published.total, 20, "the backlog must also finish");
+	assert.equal(index.entries().length, capacity);
+	assert.equal(index.full, true);
+	assert.ok(firstResident > INDEX_BYTE_BUDGET, "account for the reserve while it is held");
+	for (const resident of [firstResident, index.residentBytes]) {
+		assert.ok(resident <= INDEX_BYTE_BUDGET + indexLimits.INDEX_FRAGMENT_RESERVE_BYTES);
+	}
+	assert.ok(index.residentBytes <= INDEX_BYTE_BUDGET, "release the reserve at the delimiter");
+});
+
+test("(IS-1, IS-2) a second oversized fragment spends no bytes while the reserve is occupied", (t) => {
+	const { fileOf, indexOf } = setup(t);
+	const index = indexOf();
+	const a = sub("a");
+	const b = sub("b");
+	const fa = fileOf("a.jsonl");
+	const fb = fileOf("b.jsonl");
+	for (const [subject, file] of [[a, fa], [b, fb]]) {
+		writeText(file, `${line()}\n`);
+		index.update(subject, file);
+	}
+	saturate(index);
+	appendLarge(fa);
+	appendLarge(fb);
+	const scan = (subject, file, maxBytes = USAGE_TICK_BYTES) => index.update(subject, file, {}, { maxBytes });
+	assert.equal(scan(a, fa), USAGE_TICK_BYTES);
+	assert.equal(scan(b, fb, MiB * 2), MiB * 2, "the first attempt discovers the admission refusal");
+	assert.equal(scan(b, fb), 0, "an already refused fragment must wait without rereading");
+	assert.equal(index.getForSubject(b).pending, true);
+	assert.equal(index.getForSubject(b).published.total, 10);
+	assert.ok(scan(a, fa) < USAGE_TICK_BYTES);
+	assert.equal(index.getForSubject(a).published.total, 40);
+	assert.equal(scan(b, fb), USAGE_TICK_BYTES);
+	assert.equal(index.getForSubject(b).published.total, 10);
+	assert.ok(scan(b, fb) < USAGE_TICK_BYTES);
+	assert.equal(index.getForSubject(b).published.total, 40);
+});
+
+test("(IS-1, IS-2) rewinding the reserve owner hands priority to the oldest waiter", (t) => {
+	const { fileOf, indexOf } = setup(t);
+	const index = indexOf();
+	const rows = ["a", "b", "c"].map((id) => ({ subject: sub(id), file: fileOf(`${id}.jsonl`) }));
+	const scan = ({ subject, file }, maxBytes) => index.update(subject, file, {}, { maxBytes });
+	for (const row of rows) {
+		writeText(row.file, `${line()}\n`);
+		scan(row);
+	}
+	saturate(index);
+	const partial = '{"type":"usage","provider":"p","model":"m","usage":{"input":20},"unused":"' +
+		"x".repeat(2 * MiB);
+	for (const row of rows) {
+		fs.appendFileSync(row.file, partial + '"}\n');
+		assert.equal(scan(row, MiB + 4096), MiB + 4096);
+	}
+	const [a, b, c] = rows;
+	assert.equal(index.fragmentPriority.id, "a");
+	writeText(a.file, partial + '"}\n'); // Shorter stamp: rewind even though the replacement also needs a slot.
+	assert.equal(scan(a, MiB + 4096), MiB + 4096);
+	assert.equal(index.fragmentPriority.id, "b");
+	assert.equal(scan(c), 0);
+	assert.equal(scan(a), 0);
+	assert.ok(scan(b) > 0);
+	assert.equal(index.getForSubject(b.subject).published.total, 30);
+	assert.equal(index.fragmentPriority.id, "c");
+});
+
 function parseIndex(text) {
 	const [header, ...lines] = text.trimEnd().split("\n");
 	return { ...JSON.parse(header), entries: Object.fromEntries(lines.map((line) => {
@@ -95,8 +201,8 @@ test("(IS-1) retained fragments share the resident index budget across sessions"
 		`{"type":"usage",${fields}"usage":{"input":30},"unused":"${text}`;
 	const small = record("x".repeat(768 * 1024));
 	const streamed = "x".repeat(MiB + 1);
-	// This selected value fits the scanner's raw capture window, but the
-	// decoded array alone takes more space than the window.
+	// The reserve owner includes a captured array whose decoded representation
+	// is larger than its raw capture window.
 	const projected = record(streamed, `"provider":[${"0,".repeat(30_000)}0],`);
 	const suffix = '"}\n';
 	// Pre-admit every row; give the newest rows first claim on fragment space.
@@ -124,27 +230,29 @@ test("(IS-1) retained fragments share the resident index budget across sessions"
 	for (const { subject, file, part, keep } of rows) {
 		const entry = index.getForSubject(subject);
 		assert.equal(entry.offset, first.length + committed.length);
-		assert.equal(Boolean(entry.partial), keep, `${subject.sessionId} retained state`);
+		assert.equal(Boolean(entry.partial), keep || subject === rows[22].subject, `${subject.sessionId} retained state`);
 		assert.equal(compactUsage(entry).total, keep ? 20 : 10, `${subject.sessionId} published total`);
 		if (!keep) {
 			assert.equal(entry.pending, true);
 			assert.equal(fresh(entry), false);
 		}
 	}
-	// Exercise overflow again while the retained rows still occupy the budget.
-	for (const { subject, file, part, keep } of [...rows].sort((a, b) => Number(a.keep) - Number(b.keep))) {
+	const owner = rows[22];
+	assert.equal(index.fragmentPriority, index.getForSubject(owner.subject));
+	// Refused rows cannot rescan while the reserve owner is still active.
+	for (const { subject, file } of rows.slice(23)) {
 		const entry = index.getForSubject(subject);
-		if (!keep) {
-			const budget = 512 * 1024;
-			assert.equal(index.update(subject, file, {}, { maxBytes: budget }), budget,
-				"an unchanged file rescans from its committed offset, within the read allowance");
-			assert.equal(compactUsage(entry).total, 10, "rescan must not publish the intermediate total");
-			assert.equal(entry.pending, true);
-			assert.equal(entry.partial, undefined);
-		}
+		assert.equal(index.update(subject, file, {}, { maxBytes: 512 * 1024 }), 0);
+		assert.equal(compactUsage(entry).total, 10, "waiting must not publish the intermediate total");
+		assert.equal(entry.pending, true);
+		assert.equal(entry.partial, undefined);
+	}
+	// Finish the reserve owner first, then the waiters in refusal order.
+	for (const { subject, file, part, keep } of [...rows.slice(22), ...rows.slice(0, 22)]) {
+		const entry = index.getForSubject(subject);
 		fs.appendFileSync(file, suffix);
 		const spent = index.update(subject, file, {}, { maxBytes: MiB * 2 });
-		if (keep) {
+		if (keep || subject === owner.subject) {
 			assert.equal(spent, suffix.length + 2 * 4096, "resume by checking only fingerprint windows and the suffix");
 		} else {
 			assert.equal(spent, part.length + suffix.length, "discarded state requires a charged rescan");
