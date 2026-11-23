@@ -210,6 +210,13 @@ test("pass 2 relaxes the family when every family is excluded: session claude-op
 	assert.deepEqual(chosen, { model: "chatgpt-subscription/gpt-6.2-astra:max", lane: "ultrabrain", independence: "name" });
 });
 
+test("pass 2 accepts o3 when o3 is only an excluded family, not an excluded name", () => {
+	const box = laneBox({ ultrabrain: ["fake/o3"] }, ["fake"]);
+	const config = auditConfig(["ultrabrain"]);
+	const chosen = resolveAuditModel(box.paths, config, { sessionModels: ["o3-mini"], sessionModelsKnown: true, analystModels: ["gpt-6.2-sol"] });
+	assert.deepEqual(chosen, { model: "fake/o3", lane: "ultrabrain", independence: "name" });
+});
+
 test("a name collision across providers is excluded: opengateway/anthropic/claude-opus-5-5:max", () => {
 	const box = laneBox({ ultrabrain: ["opengateway/anthropic/claude-opus-5-5:max"] }, PROVIDERS);
 	const config = auditConfig(["ultrabrain"]);

@@ -230,31 +230,32 @@ const safeRule = (value) => {
 	return typeof text === "string" && RULE_ID.test(text) ? text : "other";
 };
 
-function modelSetOf(models) {
-	const set = new Set();
+function modelSetsOf(models) {
+	const names = new Set();
+	const families = new Set();
 	for (const model of models ?? []) {
 		if (typeof model !== "string" || !model) continue;
-		set.add(modelName(model));
-		set.add(modelFamily(model));
+		names.add(modelName(model));
+		families.add(modelFamily(model));
 	}
-	return set;
+	return { names, families };
 }
 
 /**
  * Pick the reviewer (plan IS-9). Until the session's model list is complete no
  * reviewer is advertised. Otherwise pass 1 takes the first lane candidate whose
- * family and name are both unseen among the session's models, the analyst's
- * models and the analyst's own lane model; pass 2 relaxes the family; no
- * candidate means `null`.
+ * family is unseen among the session's models, the analyst's models and the
+ * analyst's own lane model; pass 2 excludes only exact model names from that
+ * same group. No candidate means `null`.
  */
 export function resolveAuditModel(paths, config, { sessionModels = [], sessionModelsKnown = false, analystModels = [] } = {}) {
 	if (sessionModelsKnown !== true) return { blocked: "models-unknown" };
 	const analystLane = laneModels(paths, config?.analyst?.lane)[0] ?? config?.analyst?.fallbackModel;
-	const excluded = modelSetOf([...(sessionModels ?? []), ...(analystModels ?? []), analystLane].filter(Boolean));
+	const excluded = modelSetsOf([...(sessionModels ?? []), ...(analystModels ?? []), analystLane].filter(Boolean));
 	const candidates = (config?.audit?.lanes ?? []).flatMap((lane) => laneModels(paths, lane).map((model) => ({ model, lane })));
-	const family = candidates.find((candidate) => !excluded.has(modelFamily(candidate.model)) && !excluded.has(modelName(candidate.model)));
+	const family = candidates.find((candidate) => !excluded.families.has(modelFamily(candidate.model)));
 	if (family) return { model: family.model, lane: family.lane, independence: "family" };
-	const name = candidates.find((candidate) => !excluded.has(modelName(candidate.model)));
+	const name = candidates.find((candidate) => !excluded.names.has(modelName(candidate.model)));
 	if (name) return { model: name.model, lane: name.lane, independence: "name" };
 	return null;
 }
