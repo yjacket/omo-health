@@ -1,8 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import { idFromFileName } from "./collect/sessions.mjs";
-import { createSessionFileLocator } from "./collect/session-files.mjs";
+import { createSessionFileLocator, isSavedTranscriptVersion, ownsLiveMain, probeSessionHeader } from "./collect/session-files.mjs";
 import { senpiTaskStoreDir } from "./collect/tasks.mjs";
+import { isExactInode, readUsageFileStamp } from "./collect/usage.mjs";
 import { DEFAULT_CONFIG } from "./config.mjs";
 import { maskedSubjectKey, streamDecisions, subjectIdJoinKey } from "./decisions.mjs";
 import { streamInvestigations } from "./investigations.mjs";
@@ -1179,7 +1180,21 @@ function findRecordFiles(paths, nodes, ancestors, locator, usage, ambiguous) {
 		if (candidate === null || mismatch) node.usageStoreUnresolved = true;
 		// A tracker-verified file may be outside the known ledger cwds (e.g.
 		// the spawning parent was still live when the tracker saw it).
-		const file = candidate ?? (!node.usageStoreUnresolved && entry?.readError !== true && fresh(entry) ? entry.file : undefined);
+		const savedFile = !node.usageStoreUnresolved && entry?.readError !== true && entry?.file;
+		let file = candidate ?? (savedFile && fresh(entry) ? savedFile : undefined);
+		// Store discovery can rediscover the saved path after it has been replaced.
+		if (savedFile && isExactInode(entry.ino) && Number.isFinite(entry.birthtimeMs) && (candidate || !file)) {
+			const stamp = readUsageFileStamp(savedFile);
+			if (stamp && !isSavedTranscriptVersion(stamp, entry)) {
+				const subject = { ...subjectOf(node), sessionId: ledgerUsageSessionId(node.ledgerIds ?? node) ?? entry.id };
+				const probe = probeSessionHeader(savedFile, stamp.size, Infinity);
+				if (ownsLiveMain(subject, savedFile, probe, false)) file = candidate ?? savedFile;
+				else {
+					file = undefined;
+					node.usageStoreUnresolved = true;
+				}
+			}
+		}
 		return { sessionId, file };
 	}).filter(({ file }) => file);
 }

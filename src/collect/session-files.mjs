@@ -32,16 +32,19 @@ export function probeSessionHeader(file, size, maxBytes) {
 	}
 }
 
-/** The saved row supplies ownership for a legacy header only for the same file identity. */
+/** A saved version (or growth of it) can supply ownership when the header lacks proof. */
+export function isSavedTranscriptVersion(stamp, saved) {
+	return sameFileIdentity(stamp, saved) &&
+		(stamp.size > saved.size || (stamp.size === saved.size && stamp.mtimeMs === saved.mtimeMs));
+}
+
 function ownsExternal(subject, file, probe, saved) {
-	if (probe.id !== subject.sessionId) return false;
+	const projectKey = subject.projectKey ?? saved?.projectKey;
 	const headerProject = projectKeyOf(probe.cwd);
-	if (subject.projectKey != null && headerProject != null) return headerProject === subject.projectKey;
-	if (saved?.kind !== "main" || saved.file !== file || saved.projectKey == null) return false;
-	if (subject.projectKey != null && saved.projectKey !== subject.projectKey) return false;
-	return headerProject == null
-		? sameFileIdentity(readUsageFileStamp(file), saved)
-		: headerProject === saved.projectKey;
+	if ((probe.id != null && probe.id !== subject.sessionId) || (headerProject != null && headerProject !== projectKey)) return false;
+	if (ownsLiveMain({ ...subject, projectKey }, file, probe, false)) return true;
+	return saved?.kind === "main" && saved.file === file && saved.projectKey === projectKey &&
+		isSavedTranscriptVersion(readUsageFileStamp(file), saved);
 }
 
 /** An indexed identity describes a particular path, not a heartbeat's newly reported path. */
@@ -114,7 +117,7 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 			let pending = false;
 			const file = uniqueMatch(listDirSafe(paths.sessionsDir, { withFileTypes: true }), (entry) => {
 				if (pending || !entry.isDirectory()) return undefined;
-				const found = scanProject(path.join(paths.sessionsDir, entry.name), entry.name, sessionId, header);
+				const found = scanProject(path.join(paths.sessionsDir, entry.name), entry.name, sessionId, header, false);
 				pending = found.pending;
 				return found.file;
 			});
@@ -142,9 +145,10 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 		return result(file, pending);
 	};
 
-	function scanProject(dir, projectKey, sessionId, header) {
+	function scanProject(dir, projectKey, sessionId, header, scoped = true) {
 		const result = (file, pending = false) => ({ file, pending });
-		const packed = packScopedText(projectKey);
+		// Unscoped discovery must still see all candidates to check ambiguity.
+		const packed = packScopedText(`${scoped ? "s" : "u"}:${projectKey}`);
 		let project = projects.get(packed);
 		if (!project) projects.set(packed, project = { files: new Map(), scannedMs: -Infinity });
 		let file = project.files.get(sessionId);
@@ -162,6 +166,8 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 			if (!stat?.isFile()) continue;
 			const probe = probeHeaders ? header(candidate, stat.size) : undefined;
 			if (probe?.pending) return result(undefined, true);
+			const headerProject = projectKeyOf(probe?.cwd);
+			if (scoped && headerProject != null && headerProject !== projectKey) continue;
 			const nameId = idFromFileName(candidate);
 			const headerId = probe?.id;
 			if (typeof headerId === "string" && headerId && headerId !== nameId) {
