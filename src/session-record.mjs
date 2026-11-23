@@ -589,7 +589,7 @@ export function createSubjectIdMatcher(ids) {
 	};
 }
 
-function joinSessionDecisions(row, descendants, investigations, decisions, blockedIds, bounded, jobsDir) {
+function joinSessionDecisions(row, descendants, investigations, decisions, { blockedIds, blockedTasks, taskParentOwners, unknownLiveParents }, bounded, jobsDir) {
 	const nodes = [row, ...descendants];
 	const sessionAllowed = new Set(nodes.map((node) => node.sessionId).filter(nonEmpty));
 	// D8 addresses the parent session but names the affected child by its task id.
@@ -600,8 +600,10 @@ function joinSessionDecisions(row, descendants, investigations, decisions, block
 		childTasksByParent.get(parentSessionId).add(taskId);
 	}
 	const taskOnly = new Set(nodes.filter((node) => !nonEmpty(node.sessionId)).map((node) => node.taskId).filter(nonEmpty));
-	const matchSessionId = createSubjectIdMatcher([...sessionAllowed, ...blockedIds]);
-	const matchTaskId = createSubjectIdMatcher(nodes.map((node) => node.taskId));
+	const sessionTasks = new Map(nodes.filter((node) => sessionAllowed.has(node.sessionId)).map((node) => [node.sessionId, subjectOf(node).taskId]));
+	const matchSessionId = createSubjectIdMatcher([...sessionAllowed, ...blockedIds, ...childTasksByParent.keys()]);
+	const taskIds = new Set(nodes.map((node) => node.taskId).filter(nonEmpty));
+	const matchTaskId = createSubjectIdMatcher(taskIds);
 	const sessionOf = (subject) => matchSessionId(subject?.sessionId, subject?.sessionKey);
 	const taskOf = (subject) => matchTaskId(subject.taskId, subject.taskKey);
 	const taskSubjects = new Map();
@@ -619,16 +621,32 @@ function joinSessionDecisions(row, descendants, investigations, decisions, block
 		for (const entry of decisions()) if (isRecord(entry)) countSubject(entry);
 		for (const record of investigations()) if (isRecord(record)) countSubject(record);
 	}
-	const subjectMatches = (subject) => {
-		if (!isRecord(subject)) return false;
-		const sessionId = sessionOf(subject);
-		const taskId = taskOf(subject);
-		return sessionAllowed.has(sessionId) || childTasksByParent.get(sessionId)?.has(taskId) ||
-			typeof taskSubjects.get(taskId) === "string" ||
-			sessionAllowed.has(subject.parentSessionId) || sessionAllowed.has(subject.rootSessionId);
+	const subjectAttribution = (subject, legacySessionId) => {
+		if (nonEmpty(subject?.taskId)) {
+			const taskId = taskOf(subject);
+			if (!taskIds.has(taskId)) return "other";
+			if (blockedTasks.has(taskId)) {
+				const sessionId = sessionOf(subject);
+				// An independently unique session can disambiguate a reused task id.
+				if (!blockedIds.has(sessionId) && sessionTasks.get(sessionId) === taskId) return "owned";
+				// D8 names the parent as both session and parent. In that
+				// shape the parent and task together can identify one child.
+				if (subject.sessionId === subject.parentSessionId && !blockedIds.has(sessionId) &&
+					childTasksByParent.get(sessionId)?.has(taskId) && !unknownLiveParents.has(taskId) &&
+					taskParentOwners.get(taskId)?.get(sessionId) != null) return "owned";
+				if (nonEmpty(sessionId) && !sessionAllowed.has(sessionId) && !childTasksByParent.get(sessionId)?.has(taskId) &&
+					!taskOnly.has(taskId)) return "other";
+				return "blocked";
+			}
+			return taskSubjects.get(taskId) === null ? "blocked" : "owned";
+		}
+		const sessionId = nonEmpty(subject?.sessionId) ? sessionOf(subject)
+			: legacySessionId ?? subject?.parentSessionId ?? subject?.rootSessionId;
+		if (nonEmpty(subject?.sessionId) && !nonEmpty(sessionId)) return "other";
+		if (!nonEmpty(sessionId)) return "none";
+		if (!sessionAllowed.has(sessionId)) return "other";
+		return blockedIds.has(sessionId) ? "blocked" : "owned";
 	};
-	const subjectBlocked = (subject) => blockedIds.has(sessionOf(subject)) ||
-		blockedIds.has(subject?.parentSessionId) || blockedIds.has(subject?.rootSessionId);
 	const unattributedHealth = { findings: 0, actions: 0, verdicts: 0, investigations: 0 };
 
 	// 1. investigations about the session or its descendants
@@ -639,31 +657,27 @@ function joinSessionDecisions(row, descendants, investigations, decisions, block
 	const analystModels = new Set();
 	const pendingAnalystJobs = new Set();
 	let analystModelsKnown = true;
-	const addInvestigation = (record) => {
-		if (blockedFps.has(record.id) || subjectBlocked(record.subject)) unattributedHealth.investigations++;
-		else if (bounded) bounded.investigations.add({ ...investigationFacts(record), historyId: record.id });
-		else selectedInvestigations.push(record);
-	};
 	for (const record of investigations()) {
-		if (!isRecord(record) || !subjectMatches(record.subject)) continue;
+		if (!isRecord(record)) continue;
+		const attribution = subjectAttribution(record.subject);
+		if (attribution !== "owned" && attribution !== "blocked") continue;
 		if (nonEmpty(record.id)) {
 			fpSet.add(record.id);
-			if (subjectBlocked(record.subject)) blockedFps.add(record.id);
+			if (attribution === "blocked") blockedFps.add(record.id);
 		}
 		if (nonEmpty(record.model)) analystModels.add(record.model);
-		if (!blockedIds.size) addInvestigation(record);
+		if (attribution === "blocked") unattributedHealth.investigations++;
+		else if (bounded) bounded.investigations.add({ ...investigationFacts(record), historyId: record.id });
+		else selectedInvestigations.push(record);
 	}
 
 	// 2. the fp set: selected investigations plus lifecycle rows whose subject matches
 	for (const entry of decisions()) {
 		if (!isRecord(entry) || !nonEmpty(entry.fp)) continue;
-		if (subjectMatches(entry.subject) && (FINDING_EVENTS.has(entry.event) || entry.event === "investigation")) fpSet.add(entry.fp);
-		if (subjectBlocked(entry.subject) || blockedIds.has(entry.sessionId)) blockedFps.add(entry.fp);
-	}
-	if (blockedIds.size) {
-		for (const record of investigations()) {
-			if (isRecord(record) && subjectMatches(record.subject)) addInvestigation(record);
-		}
+		const attribution = subjectAttribution(entry.subject, entry.sessionId);
+		if ((attribution === "owned" || attribution === "blocked") &&
+			(FINDING_EVENTS.has(entry.event) || entry.event === "investigation")) fpSet.add(entry.fp);
+		if (attribution === "blocked") blockedFps.add(entry.fp);
 	}
 
 	// 3. decisions about the session; 4. decisions delivered to it or its descendants.
@@ -684,18 +698,21 @@ function joinSessionDecisions(row, descendants, investigations, decisions, block
 	const histories = new Map(bounded?.investigations.rows.map(({ historyId }) => [historyId, { rows: [], chars: 2 }]));
 	for (const entry of decisions()) {
 		if (!isRecord(entry)) continue;
-		const related = (nonEmpty(entry.fp) && fpSet.has(entry.fp)) || subjectMatches(entry.subject) || (nonEmpty(row.sessionId) && entry.sessionId === row.sessionId);
+		const attribution = subjectAttribution(entry.subject, entry.sessionId);
+		const related = attribution === "owned" || attribution === "blocked" || (attribution === "none" && fpSet.has(entry.fp));
 		const selected = related || sessionAllowed.has(entry.outcome?.sessionId);
 		const acted = pending && sameExecution(pending.entry, entry) && selected ? pending.entry : undefined;
-		if (pending && !acted) addAction(pending.entry, pending.deliveredOnly, pending.unattributed);
-		const unattributed = blockedFps.has(entry.fp) || subjectBlocked(entry.subject) ||
-			blockedIds.has(entry.sessionId) || blockedIds.has(entry.outcome?.sessionId) || Boolean(acted && pending.unattributed);
+		if (pending?.selected && !acted) addAction(pending.entry, pending.deliveredOnly, pending.unattributed);
+		const unattributed = attribution === "blocked" || (attribution === "none" && blockedFps.has(entry.fp)) ||
+			(!related && blockedIds.has(entry.outcome?.sessionId)) || Boolean(acted && pending.unattributed);
 		pending = undefined;
+		// A relay summary can supply facts for a selected delivery even when
+		// its source child isn't in this record's retained family.
+		const hasActed = entry.event === "investigation" && nonEmpty(entry.fp) && nonEmpty(entry.acted?.key) && nonEmpty(entry.acted?.kind);
+		if (hasActed) pending = { entry, selected, deliveredOnly: !related, unattributed };
 		if (!selected) continue;
 		if (related && !collectAnalystDecisionModels(analystModels, entry, jobsDir, pendingAnalystJobs)) analystModelsKnown = false;
-		if (entry.event === "investigation" && nonEmpty(entry.fp) && nonEmpty(entry.acted?.key) && nonEmpty(entry.acted?.kind)) {
-			pending = { entry, deliveredOnly: !related, unattributed };
-		} else addAction(entry, !related, unattributed, acted);
+		if (!hasActed) addAction(entry, !related, unattributed, acted);
 		if (unattributed) {
 			if (FINDING_EVENTS.has(entry.event)) unattributedHealth.findings++;
 			if (related && entry.event === "investigation" && verdictFacts(entry)) unattributedHealth.verdicts++;
@@ -718,7 +735,7 @@ function joinSessionDecisions(row, descendants, investigations, decisions, block
 			else history.rows.push(projected);
 		}
 	}
-	if (pending) addAction(pending.entry, pending.deliveredOnly, pending.unattributed);
+	if (pending?.selected) addAction(pending.entry, pending.deliveredOnly, pending.unattributed);
 	recoverPendingAnalystModels(analystModels, pendingAnalystJobs, jobsDir);
 	const modelHistory = {
 		unattributedHealth,
@@ -734,7 +751,6 @@ function joinSessionDecisions(row, descendants, investigations, decisions, block
 			if (rows === null) investigation.verdictHistoryTooLarge = true;
 			else investigation.verdictHistory = rows.sort(byVerdictTime);
 		}
-		const taskIds = new Set(nodes.map((node) => node.taskId).filter(nonEmpty));
 		return {
 			...modelHistory, selectedFps: [...fpSet],
 			auditSubjectIds: { sessionIds: sessionAllowed, taskIds, childTasksByParent },
@@ -747,7 +763,7 @@ function recordHealth(inputs, row, descendants) {
 	if (inputs.auditHealth) return { ...inputs.auditHealth, ...inputs.decisionJoin, configDecisions: inputs.decisionHistory.configDecisions };
 	const { decisions, investigations, messages: messagesIn } = inputs;
 	const { selectedInvestigations, fpSet, about, selected, actionEntries, analystModels, analystModelsKnown, pendingAnalystJobs, unattributedHealth } =
-		inputs.decisionJoin ?? joinSessionDecisions(row, descendants, () => investigations, () => decisions, blockedHealthIds([row, ...descendants], () => [row, ...inputs.ledger]));
+		inputs.decisionJoin ?? joinSessionDecisions(row, descendants, () => investigations, () => decisions, healthAttributionOwners([row, ...descendants], () => [row, ...inputs.ledger]));
 	const findings = selected.filter((entry) => FINDING_EVENTS.has(entry.event)).map((entry) => findingRow(entry));
 	const { machine, infoFindings, configDecisions } = inputs.decisionHistory ?? scanDecisionHistory(
 		decisions.filter((entry) => Number.isFinite(timeOf(entry))).sort((a, b) => timeOf(a) - timeOf(b)), row, activeWindows(row, descendants, inputs.now),
@@ -1258,40 +1274,54 @@ function* ledgerSubjectParents(parents, rows) {
 	}
 }
 
-function blockedHealthIds(nodes, rows, usage, liveOwners = []) {
+function healthAttributionOwners(nodes, rows, usage, liveOwners = []) {
 	const ids = new Set(nodes.flatMap(({ sessionId, parentSessionId, rootSessionId }) =>
 		[sessionId, parentSessionId, rootSessionId]).filter(nonEmpty));
+	const tasks = new Set(nodes.map((node) => node.taskId).filter(nonEmpty));
 	const firstSubject = new Map();
-	const blocked = new Set();
+	const taskOwners = new Map();
+	const taskParentOwners = new Map();
+	const unknownLiveParents = new Set();
+	const blockedIds = new Set();
 	const unscoped = new Map();
-	const consider = (id, projectKey, taskId) => {
-		if (blocked.has(id)) return;
+	const consider = (id, projectKey, taskId, parentId) => {
+		if (tasks.has(taskId)) {
+			const key = JSON.stringify([projectKey ?? null, id ?? null]);
+			trackOwner(taskOwners, taskId, key);
+			if (nonEmpty(parentId)) {
+				if (!taskParentOwners.has(taskId)) taskParentOwners.set(taskId, new Map());
+				trackOwner(taskParentOwners.get(taskId), parentId, key);
+			}
+		}
+		if (!ids.has(id) || blockedIds.has(id)) return;
 		const first = firstSubject.get(id);
-		if (!first) firstSubject.set(id, { projectKey, taskId: taskId ?? null });
-		else if (first.projectKey !== projectKey || first.taskId !== (taskId ?? null)) {
-			blocked.add(id);
+		if (!first) firstSubject.set(id, { projectKey: projectKey ?? null, taskId: taskId ?? null });
+		else if (first.projectKey !== (projectKey ?? null) || first.taskId !== (taskId ?? null)) {
+			blockedIds.add(id);
 			firstSubject.delete(id);
 		}
 	};
 	for (const { sessionId, projectKey, taskId } of liveOwners) {
-		if (ids.has(sessionId)) consider(sessionId, projectKey, taskId);
+		if (tasks.has(taskId)) unknownLiveParents.add(taskId);
+		consider(sessionId, projectKey, taskId);
 	}
-	// Exact IDs across all retained dates, regardless of the detail row selector.
+	// Check both keys across all retained dates, regardless of the detail row selector.
 	// Do not retain full matching rows or stringify the project key for each ID.
 	for (const row of rows()) {
-		const { sessionId, parentSessionId, taskId, endedMs, ledgerIds, usageTaskIdAmbiguous } = row;
-		if (!ids.has(sessionId) || blocked.has(sessionId)) continue;
+		const { sessionId, parentSessionId, endedMs, ledgerIds, usageTaskIdAmbiguous } = row;
+		const taskId = row.kind === "main" ? null : ledgerIds?.taskId ?? row.taskId ?? null;
+		if (!tasks.has(taskId) && (!ids.has(sessionId) || blockedIds.has(sessionId))) continue;
 		const { projectKey } = subjectOf(row);
-		if (projectKey) consider(sessionId, projectKey, taskId);
+		if (projectKey) consider(sessionId, projectKey, taskId, parentSessionId);
 		else {
 			const key = JSON.stringify([sessionId, parentSessionId ?? null, taskId ?? null]);
 			if (later(row, unscoped.get(key))) unscoped.set(key, { sessionId, parentSessionId, taskId, endedMs, ledgerIds, usageTaskIdAmbiguous, projectKey });
 		}
 	}
-	if (!unscoped.size) return blocked;
+	const relevant = ({ sessionId, taskId }) => tasks.has(taskId) || !blockedIds.has(sessionId);
 	const parents = new Set();
-	for (const { sessionId, parentSessionId } of unscoped.values()) {
-		if (parentSessionId && !blocked.has(sessionId)) parents.add(parentSessionId);
+	for (const row of unscoped.values()) {
+		if (row.parentSessionId && relevant(row)) parents.add(row.parentSessionId);
 	}
 	const family = new Map();
 	for (const row of ledgerSubjectParents(parents, rows)) {
@@ -1308,11 +1338,13 @@ function blockedHealthIds(nodes, rows, usage, liveOwners = []) {
 		}
 	}());
 	for (const row of unscoped.values()) {
-		if (blocked.has(row.sessionId)) continue;
+		if (!relevant(row)) continue;
 		const inherited = resolve(row).projectKey;
-		consider(row.sessionId, inherited ?? (usage ? subjectOf(usageEntryOf(usage, row)).projectKey : null), row.taskId);
+		consider(row.sessionId, inherited ?? (usage ? subjectOf(usageEntryOf(usage, row)).projectKey : null), row.taskId, row.parentSessionId);
 	}
-	return blocked;
+	const blockedTasks = new Set();
+	for (const [taskId, owner] of taskOwners) if (owner === null) blockedTasks.add(taskId);
+	return { blockedIds, blockedTasks, taskParentOwners, unknownLiveParents };
 }
 
 function recordDescendants(subject, rows, usage) {
@@ -1498,8 +1530,8 @@ export function loadSessionRecord({ paths, subject, id = subject?.sessionId, row
 		messages: newest(AUDIT_LIST_CAPS.messages, byMessageTime),
 	} : null;
 	const decisionHistory = scanDecisionHistory(streamDecisions(paths), row, activeWindows(row, descendants, now), retained?.machine);
-	const blockedIds = blockedHealthIds([row, ...descendants], () => streamEnded(paths), usage, liveOwners);
-	const decisionJoin = joinSessionDecisions(row, descendants, () => streamInvestigations(paths), () => streamDecisions(paths, sinceMs), blockedIds, retained, paths.health.jobsDir);
+	const owners = healthAttributionOwners([row, ...descendants], () => streamEnded(paths), usage, liveOwners);
+	const decisionJoin = joinSessionDecisions(row, descendants, () => streamInvestigations(paths), () => streamDecisions(paths, sinceMs), owners, retained, paths.health.jobsDir);
 	const files = findRecordFiles(paths, [row, ...scanned], ancestors, locator, usage, ambiguous);
 
 	const messages = [];

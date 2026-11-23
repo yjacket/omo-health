@@ -196,7 +196,7 @@ it("IS-7: the app detail distinguishes withheld health records from an empty his
 		investigations: [{ id: fp, subject, detector: "D1" }],
 	});
 	const render = (record) => endedRecord(row, buildSessionView(sessionRecordPage(record, null, 0)));
-	const label = "다른 프로젝트와 id가 같아 붙이지 못한 기록";
+	const label = "같은 id의 다른 세션이 있어 붙이지 못한 기록";
 	const zeroCounts = { findings: 0, actions: 0, verdicts: 0, investigations: 0 };
 	for (const record of [noHistory, { ...noHistory, truncated: { unattributedHealth: zeroCounts } }]) {
 		const rendered = JSON.stringify(render(record));

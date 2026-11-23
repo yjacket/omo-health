@@ -434,6 +434,44 @@ test("plan111 cold backfill leaves a nested link unresolved without a unique tas
 	}
 });
 
+test("plan112 a parentless backfilled child reloads its own tokens from the spawning store", (t) => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "backfill-parentless-"));
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health"), OMO_HEALTH_OMO_HOME: path.join(root, ".omo") });
+	const now = Date.now();
+	const start = now - 3 * HOUR;
+	const end = now - 2 * HOUR;
+	const a = path.join(root, "spawner");
+	const b = path.join(root, "child-workspace");
+	const storeDir = senpiTaskStoreDir(a, paths.agentDir);
+	const parentId = "review.parent";
+	const sessionId = "review.child";
+	const taskId = "st_parentless";
+	const assistant = (input) => E.assistant({ ms: end, usage: { input, output: 0, cacheRead: 0, cacheWrite: 0 } });
+	// This main shares the unresolved nested parent's ID but is not that parent.
+	writeSession(paths, projectKeyOf(a), parentId, a, start, end, [assistant(43)]);
+	writeTask(a, {
+		task_id: taskId, child_session_id: sessionId, parent_session_id: parentId, root_session_id: "review.root", depth: 2,
+		spawn_spec: { cwd: b }, status: "completed", final_response: "done", created_at: iso(start), terminal_at: iso(end),
+	}, storeDir);
+	writeJsonl(path.join(storeDir, "children", taskId, "sessions", taskId,
+		`${iso(start).replace(/[:.]/g, "-")}_${sessionId}.jsonl`), [E.header(sessionId, b, start), assistant(17)]);
+
+	assert.deepEqual(readEnded(paths), []);
+	assert.deepEqual(backfillOnce(paths, now).errors, []);
+	processBackfilledRows(paths, now);
+	const rows = readEnded(paths);
+	const parent = rows.find((row) => row.sessionId === parentId);
+	const child = rows.find((row) => row.sessionId === sessionId);
+	assert.deepEqual([child.cwd, child.storeDir, child.parentSessionId, child.parentProjectKey, child.parentTaskId], [b, storeDir, null, undefined, undefined]);
+	assert.equal(parent.childCount, 0);
+	const detail = createDetailOperations({ paths, auditDetail: () => null });
+	const load = (row) => detail({ kind: "detail", id: row.sessionId, row: expectedSelector(row), now }).record;
+	const mainDetail = load(parent);
+	assert.deepEqual(mainDetail.children, []);
+	assert.deepEqual([mainDetail.tokens?.total, mainDetail.tokens?.treeTotal, load(child).tokens?.total], [43, null, 17]);
+});
+
 test("cold backfill follows a child into a project with no main transcript", (t) => {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "backfill-nested-"));
 	t.after(() => fs.rmSync(root, { recursive: true, force: true }));

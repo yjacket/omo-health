@@ -205,6 +205,63 @@ test("IS-1/7/8 shared session IDs withhold health rows in detail and mark audit 
 	}
 });
 
+test("plan112 same-project child and main share an ID but only the child owns task-addressed health", (t) => {
+	const { root, paths } = setup();
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const now = T0 + 5 * HOUR;
+	const cwd = path.join(root, "project");
+	const parent = mainRow({ sessionId: "review.parent", cwd });
+	const child = childRow("review.1", "st_review_child", parent.sessionId, { cwd });
+	const main = mainRow({ sessionId: child.sessionId, cwd, startedMs: T0 + 3 * HOUR, endedMs: T0 + 4 * HOUR });
+	for (const row of [parent, child, main]) assert.ok(appendEnded(paths, row, { nowMs: now }));
+	const subject = { sessionId: child.sessionId, taskId: child.taskId };
+	const fp = "task-addressed";
+	const ts = iso(child.startedMs + MIN);
+	appendDecision(paths, { fp, subject, ts, event: "opened", detector: "D1", kind: "stalled", severity: "warn" });
+	appendDecision(paths, { fp: "raw-id-only", subject: { sessionId: child.sessionId }, ts, event: "opened", detector: "D5", severity: "warn" });
+	appendDecision(paths, { fp, subject, ts, detector: "D1", action: { kind: "notice" }, result: "execute", outcome: { delivered: true } });
+	appendDecision(paths, { fp, subject, ts, event: "investigation", analyst: { verdict: "act" } });
+	createInvestigations({ paths, clock: { now: () => child.startedMs + MIN } }).open({ id: fp, subject, detector: "D1" });
+
+	const detail = createDetailOperations({ paths, auditDetail: () => null });
+	for (const [row, ownsTask] of [[child, true], [main, false]]) {
+		const selector = expectedSelector(row);
+		const view = buildSessionView(detail({ kind: "detail", id: row.sessionId, row: selector, now }).record);
+		const retained = loadSessionRecord({ paths, id: row.sessionId, row: selector, now, auditRetention: true });
+		const bundle = auditBundle(retained, null, { config: DEFAULT_CONFIG, now });
+		assert.deepEqual(view.health.findings.map(({ fp }) => fp), ownsTask ? ["task-addressed"] : [], `${row.kind} detail`);
+		assert.deepEqual(bundle.omo_health_record.findings.map(({ detector }) => detector), ownsTask ? ["D1"] : [], `${row.kind} audit`);
+		for (const health of [view.health, bundle.omo_health_record]) {
+			assert.deepEqual(health.actions.map(({ kind }) => kind), ownsTask ? ["notice"] : []);
+			assert.equal(health.investigations.length, Number(ownsTask));
+			if (ownsTask) assert.equal(health.investigations[0].verdictHistory.length, 1);
+		}
+		const withheld = { findings: 1, actions: 0, verdicts: 0, investigations: 0 };
+		assert.deepEqual(view.truncated.unattributedHealth, withheld);
+		assert.deepEqual(bundle.truncated.unattributedHealth, withheld);
+		assert.equal(bundle.truncated.findings, true);
+		assert.equal(view.health.unattributedKo, "같은 id의 다른 세션이 있어 붙이지 못한 기록 1건");
+	}
+
+	// Neither a live owner nor a retained owner outside the selected family
+	// may be ignored merely because it uses a different raw session ID.
+	const twin = childRow("review.twin", child.taskId, "review.other-parent", { cwd: path.join(root, "other-project") });
+	const loadChild = (liveOwners) => loadSessionRecord({
+		paths, id: child.sessionId, row: expectedSelector(child), now, liveOwners, auditRetention: true,
+	});
+	const assertWithheld = (record) => {
+		const bundle = auditBundle(record, null, { config: DEFAULT_CONFIG, now });
+		assert.deepEqual(bundle.omo_health_record.findings, []);
+		assert.deepEqual(bundle.omo_health_record.actions, []);
+		assert.deepEqual(bundle.omo_health_record.investigations, []);
+		assert.deepEqual(bundle.truncated.unattributedHealth, { findings: 2, actions: 1, verdicts: 1, investigations: 1 });
+		assert.deepEqual([bundle.truncated.findings, bundle.truncated.actions, bundle.truncated.investigations], [true, true, true]);
+	};
+	assertWithheld(loadChild([subjectOf(twin)]));
+	assert.ok(appendEnded(paths, twin, { nowMs: now }));
+	assertWithheld(loadChild());
+});
+
 test("IS-10 health collision scan finds an older cwd-less child through its retained ancestors", (t) => {
 	const { root, paths } = setup();
 	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
