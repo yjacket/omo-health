@@ -8,7 +8,7 @@ import { idFromFileName } from "./sessions.mjs";
 import { senpiTaskStoreDir } from "./tasks.mjs";
 import { isExactInode, readUsageFileStamp, sameFileIdentity } from "./usage.mjs";
 
-const HEADER_BYTES = 64 * 1024;
+export const HEADER_BYTES = 64 * 1024;
 
 /** A header probe is atomic; callers defer the candidate if its prefix won't fit. */
 export function probeSessionHeader(file, size, maxBytes) {

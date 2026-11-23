@@ -2,7 +2,7 @@ import path from "node:path";
 import { subjectKey, subjectOf } from "./session-subject.mjs";
 import { parentPort, workerData } from "node:worker_threads";
 import { auditFileVersion, auditIndexVersion, readVersionedAuditTimeline, sameAuditVersion } from "./auditor.mjs";
-import { createSessionFileLocator, mainHeaderConflicts } from "./collect/session-files.mjs";
+import { createSessionFileLocator, HEADER_BYTES, mainHeaderConflicts, probeSessionHeader } from "./collect/session-files.mjs";
 import { isInside } from "./paths.mjs";
 import { loadSessionRecord, usageEntryOf } from "./session-record.mjs";
 import { usageEntryFor } from "./usage-index.mjs";
@@ -49,10 +49,20 @@ export function prepareAudit({ subject, now, bounds, indexEntries, indexFull, li
 		let warning;
 		const maxFileBytes = Math.min(scanBounds.messageScanMaxBytes, remaining);
 		const report = readVersionedAuditTimeline(file, tokens, { maxFileBytes, timeline, log: { warn: (_event, detail) => { warning = detail; } } });
-		if (!mainSubject.taskId && report.full?.sessionHeader) {
+		if (!mainSubject.taskId && file) {
+			let header = report.full?.sessionHeader;
+			if (!report.full && entry?.file === file) {
+				const version = auditFileVersion(file);
+				if (!sameAuditVersion(version, entry)) return { modelsAmbiguous: true };
+				const probe = probeSessionHeader(file, version.size, remaining);
+				if (probe.pending || probe.bytesRead !== Math.min(version.size, HEADER_BYTES) ||
+					!sameAuditVersion(version, auditFileVersion(file))) return { modelsAmbiguous: true };
+				header = probe;
+				report.timelineSource = { file, version, changedDuringScan: false };
+			}
 			const projectKey = mainSubject.projectKey ?? (isInside(file, paths.sessionsDir)
 				? path.basename(path.dirname(file)) : entry?.projectKey);
-			if (mainHeaderConflicts({ ...mainSubject, projectKey }, report.full.sessionHeader)) return { modelsAmbiguous: true };
+			if (header && mainHeaderConflicts({ ...mainSubject, projectKey }, header)) return { modelsAmbiguous: true };
 		}
 		return { loaded, selectedFps, auditSubjectIds, indexVersion, ...report, warning };
 	} catch (error) {

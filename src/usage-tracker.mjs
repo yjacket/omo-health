@@ -1,5 +1,5 @@
 import path from "node:path";
-import { indexedMainIdentity, ownsLiveMain, probeSessionHeader } from "./collect/session-files.mjs";
+import { indexedMainIdentity, mainHeaderConflicts, ownsLiveMain, probeSessionHeader } from "./collect/session-files.mjs";
 import { readUsageFileStamp, sameFileStamp, withUsageRecountCheck } from "./collect/usage.mjs";
 import { idFromFileName } from "./collect/sessions.mjs";
 import { childSubjectOf, ledgerParentSubject, liveSessionView, PACKED_PROJECT, packScopedText, parseSubjectKey, sessionSubjects, SubjectMap, subjectKey, subjectOf, taskParentResolver, unpackScopedText } from "./session-subject.mjs";
@@ -146,10 +146,11 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 		const update = () => index.update(subject, file, metaOf(source), options);
 		// A different sole candidate after a legacy task-only entry went missing
 		// is a new claim, not a recount of that task's previous transcript.
-		if (source.kind !== "child" || !saved?.file ||
-			(isTaskOnlyEntry(saved) && pathKey(saved.file) !== pathKey(file))) return update();
-		const owner = isTaskOnlyEntry(saved) ? { ...subject, sessionId: idFromFileName(file) } : subject;
-		return withUsageRecountCheck(file, saved, (probe) => ownsLiveMain(owner, file, probe, false), update);
+		if (source.kind !== "child" ||
+			(saved?.file && isTaskOnlyEntry(saved) && pathKey(saved.file) !== pathKey(file))) return update();
+		const owner = subject.sessionId === subject.taskId ? { ...subject, sessionId: idFromFileName(file) } : subject;
+		return withUsageRecountCheck(file, saved, (probe) => ownsLiveMain(owner, file, probe, false), update,
+			(probe) => mainHeaderConflicts(owner, probe));
 	};
 
 	/** Verify that the live collector's file belongs to this session before billing it. */

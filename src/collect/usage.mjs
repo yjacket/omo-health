@@ -1048,9 +1048,9 @@ function sessionHeader(bytes, size) {
 const recountChecks = new Map();
 
 /** Scope a child ownership check to the index's synchronous read of this file. */
-export function withUsageRecountCheck(file, saved, ownsHeader, update) {
+export function withUsageRecountCheck(file, saved, ownsHeader, update, rejectsFirstHeader) {
 	const previous = recountChecks.get(file);
-	recountChecks.set(file, { saved, ownsHeader });
+	recountChecks.set(file, { saved, ownsHeader, rejectsFirstHeader });
 	try {
 		return update();
 	} finally {
@@ -1152,13 +1152,19 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 		let headLen;
 		let head;
 		let cachedOverlay;
-		const check = restart ? recountChecks.get(file) : undefined;
-		const savedStamp = check && { size, mtimeMs, ino, birthtimeMs };
-		let ownsHeader = check && !sameFileStamp(savedStamp, check.saved) ? check.ownsHeader : undefined;
-		const refuseRecount = () => ({
-			...check.saved, partial: undefined, scanOffset: check.saved.offset,
+		const check = recountChecks.get(file);
+		const saved = isExactInode(check?.saved?.ino) && Number.isFinite(check.saved.birthtimeMs) ? check.saved : undefined;
+		let ownsHeader = restart && saved && !sameFileStamp({ size, mtimeMs, ino, birthtimeMs }, saved) ? check.ownsHeader : undefined;
+		let rejectsFirstHeader = !saved || (!from?.complete && from?.offset === 0) ? check?.rejectsFirstHeader : undefined;
+		const refuse = (previous) => ({
+			...previous, partial: undefined, scanOffset: previous?.offset,
 			rewound: true, done: false, pending: true, bytesRead,
 		});
+		const firstRecordConflicts = (acc) => {
+			if (!rejectsFirstHeader || acc?.start !== 0 || acc.kind !== "buffer" || acc.len > SESSION_HEADER_LIMIT) return false;
+			const probe = sessionHeader(Buffer.concat(acc.parts, acc.len), acc.len);
+			return rejectsFirstHeader(probe);
+		};
 		const savedUsage = restart ? undefined : cloneUsage(from.usage);
 		if (!savedUsage) {
 			usage = emptyUsage();
@@ -1168,10 +1174,13 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 			headLen = Math.min(size, HEAD_LIMIT);
 			const bytes = readRange(fd, 0, headLen);
 			head = sha1(bytes);
-			if (ownsHeader) {
+			if (ownsHeader || rejectsFirstHeader) {
 				const probe = sessionHeader(bytes, size);
-				if (probe && !ownsHeader(probe)) return refuseRecount();
-				if (probe) ownsHeader = undefined;
+				if (probe) {
+					if (ownsHeader && !ownsHeader(probe)) return refuse(saved);
+					if (rejectsFirstHeader?.(probe)) return refuse();
+					ownsHeader = rejectsFirstHeader = undefined;
+				}
 			}
 		} else {
 			usage = savedUsage;
@@ -1213,7 +1222,7 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 			if (ownsHeader) {
 				// The first scan chunk expands the fingerprint prefix without another read.
 				const probe = sessionHeader(chunk, size);
-				if (!probe || !ownsHeader(probe)) return refuseRecount();
+				if (!probe || !ownsHeader(probe)) return refuse(saved);
 				ownsHeader = undefined;
 			}
 			if (!chunk.length) break;
@@ -1228,6 +1237,7 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 					break;
 				}
 				acc = appendBytes(acc, chunk.subarray(index, newline));
+				if (firstRecordConflicts(acc)) return refuse();
 				if (needsWholeRecord(acc)) {
 					const whole = reread(acc.start, acc.len);
 					if (!whole) {
@@ -1246,6 +1256,7 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 			}
 		}
 
+		if (position === size && firstRecordConflicts(acc)) return refuse();
 		const overlay = cachedOverlay ?? emptyUsage();
 		// Keep a reused publication marked pending until the rescan gets
 		// through its first record (or evaluates the fragment at EOF).
