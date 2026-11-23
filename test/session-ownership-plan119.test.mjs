@@ -84,6 +84,43 @@ test("plan119 cold recount refuses a cross-project header and cannot launch or c
 	assert.equal(auditsToday(paths, now), 0);
 });
 
+test("plan120 history detail refuses a same-name main transcript owned by another project", (t) => {
+	const { paths, a, b } = setup(t);
+	const alice = main("review.1", a);
+	const bob = main("review.1", b);
+	const text = "Project B private review notice";
+	const { index } = openTracker(paths);
+	const files = [alice, bob].map((row) => {
+		assert.ok(appendEnded(paths, row, { nowMs: now }));
+		const file = path.join(paths.sessionsDir, subjectOf(row).projectKey, reviewName);
+		writeJsonl(file, [
+			E.header(bob.sessionId, b, now - 1000),
+			{ ...E.custom("omo-health", now - 100), content: text },
+			usageLine(17),
+		]);
+		// A prior publication may already have counted the misplaced file.
+		index.update(subjectOf(row), file, { kind: "main" });
+		return file;
+	});
+	const open = (operate, row) => {
+		const detail = operate({ kind: "detail", id: row.sessionId, row: expectedSelector(row), now });
+		assert.equal(detail.record.found, true);
+		return {
+			files: detail.files,
+			messages: detail.record.health.messages.map((message) => message.text),
+			tokens: detail.record.tokens?.total ?? null,
+		};
+	};
+	const operate = createDetailOperations({ paths, auditDetail: () => null });
+	const cold = open(operate, alice);
+	assert.equal(index.save(), true);
+	assert.deepEqual(open(operate, bob), { files: [files[1]], messages: [text], tokens: 17 });
+	assert.deepEqual([cold, open(operate, alice)], [
+		{ files: [], messages: [], tokens: null },
+		{ files: [], messages: [], tokens: null },
+	]);
+});
+
 test("plan119 headerless external transcript keeps its final append after reload but refuses a foreign replacement", (t) => {
 	const { paths, a, b } = setup(t);
 	const row = main("review.1", a);

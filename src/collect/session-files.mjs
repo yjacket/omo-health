@@ -40,8 +40,7 @@ export function isSavedTranscriptVersion(stamp, saved) {
 
 function ownsExternal(subject, file, probe, saved) {
 	const projectKey = subject.projectKey ?? saved?.projectKey;
-	const headerProject = projectKeyOf(probe.cwd);
-	if ((probe.id != null && probe.id !== subject.sessionId) || (headerProject != null && headerProject !== projectKey)) return false;
+	if (mainHeaderConflicts({ ...subject, projectKey }, probe)) return false;
 	if (ownsLiveMain({ ...subject, projectKey }, file, probe, false)) return true;
 	return saved?.kind === "main" && saved.file === file && saved.projectKey === projectKey &&
 		isSavedTranscriptVersion(readUsageFileStamp(file), saved);
@@ -54,14 +53,22 @@ export function indexedMainIdentity(file, saved, stamp) {
 	return sameFileIdentity(stamp, saved);
 }
 
+/** Missing header fields do not contradict an otherwise selected candidate. */
+export function mainHeaderConflicts({ sessionId, projectKey }, probe) {
+	const headerProject = projectKeyOf(probe.cwd);
+	return (probe.id != null && probe.id !== sessionId) || (headerProject != null && headerProject !== projectKey);
+}
+
 /** A new live path earns trust by name or header; a replacement has to prove both scoped keys. */
 export function ownsLiveMain(subject, file, probe, sameIdentity) {
 	if (sameIdentity === true) return true;
 	if (probe.pending) return false;
 	const { sessionId, projectKey } = subject;
-	const headerProject = projectKeyOf(probe.cwd);
-	if (sameIdentity === false) return probe.id === sessionId && headerProject != null && headerProject === projectKey;
-	if ((probe.id != null && probe.id !== sessionId) || (headerProject != null && headerProject !== projectKey)) return false;
+	if (sameIdentity === false) {
+		const headerProject = projectKeyOf(probe.cwd);
+		return probe.id === sessionId && headerProject != null && headerProject === projectKey;
+	}
+	if (mainHeaderConflicts(subject, probe)) return false;
 	return probe.id === sessionId || idFromFileName(file) === sessionId;
 }
 

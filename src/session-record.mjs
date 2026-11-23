@@ -1,14 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
 import { idFromFileName } from "./collect/sessions.mjs";
-import { createSessionFileLocator, isSavedTranscriptVersion, ownsLiveMain, probeSessionHeader } from "./collect/session-files.mjs";
+import { createSessionFileLocator, isSavedTranscriptVersion, mainHeaderConflicts, ownsLiveMain, probeSessionHeader } from "./collect/session-files.mjs";
 import { senpiTaskStoreDir } from "./collect/tasks.mjs";
 import { isExactInode, readUsageFileStamp } from "./collect/usage.mjs";
 import { DEFAULT_CONFIG } from "./config.mjs";
 import { maskedSubjectKey, streamDecisions, subjectIdJoinKey } from "./decisions.mjs";
 import { streamInvestigations } from "./investigations.mjs";
 import { safeSubjectId } from "./session-id.mjs";
-import { pathKey } from "./paths.mjs";
+import { isInside, pathKey } from "./paths.mjs";
 import { ENDED_LOCATION, endedKey, endedSelector, streamEnded } from "./session-ledger.mjs";
 import { ledgerParentSubject, rememberParentOwner, sessionSubjects, subjectKey, subjectOf, uniqueMatch } from "./session-subject.mjs";
 import { compactUsage, fresh, parentSubject, readUsageIndex, usageEntryFor } from "./usage-index.mjs";
@@ -1133,7 +1133,7 @@ function* dirNames(directory) {
 	}
 }
 
-function findRecordFiles(paths, nodes, ancestors, locator, usage, ambiguous) {
+function findRecordFiles(paths, nodes, ancestors, locator, usage, ambiguous, auditRetention) {
 	const wanted = new Set(nodes.filter((node) => !nonEmpty(node.taskId)).map((node) => subjectKey(subjectOf(node))));
 	const main = new Map();
 	const unscoped = new Map();
@@ -1164,7 +1164,21 @@ function findRecordFiles(paths, nodes, ancestors, locator, usage, ambiguous) {
 		if (!nonEmpty(taskId)) {
 			const subject = subjectOf(node);
 			const key = subjectKey(subject);
-			return { sessionId, file: locator ? locator.mainFile(subject) : subject.projectKey == null ? unscoped.get(key)?.file : main.get(key) };
+			const file = locator ? locator.mainFile(subject) : subject.projectKey == null ? unscoped.get(key)?.file : main.get(key);
+			// Detail uses fast filename/index discovery. Check only its final choice,
+			// not every candidate, and leave audit preparation's byte budget alone.
+			if (!auditRetention && file) {
+				const stat = statSafe(file);
+				if (!stat?.isFile()) return { sessionId };
+				const projectKey = subject.projectKey ?? (isInside(file, paths.sessionsDir)
+					? path.basename(path.dirname(file)) : usageEntryOf(usage, node, ambiguous)?.projectKey);
+				const probe = probeSessionHeader(file, stat.size, Infinity);
+				if (mainHeaderConflicts({ ...subject, projectKey }, probe)) {
+					node.usageStoreUnresolved = true;
+					return { sessionId };
+				}
+			}
+			return { sessionId, file };
 		}
 		const owner = childStoreOf(node, ancestors);
 		const candidate = childCandidate({ taskId, sessionId, ...owner });
@@ -1547,7 +1561,7 @@ export function loadSessionRecord({ paths, subject, id = subject?.sessionId, row
 	const decisionHistory = scanDecisionHistory(streamDecisions(paths), row, activeWindows(row, descendants, now), retained?.machine);
 	const owners = healthAttributionOwners([row, ...descendants], () => streamEnded(paths), usage, liveOwners);
 	const decisionJoin = joinSessionDecisions(row, descendants, () => streamInvestigations(paths), () => streamDecisions(paths, sinceMs), owners, retained, paths.health.jobsDir);
-	const files = findRecordFiles(paths, [row, ...scanned], ancestors, locator, usage, ambiguous);
+	const files = findRecordFiles(paths, [row, ...scanned], ancestors, locator, usage, ambiguous, auditRetention);
 
 	const messages = [];
 	const skipped = [];
