@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import { basename, dirname } from "node:path";
 import { performance } from "node:perf_hooks";
 import { StringDecoder } from "node:string_decoder";
 import { DEFAULT_CONFIG } from "../config.mjs";
@@ -36,6 +37,8 @@ export const RECORD_STRUCTURE_LIMIT = 64 * 1024;
 const USAGE_BUFFER_LIMIT = 1024 * 1024;
 const READ_CHUNK = 4 * 1024 * 1024;
 const HEAD_LIMIT = 4096;
+const TORN_DIR_ENTRY_LIMIT = 4096;
+const TORN_BACKUP_LIMIT = 32;
 const BOM_0 = 0xef;
 const BOM_1 = 0xbb;
 const BOM_2 = 0xbf;
@@ -883,6 +886,34 @@ function readRange(fd, position, length, onRead) {
 	return got === length ? buffer : buffer.subarray(0, got);
 }
 
+function tornBackupNames(file) {
+	const prefix = `${basename(file)}.torn-`;
+	const names = [];
+	try {
+		const dir = fs.opendirSync(dirname(file));
+		try {
+			for (let i = 0; i <= TORN_DIR_ENTRY_LIMIT; i++) {
+				const entry = dir.readSync();
+				if (!entry) return names.sort();
+				if (i === TORN_DIR_ENTRY_LIMIT) break;
+				if (!entry.name.startsWith(prefix)) continue;
+				if (names.length === TORN_BACKUP_LIMIT) break;
+				names.push(entry.name);
+			}
+		} finally {
+			dir.closeSync();
+		}
+	} catch {
+		// An incomplete listing is not evidence of append-only growth.
+	}
+	return undefined;
+}
+
+function sameTornBackupNames(before, after) {
+	return before !== undefined && after !== undefined &&
+		before.length === after.length && before.every((name, i) => name === after[i]);
+}
+
 // BigInt stats preserve all inode bits, but their *timeMs fields truncate fractions.
 function milliseconds(ns) {
 	return Number(ns / 1_000_000_000n) * 1000 + Number(ns % 1_000_000_000n) / 1_000_000;
@@ -978,12 +1009,18 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 		}
 
 		let rewound = false;
-		if (!restart && checkFragment) {
-			// Growth can hide a truncate-and-replace. Check the record's start
-			// (including its ID) and the bytes just before the saved scan cursor.
+		let backups;
+		if (!restart && hasFragment && !checkFragment) {
+			// Do not bless a backup that appeared while continuing an unchanged stamp.
+			backups = from.partial.tornBackups;
+		} else if (!restart && checkFragment) {
+			// Windows miss edits between them. Senpi saves torn bytes under
+			// a new name before truncating the session in place.
+			backups = tornBackupNames(file);
 			const length = Math.min(from.scanOffset - from.offset, HEAD_LIMIT);
 			const { firstHash, lastHash } = from.partial;
-			if (firstHash === undefined || lastHash === undefined) {
+			if (!sameTornBackupNames(from.partial.tornBackups, backups) ||
+				firstHash === undefined || lastHash === undefined) {
 				rewound = true;
 			} else {
 				if (2 * length > maxBytes) {
@@ -1127,6 +1164,7 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 			const length = Math.min(position - offset, HEAD_LIMIT);
 			acc.firstHash = fragmentHash(offset, length);
 			acc.lastHash = fragmentHash(position - length, length);
+			acc.tornBackups = !restart && hasFragment ? backups : tornBackupNames(file);
 		}
 		return {
 			offset,

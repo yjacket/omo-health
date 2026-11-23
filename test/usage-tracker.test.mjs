@@ -287,16 +287,14 @@ for (const spent of [0, 256]) test(`(IS-1, IS-12) an in-place longer replacement
 
 	const replacement = `${bigRecord(1024, usage(31, 2)).replace('"model":"m"', '"model":"replacement"')}\n`;
 	assert.ok(replacement.length > torn.length);
+	fs.writeFileSync(`${file}.torn-${T0}-00000001`, torn);
 	fs.truncateSync(file, offset);
 	fs.appendFileSync(file, replacement);
 	const stat = fs.statSync(file);
 	assert.deepEqual([fs.statSync(file, { bigint: true }).ino.toString(), stat.birthtimeMs], [ino, birthtimeMs]);
-	const checkBytes = 2 * torn.length; // The short fragment fills both windows.
 
 	if (spent) {
-		assert.equal(s.tracker.tick(world, { maxBytes: spent }).bytesRead, 0, "defer when the checks do not fit");
-		assert.equal(s.index.get(key(s, id)).scanOffset, scanOffset, "keep the old cursor until it can be checked");
-		assert.equal(s.tracker.tick(world, { maxBytes: checkBytes + spent }).bytesRead, checkBytes + spent);
+		assert.equal(s.tracker.tick(world, { maxBytes: spent }).bytesRead, spent, "the new backup rewinds without charging window checks");
 		const entry = s.index.get(key(s, id));
 		assert.equal(entry.offset, offset);
 		assert.equal(entry.scanOffset, offset + spent);
@@ -310,7 +308,54 @@ for (const spent of [0, 256]) test(`(IS-1, IS-12) an in-place longer replacement
 	assert.deepEqual(Object.keys(clean.models).sort(), ["p/m", "p/replacement"]);
 	assert.equal(s.tracker.tokensOf(sub(s, id)).tokens.total, clean.total);
 	assert.deepEqual(s.index.get(key(s, id)).published, clean);
-	assert.equal(tick.bytesRead, replacement.length - spent + (spent ? 0 : checkBytes), "after the checks, the replacement is scanned once from the committed offset");
+	assert.equal(tick.bytesRead, replacement.length - spent, "the replacement is scanned once from the committed offset");
+});
+
+test("(IS-1, IS-2, IS-12) a new torn backup invalidates matching fragment windows", (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const id = "middle-torn-rewrite";
+	const file = mainFile(s.paths, id);
+	const world = makeWorld({ now: s.clock.now(), sessions: [sessionState({ id, file, cwd: s.cwd })] });
+	const prefix = bigRecord(5 * 1024, usage(7));
+	const fragment = (total, model) => `{"note":"${"x".repeat(8192)}",${bigRecord(3 * 1024 * 1024, usage(total))
+		.replace('"model":"m"', `"model":"${model}"`).slice(1, -1)}`;
+	const torn = fragment(13, "old");
+	const replacement = fragment(29, "new");
+	writeLines(file, [prefix]);
+	s.tracker.tick(world);
+	fs.appendFileSync(file, torn);
+	const budget = 2 * 1024 * 1024;
+	assert.equal(s.tracker.tick(world, { maxBytes: budget }).bytesRead, budget);
+	const { offset, scanOffset, size, ino, birthtimeMs } = s.index.get(key(s, id));
+	assert.equal(offset, prefix.length + 1);
+	assert.equal(scanOffset, offset + budget);
+	assert.equal(s.tracker.tokensOf(sub(s, id)).tokens.total, 7);
+	assert.equal(torn.slice(0, 4096), replacement.slice(0, 4096));
+	assert.equal(torn.slice(budget - 4096, budget), replacement.slice(budget - 4096, budget));
+	assert.notEqual(torn.slice(4096, budget - 4096), replacement.slice(4096, budget - 4096));
+
+	// Senpi publishes the cut bytes before truncating in place.
+	fs.writeFileSync(`${file}.torn-${T0}-00000001`, torn);
+	fs.truncateSync(file, offset);
+	fs.appendFileSync(file, `${replacement}}\n${bigRecord(0, usage(3))}\n`);
+	const stat = fs.statSync(file);
+	assert.ok(stat.size > size);
+	assert.deepEqual([fs.statSync(file, { bigint: true }).ino.toString(), stat.birthtimeMs], [ino, birthtimeMs]);
+	const clean = readUsage(file).effective;
+	const modelIds = (totals) => Object.keys(totals.models).sort();
+	assert.deepEqual([clean.total, modelIds(clean)], [39, ["p/m", "p/new"]]);
+	const tick = s.tracker.tick(world, { maxBytes: budget });
+	const interim = s.tracker.tokensOf(sub(s, id));
+	const interimOffset = s.index.get(key(s, id)).scanOffset;
+	const second = s.tracker.tick(world, { maxBytes: budget });
+	assert.deepEqual([
+		s.tracker.tokensOf(sub(s, id)).tokens.total,
+		modelIds(s.index.get(key(s, id)).published),
+	], [clean.total, modelIds(clean)]);
+	assert.equal(tick.bytesRead, budget, "the rescan is charged from the committed offset");
+	assert.deepEqual([interim.pending, interim.tokens.total, interimOffset], [true, 7, offset + budget]);
+	assert.equal(second.bytesRead, stat.size - offset - budget);
 });
 
 test("(IS-1) a same-size rewrite with a torn fragment recounts records between the fingerprints", (t) => {
@@ -1110,8 +1155,12 @@ for (const [label, bytes] of [["40 MiB", 40 * 1024 * 1024], ["small", 512 * 1024
 		assert.equal(restarted.tokensOf(sub(s, id)).tokens.total, 7);
 		const append = `\n${bigRecord(0, usage(11))}\n`;
 		const appendedBytes = Buffer.byteLength(append);
+		fs.writeFileSync(`${file}-unrelated.torn-${T0}-00000001`, "not this session");
 		fs.appendFileSync(file, append);
 
+		const scanOffset = s.index.get(key(s, id)).scanOffset;
+		assert.equal(s.tracker.tick(world, { maxBytes: 256 }).bytesRead, 0, "defer when the checks do not fit");
+		assert.equal(s.index.get(key(s, id)).scanOffset, scanOffset, "keep the old cursor until it can be checked");
 		assert.equal(s.tracker.tick(world).bytesRead, appendedBytes + 2 * 4096, "only the window checks and append spend the live tick budget");
 		const live = s.tracker.tokensOf(sub(s, id)).tokens;
 		assert.deepEqual([live.total, live.turns], [18, 2]);

@@ -446,7 +446,8 @@ function entryBytes(entry, line) {
 	// counters). It is a floor, not a measure of the resident strings' encoding.
 	let serialized = line.length;
 	for (let i = 0; i < line.length; i++) if (line.charCodeAt(i) > 127) serialized++;
-	const fragmentBytes = entry.partial ? 2 * 64 : 0; // Two in-memory SHA-1 strings, including headers.
+	let fragmentBytes = entry.partial ? 2 * 64 : 0; // Two in-memory SHA-1 strings, including headers.
+	for (const name of entry.partial?.tornBackups ?? []) fragmentBytes += 32 + stringBytes(name);
 	return INDEX_ENTRY_OVERHEAD + fragmentBytes + modelBytes + Math.max(strings, serialized);
 }
 
