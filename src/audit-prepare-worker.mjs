@@ -41,8 +41,8 @@ export function prepareAudit({ subject, now, bounds, indexEntries, indexFull, li
 		const entry = usageEntryOf(index, session);
 		const indexVersion = auditIndexVersion(entry);
 		const mainSubject = record.subject ?? subjectOf({ ...session, sessionId: session.ledgerIds?.sessionId ?? session.sessionId });
-		const file = session.taskId ? entry?.file : mainFile(mainSubject);
-		if (!session.taskId && ambiguous.has(subjectKey(mainSubject))) return { modelsAmbiguous: true };
+		const file = mainSubject.taskId ? entry?.file : mainFile(mainSubject);
+		if (!mainSubject.taskId && ambiguous.has(subjectKey(mainSubject))) return { modelsAmbiguous: true };
 		let warning;
 		const maxFileBytes = Math.min(scanBounds.messageScanMaxBytes, remaining);
 		const report = readVersionedAuditTimeline(file, tokens, { maxFileBytes, timeline, log: { warn: (_event, detail) => { warning = detail; } } });

@@ -14,7 +14,7 @@ const SESSION_CACHE_MAX = 20;
 const ACTIVE_AUDIT_STATUSES = new Set(["requested", "queued", "launching", "running"]);
 const isAuditActive = (state) => Boolean(state && (ACTIVE_AUDIT_STATUSES.has(state.status) || state.holdUntilExit === true));
 const subjectOfRecord = ({ subject, session }, id) =>
-	subject ?? subjectOf({ ...session, sessionId: (session?.ledgerIds ?? session)?.sessionId || id });
+	subjectOf(subject ?? { ...session, sessionId: (session?.ledgerIds ?? session)?.sessionId || id });
 
 function detailSignature(paths, files) {
 	return JSON.stringify([files.map(auditFileVersion), recordsStamp(paths)]);

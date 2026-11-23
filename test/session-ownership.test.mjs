@@ -4,9 +4,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
 import { prepareAudit } from "../src/audit-prepare-worker.mjs";
-import { auditModelFacts } from "../src/auditor.mjs";
+import { auditModelFacts, createAuditor, requestAudit } from "../src/auditor.mjs";
 import { DEFAULT_CONFIG } from "../src/config.mjs";
-import { auditBundle } from "../src/judge/audit.mjs";
+import { auditBundle, resolveAuditModel } from "../src/judge/audit.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 import { buildSessionSnapshot, detectEnded } from "../src/session-board.mjs";
 import { appendEnded, appendEndedBatch, streamEnded } from "../src/session-ledger.mjs";
@@ -18,7 +18,7 @@ import { createSessionFileLocator } from "../src/collect/session-files.mjs";
 import { SessionRegistry } from "../src/collect/sessions.mjs";
 import { normalizeTask, projectStoreName, taskStoreDir } from "../src/collect/tasks.mjs";
 import { buildWorld } from "../src/state.mjs";
-import { createUsageIndex } from "../src/usage-index.mjs";
+import { createUsageIndex, parentSubject, readUsageIndex } from "../src/usage-index.mjs";
 import { createUsageTracker } from "../src/usage-tracker.mjs";
 import { expectedSelector } from "./helpers/ended-selector.mjs";
 import { E, tmpDir, writeJsonl, writeTask } from "./helpers/fixtures.mjs";
@@ -144,6 +144,136 @@ test("plan94 a same-named main enters history only for the project that ended", 
 	const history = buildEnded(loadUiInputs({ paths, now, env: {} }));
 	assert.deepEqual(history.rows.map(({ sessionId, cwd }) => [sessionId, cwd]), [["review.1", a]]);
 	assert.deepEqual(current.groups.flatMap(({ sessions }) => sessions.map(({ sessionId, cwd }) => [sessionId, cwd])), [["review.1", b]]);
+});
+
+test("plan109 a main and task transcript with the same project and ID keep their own tokens and models", async (t) => {
+	const { paths, a } = setup(t);
+	const later = main("review.shared", a);
+	const earlier = {
+		...later, kind: "child", taskId: "st_shared", parentSessionId: "review.parent",
+		parentProjectKey: subjectOf(later).projectKey, startedMs: now - 4000, endedMs: now - 2000,
+	};
+	const name = `2026-10-10T12-00-00-000Z_${later.sessionId}.jsonl`;
+	writeUsage(path.join(paths.sessionsDir, subjectOf(later).projectKey, name), 43, "claude-opus-5-5");
+	const childFile = path.join(taskStoreDir(a), "children", earlier.taskId, "sessions", earlier.taskId, name);
+	writeJsonl(childFile, [E.assistant({
+		ms: now - 3500, provider: "openai", model: "gpt-5-5", usage: { input: 17, output: 0, cacheRead: 0, cacheWrite: 0 },
+	})]);
+	fs.mkdirSync(paths.agentDir, { recursive: true });
+	fs.writeFileSync(paths.authFile, JSON.stringify({ openai: {}, "anthropic-subscription": {} }));
+	fs.mkdirSync(path.dirname(paths.omoJsonc), { recursive: true });
+	fs.writeFileSync(paths.omoJsonc, JSON.stringify({ "[native]": { categories: {
+		ultrabrain: { models: ["anthropic-subscription/claude-opus-5-5"] },
+		architect: { models: ["openai/gpt-5-5"] },
+	} } }));
+	for (const row of [earlier, later]) assert.ok(appendEnded(paths, row, { nowMs: now }));
+	const index = createUsageIndex({ file: paths.health.usageIndexFile, clock });
+	const tracker = createUsageTracker({ paths, clock, index, locator: createSessionFileLocator({ paths, clock }) });
+	tracker.queueLedger(streamEnded(paths, { withLocation: true }));
+	tracker.tick({ now, sessions: new Map(), tasks: [] });
+	index.save();
+
+	const history = buildEnded(loadUiInputs({ paths, now, env: {} }));
+	const actual = [later, earlier].map((row) => {
+		const shown = history.rows.find(({ rowSelector }) => rowSelector === expectedSelector(row));
+		let facts;
+		const { record, audit } = createDetailOperations({ paths, env: {}, resolveModel: (paths, config, input) => {
+			facts = input;
+			return resolveAuditModel(paths, config, input);
+		} })({
+			kind: "detail", id: row.sessionId, row: expectedSelector(row), now,
+		});
+		return [shown?.tokens?.total, record?.tokens?.total, facts?.sessionModels, facts?.sessionModelsKnown, audit?.planned?.model];
+	});
+	assert.deepEqual(actual, [
+		[43, 43, ["anthropic-subscription/claude-opus-5-5"], true, "openai/gpt-5-5"],
+		[17, 17, ["openai/gpt-5-5"], true, "anthropic-subscription/claude-opus-5-5"],
+	]);
+	assert.equal(loadSessionRecord({ paths, id: later.sessionId, now }).error, "ambiguous-session");
+	let at = now;
+	const auditClock = { now: () => at };
+	const summaries = ["메인 세션의 사용량은 적절했습니다.", "자식 세션의 점검 결과는 정상이었습니다."];
+	const starts = [];
+	const runner = {
+		start(job) { starts.push(job.jobId); return { pid: 5000, jobId: job.jobId }; },
+		adoptJob: () => "running",
+		poll(jobId) {
+			return { status: "done", exitCode: 0, result: {
+				overall: "sound", summary: summaries[starts.indexOf(jobId)],
+				tokens: { judgment: "normal", explanation: "정상 범위입니다." },
+				checks: [{ item: "토큰", judgment: "unverifiable", explanation: "자료가 부족합니다.", evidence: [] }],
+				recommendations: [], confidence: 0.8,
+			} };
+		},
+	};
+	const boot = () => createAuditor({ paths, clock: auditClock, config: DEFAULT_CONFIG, env: {}, runner });
+	let auditor = boot();
+	t.after(() => auditor.close());
+	for (const [i, row] of [later, earlier].entries()) {
+		const claim = requestAudit(paths, subjectOf(row), now + i);
+		assert.equal(claim.created, true);
+		assert.equal(claim.request.taskId, row.taskId ?? null);
+	}
+	for (let i = 0; i < 2; i++) {
+		at += 31_000;
+		auditor.tick(at);
+		await auditor.preparing();
+		auditor.tick(at);
+		assert.equal(starts.length, i + 1);
+		await auditor.close();
+		auditor = boot();
+		at += 31_000;
+		auditor.tick(at);
+	}
+	const restartedDetail = createDetailOperations({ paths, env: {} });
+	assert.deepEqual([later, earlier].map((row) => {
+		const { audit } = restartedDetail({ kind: "detail", id: row.sessionId, row: expectedSelector(row), now: at });
+		return [audit?.state?.taskId, audit?.state?.status, audit?.state?.result?.summary];
+	}), [[null, "done", summaries[0]], [earlier.taskId, "done", summaries[1]]]);
+});
+
+test("plan110 a persisted grandchild belongs only to its task parent when a main reuses the parent's ID", (t) => {
+	const { paths, a } = setup(t);
+	const sharedId = "review.shared";
+	const root = main("review.root", a);
+	const grandchild = { sessionId: "review.grandchild", taskId: "st_grandchild", cwd: a, status: "running" };
+	const parent = { sessionId: sharedId, taskId: "st_parent", cwd: a, status: "running", children: [grandchild] };
+	const later = main(sharedId, a);
+	const projectKey = subjectOf(later).projectKey;
+	const snapshot = (sessions) => ({ v: 1, groups: [{ sessions }] });
+	const world = { now, paths, sessions: new Map(), tasks: [] };
+	const ended = detectEnded(snapshot([{ ...root, children: [parent] }]), snapshot([]), world, now - 2000);
+	assert.equal(appendEndedBatch(paths, ended, { nowMs: now }).filter(({ appended }) => appended).length, 3);
+	assert.ok(appendEnded(paths, later, { nowMs: now }));
+	const filename = (row) => `2026-10-10T12-00-00-000Z_${row.sessionId}.jsonl`;
+	writeUsage(path.join(paths.sessionsDir, projectKey, filename(later)), 43);
+	for (const [row, tokens] of [[parent, 17], [grandchild, 6]]) {
+		writeUsage(path.join(taskStoreDir(a), "children", row.taskId, "sessions", row.taskId, filename(row)), tokens);
+	}
+
+	const rows = [...streamEnded(paths, { withLocation: true })];
+	const stored = rows.find((row) => row.taskId === grandchild.taskId);
+	assert.deepEqual([stored.parentProjectKey, stored.parentSessionId, stored.parentTaskId], [projectKey, sharedId, parent.taskId]);
+	const index = createUsageIndex({ file: paths.health.usageIndexFile, clock });
+	const tracker = createUsageTracker({ paths, clock, index, locator: createSessionFileLocator({ paths, clock }) });
+	tracker.queueLedger(rows);
+	tracker.tick(world);
+	index.save();
+	const reloaded = readUsageIndex(paths.health.usageIndexFile);
+	assert.deepEqual(parentSubject(reloaded.getForSubject(subjectOf(grandchild))), subjectOf(parent));
+	const history = buildEnded(loadUiInputs({ paths, now, env: {} }));
+	const storedParent = rows.find((row) => row.taskId === parent.taskId);
+	assert.deepEqual([storedParent, later].map((row) => {
+		const usage = tracker.tokensOf(subjectOf(row));
+		const shown = history.rows.find(({ rowSelector }) => rowSelector === expectedSelector(row));
+		const detail = readDetail(paths, row);
+		assert.equal(detail.found, true);
+		return [usage?.treeTokens, shown?.tokens?.total, shown?.treeTokens,
+			detail.children.map(({ sessionId, taskId }) => [sessionId, taskId])];
+	}), [
+		[23, 17, 23, [[grandchild.sessionId, grandchild.taskId]]],
+		[null, 43, null, []],
+	]);
 });
 
 test("plan99 a fresh heartbeat owns the live file despite a raw-ID registry collision", async (t) => {

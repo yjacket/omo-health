@@ -347,9 +347,9 @@ export function buildEnded(inputs) {
 	// only trusts a published link or the visible row's explicit parent scope.
 	const links = all.map((row) => {
 		let parent = ledgerParentSubject(row);
-		if (!parent && row.parentSessionId) {
+		if (row.parentSessionId && row.parentTaskId == null) {
 			const entry = usageEntryOf(published, row, ambiguous);
-			if (entry?.parentSessionId === row.parentSessionId) parent = parentSubject(entry);
+			if (entry?.parentSessionId === row.parentSessionId && (entry.parentKey || !parent)) parent = parentSubject(entry);
 		}
 		const parentKey = subjectKey(parent);
 		if (row.kind === "child" && parentKey) childRows.set(parentKey, (childRows.get(parentKey) ?? 0) + 1);

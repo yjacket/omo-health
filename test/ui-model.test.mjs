@@ -495,10 +495,10 @@ const overflowTitle = "토큰 합계가 표시할 수 있는 범위를 넘었습
 function overflowIndex(paths, rows, cwd) {
 	const file = paths.health.usageIndexFile;
 	const index = createUsageIndex({ file, clock: createFakeClock(NOW) });
-	for (const [id, input, parentSessionId] of rows) {
+	for (const [id, input, parentSessionId, taskId] of rows) {
 		const transcript = path.join(path.dirname(file), `${id}.jsonl`);
 		write(transcript, `{"type":"usage","provider":"p","model":"m","usage":{"input":${input}}}\n`);
-		index.update(sub(id, cwd), transcript, { parentSessionId: parentSessionId ?? null });
+		index.update(subjectOf({ sessionId: id, cwd, taskId }), transcript, { parentSessionId: parentSessionId ?? null });
 	}
 	index.save();
 	return index;
@@ -516,7 +516,7 @@ function tokenFormatters(...names) {
 
 it("board overflow survives snapshot JSON and renders on the card and child row", () => {
 	const { paths } = makeHome();
-	const index = overflowIndex(paths, [["main", "1e309"], ["child", "1e309", "main"], ["finite", "5"], ["negative", "-1e309", "finite"]], "C:/dev/proj");
+	const index = overflowIndex(paths, [["main", "1e309"], ["child", "1e309", "main", "st_x"], ["finite", "5"], ["negative", "-1e309", "finite"]], "C:/dev/proj");
 	const tracker = createUsageTracker({ paths, index, clock: createFakeClock(NOW) });
 	assert.equal(tracker.tokensOf(sub("main", "C:/dev/proj")).tokens.total, Infinity);
 	const world = makeWorld({
@@ -742,7 +742,7 @@ it("(gate 17) the disk-backed full state renders a dash in history, detail, and 
 	index.markMissing(sub("old"));
 	assert.equal(index.prune(NOW + DAY, 0), 1);
 	index.update(sub("root"), transcript);
-	index.update(sub("child"), transcript, { parentSessionId: "root" });
+	index.update(subjectOf({ sessionId: "child", taskId: "st_child" }), transcript, { parentSessionId: "root" });
 	index.save();
 	const recovered = view();
 	assert.equal(recovered.tokens.total, 42);
@@ -1349,7 +1349,7 @@ describe("ui model", () => {
 			const parentProjectKey = sub("main-a", cwd).projectKey;
 			writeUsage(home.paths, [
 				{ id: taskId, meta: { kind: "child", taskId } },
-				{ id: "child-session", total: 75 },
+				{ id: "child-session", total: 75, meta: { kind: "child", taskId } },
 				{ id: "main-a", total: 100 },
 				{ id: "main-b", total: 100 },
 				{ id: "counted-a", total: 20, meta: { parentSessionId: "main-a" } },
@@ -1393,8 +1393,8 @@ describe("ui model", () => {
 			const home = makeHome();
 			writeUsage(home.paths, [
 				{ id: "m", total: 100 },
-				{ id: "c", total: 50, meta: { parentSessionId: "m" } },
-				{ id: "g", total: 25, meta: { parentSessionId: "c" } },
+				{ id: "c", total: 50, meta: { kind: "child", taskId: "st_c", parentSessionId: "m" } },
+				{ id: "g", total: 25, meta: { kind: "child", taskId: "st_g", parentSessionId: "c", parentKey: subjectKey(subjectOf({ sessionId: "c", taskId: "st_c" })) } },
 			]);
 			writeRows(home.paths, [
 				row("m", NOW - 1000),

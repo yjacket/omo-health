@@ -10,8 +10,8 @@ const src = process.env.OMOH_MEMORY_BASELINE
 const load = (name) => import(new URL(`${name}.mjs`, src));
 const { createUsageIndex, INDEX_BYTE_BUDGET, USAGE_TICK_BYTES } = await load("usage-index");
 const subjectModule = process.env.OMOH_MEMORY_BASELINE ? null : await load("session-subject");
-const sub = (sessionId, cwd) => subjectModule ? subjectModule.subjectOf({ sessionId, cwd }) : sessionId;
-const key = (sessionId, cwd) => subjectModule ? subjectModule.subjectKey(sub(sessionId, cwd)) : sessionId;
+const sub = (sessionId, cwd, taskId) => subjectModule ? subjectModule.subjectOf({ sessionId, cwd, taskId }) : sessionId;
+const key = (sessionId, cwd, taskId) => subjectModule ? subjectModule.subjectKey(sub(sessionId, cwd, taskId)) : sessionId;
 const { resolvePaths } = await load("paths");
 const { appendEnded, hasEnded, streamEnded } = await load("session-ledger");
 const { backfillOnce } = await load("session-backfill");
@@ -181,7 +181,7 @@ if (operation === "all-sources") {
 		fs.closeSync(fd);
 	}
 	const index = open();
-	assert.equal(index.update(sub("seed", cwd), target, { kind: "child", taskId: "st_seed" }), USAGE_TICK_BYTES);
+	assert.equal(index.update(sub("seed", cwd, "st_seed"), target, { kind: "child", taskId: "st_seed" }), USAGE_TICK_BYTES);
 	const prefix = "C:/작업/" + ("a".repeat(194) + "/").repeat(100);
 	for (let i = 0; !index.full; i++) index.markMissing(sub(`existing-${i}`), { kind: "main", file: `${prefix}${i}` });
 	assert.ok(index.save());
@@ -210,7 +210,7 @@ if (operation === "all-sources") {
 	const full = mode === "full";
 	const index = open();
 	assert.equal(index.full, full);
-	assert.equal(index.get(key("seed", sparseTick ? path.join(dir, "prj") : undefined))?.published?.total, full ? 42 : undefined);
+	assert.equal(index.get(key("seed", sparseTick ? path.join(dir, "prj") : undefined, sparseTick ? "st_seed" : undefined))?.published?.total, full ? 42 : undefined);
 	const locator = createSessionFileLocator({ paths, clock });
 	const tracker = createUsageTracker({ paths, index, locator, clock });
 	const queue = () => tracker.queueLedger(streamEnded(paths, { sinceMs: now - 30 * day, withLocation: true }));
@@ -226,7 +226,7 @@ if (operation === "all-sources") {
 			assert.equal(operation === "positioned-tick" ? queue() : tracker.queueLedger(sparse()), full ? 1030 : 1031);
 			const tick = tracker.tick({ sessions: new Map() });
 			assert.equal(tick.bytesRead, full ? 0 : USAGE_TICK_BYTES);
-			assert.equal(tracker.tokensOf(sub("seed", sparseTick ? path.join(dir, "prj") : undefined))?.tokens?.total, 42);
+			assert.equal(tracker.tokensOf(sub("seed", sparseTick ? path.join(dir, "prj") : undefined, sparseTick ? "st_seed" : undefined))?.tokens?.total, 42);
 			break;
 		}
 		case "append":
@@ -300,5 +300,5 @@ if (operation === "all-sources") {
 		default:
 			assert.fail(`unknown operation: ${operation}`);
 	}
-	if (full) assert.equal(index.get(key("seed"))?.published?.total, 42);
+	if (full) assert.equal(index.get(key("seed", sparseTick ? path.join(dir, "prj") : undefined, sparseTick ? "st_seed" : undefined))?.published?.total, 42);
 }

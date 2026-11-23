@@ -37,8 +37,6 @@ export const RECORD_STRUCTURE_LIMIT = 64 * 1024;
 const USAGE_BUFFER_LIMIT = 1024 * 1024;
 const READ_CHUNK = 4 * 1024 * 1024;
 const HEAD_LIMIT = 4096;
-const TORN_DIR_ENTRY_LIMIT = 4096;
-const TORN_BACKUP_LIMIT = 32;
 const BOM_0 = 0xef;
 const BOM_1 = 0xbb;
 const BOM_2 = 0xbf;
@@ -971,32 +969,30 @@ function readRange(fd, position, length, onRead) {
 	return got === length ? buffer : buffer.subarray(0, got);
 }
 
-function tornBackupNames(file) {
+function tornBackupDigest(file) {
 	const prefix = `${basename(file)}.torn-`;
-	const names = [];
+	// Eight bytes of count followed by the order-independent XOR of SHA-256s.
+	const digest = Buffer.alloc(8 + 32);
+	let count = 0n;
 	try {
 		const dir = fs.opendirSync(dirname(file));
 		try {
-			for (let i = 0; i <= TORN_DIR_ENTRY_LIMIT; i++) {
-				const entry = dir.readSync();
-				if (!entry) return names.sort();
-				if (i === TORN_DIR_ENTRY_LIMIT) break;
+			for (let entry; (entry = dir.readSync()) !== null;) {
 				if (!entry.name.startsWith(prefix)) continue;
-				if (names.length === TORN_BACKUP_LIMIT) break;
-				names.push(entry.name);
+				count++;
+				const hash = crypto.createHash("sha256").update(entry.name).digest();
+				for (let i = 0; i < hash.length; i++) digest[8 + i] ^= hash[i];
 			}
 		} finally {
 			dir.closeSync();
 		}
+		digest.writeBigUInt64BE(count);
+		// Keep a single fixed-size string in the index's existing fragment weight accounting.
+		return [digest.toString("hex")];
 	} catch {
 		// An incomplete listing is not evidence of append-only growth.
 	}
 	return undefined;
-}
-
-function sameTornBackupNames(before, after) {
-	return before !== undefined && after !== undefined &&
-		before.length === after.length && before.every((name, i) => name === after[i]);
 }
 
 // BigInt stats preserve all inode bits, but their *timeMs fields truncate fractions.
@@ -1101,10 +1097,10 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 		} else if (!restart && checkFragment) {
 			// Windows miss edits between them. Senpi saves torn bytes under
 			// a new name before truncating the session in place.
-			backups = tornBackupNames(file);
+			backups = tornBackupDigest(file);
 			const length = Math.min(from.scanOffset - from.offset, HEAD_LIMIT);
 			const { firstHash, lastHash } = from.partial;
-			if (!sameTornBackupNames(from.partial.tornBackups, backups) ||
+			if (backups === undefined || from.partial.tornBackups?.[0] !== backups[0] ||
 				firstHash === undefined || lastHash === undefined) {
 				rewound = true;
 			} else {
@@ -1249,7 +1245,7 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 			const length = Math.min(position - offset, HEAD_LIMIT);
 			acc.firstHash = fragmentHash(offset, length);
 			acc.lastHash = fragmentHash(position - length, length);
-			acc.tornBackups = !restart && hasFragment ? backups : tornBackupNames(file);
+			acc.tornBackups = !restart && hasFragment ? backups : tornBackupDigest(file);
 		}
 		return {
 			offset,

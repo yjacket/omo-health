@@ -57,8 +57,8 @@ function mainFile(paths, id) {
 }
 
 /** `<cwd>/.omo/senpi-task/children/<taskId>/sessions/<taskId>/<ts>_<sessionId>.jsonl`. */
-const sub = (s, sessionId, cwd = s.cwd) => subjectOf({ sessionId, cwd });
-const key = (s, sessionId, cwd) => subjectKey(sub(s, sessionId, cwd));
+const sub = (s, sessionId, cwd = s.cwd, taskId) => subjectOf({ sessionId, cwd, taskId });
+const key = (s, sessionId, cwd, taskId) => subjectKey(sub(s, sessionId, cwd, taskId));
 
 function childFile(cwd, taskId, sessionId) {
 	return path.join(cwd, ".omo", "senpi-task", "children", taskId, "sessions", taskId, `2026-09-28T12-00-00-000Z_${sessionId}.jsonl`);
@@ -83,9 +83,9 @@ test("cwd-less queue lookup finds a unique indexed child and rejects a cross-pro
 	const s = setup();
 	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
 	const row = { sessionId: "seed", taskId: "st_seed", kind: "child", endedMs: T0 };
-	const own = sub(s, row.sessionId);
+	const own = subjectOf({ ...row, cwd: s.cwd });
 	const otherCwd = path.join(s.root, "other");
-	const other = sub(s, row.sessionId, otherCwd);
+	const other = subjectOf({ ...row, cwd: otherCwd });
 	const query = subjectOf(row);
 	appendEnded(s.paths, { ...row, cwd: s.cwd }, { nowMs: T0 });
 	for (const [subject, cwd, count] of [[own, s.cwd, 42], [other, otherCwd, 7]]) {
@@ -134,7 +134,7 @@ test("cwd-less queue lookup recovers the scoped child cursor from a stripped led
 	appendEnded(s.paths, { ...row, cwd: s.cwd }, { nowMs: T0 });
 	s.tracker.queueLedger([row].values());
 	s.tracker.tick(emptyWorld(s.clock));
-	assert.equal(s.tracker.tokensOf(sub(s, row.sessionId))?.tokens?.total, 42);
+	assert.equal(s.tracker.tokensOf(subjectOf({ ...row, cwd: s.cwd }))?.tokens?.total, 42);
 	assert.equal(s.index.get(subjectKey(subjectOf(row)))?.published?.total, 42);
 });
 
@@ -621,7 +621,7 @@ test("tracker tokens resolve by session id or by a unique task id when the sessi
 	const file = childFile(s.cwd, "st_x", "child-a");
 	writeLines(file, [bigRecord(0, usage(42))]);
 	s.index.update(sub(s, "child-a"), file, { kind: "child", taskId: "st_x" });
-	assert.equal(s.tracker.tokensOf(sub(s, "child-a")).tokens.total, 42);
+	assert.equal(s.tracker.tokensOf(sub(s, "child-a", s.cwd, "st_x")).tokens.total, 42);
 	assert.deepEqual([s.tracker.tokensOf(sub(s, "child-b"), "st_x"), s.tracker.tokensOf(sub(s, "st_x"))], [null, null]);
 	assert.equal(s.tracker.tokensOf(sub(s, null), "st_x").tokens.total, 42);
 });
@@ -652,7 +652,7 @@ test("(plan 61) the next tick withdraws a task-only publication and recounts whe
 	assert.deepEqual([
 		s.tracker.tokensOf(sub(s, null), taskId),
 		s.tracker.tokensOf(sub(s, "parent")).treeTokens,
-		s.index.fresh(s.index.get(key(s, taskId))),
+		s.index.fresh(s.index.get(key(s, taskId, s.cwd, taskId))),
 	], [null, null, false], "neither the old publication nor its contribution to the parent is safe");
 
 	fs.rmSync(second);
@@ -680,13 +680,13 @@ test("(IS-3) deleted task-only usage stays published until a new sole candidate 
 
 	fs.rmSync(first);
 	assert.equal(s.tracker.tick(world).bytesRead, 0);
-	const saved = readUsageIndex(s.paths.health.usageIndexFile).get(key(s, taskId));
+	const saved = readUsageIndex(s.paths.health.usageIndexFile).get(subjectKey(subjectOf(row)));
 	assert.deepEqual([s.tracker.tokensOf(sub(s, null), taskId)?.tokens?.total, saved.gone, compactUsage(saved)?.total], [42, true, 42]);
 
 	writeLines(next, [bigRecord(0, usage(99))]);
 	assert.ok(s.tracker.tick(world).bytesRead > 0);
 	assert.deepEqual(reads, [{ file: first, resumed: false }, { file: next, resumed: false }]);
-	assert.deepEqual([s.index.get(key(s, taskId)).gone, s.tracker.tokensOf(sub(s, null), taskId)?.tokens?.total], [false, 99]);
+	assert.deepEqual([s.index.get(subjectKey(subjectOf(row))).gone, s.tracker.tokensOf(sub(s, null), taskId)?.tokens?.total], [false, 99]);
 });
 
 test("board uses a unique task-only token match but never an ambiguous or wrong-session match", (t) => {
@@ -896,17 +896,19 @@ test("(IS-1, IS-3) cold backfill keeps a main when another project has a child w
 	assert.equal(fs.existsSync(s.paths.health.sessionsDir), false, "no preexisting ledger or token index");
 	assert.deepEqual(backfillOnce(s.paths, T0).errors, []);
 	const rows = [...streamEnded(s.paths, { withLocation: true })];
+	// The beta main (99 tokens) is a different transcript from the beta child (29), so both stay (plan review 110).
 	assert.deepEqual(rows.filter((row) => row.sessionId === id).map(({ cwd, kind }) => [cwd, kind]).sort(), [
-		[beta, "child"], [s.cwd, "main"],
-	], "keep the other project's main, but not the same-project shadow transcript");
+		[beta, "child"], [beta, "main"], [s.cwd, "main"],
+	].sort(), "keep every distinct transcript: the other project's main, the same-project main and the child");
 	assert.deepEqual(rows.filter((row) => row.sessionId === parent).map(({ cwd, childCount }) => [cwd, childCount]).sort(), [
 		[beta, 1], [s.cwd, 0],
 	]);
-	assert.equal(s.tracker.queueLedger(rows.values()), 4);
+	assert.equal(s.tracker.queueLedger(rows.values()), 5);
 	s.tracker.tick(emptyWorld(s.clock));
 	const saved = readUsageIndex(s.paths.health.usageIndexFile);
 	assert.equal(saved.get(key(s, id))?.published?.total, 17);
-	assert.equal(saved.get(key(s, id, beta))?.published?.total, 29);
+	assert.equal(saved.get(key(s, id, beta))?.published?.total, 99, "the same-project main keeps its own total");
+	assert.equal(saved.get(key(s, id, beta, taskId))?.published?.total, 29);
 });
 
 test("(plan 41) main file verification rejects wrong, missing, and oversized headers but trusts matching filenames", (t) => {
@@ -952,11 +954,11 @@ test("a live child attached to another session's file gets no tokens, and its ro
 	});
 	s.tracker.queueLedger([{ sessionId: "c1", kind: "child", taskId: "st_c", parentSessionId: "p1", cwd: s.cwd, endedMs: T0 }]);
 	s.tracker.tick(world);
-	assert.equal(s.index.get(key(s, "c1")).state, "missing", "the backlog found no exact child file");
+	assert.equal(s.index.get(key(s, "c1", s.cwd, "st_c")).state, "missing", "the backlog found no exact child file");
 	assert.equal(s.index.has(key(s, "other")), false, "the other session's file was never indexed");
 	assert.equal(compactUsage(s.index.get(key(s, "p1"))).total, 100);
 	assert.equal(s.tracker.tokensOf(sub(s, "p1")).treeTokens, null, "the parent's tree total excludes the mismatched child");
-	assert.equal(s.tracker.tokensOf(sub(s, "c1")), null);
+	assert.equal(s.tracker.tokensOf(sub(s, "c1", s.cwd, "st_c")), null);
 });
 
 test("(IS-4, IS-12) cold discovery shares the tick budget and keeps history pending", (t) => {
@@ -1344,20 +1346,21 @@ test("a missing child is retried after a day of fake clock on the next queueLedg
 	appendEnded(s.paths, row, { nowMs: T0 });
 	s.tracker.queueLedger([row]);
 	s.tracker.tick(emptyWorld(s.clock));
-	assert.equal(s.index.get(key(s, "c9")).state, "missing");
-	const checked = s.index.get(key(s, "c9")).checkedMs;
+	const childKey = subjectKey(subjectOf(row));
+	assert.equal(s.index.get(childKey).state, "missing");
+	const checked = s.index.get(childKey).checkedMs;
 
 	s.tracker.queueLedger([row]);
 	assert.equal(s.tracker.tick(emptyWorld(s.clock)).bytesRead, 0, "too soon: the missing row is not retried");
-	assert.equal(s.index.get(key(s, "c9")).checkedMs, checked);
+	assert.equal(s.index.get(childKey).checkedMs, checked);
 
 	writeJsonl(childFile(s.cwd, "st_9", "c9"), [E.assistant({ ms: T0, usage: usage(42) })]);
 	s.advance(DAY + 1);
 	s.tracker.queueLedger(streamEnded(s.paths, { withLocation: true }));
 	const tick = s.tracker.tick(emptyWorld(s.clock));
 	assert.ok(tick.bytesRead > 0);
-	assert.equal(compactUsage(s.index.get(key(s, "c9"))).total, 42);
-	assert.ok(s.index.get(key(s, "c9")).checkedMs > checked);
+	assert.equal(compactUsage(s.index.get(childKey)).total, 42);
+	assert.ok(s.index.get(childKey).checkedMs > checked);
 });
 
 test("an ended file that grew after a complete read is requeued and its tree total follows", () => {
@@ -1518,7 +1521,7 @@ test("(gate 14) deletion of each written field unpublishes the row until a one-s
 	const hit = JSON.stringify({ type: "message", message: { role: "assistant", provider: "p", model: "m", usage: usage(42) } });
 	fs.mkdirSync(path.dirname(file), { recursive: true });
 	fs.writeFileSync(file, `${hit}\n${hit}`); // Populate both committed usage and the EOF overlay.
-	s.index.update(sub(s, id), file, { kind: "main", taskId: "alias", parentSessionId: "parent", rootSessionId: "root" });
+	s.index.update(sub(s, id), file, { kind: "main", parentSessionId: "parent", rootSessionId: "root" });
 	s.index.save();
 	const saved = fs.readFileSync(indexFile, "utf8");
 	const fields = (node, prefix = []) => Object.entries(node).flatMap(([key, value]) => {
@@ -1550,7 +1553,7 @@ test("(gate 14) deletion of each written field unpublishes the row until a one-s
 	}
 });
 
-for (const v of [1, 2]) {
+for (const v of [1, 2, 5]) {
 	test(`(gate 15) a v${v} index starts empty and the tracker recounts`, (t) => {
 		const s = setup();
 		t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
@@ -1561,7 +1564,9 @@ for (const v of [1, 2]) {
 		s.index.update(sub(s, id), file);
 		s.index.save();
 		const entry = indexRow(fs.readFileSync(indexFile, "utf8"));
-		fs.writeFileSync(indexFile, JSON.stringify({ v, entries: { [id]: entry } }));
+		fs.writeFileSync(indexFile, v === 5
+			? `${JSON.stringify({ v })}\n${JSON.stringify({ ...entry, taskId: null })}\n`
+			: JSON.stringify({ v, entries: { [id]: entry } }));
 
 		const index = createUsageIndex({ file: indexFile, clock: s.clock, log: s.log });
 		const tracker = createUsageTracker({ paths: s.paths, index, locator: s.locator, clock: s.clock, log: s.log });
@@ -1604,8 +1609,8 @@ test("a child of a child is located through its grandparent's cwd", () => {
 	]) appendEnded(s.paths, row, { nowMs: T0 });
 	s.tracker.queueLedger(streamEnded(s.paths, { withLocation: true }));
 	s.tracker.tick(emptyWorld(s.clock));
-	assert.equal(compactUsage(s.index.get(key(s, "deep1"))).total, 4);
-	assert.equal(s.tracker.tokensOf(sub(s, "mid1")).treeTokens, 7);
+	assert.equal(compactUsage(s.index.get(key(s, "deep1", s.cwd, "st_deep"))).total, 4);
+	assert.equal(s.tracker.tokensOf(sub(s, "mid1", s.cwd, "st_mid")).treeTokens, 7);
 });
 
 test("a read failure keeps tokensOf null with one log, and the next success restores the total", () => {
@@ -1656,7 +1661,8 @@ test("tokensOf reports a raised tree total for a parent and no tree total for a 
 	}
 	s.tracker.tick(emptyWorld(s.clock));
 	assert.deepEqual(s.tracker.tokensOf(sub(s, "p2")), { tokens: compactUsage(s.index.get(key(s, "p2"))), treeTokens: 16, treeTokensComplete: true });
-	assert.deepEqual(s.tracker.tokensOf(sub(s, "c2")), { tokens: compactUsage(s.index.get(key(s, "c2"))), treeTokens: null, treeTokensComplete: true });
+	const child = sub(s, "c2", s.cwd, "st_x");
+	assert.deepEqual(s.tracker.tokensOf(child), { tokens: compactUsage(s.index.get(subjectKey(child))), treeTokens: null, treeTokensComplete: true });
 });
 
 test("(IS-3, IS-7) history includes a retained older child in its parent's detail and token tree, not as a list row", (t) => {
@@ -1775,11 +1781,11 @@ test("tree token completeness follows pending siblings and never counts a missin
 		return [treeTokens, treeTokensComplete];
 	};
 	s.tracker.queueLedger([ready, missing]);
-	assert.equal(s.index.get(key(s, ready.sessionId)), undefined);
+	assert.equal(s.index.get(subjectKey(subjectOf(ready))), undefined);
 	assert.deepEqual(tree("ready"), [120, false], "the queued sibling is known before entering the index");
 	s.tracker.tick(world);
 	assert.deepEqual(tree("ready"), [125, true], "the tree becomes complete after the sibling's read");
-	assert.equal(s.index.get(key(s, missing.sessionId)).state, "missing");
+	assert.equal(s.index.get(subjectKey(subjectOf(missing))).state, "missing");
 	assert.deepEqual(tree("missing"), [120, false]);
 	assert.deepEqual(tree("live"), [120, false], "a live sibling with no index entry still makes the tree partial");
 	s.tracker.tick(world);
@@ -1807,7 +1813,8 @@ test("(IS-2) the board snapshot includes equal and lower tree totals, but not un
 		writeJsonl(child, [E.assistant({ ms: T0, usage: usage(id === "lower" ? -3 : 0) })]);
 		s.index.update(sub(s, childId), child, meta, id === "pending" ? { maxBytes: 1 } : {});
 	}
-	assert.deepEqual([s.index.get(key(s, "pending-child")).state, s.index.get(key(s, "pending-child")).complete], ["ok", false]);
+	const pending = s.index.get(key(s, "pending-child", s.cwd, "st_pending"));
+	assert.deepEqual([pending.state, pending.complete], ["ok", false]);
 	const world = makeWorld({
 		now: T0,
 		sessions: parents.map((id) => sessionState({ cwd: s.cwd, id, startedMs: T0 - 5000 })),
@@ -1856,7 +1863,7 @@ test("sparse queued children recover ledger-only cwds in one pass per needed day
 	appendEnded(s.paths, { sessionId: "unrelated", cwd: s.cwd, endedMs: T0 - 2 * DAY }, { nowMs: T0 });
 	assert.equal(tracker.queueLedger(rows), 4);
 	const tick = tracker.tick(emptyWorld(s.clock));
-	const totals = rows.map(({ sessionId }) => tracker.tokensOf(sub(s, sessionId, path.join(s.cwd, `proj-${sessionId.split("-").at(-1)}`)))?.tokens?.total ?? null);
+	const totals = rows.map((row, i) => tracker.tokensOf(subjectOf({ ...row, cwd: path.join(s.cwd, `proj-${i}`) }))?.tokens?.total ?? null);
 	t.diagnostic(`totals=${JSON.stringify(totals)}, ledger bytes by day=${JSON.stringify([...reads.values()])}`);
 	assert.deepEqual(totals, [42, 7, null, 19]);
 	assert.equal(tick.missing, 1);
@@ -1959,10 +1966,11 @@ test("(gate 20) a 128-child live burst reads each appended ledger line once, not
 	assert.equal(tick.missing, 0);
 	for (let i = 0; i < count; i += 1) {
 		const sessionId = `child-${i}`;
-		const entry = s.index.get(key(s, sessionId, path.join(s.root, "proj", `case-${i}`)));
+		const childKey = key(s, sessionId, path.join(s.root, "proj", `case-${i}`), `st_${i}`);
+		const entry = s.index.get(childKey);
 		assert.equal(entry?.state, "ok", sessionId);
 		assert.equal(compactUsage(entry).total, i + 1, sessionId);
 		assert.equal(entry.file, childFile(path.join(s.root, "proj", `case-${i}`), `st_${i}`, sessionId), `${sessionId} resolved its own directory`);
-		assert.equal(updates.get(key(s, sessionId, path.join(s.root, "proj", `case-${i}`))), 1, `${sessionId} indexed exactly once`);
+		assert.equal(updates.get(childKey), 1, `${sessionId} indexed exactly once`);
 	}
 });

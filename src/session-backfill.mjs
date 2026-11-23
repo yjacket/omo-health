@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { createSessionFileLocator } from "./collect/session-files.mjs";
 import { entryMs, idFromFileName } from "./collect/sessions.mjs";
 import { normalizeTask, senpiTaskStoreDir, taskStoreDir } from "./collect/tasks.mjs";
 import { pathKey } from "./paths.mjs";
@@ -314,7 +315,7 @@ export function backfillOnce(paths, nowMs, { days = 30, maxBytes = Infinity, pro
 				if (!indexes.has(item.dir)) indexes.set(item.dir, readSummaryIndex(item.dir, errors));
 				const summary = indexes.get(item.dir).get(header.id);
 				const lastMs = scannedMs ?? summary?.lastActivityTime ?? toMs(header.timestamp) ?? item.mtimeMs;
-				mains.push({ dir: item.dir, header, lastMs, name, summary });
+				mains.push({ dir: item.dir, file: item.file, header, lastMs, name, summary });
 			} catch (error) {
 				errors.push(`session ${item.file}: ${error.message}`);
 			}
@@ -361,16 +362,34 @@ function scanSummary({ sinceMs, sessionFiles, sessionDirs, counts, reportedError
 		errors: [...reportedErrors, ...extraErrors.slice(0, MAX_REPORTED_ERRORS - reportedErrors.length).map((e) => clean(e, 300))] };
 }
 
+function fileIdentity(file) {
+	try {
+		const stat = fs.statSync(file, { bigint: true });
+		if (stat.isFile() && stat.ino > 0n) return `${stat.dev}:${stat.ino}`;
+	} catch {
+		// A missing or unreadable file is not evidence of a duplicate.
+	}
+}
+
+const transcriptPath = process.platform === "win32" ? pathKey : path.resolve;
+
 function* readRelated(paths, { cwds, sinceMs, errors }, budget) {
 	const tasks = [];
-	const childSubjects = new Set();
+	const { childCandidate } = createSessionFileLocator({ paths });
+	const childPaths = new Set();
+	const childIdentities = new Set();
 	const childCount = new Map();
 	const visited = new Set();
 	const queue = new Set(cwds.values());
 	function remember(t) {
 		tasks.push(t);
 		if (typeof t.spawnCwd === "string" && t.spawnCwd) queue.add(t.spawnCwd);
-		if (t.childSessionId) childSubjects.add(subjectKey({ projectKey: projectKeyOf(t.cwd), sessionId: t.childSessionId }));
+		const file = childCandidate({ taskId: t.taskId, sessionId: t.childSessionId, storeDir: t.storeDir });
+		if (file) {
+			childPaths.add(transcriptPath(file));
+			const identity = fileIdentity(file);
+			if (identity) childIdentities.add(identity);
+		}
 		// Parent IDs refer to sessions in the task store's project, not the child's spawn cwd.
 		if (t.parentSessionId) {
 			const key = subjectKey({ projectKey: t.parentProjectKey, sessionId: t.parentSessionId });
@@ -390,11 +409,11 @@ function* readRelated(paths, { cwds, sinceMs, errors }, budget) {
 		for (const task of yield* readTasks(cwd, storeDir, errors, taskBudget)) remember(task);
 	}
 
-	return { tasks, childSubjects, childCount, crashes: readCrashes(paths, sinceMs, errors), releases: readReleases(paths, sinceMs, errors, tasks) };
+	return { tasks, childPaths, childIdentities, childCount, crashes: readCrashes(paths, sinceMs, errors), releases: readReleases(paths, sinceMs, errors, tasks) };
 }
 
 function writeBatch(paths, nowMs, { sinceMs, liveCutMs, mains, related }, lastBatch) {
-	const { tasks, childSubjects, childCount, crashes, releases } = related;
+	const { tasks, childPaths, childIdentities, childCount, crashes, releases } = related;
 	const errors = [];
 	const counts = emptyCounts();
 	const pending = [];
@@ -407,7 +426,8 @@ function writeBatch(paths, nowMs, { sinceMs, liveCutMs, mains, related }, lastBa
 	for (const m of mains) {
 		const sessionId = m.header.id;
 		const key = subjectKey({ projectKey: projectKeyOf(m.header.cwd), sessionId });
-		if (childSubjects.has(key) || m.lastMs < sinceMs) continue;
+		if (m.lastMs < sinceMs || childPaths.has(transcriptPath(m.file)) ||
+			(childIdentities.size && childIdentities.has(fileIdentity(m.file)))) continue;
 		if (m.lastMs > liveCutMs) {
 			counts.live += 1;
 			continue;

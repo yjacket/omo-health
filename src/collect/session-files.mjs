@@ -60,6 +60,7 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 	};
 
 	const readMainFile = (subject) => {
+		subject = { ...subject, taskId: null };
 		const file = paths.health?.usageIndexFile;
 		const stamp = file ? readUsageFileStamp(file) : null;
 		let entry;
@@ -103,7 +104,7 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 			return probe;
 		};
 		const { sessionId, projectKey } = subject ?? {};
-		if (!sessionId) return result();
+		if (!sessionId || subject.taskId != null) return result();
 		if (projectKey == null) {
 			let pending = false;
 			const file = uniqueMatch(listDirSafe(paths.sessionsDir, { withFileTypes: true }), (entry) => {

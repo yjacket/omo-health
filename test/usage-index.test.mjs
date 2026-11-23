@@ -1,7 +1,7 @@
 import "./helpers/tmp-root.mjs";
 import { SubjectMap, subjectOf, subjectKey } from "../src/session-subject.mjs";
-const sub = (sessionId, cwd) => subjectOf({ sessionId, cwd });
-const key = (sessionId, cwd) => subjectKey(sub(sessionId, cwd));
+const sub = (sessionId, cwd, taskId) => subjectOf({ sessionId, cwd, taskId });
+const key = (sessionId, cwd, taskId) => subjectKey(sub(sessionId, cwd, taskId));
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -924,9 +924,10 @@ test("save and load round-trip the entries without the in-memory fields", (t) =>
 	assert.equal(loaded instanceof SubjectMap, true);
 	assert.equal(loaded.size, 2);
 	assert.equal(compactUsage(loaded.get(key("s1"))).total, 10);
-	assert.equal(compactUsage(loaded.get(key("s2"))).total, 20);
-	assert.equal(loaded.get(key("s2")).taskId, "st_2");
-	assert.equal(loaded.get(key("s2")).parentSessionId, "s1");
+	const child = loaded.get(key("s2", undefined, "st_2"));
+	assert.equal(compactUsage(child).total, 20);
+	assert.equal(child.taskId, "st_2");
+	assert.equal(child.parentSessionId, "s1");
 	assert.equal(index.prune(T0), 0);
 });
 
@@ -1423,10 +1424,11 @@ test("(gate 13) a markMissing row keeps all its writer fields", (t) => {
 	index.markMissing(sub("s"), meta);
 	index.save();
 	const original = fs.readFileSync(file, "utf8");
-	const loaded = readUsageIndex(file).get(key("s"));
+	const childKey = key("s", undefined, meta.taskId);
+	const loaded = readUsageIndex(file).get(childKey);
 	assert.equal(JSON.stringify(loaded), JSON.stringify(parseIndex(original).entries.s));
 	const restarted = indexOf();
-	assert.deepEqual(restarted.get(key("s")), loaded);
+	assert.deepEqual(restarted.get(childKey), loaded);
 	// Dirty the index without rewriting the missing row itself.
 	restarted.markMissing(sub("other"));
 	assert.equal(restarted.save(), true);
@@ -1673,23 +1675,24 @@ test("(IS-3) deleted task-only usage survives zero candidates, not a competing f
 	const { dir, fileOf, indexOf } = setup(t);
 	const file = fileOf();
 	const id = "st_deleted";
+	const subject = sub(id, undefined, id);
 	const index = indexOf();
 	writeText(file, `${line()}\n`);
-	index.update(sub(id), file, { kind: "child", taskId: id });
-	assert.equal(compactUsage(index.get(key(id)))?.total, 10);
+	index.update(subject, file, { kind: "child", taskId: id });
+	assert.equal(compactUsage(index.get(subjectKey(subject)))?.total, 10);
 
 	fs.rmSync(file);
-	assert.equal(compactUsage(index.get(key(id)))?.total, 10, "unlink alone must not blank the verified total");
-	index.markMissing(sub(id));
+	assert.equal(compactUsage(index.get(subjectKey(subject)))?.total, 10, "unlink alone must not blank the verified total");
+	index.markMissing(subject);
 	index.save();
-	const saved = readUsageIndex(path.join(dir, "usage.json")).get(key(id));
+	const saved = readUsageIndex(path.join(dir, "usage.json")).get(subjectKey(subject));
 	assert.deepEqual([saved.state, saved.complete, saved.gone, compactUsage(saved)?.total, fresh(saved)], ["ok", true, true, 10, false]);
 
 	writeText(fileOf("replacement.jsonl"), `${line()}\n`);
 	// Publish the daemon's revocation before a replacement can be counted.
-	index.markMissing(sub(id), {}, { withdraw: true });
+	index.markMissing(subject, {}, { withdraw: true });
 	index.save();
-	assert.equal(compactUsage(readUsageIndex(path.join(dir, "usage.json")).get(key(id))), null,
+	assert.equal(compactUsage(readUsageIndex(path.join(dir, "usage.json")).get(subjectKey(subject))), null,
 		"a different candidate cannot inherit the deleted file's total");
 });
 
@@ -1725,7 +1728,7 @@ test("get and has resolve only an explicit, unique taskId alias without a sessio
 	writeText(file, `${line()}\n`);
 	const index = indexOf();
 	index.update(sub("s1"), file, { kind: "child", taskId: "st_01a2" });
-	assert.equal(index.get(sub(undefined), "st_01a2"), index.get(key("s1")));
+	assert.equal(index.get(sub(undefined), "st_01a2"), index.get(key("s1", undefined, "st_01a2")));
 	assert.equal(index.has(sub(undefined), "st_01a2"), true);
 	assert.equal(index.has(sub(undefined), "st_absent"), false);
 });
@@ -1739,7 +1742,7 @@ test("get and has never cross session identities or resolve ambiguous task ids",
 	assert.deepEqual([index.get(sub("child-b"), "st_x"), index.get(key("st_x")), index.has(key("st_x"))], [undefined, undefined, false]);
 	index.update(sub("child-b"), file, { kind: "child", taskId: "st_x" });
 	assert.deepEqual([index.get(sub(null), "st_x"), index.has(sub(null), "st_x")], [undefined, false]);
-	assert.equal(index.get(sub("child-b"), "st_x").id, "child-b");
+	assert.equal(index.get(sub("child-b", undefined, "st_x"), "st_x").id, "child-b");
 });
 
 test("prune drops entries by checkedMs against the injected clock", (t) => {

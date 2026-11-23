@@ -275,9 +275,10 @@ test("IS-7 indexed transcript: detail shows messages for a child and descendant 
 	const { root, paths } = setup();
 	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
 	const { index, child, grandchild } = indexLiveParentTranscript(paths, root, T0, { descendant: true });
-	for (const { id, file } of [child, grandchild]) {
-		assert.equal(index.get(key(id, root))?.file, file);
-		assert.equal(fresh(index.get(key(id, root))), true);
+	for (const { id, file, taskId } of [child, grandchild]) {
+		const key = subjectKey(subjectOf({ sessionId: id, cwd: root, taskId }));
+		assert.equal(index.get(key)?.file, file);
+		assert.equal(fresh(index.get(key)), true);
 	}
 	const detail = createDetailOperations({ paths, auditDetail: () => null });
 	const job = { kind: "detail", id: child.id, now: T0 };
@@ -287,7 +288,7 @@ test("IS-7 indexed transcript: detail shows messages for a child and descendant 
 	assert.deepEqual(result.files, [child.file, grandchild.file]);
 
 	fs.appendFileSync(child.file, "\n");
-	assert.equal(fresh(index.get(key(child.id, root))), false);
+	assert.equal(fresh(index.get(subjectKey(subjectOf({ sessionId: child.id, cwd: root, taskId: child.taskId })))), false);
 	const afterAppend = detail(job);
 	assert.deepEqual(afterAppend.record.health.messages.map(({ recipient }) => recipient), [grandchild.id]);
 	assert.deepEqual(afterAppend.files, [grandchild.file]);
@@ -297,7 +298,7 @@ test("IS-7 indexed transcript: an ambiguous task-only path is not used by detail
 	const { root, paths } = setup();
 	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
 	const { index, child } = indexLiveParentTranscript(paths, root, T0, { taskOnly: true });
-	assert.equal(fresh(index.get(key(child.id, root))), true);
+	assert.equal(fresh(index.get(subjectKey(subjectOf({ sessionId: child.id, cwd: root, taskId: child.taskId })))), true);
 	writeJsonl(path.join(path.dirname(child.file), "second-session.jsonl"), [ohealth(child.ms, "Another owner")]);
 	const detail = createDetailOperations({ paths, auditDetail: () => null });
 	const result = detail({ kind: "detail", id: child.id, now: T0 });

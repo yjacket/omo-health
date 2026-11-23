@@ -1,6 +1,6 @@
 import "./helpers/tmp-root.mjs";
 import { auditFileKey, projectKeyOf, subjectOf, subjectKey } from "../src/session-subject.mjs";
-const sub = (sessionId, cwd = sessionId === "Review.1" ? "C:/dev/other" : "C:/dev/proj") => subjectOf({ sessionId, cwd });
+const sub = (sessionId, cwd = sessionId === "Review.1" ? "C:/dev/other" : "C:/dev/proj", taskId) => subjectOf({ sessionId, cwd, taskId });
 const key = (sessionId, cwd) => subjectKey(sub(sessionId, cwd));
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
@@ -143,12 +143,12 @@ function harness({ providers = ["anthropic-subscription", "openai", "google", "x
 		await auditor.preparing();
 		auditor.tick(state.now);
 	};
-	h.request = (id, cwd) => {
-		const claim = requestAudit(paths, sub(id, cwd), state.now);
+	h.request = (id, cwd, taskId) => {
+		const claim = requestAudit(paths, sub(id, cwd, taskId), state.now);
 		state.now += 1;
 		return claim;
 	};
-	h.record = (id, cwd) => readJsonSafe(path.join(paths.health.auditsDir, `${auditFileKey(sub(id, cwd))}.json`));
+	h.record = (id, cwd, taskId) => readJsonSafe(path.join(paths.health.auditsDir, `${auditFileKey(sub(id, cwd, taskId))}.json`));
 	h.budget = () => readJsonSafe(paths.health.auditBudgetFile);
 	h.jobsOf = (id) => h.runner.starts.filter((start) => start.jobId.endsWith(`-${id}`));
 	return h;
@@ -236,12 +236,13 @@ test("IS-8: one ordinary cold turn does not require a D4 check", async (t) => {
 test("IS-7 indexed transcript: audit includes the message ref for a child located through a live parent", async () => {
 	const h = harness({ sessions: [] });
 	const { index, child } = indexLiveParentTranscript(h.paths, h.root, BASE);
-	assert.equal(index.get(key(child.id, h.root))?.file, child.file);
-	assert.equal(fresh(index.get(key(child.id, h.root))), true);
+	const key = subjectKey(sub(child.id, h.root, child.taskId));
+	assert.equal(index.get(key)?.file, child.file);
+	assert.equal(fresh(index.get(key)), true);
 	const auditor = h.auditor({ index });
-	h.request(child.id, h.root);
+	h.request(child.id, h.root, child.taskId);
 	await h.prepare(auditor);
-	assert.equal(h.record(child.id, h.root).status, "running");
+	assert.equal(h.record(child.id, h.root, child.taskId).status, "running");
 	const document = fs.readFileSync(path.join(h.runner.starts[0].cwd, "bundle.md"), "utf8");
 	const bundle = JSON.parse(document.split("\n").find((line) => line.startsWith('{"session":')));
 	assert.equal(bundle.tokens.total, 51_302);
@@ -1546,13 +1547,13 @@ test("a fresh task-keyed entry from another store cannot certify a queued child 
 		appendEnded(h.paths, { sessionId, taskId, kind: "child", startedMs: BASE - 180_000, endedMs: BASE - 60_000, outcome: "completed", cwd });
 		if (sessionId === "child-a") index.update(sub(taskId, cwd), file, { kind: "child", taskId });
 	}
-	assert.equal(fresh(index.get(key(taskId, path.join(h.root, "child-a")))), true);
-	assert.equal(index.has(key("child-b", path.join(h.root, "child-b"))), false);
+	assert.equal(fresh(index.get(subjectKey(sub(taskId, path.join(h.root, "child-a"), taskId)))), true);
+	assert.equal(index.has(subjectKey(sub("child-b", path.join(h.root, "child-b"), taskId))), false);
 	assert.ok(index.save(), "publish the colliding entry to the preparation worker");
 
-	h.request("child-b", path.join(h.root, "child-b"));
+	h.request("child-b", path.join(h.root, "child-b"), taskId);
 	await h.prepare(h.auditor({ index }));
-	const { status, reason } = h.record("child-b", path.join(h.root, "child-b"));
+	const { status, reason } = h.record("child-b", path.join(h.root, "child-b"), taskId);
 	assert.deepEqual([status, reason, h.runner.starts.length, h.budget()], ["failed", "models-unknown", 0, undefined]);
 });
 

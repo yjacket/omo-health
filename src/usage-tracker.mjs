@@ -134,7 +134,6 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 
 	const metaOf = (source) => ({
 		kind: source?.kind ?? null,
-		taskId: source?.taskId ?? null,
 		parentSessionId: source?.parentSessionId ?? null,
 		rootSessionId: source?.rootSessionId ?? null,
 		parentKey: Object.hasOwn(source, ENDED_LOCATION) && source.parentSessionId
@@ -198,7 +197,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 		const seen = packedMap();
 		for (const row of fallbacks()) {
 			if (!row.taskId) continue;
-			const task = { sessionId: row.taskId, [PACKED_PROJECT]: row[PACKED_PROJECT] };
+			const task = { sessionId: row.taskId, taskId: row.taskId, [PACKED_PROJECT]: row[PACKED_PROJECT] };
 			if (seen.has(task)) ambiguous.set(task, true);
 			else seen.set(task, true);
 		}
@@ -247,8 +246,10 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 				const { sessionId, taskId, kind, endedMs, parentSessionId, rootSessionId } = source;
 				const { projectKey } = subjectOf(source);
 				const row = Object.assign(Object.create(ledgerIdentity), {
-					sessionId, taskId, kind, endedMs, parentSessionId, rootSessionId, [ENDED_LOCATION]: source[ENDED_LOCATION],
+					sessionId, kind, endedMs, parentSessionId, rootSessionId, [ENDED_LOCATION]: source[ENDED_LOCATION],
 				});
+				if (taskId != null) row.taskId = taskId;
+				if (source.parentTaskId != null) row.parentTaskId = source.parentTaskId;
 				compactProject(row, projectKey);
 				if (isNonEmptyString(source.storeDir)) row.storeDir = source.storeDir;
 				if (source.parentProjectKey != null) row.packedParentProject = packScopedText(source.parentProjectKey);
@@ -277,7 +278,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 				const compact = compactRows();
 				return paths ? (function* () { yield* compact; yield* streamEnded(paths); })() : compact;
 			};
-			parentOwners = legacyParentOwners(compactRows(), links);
+			parentOwners = legacyParentOwners(compactRows, links);
 			for (const row of ledgerRows.values()) {
 				if (row.parentSessionId && ledgerUsageSessionId(row)) {
 					parentLinksChanged = index.recordParentLink?.(row, metaOf(row).parentKey) || parentLinksChanged;
@@ -335,7 +336,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 				const hasSpawningStore = session.kind === "child" && session.task?.storeDir;
 				const spawningParent = hasSpawningStore && taskParent(session.task);
 				const subject = hasSpawningStore
-					? childSubjectOf({ sessionId: session.id, task: session.task, world, parent: spawningParent })
+					? childSubjectOf({ sessionId: session.id, task: session.task, world, parent: spawningParent, child: session })
 					: liveSubject(session);
 				const parent = byId.get(session.parentSessionId);
 				const root = byId.get(session.rootSessionId);
@@ -346,7 +347,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 					}
 					if (!relative) continue;
 					const linked = liveSubject(relative);
-					if (linked.projectKey !== subject.projectKey || linked.sessionId !== session[`${field}SessionId`]) {
+					if (linked.taskId != null || linked.projectKey !== subject.projectKey || linked.sessionId !== session[`${field}SessionId`]) {
 						subject[`${field}Key`] = subjectKey(linked);
 					}
 				}
@@ -442,7 +443,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			// progress even if it moved from the live set into the backlog.
 			const priorityBacklog = !priorityLive && priority ? queue.get(priority) : undefined;
 			const backlogReady = !priorityBacklog || budget <= 0 || readBacklog({
-				sessionId: priorityBacklog.sessionId, [PACKED_PROJECT]: priorityBacklog[PACKED_PROJECT],
+				sessionId: priorityBacklog.sessionId, taskId: priorityBacklog.taskId, [PACKED_PROJECT]: priorityBacklog[PACKED_PROJECT],
 			}, priorityBacklog) !== false;
 			if (priorityLive) liveAppends.unshift(priorityLive);
 			// (a) live appends, then (b) first/incomplete live reads. A previous

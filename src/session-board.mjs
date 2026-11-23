@@ -327,9 +327,9 @@ export function detectEnded(prevSnapshot, snapshot, world, nowMs = world.now) {
 			for (const row of parent.children ?? []) {
 				const sessionId = row.sessionId || row.taskId;
 				// The root already scopes both the child ID and the task alias.
-				const key = JSON.stringify([endedKey(root), parentSessionId, sessionId]);
-				children.set(key, { row, sessionId, parentSessionId, root, parentCwd: cwd, parentProjectKey: subjectOf({ cwd }).projectKey });
-				if (byTask && row.sessionId) byTask.set(JSON.stringify([endedKey(root), parentSessionId, row.taskId]), row);
+				const key = JSON.stringify([endedKey(root), parentSessionId, sessionId, row.taskId ?? null]);
+				children.set(key, { row, sessionId, parentSessionId, parentTaskId: parent.taskId, root, parentCwd: cwd, parentProjectKey: subjectOf({ cwd }).projectKey });
+				if (byTask && row.sessionId) byTask.set(JSON.stringify([endedKey(root), parentSessionId, row.taskId, row.taskId ?? null]), row);
 				visit(row, root, cwd);
 			}
 		};
@@ -397,7 +397,7 @@ export function detectEnded(prevSnapshot, snapshot, world, nowMs = world.now) {
 		});
 	}
 
-	for (const [key, { row, sessionId, parentSessionId, root, parentCwd, parentProjectKey }] of prevChildren) {
+	for (const [key, { row, sessionId, parentSessionId, parentTaskId, root, parentCwd, parentProjectKey }] of prevChildren) {
 		if (TERMINAL_STATUSES.has(row.status)) continue;
 		// A running task-only child may acquire its session ID between snapshots.
 		const current = curChildren.get(key)?.row ?? (!row.sessionId ? currentByTask.get(key) : undefined);
@@ -441,6 +441,7 @@ export function detectEnded(prevSnapshot, snapshot, world, nowMs = world.now) {
 			kind: "child",
 			parentSessionId: parentSessionId ?? null,
 			...(parentProjectKey ? { parentProjectKey } : {}),
+			...(parentTaskId ? { parentTaskId } : {}),
 			taskId,
 			title: row.name,
 			cwd: row.cwd || current?.cwd || task?.spawnCwd || parentCwd || world.sessions?.get(parentSessionId)?.cwd || null,

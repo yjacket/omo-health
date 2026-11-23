@@ -11,6 +11,7 @@ import { BACKFILL_MARKER, backfillOnce } from "../src/session-backfill.mjs";
 import { appendEnded, readEnded, streamEnded } from "../src/session-ledger.mjs";
 import { projectKeyOf, subjectOf } from "../src/session-subject.mjs";
 import { createDetailOperations } from "../src/ui/detail-worker.mjs";
+import { buildEnded, loadUiInputs } from "../src/ui/model.mjs";
 import { createUsageIndex } from "../src/usage-index.mjs";
 import { createUsageTracker } from "../src/usage-tracker.mjs";
 import { expectedSelector } from "./helpers/ended-selector.mjs";
@@ -109,8 +110,46 @@ function processBackfilledRows(paths, now) {
 	const tracker = createUsageTracker({ paths, clock, index, locator: createSessionFileLocator({ paths, clock }) });
 	tracker.queueLedger(streamEnded(paths, { withLocation: true }));
 	tracker.tick({ now, sessions: new Map(), tasks: [] });
+	index.save();
 	return tracker;
 }
+
+test("plan110 cold backfill keeps distinct same-project, same-ID main and child transcripts", (t) => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "backfill-shared-id-"));
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health"), OMO_HEALTH_OMO_HOME: path.join(root, ".omo") });
+	const cwd = path.join(root, "project");
+	const projectKey = projectKeyOf(cwd);
+	const now = Date.now();
+	const sessionId = "review.shared";
+	const taskId = "st_shared";
+	const assistant = (input, ms) => E.assistant({ ms, usage: { input, output: 0, cacheRead: 0, cacheWrite: 0 } });
+	const childStart = now - 4 * HOUR;
+	const childEnd = now - 3 * HOUR;
+	writeTask(cwd, {
+		task_id: taskId, parent_session_id: "review.root", child_session_id: sessionId,
+		status: "completed", final_response: "done", started_at: iso(childStart), terminal_at: iso(childEnd),
+	});
+	writeJsonl(path.join(senpiTaskStoreDir(cwd, paths.agentDir), "children", taskId, "sessions", taskId,
+		`${iso(childStart).replace(/[:.]/g, "-")}_${sessionId}.jsonl`), [
+		E.header(sessionId, cwd, childStart), assistant(17, childEnd),
+	]);
+	const mainEnd = now - HOUR;
+	writeSession(paths, projectKey, sessionId, cwd, now - 2 * HOUR, mainEnd, [assistant(43, mainEnd)]);
+
+	assert.deepEqual(readEnded(paths), []);
+	assert.deepEqual(backfillOnce(paths, now).errors, []);
+	const rows = readEnded(paths);
+	const tracker = processBackfilledRows(paths, now);
+	const history = buildEnded(loadUiInputs({ paths, now, env: {} }));
+	assert.deepEqual(rows.map((row) => {
+		const shown = history.rows.find(({ rowSelector }) => rowSelector === expectedSelector(row));
+		return [row.kind, subjectOf(row), row.endedMs, tracker.tokensOf(subjectOf(row))?.tokens.total, shown?.tokens?.total];
+	}), [
+		["main", { projectKey, sessionId, taskId: null }, mainEnd, 43, 43],
+		["child", { projectKey, sessionId, taskId }, childEnd, 17, 17],
+	]);
+});
 
 test("backfill attributes releases only to a uniquely identified child", (t) => {
 	const { paths, now, startedMs, endedMs, sessionId, a, b } = setupProjectPair(t);
@@ -263,8 +302,10 @@ test("a v2 upgrade restores a missing project ranked 2,001st before marking v3",
 	fs.utimesSync(transcript(a), now / 1000, now / 1000);
 	fs.utimesSync(transcript(b), now / 1000, (now - HOUR) / 1000);
 	let firstBatchBytes = fs.statSync(transcript(a)).size;
+	let childAlias;
 	for (let i = 0; i < 1999; i++) {
 		const file = writeSession(paths, projectKeyOf(a), `filler-${i}`, a, startedMs, i < 2 ? endedMs : now);
+		if (i === 1) childAlias = file;
 		fs.utimesSync(file, now / 1000, now / 1000);
 		firstBatchBytes += fs.statSync(file).size;
 	}
@@ -274,6 +315,9 @@ test("a v2 upgrade restores a missing project ranked 2,001st before marking v3",
 		spawn_spec: { cwd: a }, status: "completed", final_response: "done",
 		created_at: iso(startedMs), terminal_at: iso(endedMs),
 	});
+	const childDir = path.join(senpiTaskStoreDir(b, paths.agentDir), "children", "st_cross_batch", "sessions", "st_cross_batch");
+	fs.mkdirSync(childDir, { recursive: true });
+	fs.linkSync(childAlias, path.join(childDir, path.basename(childAlias)));
 
 	let progress = {};
 	backfillOnce(paths, now, { maxBytes: firstBatchBytes, progress });

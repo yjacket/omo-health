@@ -230,7 +230,7 @@ describe("session view", () => {
 			["tokenReading", "endedTokenFacts"].map((name) => app.match(new RegExp(`function ${name}\\([^]*?\\n\\t\\}`))[0]).join("\n") + "\nendedTokenFacts",
 			{
 				el: (tag, attrs) => ({ tag, ...attrs }), facts: (rows) => rows, fullCount: String,
-				empty: () => null, note: () => null, plain: (text) => text, costText: () => "-",
+				empty: () => null, note: () => null, plain: (text) => text, costText: () => "-", lastState: {},
 			},
 		);
 		const status = () => {
@@ -241,7 +241,7 @@ describe("session view", () => {
 		};
 		assert.deepEqual(status(), [42, false, "42", null]);
 		fs.rmSync(file);
-		index.markMissing(sub(taskId));
+		index.markMissing(subjectOf(row));
 		assert.deepEqual(status(), [42, true, "42", "파일 삭제됨"]);
 	});
 
@@ -255,7 +255,7 @@ describe("session view", () => {
 		for (const [id, value, parentSessionId] of [["s-main", "1e309"], ["s-child", "-1e309", "s-main"]]) {
 			const file = path.join(root, `${id}.jsonl`);
 			fs.writeFileSync(file, `{"type":"usage","provider":"p","model":"m","usage":{"input":${value}}}\n`);
-			index.update(sub(id), file, { parentSessionId: parentSessionId ?? null });
+			index.update(subjectOf({ sessionId: id, taskId: parentSessionId ? "st_a" : null }), file, { parentSessionId: parentSessionId ?? null });
 		}
 		index.save();
 		const record = loadSessionRecord({ paths, id: row.sessionId, now: T0 });

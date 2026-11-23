@@ -508,7 +508,7 @@ export function usageEntryOf(usage, row, ambiguous) {
 	if (row.usageStoreUnresolved) return null;
 	const ids = row.ledgerIds ?? row;
 	if (ambiguousUsageFallback(row, ambiguous, ids)) return null;
-	const subject = { ...subjectOf(row), sessionId: ledgerUsageSessionId(ids) };
+	const subject = { ...subjectOf(row), sessionId: ledgerUsageSessionId(ids), taskId: ids.taskId ?? null };
 	let entry = usageEntryFor(usage, subject, ids.taskId);
 	// An old cwd-less child may have been verified through a live parent not recorded in the ledger.
 	if (entry === undefined && !subject.sessionId && !subject.projectKey && ids.parentSessionId) {
@@ -527,16 +527,23 @@ export function usageTreeLink(usage, row, ambiguous, parentOwners) {
 	const entry = usageEntryOf(usage, row, ambiguous);
 	const subject = subjectOf(row, subjectOf(entry));
 	const id = ledgerUsageSessionId(row) ?? entry?.id;
-	const key = subjectKey({ ...subject, sessionId: id ?? row.taskId });
+	const key = subjectKey(entry?.id && !ledgerUsageSessionId(row) ? subjectOf(entry) : { ...subject, sessionId: id ?? row.taskId });
 	const parentKey = row.parentKey ?? subjectKey(ledgerParentSubject(row, parentOwners));
 	return { key, parentKey, ...(id ? {} : { unresolved: true }) };
 }
 
 /** Resolve bare parent links against the retained ledger, not just visible rows. */
-export function legacyParentOwners(children, rows) {
+export function legacyParentOwners(compactRows, rows) {
 	const ids = new Set();
-	for (const row of children) if (row.parentSessionId && row.parentProjectKey == null) ids.add(row.parentSessionId);
+	const scopedIds = new Set();
+	for (const row of compactRows()) {
+		if (!row.parentSessionId || row.parentTaskId != null) continue;
+		(row.parentProjectKey == null ? ids : scopedIds).add(row.parentSessionId);
+	}
 	const owners = new Map();
+	if (scopedIds.size) {
+		for (const row of compactRows()) if (scopedIds.has(row.sessionId) && !ids.has(row.sessionId)) rememberParentOwner(owners, subjectOf(row));
+	}
 	if (!ids.size) return owners;
 	const family = [...ledgerSubjectParents(new Set(ids), rows)];
 	const resolve = sessionSubjects(family);
@@ -555,9 +562,9 @@ export function* retainedTreeRows(paths, rows, { beforeMs, withLocation } = {}) 
 	for (let depth = 0; depth < DEPTH_MAX && parents.size; depth += 1) {
 		const next = new Set();
 		for (const row of streamEnded(paths, { beforeMs, withLocation })) {
-			const { sessionId, taskId, kind, endedMs, parentSessionId, parentProjectKey, endedProjectKey, rootSessionId, cwd } = row;
+			const { sessionId, taskId, kind, endedMs, parentSessionId, parentTaskId, parentProjectKey, endedProjectKey, rootSessionId, cwd } = row;
 			if (!parents.has(parentSessionId) || !nonEmpty(sessionId)) continue;
-			yield { sessionId, taskId, kind, endedMs, parentSessionId, parentProjectKey, endedProjectKey, rootSessionId, cwd, [ENDED_LOCATION]: row[ENDED_LOCATION] };
+			yield { sessionId, taskId, kind, endedMs, parentSessionId, parentTaskId, parentProjectKey, endedProjectKey, rootSessionId, cwd, [ENDED_LOCATION]: row[ENDED_LOCATION] };
 			if (!seen.has(sessionId)) {
 				seen.add(sessionId);
 				next.add(sessionId);
@@ -1181,14 +1188,14 @@ function childStoreOf(node, ancestors) {
 
 const later = (a, b) => !b || Number(a.endedMs) > Number(b.endedMs);
 
-const parentLookupKey = (row) => subjectKey({ sessionId: row.parentSessionId, projectKey: row.parentProjectKey });
+const parentLookupKey = (row) => subjectKey({ sessionId: row.parentSessionId, projectKey: row.parentProjectKey, taskId: row.parentTaskId });
 
 /** Resolve an ended ID (or unique task alias) without retaining unrelated rows. */
 export function resolveLedgerSubject(paths, id, { row: selector, subject, usage, liveOwners = [] } = {}) {
 	const rows = () => streamEnded(paths);
 	const selected = resolveLedgerSubjects(new Set([id]), rows, rows, { selector, subject, usage, allowAliases: true }).get(id) ?? {};
 	if (selector === undefined && !subject && selected.row &&
-		liveOwners.some((owner) => owner.sessionId === id && owner.projectKey !== selected.subject.projectKey)) {
+		liveOwners.some((owner) => owner.sessionId === selected.subject.sessionId && subjectKey(owner) !== subjectKey(selected.subject))) {
 		return { error: "ambiguous-session" };
 	}
 	return selected;
@@ -1228,8 +1235,7 @@ function resolveLedgerSubjects(ids, rows, retainedRows, { selector, subject, usa
 	for (const [id, { exact, aliases }] of matchesById) {
 		const matches = exact.size ? exact : aliases;
 		if (matches.size > 1) {
-			const projects = new Set([...matches.values()].map((row) => row.projectKey));
-			if (projects.size > 1) results.set(id, { error: "ambiguous-session" });
+			results.set(id, { error: "ambiguous-session" });
 		} else {
 			const row = matches.values().next().value;
 			if (row) results.set(id, { row, subject: subjectOf(row) });
@@ -1255,19 +1261,20 @@ function* ledgerSubjectParents(parents, rows) {
 function blockedHealthIds(nodes, rows, usage, liveOwners = []) {
 	const ids = new Set(nodes.flatMap(({ sessionId, parentSessionId, rootSessionId }) =>
 		[sessionId, parentSessionId, rootSessionId]).filter(nonEmpty));
-	const firstProject = new Map();
+	const firstSubject = new Map();
 	const blocked = new Set();
 	const unscoped = new Map();
-	const consider = (id, projectKey) => {
+	const consider = (id, projectKey, taskId) => {
 		if (blocked.has(id)) return;
-		if (!firstProject.has(id)) firstProject.set(id, projectKey);
-		else if (firstProject.get(id) !== projectKey) {
+		const first = firstSubject.get(id);
+		if (!first) firstSubject.set(id, { projectKey, taskId: taskId ?? null });
+		else if (first.projectKey !== projectKey || first.taskId !== (taskId ?? null)) {
 			blocked.add(id);
-			firstProject.delete(id);
+			firstSubject.delete(id);
 		}
 	};
-	for (const { sessionId, projectKey } of liveOwners) {
-		if (ids.has(sessionId)) consider(sessionId, projectKey);
+	for (const { sessionId, projectKey, taskId } of liveOwners) {
+		if (ids.has(sessionId)) consider(sessionId, projectKey, taskId);
 	}
 	// Exact IDs across all retained dates, regardless of the detail row selector.
 	// Do not retain full matching rows or stringify the project key for each ID.
@@ -1275,9 +1282,9 @@ function blockedHealthIds(nodes, rows, usage, liveOwners = []) {
 		const { sessionId, parentSessionId, taskId, endedMs, ledgerIds, usageTaskIdAmbiguous } = row;
 		if (!ids.has(sessionId) || blocked.has(sessionId)) continue;
 		const { projectKey } = subjectOf(row);
-		if (projectKey) consider(sessionId, projectKey);
+		if (projectKey) consider(sessionId, projectKey, taskId);
 		else {
-			const key = JSON.stringify([sessionId, parentSessionId ?? null]);
+			const key = JSON.stringify([sessionId, parentSessionId ?? null, taskId ?? null]);
 			if (later(row, unscoped.get(key))) unscoped.set(key, { sessionId, parentSessionId, taskId, endedMs, ledgerIds, usageTaskIdAmbiguous, projectKey });
 		}
 	}
@@ -1303,7 +1310,7 @@ function blockedHealthIds(nodes, rows, usage, liveOwners = []) {
 	for (const row of unscoped.values()) {
 		if (blocked.has(row.sessionId)) continue;
 		const inherited = resolve(row).projectKey;
-		consider(row.sessionId, inherited ?? (usage ? subjectOf(usageEntryOf(usage, row)).projectKey : null));
+		consider(row.sessionId, inherited ?? (usage ? subjectOf(usageEntryOf(usage, row)).projectKey : null), row.taskId);
 	}
 	return blocked;
 }
@@ -1313,12 +1320,12 @@ function recordDescendants(subject, rows, usage) {
 	const identityOf = (row) => {
 		const key = descendantKey(row, row);
 		if (typeof row.sessionId !== "string") return key;
-		const [id, parent, project] = JSON.parse(key);
+		const [id, parent, project, taskId] = JSON.parse(key);
 		if (typeof project !== "string") return key;
 		// Keep the exact ledger identity without copying the same project path
 		// into every descendant key. These ordinals never leave this walk.
 		if (!projects.has(project)) projects.set(project, projects.size);
-		return `project:${JSON.stringify([id, parent, projects.get(project)])}`;
+		return `project:${JSON.stringify([id, parent, projects.get(project), taskId ?? null])}`;
 	};
 	const seen = new Set([identityOf(subject), descendantKey(subject)]);
 	const nodes = new Map();
@@ -1370,10 +1377,10 @@ function recordDescendants(subject, rows, usage) {
 			const matches = map.get(key);
 			const prior = matches.get(identity);
 			if (!prior || (fromLedger && later(node, prior.node))) {
-				const { sessionId, taskId, parentSessionId, parentProjectKey, title, outcome, startedMs, endedMs, cwd } = node;
+				const { sessionId, taskId, parentSessionId, parentTaskId, parentProjectKey, title, outcome, startedMs, endedMs, cwd } = node;
 				// JSON parsing yields fresh strings even for adjacent identical cwd values.
 				if (cwd !== lastCwd) lastCwd = cwd;
-				matches.set(identity, { node: { sessionId, taskId, parentSessionId, parentProjectKey, title, outcome, startedMs, endedMs, cwd: lastCwd, projectKey: own.projectKey }, fromLedger });
+				matches.set(identity, { node: { sessionId, taskId, parentSessionId, parentTaskId, parentProjectKey, title, outcome, startedMs, endedMs, cwd: lastCwd, projectKey: own.projectKey }, fromLedger });
 			}
 		};
 		consider(subject, true);
@@ -1382,9 +1389,9 @@ function recordDescendants(subject, rows, usage) {
 			const { sessionId: id, projectKey } = subjectOf(entry);
 			const { taskId, parentKey, startedMs, checkedMs } = entry;
 			const parent = parentSubject({ ...entry, projectKey });
-			if (parent && !ledgerMirrors.has(subjectKey({ sessionId: id, projectKey })) &&
-				!ledgerMirrors.has(subjectKey({ sessionId: id, projectKey: null }))) {
-				consider({ sessionId: id, taskId, parentSessionId: parent.sessionId, parentProjectKey: parentKey ? parent.projectKey : undefined, startedMs, endedMs: checkedMs, projectKey }, false);
+			if (parent && !ledgerMirrors.has(subjectKey({ sessionId: id, projectKey, taskId })) &&
+				!ledgerMirrors.has(subjectKey({ sessionId: id, projectKey: null, taskId }))) {
+				consider({ sessionId: id, taskId, parentSessionId: parent.sessionId, parentTaskId: parent.taskId, parentProjectKey: parentKey ? parent.projectKey : undefined, startedMs, endedMs: checkedMs, projectKey }, false);
 			}
 		}
 		const matches = direct.get(null) ?? new Map();
@@ -1404,7 +1411,8 @@ function recordDescendants(subject, rows, usage) {
 				: parentOwners.has(parentId) ? null
 				: (!fromLedger && node.projectKey != null) ? peers.get(node.projectKey)
 				: peers.size === 1 ? peers.values().next().value : null;
-			if (!parent || (!owner && fromLedger && ids.has(parentId) && !parent.indexOnly)) continue;
+			if (!parent || (owner && subjectOf(parent).taskId !== (owner.taskId ?? null)) ||
+				(!owner && fromLedger && ids.has(parentId) && !parent.indexOnly)) continue;
 			const parentProject = subjectOf(parent).projectKey;
 			const { sessionId, taskId, parentSessionId, title, outcome, endedMs, cwd, storeDir } = node;
 			let { startedMs } = node;
@@ -1414,7 +1422,7 @@ function recordDescendants(subject, rows, usage) {
 				startedMs = parent.startedMs;
 			}
 			seen.add(identity);
-			const descendant = { sessionId, taskId: taskId ?? null, parentSessionId, parentProjectKey: parentProject, title: title ?? null, outcome: outcome ?? null, startedMs, endedMs: Number.isFinite(msOf(endedMs)) ? msOf(endedMs) : null, cwd, projectKey: subjectOf(node, parent).projectKey, depth, indexOnly: !fromLedger };
+			const descendant = { sessionId, taskId: taskId ?? null, parentSessionId, parentTaskId: subjectOf(parent).taskId, parentProjectKey: parentProject, title: title ?? null, outcome: outcome ?? null, startedMs, endedMs: Number.isFinite(msOf(endedMs)) ? msOf(endedMs) : null, cwd, projectKey: subjectOf(node, parent).projectKey, depth, indexOnly: !fromLedger };
 			if (nonEmpty(storeDir)) descendant.storeDir = storeDir;
 			frontier.push(descendant);
 			nodes.set(identity, descendant);

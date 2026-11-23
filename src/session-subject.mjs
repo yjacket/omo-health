@@ -25,22 +25,28 @@ export function projectKeyOf(cwd) {
 }
 
 export function subjectOf(row, parent) {
+	const taskId = row?.kind === "main" ? null : row?.ledgerIds?.taskId ?? row?.taskId ?? null;
 	// The ledger records this only when it resolved a project without an own cwd.
 	if (row?.endedProjectKey && row.projectKey == null) {
-		return { projectKey: projectKeyOf(row.cwd) ?? row.endedProjectKey, sessionId: row.sessionId ?? row.id ?? null };
+		return { projectKey: projectKeyOf(row.cwd) ?? row.endedProjectKey, sessionId: row.sessionId ?? row.id ?? null, taskId };
 	}
 	return {
 		projectKey: row?.projectKey ?? projectKeyOf(row?.cwd) ?? parent?.projectKey ?? null,
 		sessionId: row?.sessionId ?? row?.id ?? null,
+		taskId,
 	};
 }
 
 /** A task can identify its child's project before the transcript reaches the live registry. */
-export function childSubjectOf({ sessionId, task, world, parent }) {
-	const live = sessionId ? world?.sessions?.get(sessionId) : undefined;
+export function childSubjectOf({ sessionId, task, world, parent, child }) {
+	const taskId = task?.taskId ?? child?.taskId ?? null;
+	const registered = child ?? (sessionId ? world?.sessions?.get(sessionId) : undefined);
+	const live = registered?.kind === "child" &&
+		(!taskId || (registered.taskId ?? registered.task?.taskId) === taskId) ? registered : undefined;
 	return {
 		projectKey: projectKeyOf(live?.cwd) ?? projectKeyOf((task ?? live?.task)?.spawnCwd) ?? parent?.projectKey ?? null,
 		sessionId: sessionId ?? null,
+		taskId: taskId ?? live?.taskId ?? live?.task?.taskId ?? null,
 	};
 }
 
@@ -69,12 +75,14 @@ export function taskParentResolver(world, agentDir = world?.paths?.agentDir, kno
 		const sessionId = task?.parentSessionId;
 		if (!sessionId) return null;
 		// Store-less callers have no provenance; only these may use the old fallback.
-		if (!task.storeDir) return { sessionId, projectKey: legacyParent?.projectKey ?? null };
+		if (!task.storeDir) return { sessionId, projectKey: legacyParent?.projectKey ?? null, taskId: legacyParent?.taskId ?? null };
 		const storeDir = path.resolve(task.storeDir);
 		if (path.basename(storeDir) !== "senpi-task") return null;
 		const dir = path.dirname(storeDir);
 		const projectKey = path.basename(dir) === ".omo" ? projectKeyOf(path.dirname(dir)) : userStoreProject(storeDir);
-		return projectKey ? { sessionId, projectKey } : null;
+		const live = world?.sessions?.get(sessionId);
+		const parent = subjectOf(live);
+		return projectKey ? { sessionId, projectKey, taskId: parent.projectKey === projectKey ? parent.taskId : null } : null;
 	};
 }
 
@@ -129,28 +137,32 @@ export function worldLiveOwners(world) {
 
 /** Track only the requested IDs. Repeated rows of one scoped subject are one owner. */
 export function rememberParentOwner(owners, subject) {
-	const { sessionId, projectKey } = subject;
+	const { sessionId } = subject;
 	if (!owners.has(sessionId)) owners.set(sessionId, subject);
-	else if (owners.get(sessionId)?.projectKey !== projectKey) owners.set(sessionId, null);
+	else if (subjectKey(owners.get(sessionId)) !== subjectKey(subject)) owners.set(sessionId, null);
 }
 
 export function ledgerParentSubject(row, owners) {
 	if (!row.parentSessionId) return null;
-	return row.parentProjectKey != null
-		? { sessionId: row.parentSessionId, projectKey: row.parentProjectKey }
-		: owners?.get(row.parentSessionId) ?? null;
+	const sessionId = row.parentSessionId;
+	const owner = owners?.get(sessionId);
+	if (row.parentProjectKey == null) return owner ?? null;
+	if (row.parentTaskId == null && owner?.projectKey === row.parentProjectKey) return owner;
+	return { sessionId, projectKey: row.parentProjectKey, taskId: row.parentTaskId ?? null };
 }
 
 export function subjectKey(subject) {
-	return subject?.sessionId ? JSON.stringify([subject.projectKey ?? null, subject.sessionId]) : null;
+	return subject?.sessionId ? JSON.stringify([subject.projectKey ?? null, subject.sessionId, subject.taskId ?? null]) : null;
 }
 
 export function parseSubjectKey(key) {
 	if (typeof key !== "string") return key;
 	try {
 		const parts = JSON.parse(key);
-		if (Array.isArray(parts) && parts.length === 2 && (parts[0] === null || typeof parts[0] === "string") &&
-			typeof parts[1] === "string" && parts[1]) return { projectKey: parts[0], sessionId: parts[1] };
+		if (Array.isArray(parts) && (parts.length === 2 || parts.length === 3) && (parts[0] === null || typeof parts[0] === "string") &&
+			typeof parts[1] === "string" && parts[1] && (parts[2] == null || typeof parts[2] === "string")) {
+			return { projectKey: parts[0], sessionId: parts[1], ...(parts.length === 3 ? { taskId: parts[2] } : {}) };
+		}
 	} catch {}
 	return null;
 }
@@ -184,7 +196,21 @@ export function unpackScopedText(text) {
 
 export const PACKED_PROJECT = Symbol("packed project key");
 
-/** Scope raw IDs without storing serialized [project, id] keys. String keys are accepted at API boundaries. */
+// Most rows are mains: keep their raw ID and never repeat the project in an inner key.
+function innerKey(subject) {
+	const id = subject.sessionId ?? subject.id;
+	if (subject.taskId != null) return `\0${JSON.stringify([id, subject.taskId])}`;
+	return id?.startsWith("\0") ? `\0${id}` : id;
+}
+
+function innerSubject(key) {
+	if (!key.startsWith("\0")) return { sessionId: key };
+	if (key.startsWith("\0\0")) return { sessionId: key.slice(1) };
+	const [sessionId, taskId] = JSON.parse(key.slice(1));
+	return { sessionId, taskId };
+}
+
+/** Scope transcript IDs without storing serialized project keys in every row. */
 export class SubjectMap {
 	#projects = new Map();
 	#order;
@@ -210,7 +236,7 @@ export class SubjectMap {
 	get(key) {
 		const subject = parseSubjectKey(key);
 		if (!subject) return undefined;
-		const slot = this.#projects.get(this.#project(subject))?.ids.get(subject.sessionId ?? subject.id);
+		const slot = this.#projects.get(this.#project(subject))?.ids.get(innerKey(subject));
 		return this.#order ? slot?.value : slot;
 	}
 
@@ -218,7 +244,21 @@ export class SubjectMap {
 	getForSubject(subject) {
 		if (subject.projectKey != null) return this.get(subject);
 		const id = subject.sessionId ?? subject.id;
-		const slot = uniqueMatch(this.#projects.values(), ({ ids }) => ids.get(id));
+		const key = innerKey(subject);
+		if ("taskId" in subject) {
+			const slot = uniqueMatch(this.#projects.values(), ({ ids }) => ids.get(key));
+			return this.#order && slot != null ? slot.value : slot;
+		}
+		const slots = function* (projects) {
+			for (const { ids, children } of projects) {
+				if (ids.has(key)) yield ids.get(key);
+				if (!children) continue;
+				for (const [inner, value] of ids) {
+					if (inner.startsWith("\0[") && innerSubject(inner).sessionId === id) yield value;
+				}
+			}
+		};
+		const slot = uniqueMatch(slots(this.#projects.values()), (slot) => slot);
 		return this.#order && slot != null ? slot.value : slot;
 	}
 
@@ -227,11 +267,14 @@ export class SubjectMap {
 	set(key, value) {
 		const subject = parseSubjectKey(key);
 		const project = this.#project(subject);
-		const id = subject.sessionId ?? subject.id;
+		const id = innerKey(subject);
 		let bucket = this.#projects.get(project);
-		if (!bucket) this.#projects.set(project, bucket = { key: project, ids: new Map() });
+		if (!bucket) this.#projects.set(project, bucket = { key: project, ids: new Map(), children: 0 });
 		const { ids } = bucket;
-		if (!ids.has(id)) this.#size++;
+		if (!ids.has(id)) {
+			this.#size++;
+			if (subject.taskId != null) bucket.children++;
+		}
 		if (this.#order) {
 			const slot = ids.get(id);
 			if (slot) slot.value = value;
@@ -248,11 +291,13 @@ export class SubjectMap {
 		const subject = parseSubjectKey(key);
 		if (!subject) return false;
 		const project = this.#project(subject);
-		const id = subject.sessionId ?? subject.id;
-		const ids = this.#projects.get(project)?.ids;
+		const id = innerKey(subject);
+		const bucket = this.#projects.get(project);
+		const ids = bucket?.ids;
 		if (!ids?.has(id)) return false;
 		this.#order?.delete(ids.get(id));
 		ids.delete(id);
+		if (subject.taskId != null) bucket.children--;
 		if (!ids.size) this.#projects.delete(project);
 		this.#size--;
 		return true;
@@ -270,9 +315,9 @@ export class SubjectMap {
 	}
 
 	*subjects() {
-		const subject = (project, sessionId) => this.#pack
-			? { [PACKED_PROJECT]: project, get projectKey() { return unpackScopedText(project); }, sessionId }
-			: { projectKey: project, sessionId };
+		const subject = (project, key) => this.#pack
+			? { [PACKED_PROJECT]: project, get projectKey() { return unpackScopedText(project); }, ...innerSubject(key) }
+			: { projectKey: project, ...innerSubject(key) };
 		if (this.#order) {
 			for (const { project, id, value } of this.#order) yield [subject(project, id), value];
 		} else {
@@ -290,6 +335,7 @@ export class SubjectMap {
 /** Hash only explicit subjects, never legacy raw-id records. */
 export function auditFileKey(subject) {
 	if (safeSubjectId(subject?.sessionId) === null ||
+		(subject.taskId != null && safeSubjectId(subject.taskId) === null) ||
 		(subject.projectKey !== null && (typeof subject.projectKey !== "string" || !subject.projectKey))) return null;
 	return createHash("sha256").update(subjectKey(subject)).digest("hex").slice(0, 32);
 }
@@ -307,7 +353,7 @@ export function sessionSubjects(rows, world) {
 	const resolve = (row, remaining = 8) => {
 		const sessionId = row?.sessionId ?? row?.id;
 		const liveChild = row?.kind === "child" && sessionId && world?.sessions?.get(sessionId) === row;
-		const own = liveChild ? childSubjectOf({ sessionId, world }) : subjectOf(row);
+		const own = liveChild ? childSubjectOf({ sessionId, world, child: row }) : subjectOf(row);
 		if (own.projectKey || !remaining || !row?.parentSessionId) return own;
 		if (row.parentProjectKey != null) return { ...own, projectKey: row.parentProjectKey };
 		const parents = byId.get(row.parentSessionId) ?? [];

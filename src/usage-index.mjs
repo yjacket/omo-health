@@ -17,7 +17,7 @@ import { atomicWriteChunks, statSafe } from "./util/fsx.mjs";
  * advances record by record, while `published` only moves when a read ends
  * `done`, so a partial append never shows an intermediate sum (IS-1, IS-3, IS-12).
  */
-export const USAGE_INDEX_VERSION = 5;
+export const USAGE_INDEX_VERSION = 6;
 const INDEX_HEADER = JSON.stringify({ v: USAGE_INDEX_VERSION });
 const FULL_HEADER = JSON.stringify({ v: USAGE_INDEX_VERSION, full: true });
 const FULL_ENTRY = Object.freeze({ state: "full" });
@@ -41,10 +41,10 @@ const TREE_DEPTH = 8;
 
 const isObject = (value) => typeof value === "object" && value !== null;
 
-const META_KEYS = ["kind", "taskId", "parentSessionId", "rootSessionId", "parentKey", "rootKey"];
+const META_KEYS = ["kind", "parentSessionId", "rootSessionId", "parentKey", "rootKey"];
 const MEMORY_ONLY_KEYS = ["scanOffset", "partial", "readError", "pending"];
 const USAGE_KEYS = ["usage", "overlay", "published"];
-const ENTRY_STRING_KEYS = ["id", "projectKey", "file", ...META_KEYS, "state", "head", "tail", "ino"];
+const ENTRY_STRING_KEYS = ["id", "projectKey", "file", "taskId", ...META_KEYS, "state", "head", "tail", "ino"];
 const OTHER_MODELS = "(other models)";
 const SPILL_KEYS = new Set([OTHER_MODELS, "(model id too long)", "(model id unreadable)"]);
 export const isSpillModelKey = (key) => SPILL_KEYS.has(key);
@@ -55,7 +55,6 @@ const PERSISTED_KEYS = [
 	"projectKey",
 	"file",
 	"kind",
-	"taskId",
 	"parentSessionId",
 	"rootSessionId",
 	"parentKey",
@@ -78,13 +77,13 @@ const PERSISTED_KEYS = [
 	"checkedMs",
 ];
 
-function newEntry({ sessionId: id, projectKey = null }) {
+function newEntry({ sessionId: id, projectKey = null, taskId }) {
 	return {
 		id,
 		projectKey,
 		file: null,
 		kind: null,
-		taskId: null,
+		...(taskId != null ? { taskId } : {}),
 		parentSessionId: null,
 		rootSessionId: null,
 		parentKey: null,
@@ -114,7 +113,7 @@ function applyMeta(entry, meta) {
 	for (const [key, id] of [["parentKey", "parentSessionId"], ["rootKey", "rootSessionId"]]) {
 		if (id in meta && !(key in meta)) entry[key] = null;
 		const linked = parseSubjectKey(entry[key]);
-		if (linked && linked.projectKey === entry.projectKey && linked.sessionId === entry[id]) entry[key] = null;
+		if (linked && linked.taskId == null && linked.projectKey === entry.projectKey && linked.sessionId === entry[id]) entry[key] = null;
 	}
 }
 
@@ -123,7 +122,7 @@ export function parentSubject(entry) {
 	// same-project link (null).
 	if (entry.parentKey === "") return null;
 	return parseSubjectKey(entry.parentKey) ?? (entry.parentSessionId ?
-		{ projectKey: entry.projectKey, sessionId: entry.parentSessionId } : null);
+		{ projectKey: entry.projectKey, sessionId: entry.parentSessionId, taskId: null } : null);
 }
 
 function hasStatCursor(entry) {
@@ -291,6 +290,7 @@ export function treeTotals(entries, knownRows = [], treeKey = (key) => key) {
 function persisted(entry) {
 	const out = {};
 	for (const key of PERSISTED_KEYS) out[key] = entry[key];
+	if (entry.taskId != null) out.taskId = entry.taskId;
 	if (typeof entry.ownershipUnique === "boolean") out.ownershipUnique = entry.ownershipUnique;
 	// Non-finite leaves are tagged by the serializer, not by copying the trees here:
 	// a 105k-model entry copied into a second tree of the same size aborts at 96 MiB.
@@ -386,7 +386,9 @@ function validateEntry(entry, remaining) {
 	if (entry.state === "ok") for (const key of MEMORY_ONLY_KEYS) delete entry[key];
 	const hasOwnership = Object.hasOwn(entry, "ownershipUnique");
 	if (hasOwnership && typeof entry.ownershipUnique !== "boolean") return -1;
-	if (Object.keys(entry).length !== PERSISTED_KEYS.length + Number(hasOwnership) ||
+	const hasTask = Object.hasOwn(entry, "taskId");
+	if (hasTask && !isId(entry.taskId)) return -1;
+	if (Object.keys(entry).length !== PERSISTED_KEYS.length + Number(hasOwnership) + Number(hasTask) ||
 		!PERSISTED_KEYS.every((key) => Object.hasOwn(entry, key))) return -1;
 	if (typeof entry.id !== "string" || !nullableString(entry.projectKey) || !META_KEYS.every((key) => nullableString(entry[key]))) return -1;
 	if (!Number.isFinite(entry.checkedMs) || typeof entry.complete !== "boolean" || typeof entry.gone !== "boolean") return -1;
@@ -481,8 +483,10 @@ export function usageEntryFor(usage, subject, taskId) {
 	if (subject?.sessionId) {
 		if (usage?.getForSubject) return usage.getForSubject(subject);
 		if (subject.projectKey != null) return usage?.get(subjectKey(subject));
-		return uniqueMatch(usage?.values() ?? [], (entry) => entry?.id === subject.sessionId ? entry : undefined);
+		return uniqueMatch(usage?.values() ?? [], (entry) => entry?.id === subject.sessionId &&
+			(!("taskId" in subject) || (entry.taskId ?? null) === subject.taskId) ? entry : undefined);
 	}
+	taskId ??= subject?.taskId;
 	if (!isId(taskId)) return undefined;
 	let match;
 	for (const entry of usage?.values() ?? []) {
@@ -500,14 +504,18 @@ export function usageEntryFor(usage, subject, taskId) {
 }
 
 /** Snapshot the subject and descendants for one audit, not the resident scan cursors. */
-export function relatedUsageEntries(index, sessionId) {
+export function relatedUsageEntries(index, subject) {
+	const matchesSubject = typeof subject === "string"
+		? (candidate) => candidate?.sessionId === subject
+		: (candidate) => subjectKey(candidate) === subjectKey(subject);
 	const related = [];
 	for (const entry of index?.values() ?? []) {
-		let matches = entry.id === sessionId || entry.rootSessionId === sessionId;
+		let matches = matchesSubject(subjectOf(entry)) ||
+			(entry.rootSessionId && matchesSubject(parseSubjectKey(entry.rootKey) ?? { projectKey: entry.projectKey, sessionId: entry.rootSessionId }));
 		let parent = parentSubject(entry);
 		for (let depth = 0; !matches && parent && depth < TREE_DEPTH; depth += 1) {
+			if (matchesSubject(parent)) { matches = true; break; }
 			const ancestor = (index.getExact ?? index.get).call(index, subjectKey(parent));
-			matches = ancestor?.id === sessionId;
 			parent = ancestor && parentSubject(ancestor);
 		}
 		if (matches) {
@@ -690,6 +698,7 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 		 * while `readError` hides them from the board.
 		 */
 		update(subject, path, meta = {}, { maxBytes = Infinity, ownershipUnique } = {}) {
+			if (subject.taskId == null && meta.kind !== "main" && meta.taskId != null) subject = { ...subject, taskId: meta.taskId };
 			const id = subject;
 			const stored = entries.get(id);
 			const entry = stored && Object.hasOwn(stored, "file") ? stored : newEntry(subject);
@@ -789,6 +798,7 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 		 * a conflicting lookup (including one in another store) clears the claim.
 		 */
 		markMissing(subject, meta = {}, { withdraw = false } = {}) {
+			if (subject.taskId == null && meta.kind !== "main" && meta.taskId != null) subject = { ...subject, taskId: meta.taskId };
 			const id = subject;
 			const entry = entries.get(id) ?? newEntry(subject);
 			const previousSlots = weights.get(id)?.slots ?? null;
@@ -950,9 +960,10 @@ function loadUsageIndex(file, trackWeights = true) {
 			for (const { row, key } of rows()) {
 				const { id } = row;
 				const projectKey = entries.canonicalProject(key.projectKey);
-				const size = markerOverhead + stringBytes(id) + stringBytes(projectKey);
+				const taskId = isId(row.taskId) ? row.taskId : null;
+				const size = markerOverhead + stringBytes(id) + stringBytes(projectKey) + stringBytes(taskId);
 				if (bytes + size > INDEX_BYTE_BUDGET || validateEntry(row, USAGE_INDEX_MODEL_BUDGET - named) >= 0) continue;
-				const marker = { id, projectKey, state: "ok", complete: false, offset: 0 };
+				const marker = { id, projectKey, ...(taskId === null ? {} : { taskId }), state: "ok", complete: false, offset: 0 };
 				entries.set(marker, marker);
 				bytes += size;
 				if (trackWeights) weights.set(marker, { slots: null, bytes: size });

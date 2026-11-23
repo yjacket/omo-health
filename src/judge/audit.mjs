@@ -564,6 +564,7 @@ export function auditBundle(record, timeline, { config, now, configDecisions = [
 	const session = isObject(record?.session) ? record.session : {};
 	// ledgerIds are local-only exact keys; the corresponding display fields may already be masked.
 	const sessionIds = session.ledgerIds ?? session;
+	const subject = record?.subject ?? sessionIds;
 	const health = isObject(record?.health) ? record.health : {};
 	const children = Array.isArray(record?.children) ? record.children : [];
 	const messagesSkipped = Array.isArray(record?.truncated?.messagesSkipped) ? record.truncated.messagesSkipped.length : 0;
@@ -614,8 +615,8 @@ export function auditBundle(record, timeline, { config, now, configDecisions = [
 	if (investigations.some((row) => row?.verdictHistoryTooLarge)) throw new Error("evidence-too-large");
 	const bundle = {
 		session: {
-			sessionId: subjectIdOf(sessionIds.sessionId),
-			taskId: subjectIdOf(sessionIds.taskId),
+			sessionId: subjectIdOf(subject.sessionId),
+			taskId: subjectIdOf(subject.taskId),
 			kind: textOf(session.kind),
 			parentSessionId: subjectIdOf(sessionIds.parentSessionId),
 			outcome: textOf(session.outcome),

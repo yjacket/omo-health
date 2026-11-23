@@ -473,13 +473,17 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 		}
 
 		const safe8 = record.sessionId.replace(/[^A-Za-z0-9]/g, "").slice(0, 8) || "x";
-		const jobId = `audit-${now.toString(36)}-${(seq++).toString(36)}-${safe8}`;
+		let jobId;
+		let jobDir;
+		do {
+			jobId = `audit-${now.toString(36)}-${(seq++).toString(36)}-${safe8}`;
+			jobDir = path.join(jobsDir, jobId);
+		} while (fs.existsSync(jobDir));
 		const laneSessionId = crypto.randomUUID();
-		const jobDir = path.join(jobsDir, jobId);
 		ensureDir(jobDir);
 		atomicWriteFile(bundleFileOf(jobId), auditDocument(bundle));
 		atomicWriteJson(path.join(jobDir, "refs.json"), { refs: refsOf(bundle), findingRefs: detectorFindingRefs(bundle) });
-		atomicWriteJson(path.join(jobDir, "analyst.json"), { jobId, sessionId: laneSessionId, kind: "audit", subject: { sessionId: loaded.session?.sessionId ?? record.sessionId, taskId: loaded.session?.taskId ?? null }, model: choice.model, lane: choice.lane, createdMs: now });
+		atomicWriteJson(path.join(jobDir, "analyst.json"), { jobId, sessionId: laneSessionId, kind: "audit", subject: subjectOf(record), model: choice.model, lane: choice.lane, createdMs: now });
 
 		Object.assign(record, { status: "launching", jobId, laneSessionId, model: choice.model, lane: choice.lane, independence: choice.independence, launchMs: now, prepMs: Number.isFinite(full?.prepMs) ? Math.round(full.prepMs) : null });
 		record.firedDetectors = firedDetectors(bundle);
@@ -552,7 +556,7 @@ export function createAuditor({ paths, config, clock, log, runner, index, env = 
 			// have a child whose cwd is in another project, so preserve its candidate entries.
 			// The daemon publishes its live board before ticking the auditor.
 			const owners = liveOwners ?? boardLiveOwners(paths);
-			worker.postMessage({ subject: subjectOf(record), now, liveOwners: owners, indexEntries: relatedUsageEntries(source, record.sessionId), indexFull: source?.full === true, bounds: {
+			worker.postMessage({ subject: subjectOf(record), now, liveOwners: owners, indexEntries: relatedUsageEntries(source, subjectOf(record)), indexFull: source?.full === true, bounds: {
 				preparationMaxBytes: TIMELINE_MAX_BYTES + MESSAGE_SCAN_TOTAL_BYTES,
 				messageScanMaxBytes: timelineMaxBytes, messageScanTotalBytes: MESSAGE_SCAN_TOTAL_BYTES,
 				descendantScanMax: DESCENDANT_SCAN_MAX, tokens: config.tokens,

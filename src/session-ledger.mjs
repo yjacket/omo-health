@@ -146,7 +146,8 @@ export function locateEndedRows(paths, rows, { fs: fsImpl = fs } = {}) {
 export function endedKey(row) {
 	if (typeof row?.sessionId !== "string") return undefined;
 	const parent = row.parentSessionId || null;
-	return JSON.stringify([row.sessionId, parent, projectKeyOf(row.cwd) ?? row.endedProjectKey ?? (parent ? null : row.cwd || null)]);
+	const taskId = subjectOf(row).taskId;
+	return JSON.stringify([row.sessionId, parent, projectKeyOf(row.cwd) ?? row.endedProjectKey ?? (parent ? null : row.cwd || null), ...(taskId ? [taskId] : [])]);
 }
 
 export function endedSelector(row) {

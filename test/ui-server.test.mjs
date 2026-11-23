@@ -1,6 +1,6 @@
 import "./helpers/tmp-root.mjs";
 import { projectKeyOf, subjectKey, subjectOf } from "../src/session-subject.mjs";
-const sub = (sessionId, cwd) => subjectOf({ sessionId, cwd });
+const sub = (sessionId, cwd, taskId) => subjectOf({ sessionId, cwd, taskId });
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -837,7 +837,6 @@ describe("ui server", { timeout: 20_000 }, () => {
 							rootKey: null,
 							file: sessionFile,
 							kind: "main",
-							taskId: null,
 							parentSessionId: null,
 							rootSessionId: null,
 							state: "ok",
@@ -1743,7 +1742,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 					});
 					const index = createUsageIndex({ file: world.paths.health.usageIndexFile, clock: { now: world.now } });
 					index.update(sub(taskId, children[0].cwd), files[0], { kind: "child", taskId });
-					assert.equal(index.fresh(index.get(subjectKey(sub(taskId, children[0].cwd)))), true);
+					assert.equal(index.fresh(index.get(subjectKey(sub(taskId, children[0].cwd, taskId)))), true);
 					assert.equal(index.has(subjectKey(subjectOf(children[1]))), false);
 					index.save();
 
@@ -1943,7 +1942,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 					assert.deepEqual(ledger().filter((row) => row.sessionId === taskId).map(facts), expected);
 					const history = buildEnded({ ended: ledger(), now: nowMs }).rows.filter((row) => row.sessionId === taskId);
 					assert.deepEqual(history.map(facts), expected);
-					assert.deepEqual(history.map((row) => row.detailRow), children.map((row) => expectedSelector({ ...row, sessionId: taskId })));
+					assert.deepEqual(history.map((row) => row.detailRow), children.map((row) => expectedSelector({ ...row, sessionId: taskId, taskId })));
 					const { port } = await ui.listen();
 					for (const row of history) {
 						const { status, body } = await getAt(port, `/api/session?id=${row.sessionId}&row=${row.detailRow}`);
@@ -2294,7 +2293,7 @@ describe("ui server", { timeout: 20_000 }, () => {
 						assert.deepEqual([accepted.status, accepted.body.audit.sessionId], [202, world.sessionId], `${first} must be accepted as the canonical session`);
 						const refused = await postAt(auditPort, "/api/audit", { sessionId: second });
 						assert.deepEqual([refused.status, refused.body.error], [409, "running"], `${second} must find the first request`);
-						assert.deepEqual(fs.readdirSync(world.paths.health.auditRequestsDir), [`${auditFileKey(sub(world.sessionId, world.dir))}.json`]);
+						assert.deepEqual(fs.readdirSync(world.paths.health.auditRequestsDir), [`${auditFileKey(sub(world.sessionId, world.dir, world.taskId))}.json`]);
 					} finally {
 						await auditServer.close();
 						fs.rmSync(world.dir, { recursive: true, force: true });
@@ -2309,7 +2308,8 @@ describe("ui server", { timeout: 20_000 }, () => {
 					path.join(world.paths.health.sessionsDir, "ended-2026-11-22.jsonl"),
 					`${JSON.stringify({ v: 1, sessionId: world.sessionId, taskId: world.taskId, cwd: world.dir, kind: "child", outcome: "answered", startedMs: world.now() - 1_000, endedMs: world.now() })}\n`,
 				);
-				writeJson(path.join(world.paths.health.auditRequestsDir, `${auditFileKey(sub(world.sessionId, world.dir))}.json`), { v: 1, ...sub(world.sessionId, world.dir), requestedMs: world.now() - 1_000 });
+				const subject = sub(world.sessionId, world.dir, world.taskId);
+				writeJson(path.join(world.paths.health.auditRequestsDir, `${auditFileKey(subject)}.json`), { v: 1, ...subject, requestedMs: world.now() - 1_000 });
 				const auditServer = createUiServer({
 					paths: world.paths,
 					token: TOKEN,
