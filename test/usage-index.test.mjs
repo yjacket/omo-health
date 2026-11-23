@@ -82,11 +82,11 @@ function saturate(index) {
 	}
 }
 
-function appendLarge(file) {
+function appendLarge(file, delimiter = "\n") {
 	const chunk = "x".repeat(MiB);
 	fs.appendFileSync(file, '{"type":"usage","provider":"p","model":"m","usage":{"input":30},"unused":"');
 	for (let i = 0; i < 40; i++) fs.appendFileSync(file, chunk);
-	fs.appendFileSync(file, '"}\n');
+	fs.appendFileSync(file, '"}' + delimiter);
 }
 
 test("(IS-1, IS-2, IS-12) a saturated index finishes a 40 MiB append and reads backlog in two ticks", (t) => {
@@ -122,6 +122,59 @@ test("(IS-1, IS-2, IS-12) a saturated index finishes a 40 MiB append and reads b
 		assert.ok(resident <= INDEX_BYTE_BUDGET + indexLimits.INDEX_FRAGMENT_RESERVE_BYTES);
 	}
 	assert.ok(index.residentBytes <= INDEX_BYTE_BUDGET, "release the reserve at the delimiter");
+});
+
+test("(IS-1, IS-2, IS-12) an unchanged unterminated EOF yields the reserve to a complete append", (t) => {
+	const { clock, fileOf, indexOf } = setup(t);
+	const index = indexOf();
+	const a = { id: "abcdef01", kind: "main", file: fileOf("2026-09-28T12-00-00-000Z_abcdef01.jsonl") };
+	const b = { id: "abcdef02", kind: "main", file: fileOf("2026-09-28T12-00-00-000Z_abcdef02.jsonl") };
+	const tracker = createUsageTracker({ clock, index });
+	const world = { sessions: new Map([[a.id, a], [b.id, b]]) };
+	const entryOf = (session) => index.getForSubject(sub(session.id));
+	for (const session of [a, b]) {
+		writeText(session.file, `${line()}\n`);
+		index.update(sub(session.id), session.file, { kind: "main" });
+	}
+	saturate(index);
+	const capacity = index.entries().length;
+	const tick = () => {
+		const { bytesRead } = tracker.tick(world);
+		assert.ok(bytesRead <= USAGE_TICK_BYTES);
+		assert.equal(index.entries().length, capacity);
+		assert.equal(index.full, true);
+		assert.ok(index.residentBytes <= INDEX_BYTE_BUDGET + indexLimits.INDEX_FRAGMENT_RESERVE_BYTES);
+		return bytesRead;
+	};
+	const assertAPending = () => {
+		const { tokens, pending } = tracker.tokensOf(sub(a.id));
+		assert.equal(tokens.total, 10, "A keeps showing its last published total");
+		assert.equal(pending, true);
+	};
+	appendLarge(a.file, "");
+	tick();
+	tick();
+	assert.equal(index.fragmentPriority, entryOf(a));
+	assert.equal(entryOf(a).scanOffset, fs.statSync(a.file).size);
+	assert.equal(tick(), 0, "with no waiter, keep the fragment without rereading");
+	assertAPending();
+	appendLarge(b.file);
+	for (let n = 0; n < 3; n++) {
+		tick();
+		assertAPending();
+	}
+	assert.equal(entryOf(b).published.total, 40, "B publishes within three ticks without an append to A");
+	assert.deepEqual(entryOf(b).published, readUsage(b.file).effective);
+	assert.equal(entryOf(a).partial, undefined, "A discarded its retained EOF fragment");
+	assert.equal(entryOf(a).scanOffset, entryOf(a).offset);
+	assert.equal(tick(), 0, "parked A does not spend budget on unchanged bytes");
+	fs.appendFileSync(a.file, "\n");
+	assert.equal(tick(), USAGE_TICK_BYTES, "A's changed file is rescanned on budget from its committed offset");
+	assertAPending();
+	assert.ok(tick() > 0);
+	assert.deepEqual(entryOf(a).published, readUsage(a.file).effective);
+	assert.equal(entryOf(a).published.total, 40);
+	assert.equal(entryOf(a).pending, false);
 });
 
 test("(IS-1, IS-2) a second oversized fragment spends no bytes while the reserve is occupied", (t) => {
@@ -219,7 +272,9 @@ test("(IS-1) retained fragments share the resident index budget across sessions"
 	}
 	for (const { subject, file, part } of rows) {
 		fs.appendFileSync(file, committed + part);
-		index.update(subject, file);
+		// This case tests contention while the owner still has unread bytes.
+		const maxBytes = subject === rows[22].subject ? committed.length + part.length - 1 : Infinity;
+		index.update(subject, file, {}, { maxBytes });
 	}
 
 	const retained = index.entries().reduce((bytes, { partial }) =>
@@ -252,8 +307,10 @@ test("(IS-1) retained fragments share the resident index budget across sessions"
 		const entry = index.getForSubject(subject);
 		fs.appendFileSync(file, suffix);
 		const spent = index.update(subject, file, {}, { maxBytes: MiB * 2 });
-		if (keep || subject === owner.subject) {
+		if (keep) {
 			assert.equal(spent, suffix.length + 2 * 4096, "resume by checking only fingerprint windows and the suffix");
+		} else if (subject === owner.subject) {
+			assert.equal(spent, 1 + suffix.length + 2 * 4096, "resume by checking fingerprints and reading only the unread byte and suffix");
 		} else {
 			assert.equal(spent, part.length + suffix.length, "discarded state requires a charged rescan");
 		}

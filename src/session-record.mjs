@@ -914,12 +914,114 @@ const SCAN_LINE_MAX = 1024 * 1024;
 const SCAN_NEWLINE = 0x0a;
 const SCAN_MARKER = Buffer.from('"customType":"omo-health"', "utf8");
 
+// The usage scanner has a fixed projection that omits content and display.
+// For oversized JSON.stringify records, walk the top-level members instead:
+// nested values (including details) only affect quote/escape state and depth.
+function oversizedMessageScanner(bounded) {
+	const fields = Object.create(null);
+	// At most six encoded bytes per UTF-16 unit. The lookahead also leaves
+	// room for a two-unit UTF-8 character at the display truncation boundary.
+	const raw = Buffer.allocUnsafe(bounded ? 6 * 128 : 6 * (DETAIL_TEXT_MAX + 1));
+	let state = "root";
+	let key;
+	let depth = 0;
+	let quoted = false;
+	let escape = 0;
+	let limit = 0;
+	let units = 0;
+	let length = 0;
+
+	const reset = (max) => { limit = max; units = length = 0; };
+	const parse = (string) => {
+		const text = raw.toString("utf8", 0, length);
+		return JSON.parse(string ? `"${text}"` : text);
+	};
+	const wanted = () => key === "type" || key === "customType" || key === "timestamp" ||
+		key === "display" || (!bounded && key === "content");
+	const assign = (value) => {
+		if (wanted()) fields[key] = value;
+		state = "after";
+	};
+
+	function step(byte) {
+		if (quoted) {
+			if (byte === 0x22 && escape === 0) {
+				quoted = false;
+				if (depth !== 0) return;
+				const value = limit && (units <= limit || key === "content" && state === "value") ? parse(true) : undefined;
+				if (state === "value") assign(value);
+				else {
+					key = value;
+					state = "colon";
+				}
+				return;
+			}
+			if (byte < 0x20) { state = "invalid"; return; }
+			if (limit) {
+				// A JSON escape or a UTF-8 continuation belongs to the preceding unit.
+				if (escape === 0 && (byte & 0xc0) !== 0x80) units += byte >= 0xf0 ? 2 : 1;
+				if (units <= limit && length < raw.length) raw[length++] = byte;
+			}
+			if (escape === -1) escape = byte === 0x75 ? 4 : 0; // \uXXXX
+			else if (escape > 0) escape--;
+			else if (byte === 0x5c) escape = -1;
+			return;
+		}
+		if (depth !== 0) {
+			if (byte === 0x22) quoted = true;
+			else if (byte === 0x7b || byte === 0x5b) depth++;
+			else if ((byte === 0x7d || byte === 0x5d) && --depth === 0) assign(undefined);
+			return;
+		}
+		const space = byte === 0x20 || byte === 0x09 || byte === 0x0d;
+		if (state === "scalar") {
+			if (space || byte === 0x2c || byte === 0x7d) assign(limit && length <= limit ? parse(false) : undefined);
+			else {
+				if (length <= limit && limit) raw[length++] = byte;
+				return;
+			}
+		}
+		if (space) return;
+		if (state === "root" && byte === 0x7b) state = "first";
+		else if ((state === "first" || state === "after") && byte === 0x7d) state = "end";
+		else if ((state === "first" || state === "key") && byte === 0x22) {
+			reset(32);
+			quoted = true;
+		} else if (state === "colon" && byte === 0x3a) state = "value";
+		else if (state === "after" && byte === 0x2c) state = "key";
+		else if (state === "value") {
+			if (byte === 0x22) {
+				reset(wanted() ? key === "content" ? DETAIL_TEXT_MAX + 1 : 128 : 0);
+				quoted = true;
+			} else if (byte === 0x7b || byte === 0x5b) {
+				reset(0);
+				depth = 1;
+			} else if (byte === 0x2d || (byte >= 0x30 && byte <= 0x39) || byte === 0x74 || byte === 0x66 || byte === 0x6e) {
+				reset(key === "timestamp" || key === "display" ? 128 : 0);
+				if (limit) raw[length++] = byte;
+				state = "scalar";
+			} else state = "invalid";
+		} else state = "invalid";
+	}
+
+	return {
+		push(bytes) {
+			try {
+				for (let i = 0; i < bytes.length && state !== "invalid"; i++) step(bytes[i]);
+			} catch {
+				// An invalid captured JSON token invalidates this line, not the scan.
+				state = "invalid";
+			}
+		},
+		finish() { return state === "end" ? fields : null; },
+	};
+}
+
 /**
  * Only lines naming the `omo-health` custom type are parsed; the rest of the
  * transcript is never decoded as content. The file is read in 4 MiB chunks so
  * a session file larger than the daemon heap (96 MiB) cannot exhaust it, and a
- * line over 1 MiB is dropped without being buffered past the limit (an
- * `omo-health` message line is small, so it is never one).
+ * line over 1 MiB switches to the bounded top-level scanner.
  */
 export function scanOmoHealthMessages(file) {
 	return [...streamOmoHealthMessages(file)];
@@ -932,14 +1034,7 @@ function* streamOmoHealthMessages(file, bounded = false) {
 	} catch {
 		return;
 	}
-	const consume = (bytes) => {
-		if (!bytes.length || !bytes.includes(SCAN_MARKER)) return;
-		let entry;
-		try {
-			entry = JSON.parse(bytes.toString("utf8"));
-		} catch {
-			return;
-		}
+	const project = (entry) => {
 		if (!isRecord(entry) || (entry.type !== "custom_message" && entry.type !== "custom") || entry.customType !== "omo-health") return;
 		const ms = msOf(entry.timestamp);
 		const message = { ms: Number.isFinite(ms) ? ms : null, kind: auditMessageKind(entry.details?.kind) };
@@ -947,10 +1042,18 @@ function* streamOmoHealthMessages(file, bounded = false) {
 		const text = typeof entry.content === "string" ? entry.content : isRecord(entry.content) ? JSON.stringify(entry.content) : "";
 		return { ...message, text: cleanDetail(text) };
 	};
+	const consume = (bytes) => {
+		if (!bytes.length || !bytes.includes(SCAN_MARKER)) return;
+		try {
+			return project(JSON.parse(bytes.toString("utf8")));
+		} catch {
+			return;
+		}
+	};
 	try {
 		const chunk = Buffer.allocUnsafe(SCAN_CHUNK);
 		let carry = null;
-		let overlong = false;
+		let oversized = null;
 		for (;;) {
 			const n = fs.readSync(fd, chunk, 0, SCAN_CHUNK, null);
 			if (n === 0) break;
@@ -959,34 +1062,24 @@ function* streamOmoHealthMessages(file, bounded = false) {
 			while (pos < n) {
 				const newline = view.indexOf(SCAN_NEWLINE, pos);
 				const piece = view.subarray(pos, newline === -1 ? n : newline);
+				if (!oversized && (carry?.length ?? 0) + piece.length > SCAN_LINE_MAX) {
+					oversized = oversizedMessageScanner(bounded);
+					if (carry) oversized.push(carry);
+					carry = null;
+				}
+				if (oversized) oversized.push(piece);
 				if (newline === -1) {
-					if (!overlong) {
-						if ((carry?.length ?? 0) + piece.length > SCAN_LINE_MAX) {
-							overlong = true;
-							carry = null;
-						} else {
-							carry = carry ? Buffer.concat([carry, piece]) : Buffer.from(piece);
-						}
-					}
+					if (!oversized) carry = carry ? Buffer.concat([carry, piece]) : Buffer.from(piece);
 					break;
 				}
-				if (overlong) {
-					overlong = false;
-					carry = null;
-				} else if ((carry?.length ?? 0) + piece.length > SCAN_LINE_MAX) {
-					carry = null;
-				} else {
-					const message = consume(carry ? Buffer.concat([carry, piece]) : piece);
-					if (message) yield message;
-					carry = null;
-				}
+				const message = oversized ? project(oversized.finish()) : consume(carry ? Buffer.concat([carry, piece]) : piece);
+				if (message) yield message;
+				oversized = carry = null;
 				pos = newline + 1;
 			}
 		}
-		if (!overlong && carry) {
-			const message = consume(carry);
-			if (message) yield message;
-		}
+		const message = oversized ? project(oversized.finish()) : carry && consume(carry);
+		if (message) yield message;
 	} catch {
 		return;
 	} finally {

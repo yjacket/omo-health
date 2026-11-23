@@ -1401,6 +1401,54 @@ function jsonl(entries) {
 	return entries.map((entry) => `${typeof entry === "string" ? entry : JSON.stringify(entry)}\n`).join("");
 }
 
+test("IS-7: an oversized senpi health notice appears once in detail and audit counts without leaking its payload", (t) => {
+	const { root, paths } = setup();
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const row = mainRow();
+	const small = ohealth(T0 + MIN, "normal notice");
+	const ms = T0 + 2 * MIN;
+	const content = 'Private oversized notice: "확인"\nnext line \\';
+	const privateDetail = "private-oversized-details";
+	// Senpi serializes the extension payload first, then the id, parentId and
+	// timestamp. The real timestamp here falls beyond the first 4 MiB read.
+	const big = {
+		type: "custom_message", customType: "omo-health", content, display: true,
+		details: { kind: "self-notice", timestamp: small.timestamp, content: "nested decoy", dump: privateDetail.repeat(Math.ceil(4 * MIB / privateDetail.length)) },
+		id: "big-notice", parentId: small.id, timestamp: iso(ms),
+	};
+	assert.ok(Buffer.byteLength(JSON.stringify(big.details)) > 2 * MIB);
+	writeLedger(paths, [row]);
+	mainSessionFile(paths, row.sessionId, [{ type: "session", id: row.sessionId, cwd: row.cwd }, small, big]);
+	const options = { paths, id: row.sessionId, now: row.endedMs };
+	const detail = createDetailOperations({ paths, auditDetail: () => null });
+	const { record } = detail({ kind: "detail", id: row.sessionId, now: options.now });
+	const { health } = buildSessionView(record);
+	assert.deepEqual(health.messages, [
+		{ ms, kind: null, recipient: row.sessionId, text: content },
+		{ ms: T0 + MIN, kind: "self-notice", recipient: row.sessionId, text: small.content },
+	]);
+	assert.equal(health.counts.messages, 2);
+	const retained = loadSessionRecord({ ...options, auditRetention: true });
+	assert.equal(retained.health.counts.messages, 2);
+	const bundleOf = (source) => auditBundle(source, null, { config: DEFAULT_CONFIG, now: options.now });
+	const bundle = bundleOf(retained);
+	assert.deepEqual(bundle.omo_health_record.messages, [
+		{ ref: "M1", ms, kind: null }, { ref: "M2", ms: T0 + MIN, kind: "self-notice" },
+	]);
+	assert.deepEqual(bundle, bundleOf(record));
+	assert.doesNotMatch(JSON.stringify(bundle), /Private oversized notice|private-oversized-details|nested decoy|normal notice/);
+});
+
+test("IS-7: an oversized final line retains only the existing 20,000-unit display text", (t) => {
+	const dir = tmpDir("omoh-scan-oversized-text-");
+	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+	const file = scanFile(dir);
+	const prefix = '"\\\n\u0001확'.repeat(3_999) + "abcd";
+	const msg = { ...ohealth(T0, `${prefix}🙂${"z".repeat(MIB)}`), display: true };
+	fs.writeFileSync(file, JSON.stringify(msg));
+	assert.deepEqual(scanOmoHealthMessages(file), [{ ms: T0, kind: null, text: `${prefix}…` }]);
+});
+
 test("an omo-health message line that straddles the 4 MiB read boundary is found", (t) => {
 	const dir = tmpDir("omoh-scan-edge-");
 	t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

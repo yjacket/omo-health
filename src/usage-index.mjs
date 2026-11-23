@@ -534,6 +534,7 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 	let reserveOwner;
 	let reserveBytes = 0;
 	const waiting = new Set();
+	const parkedAtEof = new WeakSet();
 	const oldestWaiting = () => waiting.values().next().value;
 	const fragmentBlocked = (entry, path) => waiting.has(entry) &&
 		(reserveOwner !== undefined || oldestWaiting() !== entry) &&
@@ -542,6 +543,13 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 		if (reserveOwner !== entry) return;
 		reserveOwner = undefined;
 		reserveBytes = 0;
+	};
+	const discardFragment = (entry) => {
+		entry.partial = undefined;
+		entry.scanOffset = entry.offset;
+		entry.evaluatedTo = entry.offset;
+		entry.overlay = emptyUsage();
+		entry.pending = true;
 	};
 
 	const unweigh = (id) => {
@@ -577,11 +585,7 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 				reserveBytes = fragment;
 			} else {
 				waiting.add(entry);
-				entry.partial = undefined;
-				entry.scanOffset = entry.offset;
-				entry.evaluatedTo = entry.offset;
-				entry.overlay = emptyUsage();
-				entry.pending = true;
+				discardFragment(entry);
 			}
 			slots = boundedModels(entry, USAGE_INDEX_MODEL_BUDGET - named, true);
 			line = serializeEntry(entry);
@@ -604,6 +608,15 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 		weights.set(key, { slots, bytes: size });
 		bytes += size;
 		named += slots ?? 0;
+		// A delimiter deferred for a budgeted whole-record reread is still
+		// actionable; only an open record at EOF needs the writer to progress.
+		if (waiting.size && reserveOwner?.partial && reserveOwner.scanOffset === reserveOwner.size &&
+			reserveOwner.partial.kind !== "reread") {
+			const owner = reserveOwner;
+			release(owner);
+			discardFragment(owner);
+			parkedAtEof.add(owner);
+		}
 		return entry;
 	};
 
@@ -698,6 +711,14 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 				entry.ownershipUnique = ownershipUnique ?? isSoleChildSessionFile(path);
 			} else if (!sameFile || entry.kind !== "child" || !entry.taskId) delete entry.ownershipUnique;
 			entry.checkedMs = clock.now();
+			if (parkedAtEof.has(entry)) {
+				// Do not compete with waiters by rescanning the same open record.
+				if (sameFile && sameFileStamp(readUsageFileStamp(path), entry)) {
+					admit(entry, previousSlots);
+					return 0;
+				}
+				parkedAtEof.delete(entry);
+			}
 			// Keep any last published total for a missing file, but never resume or compare a malformed cursor.
 			const canResume = !isTaskOnlyEntry(entry) || (sameFile && !entry.gone);
 			const from = canResume && hasStatCursor(entry) ? entry : undefined;
@@ -774,6 +795,7 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			unweigh(id);
 			release(entry);
 			waiting.delete(entry);
+			parkedAtEof.delete(entry);
 			applyMeta(entry, meta);
 			if (meta?.file) entry.file = meta.file;
 			const taskOnly = isTaskOnlyEntry(entry);
