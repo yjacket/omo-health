@@ -808,11 +808,10 @@ test("a complete live session reads only appended bytes each tick", () => {
 	assert.equal(s.index.get(key(s, "m1")).published.total, 25);
 });
 
-test("(plan 41) a sensor-reported review.jsonl keeps the live token total in history", (t) => {
+function checkSensorTranscriptReload(t, { id, filename, finalUsage = 0 }) {
 	const s = setup();
 	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
-	const id = "review-session";
-	const file = path.join(s.cwd, "review.jsonl");
+	const file = path.join(s.cwd, filename);
 	writeJsonl(file, [E.header(id, s.cwd, T0 - 5000), E.assistant({ ms: T0 - 1000, usage: usage(38, 4) })]);
 	const sensor = { sessionId: id, sessionFile: file, cwd: s.cwd, pid: 100, ts: T0 - 1000 };
 	const registry = new SessionRegistry({ paths: s.paths, clock: s.clock });
@@ -830,19 +829,70 @@ test("(plan 41) a sensor-reported review.jsonl keeps the live token total in his
 	const [row] = detectEnded(snapshot, board(ended), ended);
 	assert.equal(row?.sessionId, id);
 	assert.equal(appendEnded(s.paths, row, { nowMs: s.clock.now() }), true);
-	// A non-usage append makes the ended row stale and forces a path lookup after restart.
+	// An append after the last live tick makes the ended row stale on restart.
 	s.index.save();
-	fs.appendFileSync(file, `${JSON.stringify(E.user("one last note", s.clock.now()))}\n`);
+	const lastRecord = finalUsage
+		? E.assistant({ ms: s.clock.now(), usage: usage(finalUsage) })
+		: E.user("one last note", s.clock.now());
+	fs.appendFileSync(file, `${JSON.stringify(lastRecord)}\n`);
 	const index = createUsageIndex({ file: s.paths.health.usageIndexFile, clock: s.clock });
 	const locator = createSessionFileLocator({ paths: s.paths, clock: s.clock });
 	const tracker = createUsageTracker({ paths: s.paths, index, locator, clock: s.clock });
 	assert.equal(tracker.queueLedger(streamEnded(s.paths, { withLocation: true })), 1);
-	assert.ok(tracker.tick(ended).bytesRead > 0, "reopens the custom path from the saved index");
+	const { bytesRead } = tracker.tick(ended);
 	const saved = readUsageIndex(s.paths.health.usageIndexFile);
 	const history = endedRow(row, 0, saved);
+	assert.equal(history.tokens?.total, liveRow.tokens.total + finalUsage);
+	assert.ok(bytesRead > 0, "reopens the custom path from the saved index");
 	assert.equal(saved.get(key(s, id))?.file, file);
 	assert.equal(history.tokensGone, false);
-	assert.equal(history.tokens?.total, liveRow.tokens.total);
+}
+
+test("(plan 41) a sensor-reported review.jsonl keeps the live token total in history", (t) => {
+	checkSensorTranscriptReload(t, { id: "review-session", filename: "review.jsonl" });
+});
+
+test("(plan 113) an external timestamp-named transcript counts the last append after reload", (t) => {
+	checkSensorTranscriptReload(t, { id: "review.1", filename: "2026-11-22_review.1.jsonl", finalUsage: 10 });
+});
+
+test("(plan 113) a parentless backfilled child reloads tokens from its spawning store", (t) => {
+	const s = setup();
+	t.after(() => fs.rmSync(s.root, { recursive: true, force: true }));
+	const beta = path.join(s.root, "beta");
+	const taskId = "st_parentless";
+	const id = "child.1";
+	const endedMs = T0 - 60 * 60_000;
+	const startedMs = endedMs - 5000;
+	const storeDir = path.join(s.cwd, ".omo", "senpi-task");
+	// Seed discovery of project A's task store without supplying a parent link.
+	writeJsonl(mainFile(s.paths, "seed"), [E.header("seed", s.cwd, startedMs), E.user("seed", endedMs)]);
+	const taskPath = path.join(storeDir, "tasks", `${taskId}.json`);
+	fs.mkdirSync(path.dirname(taskPath), { recursive: true });
+	fs.writeFileSync(taskPath, JSON.stringify({
+		task_id: taskId, child_session_id: id, status: "completed", final_response: "done",
+		created_at: iso(startedMs), terminal_at: iso(endedMs), spawn_spec: { cwd: beta },
+	}));
+	const file = childFile(s.cwd, taskId, id);
+	writeJsonl(file, [E.header(id, beta, startedMs), E.assistant({ ms: endedMs, usage: usage(29) })]);
+
+	assert.deepEqual([...streamEnded(s.paths)], [], "backfill starts with an empty ledger");
+	backfillOnce(s.paths, s.clock.now());
+	const rows = [...streamEnded(s.paths, { withLocation: true })];
+	const row = rows.find((entry) => entry.taskId === taskId);
+	assert.equal(row?.cwd, beta);
+	assert.equal(row.parentSessionId, null);
+	const index = createUsageIndex({ file: s.paths.health.usageIndexFile, clock: s.clock });
+	const locator = createSessionFileLocator({ paths: s.paths, clock: s.clock });
+	const tracker = createUsageTracker({ paths: s.paths, index, locator, clock: s.clock });
+	tracker.queueLedger(rows.values());
+	tracker.tick(emptyWorld(s.clock));
+
+	const saved = readUsageIndex(s.paths.health.usageIndexFile);
+	const history = endedRow(row, 0, saved);
+	assert.equal(history.tokens?.total, 29);
+	assert.equal(history.tokensGone, false);
+	assert.equal(saved.get(key(s, id, beta, taskId))?.file, file);
 });
 
 test("(IS-3) cold backlog shows tokens in history for a backfilled review.jsonl", (t) => {
@@ -1271,7 +1321,9 @@ test("(gate 10) a previously published ended file stays queued through three rea
 		assert.deepEqual(s.tracker.tokensOf(sub(s, row.sessionId)).tokens, previous);
 		assert.equal(s.events.some(({ event }) => event === "usage_backlog"), false, `tick ${i} has not drained the queue`);
 	}
-	assert.equal(s.tracker.tick(world).bytesRead, HEADER_BYTES + size - Buffer.byteLength(record) - 1 - 2 * USAGE_TICK_BYTES);
+	// Each tick probes the indexed path; the first tick also scans the directory
+	// because this transcript has no session header.
+	assert.equal(s.tracker.tick(world).bytesRead, 4 * HEADER_BYTES + size - Buffer.byteLength(record) - 1 - 2 * USAGE_TICK_BYTES);
 	assert.equal(s.index.fresh(s.index.get(key(s, row.sessionId))), true);
 	assert.equal(s.tracker.tokensOf(sub(s, row.sessionId)).tokens.total, 1_000_001);
 	assert.equal(s.tracker.tokensOf(sub(s, row.sessionId)).tokens.total, readUsage(file).effective.total);
@@ -1297,7 +1349,8 @@ test("(gate 10) a queued file that grows after publication drains through its ne
 	fs.appendFileSync(file, appended);
 	assert.equal(s.tracker.tick(world).bytesRead, USAGE_TICK_BYTES);
 	assert.equal(s.tracker.tokensOf(sub(s, row.sessionId)).tokens.total, 7);
-	assert.equal(s.tracker.tick(world).bytesRead, Buffer.byteLength(appended) - USAGE_TICK_BYTES);
+	assert.equal(s.tracker.tick(world).bytesRead, 2 * HEADER_BYTES + Buffer.byteLength(appended) - USAGE_TICK_BYTES,
+		"both post-publication ticks probe the indexed file before reading the append");
 	assert.equal(s.tracker.tokensOf(sub(s, row.sessionId)).tokens.total, 10);
 	assert.equal(s.index.fresh(s.index.get(key(s, row.sessionId))), true);
 	assert.equal(s.tracker.tick(world).bytesRead, 0);
@@ -1379,7 +1432,8 @@ test("an ended file that grew after a complete read is requeued and its tree tot
 	fs.appendFileSync(parent, appended);
 	s.tracker.queueLedger([parentRow]);
 	const tick = s.tracker.tick(emptyWorld(s.clock));
-	assert.equal(tick.bytesRead, Buffer.byteLength(appended));
+	assert.equal(tick.bytesRead, Math.min(HEADER_BYTES, fs.statSync(parent).size) + Buffer.byteLength(appended),
+		"only the indexed path probe and the appended record are charged");
 	assert.equal(compactUsage(s.index.get(key(s, "p1"))).total, 17);
 	assert.equal(s.tracker.tokensOf(sub(s, "p1")).treeTokens, 22);
 });
@@ -1401,8 +1455,8 @@ test("a restart resumes an interrupted file from the saved offset instead of rec
 	const tracker = createUsageTracker({ paths: s.paths, index, locator, clock: s.clock, log: s.log });
 	tracker.queueLedger([row]);
 	const tick = tracker.tick(emptyWorld(s.clock));
-	assert.equal(tick.bytesRead, HEADER_BYTES + fs.statSync(file).size - savedOffset,
-		"after header discovery, counting reads only the bytes after the persisted offset");
+	assert.equal(tick.bytesRead, 2 * HEADER_BYTES + fs.statSync(file).size - savedOffset,
+		"after the indexed probe and header discovery, counting reads only the bytes after the persisted offset");
 	assert.equal(index.get(key(s, "r1")).complete, true);
 	assert.equal(compactUsage(index.get(key(s, "r1"))).total, 600);
 });

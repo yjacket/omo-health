@@ -54,19 +54,13 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 	let usageStamp;
 	let indexedMainEntries = new SubjectMap();
 
-	const residentMainFile = (subject) => {
-		const file = indexedFile(subject);
-		return file && idFromFileName(file) !== subject.sessionId ? file : undefined;
-	};
-
 	const readMainFile = (subject) => {
 		subject = { ...subject, taskId: null };
 		const file = paths.health?.usageIndexFile;
 		const stamp = file ? readUsageFileStamp(file) : null;
 		let entry;
 		if (subject.projectKey == null) {
-			// Check uniqueness before filtering unusable entries; never keep the
-			// entire on-disk index just to locate custom paths.
+			// Check uniqueness across the entire index before filtering unusable entries.
 			if (stamp === null) return undefined;
 			entry = readUsageIndex(file).getForSubject(subject);
 		} else {
@@ -75,18 +69,18 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 				indexedMainEntries = new SubjectMap();
 				if (stamp !== null) {
 					for (const row of readUsageIndex(file).values()) {
-						if (row.kind === "main" && row.file && (!probeHeaders || idFromFileName(row.file) !== row.id)) indexedMainEntries.set(row, row);
+						if (row.kind === "main" && row.file) indexedMainEntries.set(row, row);
 					}
 				}
 			}
 			entry = indexedMainEntries.get(subject);
 		}
-		if (entry?.kind !== "main" || !entry.file || (probeHeaders && idFromFileName(entry.file) === entry.id)) return undefined;
+		if (entry?.kind !== "main" || !entry.file) return undefined;
 		if (!probeHeaders && (entry?.readError === true || !fresh(entry))) return undefined;
 		return entry?.file;
 	};
 
-	const indexedMainFile = typeof indexedFile === "function" ? residentMainFile : readMainFile;
+	const indexedMainFile = typeof indexedFile === "function" ? indexedFile : readMainFile;
 
 	function* mainCandidates(dir) {
 		for (const name of listDirSafe(dir)) {
@@ -126,7 +120,7 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 		if (!/^--[^/\\:]*--$/.test(projectKey)) return result();
 		const dir = path.join(paths.sessionsDir, projectKey);
 		const owns = (file) => file && pathKey(path.dirname(file)) === pathKey(dir);
-		// An already verified custom transcript can live outside senpi’s sessions tree.
+		// An indexed transcript can live outside senpi’s sessions tree even if its name is conventional.
 		const custom = (file) => file && !isInside(file, paths.sessionsDir);
 		if (!probeHeaders) {
 			const verified = readMainFile(subject);
@@ -134,7 +128,7 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 		} else if (indexedFile === undefined) {
 			indexedFile = indexedMainFile(subject);
 		}
-		if (probeHeaders && (owns(indexedFile) || custom(indexedFile)) && idFromFileName(indexedFile) !== sessionId) {
+		if (probeHeaders && (owns(indexedFile) || custom(indexedFile))) {
 			const stat = statSafe(indexedFile);
 			if (stat?.isFile()) {
 				const probe = header(indexedFile, stat.size);

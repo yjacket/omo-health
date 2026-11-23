@@ -508,7 +508,7 @@ function writeBatch(paths, nowMs, { sinceMs, liveCutMs, mains, related }, lastBa
 			parentSessionId: parent?.sessionId ?? null,
 			...(parent?.projectKey ? { parentProjectKey: parent.projectKey } : {}),
 			...(parent?.taskId ? { parentTaskId: parent.taskId } : {}),
-			...(!parent && t.parentSessionId ? { storeDir: t.storeDir } : {}),
+			...(!parent ? { storeDir: t.storeDir } : {}),
 			taskId: t.taskId,
 			title: clean(t.name ?? t.summary ?? t.taskId, TITLE_MAX) || t.taskId,
 			cwd: t.cwd,
