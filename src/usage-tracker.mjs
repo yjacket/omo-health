@@ -1,6 +1,7 @@
 import path from "node:path";
 import { indexedMainIdentity, ownsLiveMain, probeSessionHeader } from "./collect/session-files.mjs";
-import { readUsageFileStamp, sameFileStamp } from "./collect/usage.mjs";
+import { readUsageFileStamp, sameFileStamp, withUsageRecountCheck } from "./collect/usage.mjs";
+import { idFromFileName } from "./collect/sessions.mjs";
 import { childSubjectOf, ledgerParentSubject, liveSessionView, PACKED_PROJECT, packScopedText, parseSubjectKey, sessionSubjects, SubjectMap, subjectKey, subjectOf, taskParentResolver, unpackScopedText } from "./session-subject.mjs";
 import { isInside, pathKey } from "./paths.mjs";
 import { boardTaskLinks } from "./session-board.mjs";
@@ -140,6 +141,16 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 	});
 
 	const childCandidate = (query) => (locator?.childCandidate ?? locator?.childFile)?.(query);
+
+	const updateUsage = (subject, file, source, options, saved) => {
+		const update = () => index.update(subject, file, metaOf(source), options);
+		// A different sole candidate after a legacy task-only entry went missing
+		// is a new claim, not a recount of that task's previous transcript.
+		if (source.kind !== "child" || !saved?.file ||
+			(isTaskOnlyEntry(saved) && pathKey(saved.file) !== pathKey(file))) return update();
+		const owner = isTaskOnlyEntry(saved) ? { ...subject, sessionId: idFromFileName(file) } : subject;
+		return withUsageRecountCheck(file, saved, (probe) => ownsLiveMain(owner, file, probe, false), update);
+	};
 
 	/** Verify that the live collector's file belongs to this session before billing it. */
 	const verify = (session, file, entry, liveSessions, cwdOf, maxBytes) => {
@@ -434,14 +445,14 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 				const taskOnly = row.kind === "child" && !ledgerUsageSessionId(row);
 				if (taskOnly) taskOnlyChecks.set(row, row);
 				if (budget <= 0) return false;
-				budget = Math.max(0, budget - index.update(subjectOf(row), rowFile, metaOf(row), {
+				budget = Math.max(0, budget - updateUsage(subjectOf(row), rowFile, row, {
 					maxBytes: budget, ownershipUnique: taskOnly ? true : null,
-				}));
+				}, exactEntry(id)));
 				const entry = exactEntry(id);
 				// Missing/gone files are retried by queueLedger, not every tick.
 				if (entry.readError === true) return;
 				if (entry.state === "missing" || entry.state === "full" || entry.gone === true ||
-					(entry.state === "ok" && entry.complete === true && entry.evaluatedTo === entry.size)) {
+					(entry.state === "ok" && entry.complete === true && !entry.pending && entry.evaluatedTo === entry.size)) {
 					queue.delete(queuedKey);
 				}
 			};
@@ -480,9 +491,9 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 					}
 				}
 				if (!matches || budget <= 0) continue;
-				budget = Math.max(0, budget - index.update(subject, file, metaOf(session), {
+				budget = Math.max(0, budget - updateUsage(subject, file, session, {
 					maxBytes: budget, ownershipUnique: session.id === session.taskId ? true : null,
-				}));
+				}, entry));
 			}
 			// Ownership checks cost no transcript bytes and must run even when live
 			// reads exhaust the budget. A different path or a veto invalidates the old claim.

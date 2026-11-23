@@ -37,6 +37,7 @@ export const RECORD_STRUCTURE_LIMIT = 64 * 1024;
 const USAGE_BUFFER_LIMIT = 1024 * 1024;
 const READ_CHUNK = 4 * 1024 * 1024;
 const HEAD_LIMIT = 4096;
+const SESSION_HEADER_LIMIT = 64 * 1024;
 const BOM_0 = 0xef;
 const BOM_1 = 0xbb;
 const BOM_2 = 0xbf;
@@ -1032,6 +1033,32 @@ export function sameFileStamp(a, b) {
 	return sameFileIdentity(a, b) && a.size === b.size && a.mtimeMs === b.mtimeMs;
 }
 
+// Read only the first record, with the same bound as the locator's header probe.
+function sessionHeader(bytes, size) {
+	const prefix = bytes.subarray(0, SESSION_HEADER_LIMIT);
+	const end = prefix.indexOf(NEWLINE);
+	if (end < 0 && prefix.length < Math.min(size, SESSION_HEADER_LIMIT)) return undefined;
+	try {
+		const entry = JSON.parse(prefix.toString("utf8", 0, end < 0 ? prefix.length : end));
+		if (entry?.type === "session") return { id: entry.id, cwd: entry.cwd };
+	} catch {}
+	return {};
+}
+
+const recountChecks = new Map();
+
+/** Scope a child ownership check to the index's synchronous read of this file. */
+export function withUsageRecountCheck(file, saved, ownsHeader, update) {
+	const previous = recountChecks.get(file);
+	recountChecks.set(file, { saved, ownsHeader });
+	try {
+		return update();
+	} finally {
+		if (previous) recountChecks.set(file, previous);
+		else recountChecks.delete(file);
+	}
+}
+
 /**
  * Read token usage from `file`, resuming from the persisted fields in `from`.
  * Returns null for a missing file; read errors throw. `offset` is the end of the
@@ -1125,6 +1152,13 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 		let headLen;
 		let head;
 		let cachedOverlay;
+		const check = restart ? recountChecks.get(file) : undefined;
+		const savedStamp = check && { size, mtimeMs, ino, birthtimeMs };
+		let ownsHeader = check && !sameFileStamp(savedStamp, check.saved) ? check.ownsHeader : undefined;
+		const refuseRecount = () => ({
+			...check.saved, partial: undefined, scanOffset: check.saved.offset,
+			rewound: true, done: false, pending: true, bytesRead,
+		});
 		const savedUsage = restart ? undefined : cloneUsage(from.usage);
 		if (!savedUsage) {
 			usage = emptyUsage();
@@ -1132,7 +1166,13 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 			scanOffset = 0;
 			partial = undefined;
 			headLen = Math.min(size, HEAD_LIMIT);
-			head = hashRange(0, headLen);
+			const bytes = readRange(fd, 0, headLen);
+			head = sha1(bytes);
+			if (ownsHeader) {
+				const probe = sessionHeader(bytes, size);
+				if (probe && !ownsHeader(probe)) return refuseRecount();
+				if (probe) ownsHeader = undefined;
+			}
 		} else {
 			usage = savedUsage;
 			offset = from.offset;
@@ -1170,6 +1210,12 @@ export function readUsage(file, from, { maxBytes = Infinity, onScanBytes } = {})
 		scan: while (acc?.kind !== "reread" && position < size && bytesRead < maxBytes) {
 			const want = Math.min(READ_CHUNK, size - position, maxBytes - bytesRead);
 			const chunk = readRange(fd, position, want, charge);
+			if (ownsHeader) {
+				// The first scan chunk expands the fingerprint prefix without another read.
+				const probe = sessionHeader(chunk, size);
+				if (!probe || !ownsHeader(probe)) return refuseRecount();
+				ownsHeader = undefined;
+			}
 			if (!chunk.length) break;
 			const chunkStart = position;
 			position += chunk.length;
@@ -1565,10 +1611,12 @@ export function usageTimeline(file, { cacheStormWrite = Infinity, cacheStormRead
 		};
 		let position = 0;
 		let acc;
+		let header;
 		while (position < size) {
 			const want = Math.min(READ_CHUNK, size - position);
 			const chunk = readRange(fd, position, want);
 			if (!chunk.length) break;
+			if (position === 0) header = sessionHeader(chunk, size);
 			const chunkStart = position;
 			position += chunk.length;
 			if (!acc) acc = newAccumulator(chunkStart);
@@ -1590,7 +1638,7 @@ export function usageTimeline(file, { cacheStormWrite = Infinity, cacheStormRead
 		const denominator = totals.input + totals.cacheRead + totals.cacheWrite;
 		// The scanner projects turn counters and time, but not content or error details.
 		const incomplete = stats.largeRecords > 0;
-		return {
+		return Object.defineProperty({
 			totals,
 			largeRecords: stats.largeRecords,
 			hours: [...stats.hours.values()].sort((a, b) => a.hourMs - b.hourMs).slice(-240),
@@ -1613,7 +1661,7 @@ export function usageTimeline(file, { cacheStormWrite = Infinity, cacheStormRead
 			},
 			images: { peakCount: stats.peakCount, peakMiB: stats.peakBytes / (1024 * 1024), incomplete },
 			prepMs: performance.now() - started,
-		};
+		}, "sessionHeader", { value: header });
 	} finally {
 		fs.closeSync(fd);
 	}

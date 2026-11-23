@@ -1,7 +1,8 @@
+import path from "node:path";
 import { subjectKey, subjectOf } from "./session-subject.mjs";
 import { parentPort, workerData } from "node:worker_threads";
 import { auditFileVersion, auditIndexVersion, readVersionedAuditTimeline, sameAuditVersion } from "./auditor.mjs";
-import { createSessionFileLocator } from "./collect/session-files.mjs";
+import { createSessionFileLocator, mainHeaderConflicts } from "./collect/session-files.mjs";
 import { isInside } from "./paths.mjs";
 import { loadSessionRecord, usageEntryOf } from "./session-record.mjs";
 import { usageEntryFor } from "./usage-index.mjs";
@@ -48,6 +49,11 @@ export function prepareAudit({ subject, now, bounds, indexEntries, indexFull, li
 		let warning;
 		const maxFileBytes = Math.min(scanBounds.messageScanMaxBytes, remaining);
 		const report = readVersionedAuditTimeline(file, tokens, { maxFileBytes, timeline, log: { warn: (_event, detail) => { warning = detail; } } });
+		if (!mainSubject.taskId && report.full?.sessionHeader) {
+			const projectKey = mainSubject.projectKey ?? (isInside(file, paths.sessionsDir)
+				? path.basename(path.dirname(file)) : entry?.projectKey);
+			if (mainHeaderConflicts({ ...mainSubject, projectKey }, report.full.sessionHeader)) return { modelsAmbiguous: true };
+		}
 		return { loaded, selectedFps, auditSubjectIds, indexVersion, ...report, warning };
 	} catch (error) {
 		if (error !== DISCOVERY_TOO_LARGE) throw error;

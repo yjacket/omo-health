@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
 import { prepareAudit } from "../src/audit-prepare-worker.mjs";
-import { auditsToday, createAuditor } from "../src/auditor.mjs";
+import { auditsToday, createAuditor, readAuditState, requestAudit } from "../src/auditor.mjs";
 import { DEFAULT_CONFIG } from "../src/config.mjs";
 import { auditBundle } from "../src/judge/audit.mjs";
 import { resolvePaths } from "../src/paths.mjs";
@@ -14,7 +14,7 @@ import { createDetailOperations } from "../src/ui/detail-worker.mjs";
 import { buildEnded, loadUiInputs } from "../src/ui/model.mjs";
 import { createSessionFileLocator } from "../src/collect/session-files.mjs";
 import { taskStoreDir } from "../src/collect/tasks.mjs";
-import { createUsageIndex } from "../src/usage-index.mjs";
+import { createUsageIndex, fresh, usageEntryFor } from "../src/usage-index.mjs";
 import { createUsageTracker } from "../src/usage-tracker.mjs";
 import { expectedSelector } from "./helpers/ended-selector.mjs";
 import { E, tmpDir, writeJsonl } from "./helpers/fixtures.mjs";
@@ -84,7 +84,7 @@ test("plan119 cold recount refuses a cross-project header and cannot launch or c
 	assert.equal(auditsToday(paths, now), 0);
 });
 
-test("plan120 history detail refuses a same-name main transcript owned by another project", (t) => {
+function misplacedMain(t) {
 	const { paths, a, b } = setup(t);
 	const alice = main("review.1", a);
 	const bob = main("review.1", b);
@@ -102,6 +102,11 @@ test("plan120 history detail refuses a same-name main transcript owned by anothe
 		index.update(subjectOf(row), file, { kind: "main" });
 		return file;
 	});
+	return { paths, alice, bob, text, index, files };
+}
+
+test("plan120 history detail refuses a same-name main transcript owned by another project", (t) => {
+	const { paths, alice, bob, text, index, files } = misplacedMain(t);
 	const open = (operate, row) => {
 		const detail = operate({ kind: "detail", id: row.sessionId, row: expectedSelector(row), now });
 		assert.equal(detail.record.found, true);
@@ -119,6 +124,27 @@ test("plan120 history detail refuses a same-name main transcript owned by anothe
 		{ files: [], messages: [], tokens: null },
 		{ files: [], messages: [], tokens: null },
 	]);
+});
+
+test("plan121 a queued audit refuses the misplaced main even though its index stamp matches", async (t) => {
+	const { paths, alice, index } = misplacedMain(t);
+	const subject = subjectOf(alice);
+	assert.equal(fresh(usageEntryFor(index, subject)), true);
+	assert.equal(index.save(), true);
+	fs.writeFileSync(paths.omoJsonc, JSON.stringify({ "[native]": { categories: { ultrabrain: { models: ["openai/gpt-5-5"] } } } }));
+	fs.writeFileSync(paths.authFile, JSON.stringify({ openai: {} }));
+	let launches = 0;
+	const auditor = createAuditor({ paths, index, clock, config: DEFAULT_CONFIG, env: {}, runner: {
+		start() { launches++; return { pid: 5001 }; },
+	} });
+	t.after(() => auditor.close());
+	assert.equal(requestAudit(paths, subject, now).created, true);
+	await auditor.tick(now);
+	await auditor.preparing();
+	await auditor.tick(now);
+	const record = readAuditState(paths, subject);
+	assert.deepEqual([record?.status, record?.reason, launches, auditsToday(paths, now)],
+		["failed", "models-unknown", 0, 0]);
 });
 
 test("plan119 headerless external transcript keeps its final append after reload but refuses a foreign replacement", (t) => {
@@ -165,3 +191,40 @@ test("plan119 detail accepts an unchanged saved child but refuses a same-ID chil
 	const replaced = detail();
 	assert.deepEqual([replaced.record.found, replaced.files, replaced.record.tokens?.total ?? null], [true, [], null]);
 });
+
+for (const route of ["live", "ledger"]) {
+	for (const change of ["replacement", "in-place rewrite"]) {
+		test(`plan121 ${route} child recount refuses a cross-project ${change}`, (t) => {
+			const { paths, a, b } = setup(t);
+			const child = { ...main("review.1", a), kind: "child", taskId: "st_review" };
+			const subject = subjectOf(child);
+			const file = path.join(taskStoreDir(a), "children", child.taskId, "sessions", child.taskId, reviewName);
+			writeJsonl(file, [E.header(child.sessionId, a, now - 1000), usageLine(17)]);
+			const liveWorld = { ...world, sessions: new Map([[child.sessionId, { ...child, id: child.sessionId, file }]]) };
+			let { index, tracker } = openTracker(paths);
+			tracker.tick(liveWorld);
+			assert.equal(tracker.tokensOf(subject)?.tokens.total, 17);
+			const models = { ...usageEntryFor(index, subject).published.usedModels };
+			assert.equal(index.save(), true);
+			const foreign = [E.header(child.sessionId, b, now - 1000), E.assistant({
+				ms: now - 50, provider: "openai", model: "gpt-5-5", usage: { input: 99, output: 0, cacheRead: 0, cacheWrite: 0 },
+			})];
+			if (change === "replacement") {
+				writeJsonl(`${file}.new`, foreign);
+				fs.renameSync(`${file}.new`, file);
+			} else {
+				writeJsonl(file, foreign);
+			}
+			if (route === "ledger") {
+				assert.ok(appendEnded(paths, child, { nowMs: now }));
+				({ index, tracker } = openTracker(paths));
+				assert.equal(tracker.queueLedger(streamEnded(paths, { withLocation: true })), 1);
+			}
+			tracker.tick(route === "live" ? liveWorld : world);
+			const entry = usageEntryFor(index, subject);
+			const display = tracker.tokensOf(subject);
+			assert.deepEqual([display?.tokens.total, entry.published.usedModels, display?.pending, fresh(entry)],
+				[17, models, true, false]);
+		});
+	}
+}
