@@ -4,7 +4,7 @@ import { createSessionFileLocator } from "../collect/session-files.mjs";
 import { loadConfig } from "../config.mjs";
 import { resolveAuditModel } from "../judge/audit.mjs";
 import { isInside } from "../paths.mjs";
-import { loadSessionRecord, recoverPendingAnalystModels, usageEntryOf } from "../session-record.mjs";
+import { childHeaderConflicts, loadSessionRecord, recoverPendingAnalystModels, usageEntryOf } from "../session-record.mjs";
 import { fresh, readUsageIndex, usageEntryFor } from "../usage-index.mjs";
 import { AUDIT_TERMINATION_UNCONFIRMED_LABEL, auditReasonLabel, auditStatusLabel } from "./labels.mjs";
 import { daemonStatus, loadDaemonInputs, recordsStamp } from "./model.mjs";
@@ -60,7 +60,13 @@ export function createDetailOperations({
 			locator.mainFile(subjectOfRecord(record, id), entry) !== entry.file)) {
 			return { ...auditModelFacts(entry, null), sessionModelsKnown: false };
 		}
-		return auditModelFacts(entry, readAuditTimeline(entry.file, tokens));
+		const full = readAuditTimeline(entry.file, tokens);
+		const subject = subjectOfRecord(record, id);
+		if (subject.taskId && full?.sessionHeader &&
+			childHeaderConflicts({ ...subject, projectKey: subject.projectKey ?? entry.projectKey }, entry.file, full.sessionHeader)) {
+			return { ...auditModelFacts(null, null), sessionModelsKnown: false };
+		}
+		return auditModelFacts(entry, full);
 	}
 
 	function preview(id, record) {

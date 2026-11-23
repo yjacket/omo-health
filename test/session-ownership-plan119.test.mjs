@@ -135,7 +135,10 @@ test("plan121 a queued audit refuses the misplaced main even though its index st
 });
 
 async function misplacedMainAudit(t, options) {
-	const { paths, alice, index } = misplacedMain(t);
+	await assertMisplacedAuditRefused(t, misplacedMain(t), options);
+}
+
+async function assertMisplacedAuditRefused(t, { paths, alice, index }, options) {
 	const subject = subjectOf(alice);
 	assert.equal(fresh(usageEntryFor(index, subject)), true);
 	assert.equal(index.save(), true);
@@ -199,6 +202,56 @@ test("plan119 detail accepts an unchanged saved child but refuses a same-ID chil
 	const replaced = detail();
 	assert.deepEqual([replaced.record.found, replaced.files, replaced.record.tokens?.total ?? null], [true, [], null]);
 });
+
+function misplacedChild(t) {
+	const { paths, a, b } = setup(t);
+	const alice = { ...main("review.1", a), kind: "child", taskId: "st_review" };
+	const bob = { ...main("review.1", b), kind: "child", taskId: "st_review" };
+	const text = "Project B private child notice";
+	const files = [alice, bob].map((row) => {
+		assert.ok(appendEnded(paths, row, { nowMs: now }));
+		const file = path.join(taskStoreDir(row.cwd), "children", row.taskId, "sessions", row.taskId, reviewName);
+		writeJsonl(file, [
+			E.header(bob.sessionId, b, now - 1000),
+			{ ...E.custom("omo-health", now - 100), content: text },
+			usageLine(17),
+		]);
+		return file;
+	});
+	return { paths, alice, bob, text, files };
+}
+
+test("plan123 history detail refuses a same-name foreign child with no index entry", (t) => {
+	const { paths, alice, bob, text, files } = misplacedChild(t);
+	const operate = createDetailOperations({ paths, auditDetail: () => null });
+	const detail = (row) => {
+		const result = operate({ kind: "detail", id: row.sessionId, row: expectedSelector(row), now });
+		assert.equal(result.record.found, true);
+		return {
+			files: result.files,
+			messages: result.record.health.messages.map((message) => message.text),
+			tokens: result.record.tokens?.total ?? null,
+		};
+	};
+	assert.equal(fs.existsSync(paths.health.usageIndexFile), false);
+	const cold = detail(alice);
+	const { index, tracker } = openTracker(paths);
+	assert.equal(tracker.queueLedger(streamEnded(paths, { withLocation: true })), 2);
+	tracker.tick(world);
+	assert.equal(index.save(), true);
+	assert.deepEqual(detail(bob), { files: [files[1]], messages: [text], tokens: 17 });
+	assert.deepEqual(cold, { files: [], messages: [], tokens: null });
+});
+
+for (const [mode, options] of [["timeline", {}], ["index-only", { timelineMaxBytes: 1 }]]) {
+	test(`plan123 a ${mode} queued audit refuses a foreign child despite the matching index stamp`, async (t) => {
+		const fixture = misplacedChild(t);
+		fs.mkdirSync(path.dirname(fixture.paths.authFile), { recursive: true });
+		const { index } = openTracker(fixture.paths);
+		index.update(subjectOf(fixture.alice), fixture.files[0], { kind: "child" });
+		await assertMisplacedAuditRefused(t, { ...fixture, index }, options);
+	});
+}
 
 for (const route of ["live", "ledger"]) {
 	test(`plan122 ${route} first child read refuses a same-name foreign transcript from a cold index`, (t) => {

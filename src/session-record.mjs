@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { idFromFileName } from "./collect/sessions.mjs";
-import { createSessionFileLocator, isSavedTranscriptVersion, mainHeaderConflicts, ownsLiveMain, probeSessionHeader } from "./collect/session-files.mjs";
+import { createSessionFileLocator, HEADER_BYTES, isSavedTranscriptVersion, mainHeaderConflicts, ownsLiveMain, probeSessionHeader } from "./collect/session-files.mjs";
 import { senpiTaskStoreDir } from "./collect/tasks.mjs";
 import { isExactInode, readUsageFileStamp } from "./collect/usage.mjs";
 import { DEFAULT_CONFIG } from "./config.mjs";
@@ -487,6 +487,12 @@ function modelRows(published) {
 export function ledgerUsageSessionId({ sessionId, taskId }) {
 	// Live and backfill writers use the task ID as the ledger key if there is no child session ID.
 	return nonEmpty(sessionId) && sessionId !== taskId ? sessionId : null;
+}
+
+export function childHeaderConflicts(subject, file, header) {
+	// A task-only ledger key is an alias, not the transcript's session id.
+	const sessionId = ledgerUsageSessionId(subject) ?? idFromFileName(file);
+	return mainHeaderConflicts({ ...subject, sessionId }, header);
 }
 
 const ambiguousUsageFallback = (row, ambiguous, ids = row) =>
@@ -1061,7 +1067,7 @@ export function scanOmoHealthMessages(file) {
 	return [...streamOmoHealthMessages(file)];
 }
 
-function* streamOmoHealthMessages(file, bounded = false) {
+function* streamOmoHealthMessages(file, bounded = false, rejectsHeader) {
 	let fd;
 	try {
 		fd = fs.openSync(file, "r");
@@ -1084,6 +1090,15 @@ function* streamOmoHealthMessages(file, bounded = false) {
 			return;
 		}
 	};
+	const rejected = (bytes) => {
+		let header;
+		try {
+			header = JSON.parse(bytes.toString("utf8", 0, Math.min(bytes.length, HEADER_BYTES)));
+		} catch {
+			return false;
+		}
+		return header?.type === "session" && rejectsHeader(header);
+	};
 	try {
 		const chunk = Buffer.allocUnsafe(SCAN_CHUNK);
 		let carry = null;
@@ -1096,6 +1111,11 @@ function* streamOmoHealthMessages(file, bounded = false) {
 			while (pos < n) {
 				const newline = view.indexOf(SCAN_NEWLINE, pos);
 				const piece = view.subarray(pos, newline === -1 ? n : newline);
+				if (rejectsHeader && (newline !== -1 || (carry?.length ?? 0) + piece.length >= HEADER_BYTES)) {
+					const prefix = piece.subarray(0, HEADER_BYTES - (carry?.length ?? 0));
+					if (rejected(carry ? Buffer.concat([carry, prefix]) : prefix)) return;
+					rejectsHeader = undefined;
+				}
 				if (!oversized && (carry?.length ?? 0) + piece.length > SCAN_LINE_MAX) {
 					oversized = oversizedMessageScanner(bounded);
 					if (carry) oversized.push(carry);
@@ -1112,6 +1132,7 @@ function* streamOmoHealthMessages(file, bounded = false) {
 				pos = newline + 1;
 			}
 		}
+		if (rejectsHeader && carry && rejected(carry)) return;
 		const message = oversized ? project(oversized.finish()) : carry && consume(carry);
 		if (message) yield message;
 	} catch {
@@ -1209,7 +1230,13 @@ function findRecordFiles(paths, nodes, ancestors, locator, usage, ambiguous, aud
 				}
 			}
 		}
-		return { sessionId, file };
+		const subject = { ...subjectOf(node, subjectOf(entry)), sessionId: ledgerUsageSessionId(node.ledgerIds ?? node) ?? entry?.id ?? sessionId };
+		const rejectsHeader = (header) => {
+			if (!childHeaderConflicts(subject, file, header)) return false;
+			node.usageStoreUnresolved = true;
+			return true;
+		};
+		return { sessionId, file, rejectsHeader };
 	}).filter(({ file }) => file);
 }
 
@@ -1567,19 +1594,24 @@ export function loadSessionRecord({ paths, subject, id = subject?.sessionId, row
 	const skipped = [];
 	const transcriptFiles = auditRetention ? null : new Set();
 	let scannedBytes = 0;
-	for (const { sessionId, file } of files) {
+	for (const { sessionId, file, rejectsHeader } of files) {
 		const stat = statSafe(file);
 		if (!stat?.isFile()) continue;
-		if (stat.size > messageScanMaxBytes || scannedBytes + stat.size > messageScanTotalBytes) {
+		const overBudget = stat.size > messageScanMaxBytes || scannedBytes + stat.size > messageScanTotalBytes;
+		if (rejectsHeader && !auditRetention && (overBudget || scanMessages) &&
+			rejectsHeader(probeSessionHeader(file, stat.size, Infinity))) continue;
+		if (overBudget) {
 			skipped.push(file);
 			continue;
 		}
 		scannedBytes += stat.size;
-		transcriptFiles?.add(file);
-		for (const message of (scanMessages ? scanMessages(file) : streamOmoHealthMessages(file, auditRetention)) ?? []) {
+		let refused = false;
+		const checkHeader = rejectsHeader && ((header) => (refused = rejectsHeader(header)));
+		for (const message of (scanMessages ? scanMessages(file) : streamOmoHealthMessages(file, auditRetention, checkHeader)) ?? []) {
 			if (!retained) messages.push({ ...message, recipient: sessionId });
 			else if (isRecord(message)) retained.messages.add({ ms: Number.isFinite(message.ms) ? message.ms : null, kind: auditMessageKind(message.kind) });
 		}
+		if (!refused) transcriptFiles?.add(file);
 	}
 
 	const auditHealth = retained && auditRecordHealth(retained, decisionHistory.infoFindings);

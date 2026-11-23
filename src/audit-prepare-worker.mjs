@@ -4,7 +4,7 @@ import { parentPort, workerData } from "node:worker_threads";
 import { auditFileVersion, auditIndexVersion, readVersionedAuditTimeline, sameAuditVersion } from "./auditor.mjs";
 import { createSessionFileLocator, HEADER_BYTES, mainHeaderConflicts, probeSessionHeader } from "./collect/session-files.mjs";
 import { isInside } from "./paths.mjs";
-import { loadSessionRecord, usageEntryOf } from "./session-record.mjs";
+import { childHeaderConflicts, loadSessionRecord, usageEntryOf } from "./session-record.mjs";
 import { usageEntryFor } from "./usage-index.mjs";
 
 const DISCOVERY_TOO_LARGE = Symbol("discovery-too-large");
@@ -43,13 +43,14 @@ export function prepareAudit({ subject, now, bounds, indexEntries, indexFull, li
 		const session = loaded.session ?? {};
 		const entry = usageEntryOf(index, session);
 		const indexVersion = auditIndexVersion(entry);
-		const mainSubject = record.subject ?? subjectOf({ ...session, sessionId: session.ledgerIds?.sessionId ?? session.sessionId });
-		const file = mainSubject.taskId ? entry?.file : mainFile(mainSubject);
-		if (!mainSubject.taskId && ambiguous.has(subjectKey(mainSubject))) return { modelsAmbiguous: true };
+		const owner = record.subject ?? subjectOf({ ...session, sessionId: session.ledgerIds?.sessionId ?? session.sessionId });
+		const child = Boolean(owner.taskId);
+		const file = child ? entry?.file : mainFile(owner);
+		if (!child && ambiguous.has(subjectKey(owner))) return { modelsAmbiguous: true };
 		let warning;
 		const maxFileBytes = Math.min(scanBounds.messageScanMaxBytes, remaining);
 		const report = readVersionedAuditTimeline(file, tokens, { maxFileBytes, timeline, log: { warn: (_event, detail) => { warning = detail; } } });
-		if (!mainSubject.taskId && file) {
+		if (file) {
 			let header = report.full?.sessionHeader;
 			if (!report.full && entry?.file === file) {
 				const version = auditFileVersion(file);
@@ -60,9 +61,11 @@ export function prepareAudit({ subject, now, bounds, indexEntries, indexFull, li
 				header = probe;
 				report.timelineSource = { file, version, changedDuringScan: false };
 			}
-			const projectKey = mainSubject.projectKey ?? (isInside(file, paths.sessionsDir)
+			const projectKey = owner.projectKey ?? (!child && isInside(file, paths.sessionsDir)
 				? path.basename(path.dirname(file)) : entry?.projectKey);
-			if (header && mainHeaderConflicts({ ...mainSubject, projectKey }, header)) return { modelsAmbiguous: true };
+			if (header && (child
+				? childHeaderConflicts({ ...owner, projectKey }, file, header)
+				: mainHeaderConflicts({ ...owner, projectKey }, header))) return { modelsAmbiguous: true };
 		}
 		return { loaded, selectedFps, auditSubjectIds, indexVersion, ...report, warning };
 	} catch (error) {
