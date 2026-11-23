@@ -462,6 +462,37 @@ function hasTruncatedIdentity(entry) {
 	return truncated(owner?.provider) || truncated(owner?.model) || truncated(owner?.responseModel);
 }
 
+function capturedStringBytes(text) {
+	return text.length * (/[^\x00-\xff]/.test(text) ? 2 : 1);
+}
+
+// A selected value can be an arbitrary JSON subtree, including deeply nested
+// invalid counters. Walk it iteratively and weigh the decoded values, not the
+// raw bytes that produced them. Headers and slots use conservative allowances.
+function projectedBytes(entry) {
+	const pending = [entry];
+	let bytes = 0;
+	while (pending.length) {
+		const value = pending.pop();
+		if (typeof value === "string") bytes += 32 + capturedStringBytes(value);
+		else if (value && typeof value === "object" && value !== TRUNCATED_VALUE && value !== TRUNCATED_NONSTRING_ID) {
+			bytes += 64;
+			if (Array.isArray(value)) {
+				bytes += 8 * value.length;
+				for (const item of value) if (typeof item === "string" || (item && typeof item === "object")) pending.push(item);
+			} else if (value[TRUNCATED_STRING_ID] !== undefined) {
+				pending.push(value[TRUNCATED_STRING_ID]);
+			} else {
+				for (const key of Object.keys(value)) {
+					bytes += 40 + capturedStringBytes(key);
+					pending.push(value[key]);
+				}
+			}
+		}
+	}
+	return bytes;
+}
+
 /** Validating projection for records above the buffer limit. Only a selected
  * value can own the capture buffer. The stack below the projected objects is
  * just container-kind bits: ancestors always resume in STATE_AFTER. */
@@ -731,7 +762,29 @@ export function createRecordScanner() {
 		get incomplete() {
 			return !malformed && state !== STATE_END;
 		},
+		get retainedBytes() {
+			return 1024 + containers.byteLength + keyRaw.buffer.byteLength + raw.buffer.byteLength +
+				projected.length * 64 + projectedBytes(entry) +
+				(capture?.decimal ? 64 + capturedStringBytes(capture.decimal.digits) : 0);
+		},
 	};
+}
+
+/** Resident payload of a live accumulator, excluding fingerprints and backup names. */
+export function retainedFragmentBytes(partial) {
+	if (partial?.[RECORD_ACCUMULATOR] !== true) return 0;
+	if (partial.kind === "scanner") {
+		return partial.scanner.retainedBytes + (partial.markerTail ? 64 + partial.markerTail.buffer.byteLength : 0);
+	}
+	if (partial.kind !== "buffer") return 0;
+	let bytes = 64 + 72 * partial.parts.length;
+	const backings = new Set();
+	for (const { buffer } of partial.parts) {
+		if (backings.has(buffer)) continue;
+		backings.add(buffer);
+		bytes += buffer.byteLength;
+	}
+	return bytes;
 }
 
 function newAccumulator(start) {

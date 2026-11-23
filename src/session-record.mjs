@@ -569,6 +569,19 @@ export function* retainedTreeRows(paths, rows, { beforeMs, withLocation } = {}) 
 
 const FULL_USAGE = Object.freeze({ state: "full" });
 
+/** Resolve a stored subject ID against the join keys of exact ledger IDs. */
+export function createSubjectIdMatcher(ids) {
+	const byKey = new Map();
+	for (const id of ids) {
+		const key = subjectIdJoinKey(id);
+		if (key) trackOwner(byKey, key, id);
+	}
+	return (id, key) => {
+		const maskedKey = maskedSubjectKey(id, key);
+		return maskedKey ? byKey.get(maskedKey) : id;
+	};
+}
+
 function joinSessionDecisions(row, descendants, investigations, decisions, blockedIds, bounded, jobsDir) {
 	const nodes = [row, ...descendants];
 	const sessionAllowed = new Set(nodes.map((node) => node.sessionId).filter(nonEmpty));
@@ -580,24 +593,10 @@ function joinSessionDecisions(row, descendants, investigations, decisions, block
 		childTasksByParent.get(parentSessionId).add(taskId);
 	}
 	const taskOnly = new Set(nodes.filter((node) => !nonEmpty(node.sessionId)).map((node) => node.taskId).filter(nonEmpty));
-	// Resolve keys only against this tree's exact IDs. Keep the raw-ID sets for
-	// ordinary rows and for the audit launch recheck.
-	const byJoinKey = (ids) => {
-		const byKey = new Map();
-		for (const id of ids) {
-			const key = subjectIdJoinKey(id);
-			if (key) trackOwner(byKey, key, id);
-		}
-		return byKey;
-	};
-	const sessionsByKey = byJoinKey([...sessionAllowed, ...blockedIds]);
-	const tasksByKey = byJoinKey(nodes.map((node) => node.taskId));
-	const exactId = (byKey, id, key) => {
-		const maskedKey = maskedSubjectKey(id, key);
-		return maskedKey ? byKey.get(maskedKey) : id;
-	};
-	const sessionOf = (subject) => exactId(sessionsByKey, subject?.sessionId, subject?.sessionKey);
-	const taskOf = (subject) => exactId(tasksByKey, subject.taskId, subject.taskKey);
+	const matchSessionId = createSubjectIdMatcher([...sessionAllowed, ...blockedIds]);
+	const matchTaskId = createSubjectIdMatcher(nodes.map((node) => node.taskId));
+	const sessionOf = (subject) => matchSessionId(subject?.sessionId, subject?.sessionKey);
+	const taskOf = (subject) => matchTaskId(subject.taskId, subject.taskKey);
 	const taskSubjects = new Map();
 	if (taskOnly.size) {
 		const countSubject = ({ subject } = {}) => {

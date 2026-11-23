@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { addModelCounters, emptyModelBilling, isExactInode, MODEL_KEY_LENGTH, MODEL_KEY_LIMIT, readUsage, readUsageFileStamp, sameFileStamp } from "./collect/usage.mjs";
+import { addModelCounters, emptyModelBilling, emptyUsage, isExactInode, MODEL_KEY_LENGTH, MODEL_KEY_LIMIT, readUsage, readUsageFileStamp, retainedFragmentBytes, sameFileStamp } from "./collect/usage.mjs";
 import { pathKey } from "./paths.mjs";
 import { parseSubjectKey, SubjectMap, subjectKey, subjectOf, uniqueMatch } from "./session-subject.mjs";
 import { atomicWriteChunks, statSafe } from "./util/fsx.mjs";
@@ -446,9 +446,14 @@ function entryBytes(entry, line) {
 	// counters). It is a floor, not a measure of the resident strings' encoding.
 	let serialized = line.length;
 	for (let i = 0; i < line.length; i++) if (line.charCodeAt(i) > 127) serialized++;
-	let fragmentBytes = entry.partial ? 2 * 64 : 0; // Two in-memory SHA-1 strings, including headers.
-	for (const name of entry.partial?.tornBackups ?? []) fragmentBytes += 32 + stringBytes(name);
-	return INDEX_ENTRY_OVERHEAD + fragmentBytes + modelBytes + Math.max(strings, serialized);
+	return INDEX_ENTRY_OVERHEAD + modelBytes + Math.max(strings, serialized);
+}
+
+function fragmentBytes(partial) {
+	if (!partial) return 0;
+	let bytes = 2 * 64 + retainedFragmentBytes(partial); // Include two in-memory SHA-1 strings.
+	for (const name of partial.tornBackups ?? []) bytes += 32 + stringBytes(name);
+	return bytes;
 }
 
 function fitsIndexLine(text) {
@@ -534,10 +539,23 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 		weights.delete(id);
 	};
 
-	const admit = (entry, slots) => {
+	const admit = (entry, slots, deferPublication) => {
 		const key = entry;
-		const line = serializeEntry(entry);
-		const size = entryBytes(entry, line);
+		let line = serializeEntry(entry);
+		let size = entryBytes(entry, line) + fragmentBytes(entry.partial);
+		if (entry.partial && bytes + size > INDEX_BYTE_BUDGET) {
+			// Keep the committed cursor; the next read charges the rescan to its
+			// tick allowance. Do not let a provisional EOF replace the publication.
+			entry.partial = undefined;
+			entry.scanOffset = entry.offset;
+			entry.evaluatedTo = entry.offset;
+			entry.overlay = emptyUsage();
+			entry.pending = true;
+			deferPublication?.();
+			slots = boundedModels(entry, USAGE_INDEX_MODEL_BUDGET - named, true);
+			line = serializeEntry(entry);
+			size = entryBytes(entry, line);
+		}
 		if (bytes + size > INDEX_BYTE_BUDGET || !fitsIndexLine(line)) {
 			if (entries.delete(key) || !full) dirty = true;
 			full = true;
@@ -666,8 +684,9 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			}
 			entry.state = "ok";
 			entry.gone = false;
+			const { complete, published } = entry;
 			// The cursor may restart without withdrawing the last publication.
-			entry.complete = result.done === true || entry.complete === true;
+			entry.complete = result.done === true || complete === true;
 			entry.size = result.size;
 			entry.mtimeMs = result.mtimeMs;
 			entry.offset = result.offset;
@@ -684,7 +703,10 @@ export function createUsageIndex({ file, clock, log, read = readUsage } = {}) {
 			entry.pending = result.pending === true || (!result.done && entry.published !== null);
 			if (result.done === true) entry.published = result.effective;
 			const slots = boundedModels(entry, USAGE_INDEX_MODEL_BUDGET - named, entry.pending && entry.published !== null);
-			admit(entry, slots);
+			admit(entry, slots, result.done && entry.partial ? () => {
+				entry.complete = complete;
+				entry.published = published;
+			} : undefined);
 			return result.bytesRead;
 		},
 		/**

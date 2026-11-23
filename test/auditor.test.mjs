@@ -1175,14 +1175,14 @@ test("(IS-1, IS-8) three consecutive index version changes without a timeline fa
 	assert.equal(auditor.preparing(), undefined);
 });
 
-async function prepareWithFrozenRecord(h, mutate) {
+async function prepareWithFrozenRecord(h, mutate, id = "m1") {
 	const signal = new Int32Array(new SharedArrayBuffer(8));
 	const auditor = h.auditor({ createWorker(_url, options) {
 		return new Worker(new URL("./helpers/audit-prepare-probe.mjs", import.meta.url), {
 			...options, workerData: { paths: h.paths, mode: "block-after-record", signal },
 		});
 	} });
-	h.request("m1");
+	h.request(id);
 	h.tick(auditor);
 	try {
 		await Atomics.waitAsync(signal, 0, 0, 30_000).value;
@@ -1227,6 +1227,36 @@ test("(IS-9 launch refresh) a changed investigation file joins prepared models a
 	assert.equal(h.runner.starts.length, 0, "neither the previous nor the current analyst may review");
 	assert.equal(h.record("m1").reason, "no-model");
 	assert.equal(h.budget(), undefined);
+});
+
+test("(IS-9 launch refresh) a newly opened masked investigation blocks until its analyst model is recorded", async (t) => {
+	const id = "sk-ant-abcdefgh";
+	const h = harness({ sessions: [id] });
+	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+	const store = createInvestigations(h);
+	const fp = "late-masked-investigation";
+	const requested = "xai/grok-5";
+	const fallback = LANES.ultrabrain[0];
+	const run = { ts: new Date(BASE).toISOString(), event: "investigation", fp, jobId: "late-masked-analyst" };
+	await prepareWithFrozenRecord(h, () => {
+		store.open({ id: fp, subject: { sessionId: id } });
+		store.attach(fp, { status: "analyzing", model: requested, jobId: run.jobId });
+		const { subject } = store.get(fp);
+		assert.notEqual(subject.sessionId, id, "the investigation writer masks the raw ID");
+		assert.match(subject.sessionKey, /^redacted-id-[a-f0-9]{12}$/);
+		// Like the engine, the decision only identifies the subject through the investigation's fp.
+		appendDecision(h.paths, { ...run, status: "analyzing", model: requested });
+	}, id);
+	assert.deepEqual([h.record(id).status, h.record(id).reason, h.runner.starts.length, h.budget()],
+		["failed", "analyst-models-unknown", 0, undefined]);
+
+	await prepareWithFrozenRecord(h, () => {
+		store.attach(fp, { status: "verdict", model: fallback });
+		appendDecision(h.paths, { ...run, status: "verdict", analyst: { verdict: "act" }, usedModels: [requested, fallback] });
+	}, id);
+	assert.equal(h.record(id).status, "running");
+	assert.deepEqual(h.runner.starts.map(modelOf), [LANES.architect[0]]);
+	assert.equal(h.budget().count, 1);
 });
 
 test("(IS-9 launch refresh) new descendant investigations exclude their analyst but unrelated ones do not", async () => {

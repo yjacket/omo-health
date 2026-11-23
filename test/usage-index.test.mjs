@@ -86,6 +86,77 @@ function indexText({ v, entries }) {
 	return [JSON.stringify({ v }), ...Object.values(entries).map((entry) => JSON.stringify(entry))].join("\n") + "\n";
 }
 
+test("(IS-1) retained fragments share the resident index budget across sessions", (t) => {
+	const { clock, fileOf, indexOf } = setup(t);
+	const index = indexOf();
+	const first = `${line()}\n`;
+	const committed = `${line()}\n`;
+	const record = (text, fields = "") =>
+		`{"type":"usage",${fields}"usage":{"input":30},"unused":"${text}`;
+	const small = record("x".repeat(768 * 1024));
+	const streamed = "x".repeat(MiB + 1);
+	// This selected value fits the scanner's raw capture window, but the
+	// decoded array alone takes more space than the window.
+	const projected = record(streamed, `"provider":[${"0,".repeat(30_000)}0],`);
+	const suffix = '"}\n';
+	// Pre-admit every row; give the newest rows first claim on fragment space.
+	const rows = Array.from({ length: 32 }, (_, i) => ({
+		subject: sub(`fragment-${i}`),
+		file: fileOf(`fragment-${i}.jsonl`),
+		part: i === 21 ? record(streamed) : i === 22 ? projected : small,
+		keep: i <= 21,
+	}));
+	for (const { subject, file } of [...rows].reverse()) {
+		clock.advance(1);
+		writeText(file, first);
+		index.update(subject, file);
+	}
+	for (const { subject, file, part } of rows) {
+		fs.appendFileSync(file, committed + part);
+		index.update(subject, file);
+	}
+
+	const retained = index.entries().reduce((bytes, { partial }) =>
+		bytes + (partial?.parts?.reduce((n, part) => n + part.buffer.byteLength, 0) ?? 0), 0);
+	assert.ok(retained <= INDEX_BYTE_BUDGET,
+		`retained transcript buffers alone total ${retained} bytes (budget ${INDEX_BYTE_BUDGET})`);
+	assert.equal(index.full, false, "fragment overflow must not reject a row");
+	for (const { subject, file, part, keep } of rows) {
+		const entry = index.getForSubject(subject);
+		assert.equal(entry.offset, first.length + committed.length);
+		assert.equal(Boolean(entry.partial), keep, `${subject.sessionId} retained state`);
+		assert.equal(compactUsage(entry).total, keep ? 20 : 10, `${subject.sessionId} published total`);
+		if (!keep) {
+			assert.equal(entry.pending, true);
+			assert.equal(fresh(entry), false);
+		}
+	}
+	// Exercise overflow again while the retained rows still occupy the budget.
+	for (const { subject, file, part, keep } of [...rows].sort((a, b) => Number(a.keep) - Number(b.keep))) {
+		const entry = index.getForSubject(subject);
+		if (!keep) {
+			const budget = 512 * 1024;
+			assert.equal(index.update(subject, file, {}, { maxBytes: budget }), budget,
+				"an unchanged file rescans from its committed offset, within the read allowance");
+			assert.equal(compactUsage(entry).total, 10, "rescan must not publish the intermediate total");
+			assert.equal(entry.pending, true);
+			assert.equal(entry.partial, undefined);
+		}
+		fs.appendFileSync(file, suffix);
+		const spent = index.update(subject, file, {}, { maxBytes: MiB * 2 });
+		if (keep) {
+			assert.equal(spent, suffix.length + 2 * 4096, "resume by checking only fingerprint windows and the suffix");
+		} else {
+			assert.equal(spent, part.length + suffix.length, "discarded state requires a charged rescan");
+		}
+		const clean = readUsage(file).effective;
+		assert.equal(clean.total, 50);
+		assert.deepEqual(entry.published, clean);
+		assert.equal(entry.pending, false);
+		assert.equal(fresh(entry), true);
+	}
+});
+
 test("(IS-1, IS-12) a dense 15 MiB tool result publishes under the daemon heap cap", (t) => {
 	const { dir, fileOf } = setup(t);
 	const file = fileOf();

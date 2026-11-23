@@ -8,7 +8,7 @@ import { auditBundle, auditDocument, detectorFindingRefs, firedDetectors, hasDet
 import { ANALYST_POLL_MS, parseAnalystOutput, unavailableReason } from "./judge/analyst.mjs";
 import { laneArgs } from "./judge/lane.mjs";
 import { auditFileKey, boardLiveOwners, subjectKey, subjectOf } from "./session-subject.mjs";
-import { collectAnalystDecisionModels, configDecisionFact, recoverPendingAnalystModels, usageEntryOf } from "./session-record.mjs";
+import { collectAnalystDecisionModels, configDecisionFact, createSubjectIdMatcher, recoverPendingAnalystModels, usageEntryOf } from "./session-record.mjs";
 import { auditReasonLabel } from "./ui/labels.mjs";
 import { fresh, isSpillModelKey, readUsageIndex, relatedUsageEntries } from "./usage-index.mjs";
 import { atomicWriteFile, atomicWriteJson, ensureDir, listDirSafe, readJsonSafe, readTextSafe, removeSafe } from "./util/fsx.mjs";
@@ -207,9 +207,13 @@ function launchAuditFacts(paths, investigations, loaded, selectedFps, auditSubje
 	const configDecisions = [];
 	const fps = new Set(selectedFps);
 	const add = (model) => { if (typeof model === "string" && model) models.add(model); };
+	const matchSessionId = createSubjectIdMatcher(auditSubjectIds?.sessionIds ?? []);
+	const matchTaskId = createSubjectIdMatcher(auditSubjectIds?.taskIds ?? []);
 	const matches = (subject) => {
 		if (!subject || !auditSubjectIds) return false;
-		const { sessionId, taskId, parentSessionId } = subject;
+		const sessionId = matchSessionId(subject.sessionId, subject.sessionKey);
+		const taskId = matchTaskId(subject.taskId, subject.taskKey);
+		const { parentSessionId } = subject;
 		// A parent pointing at an unrelated task is not itself a subject match.
 		return auditSubjectIds.sessionIds.has(sessionId) || (parentSessionId
 			? auditSubjectIds.childTasksByParent.get(parentSessionId)?.has(taskId)
