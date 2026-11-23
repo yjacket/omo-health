@@ -2,6 +2,7 @@ import { subjectKey, subjectOf } from "./session-subject.mjs";
 import { parentPort, workerData } from "node:worker_threads";
 import { auditFileVersion, auditIndexVersion, readVersionedAuditTimeline, sameAuditVersion } from "./auditor.mjs";
 import { createSessionFileLocator } from "./collect/session-files.mjs";
+import { isInside } from "./paths.mjs";
 import { loadSessionRecord, usageEntryOf } from "./session-record.mjs";
 import { usageEntryFor } from "./usage-index.mjs";
 
@@ -22,12 +23,13 @@ export function prepareAudit({ subject, now, bounds, indexEntries, indexFull, li
 		const id = subjectKey(subject);
 		if (discovered.has(id)) return discovered.get(id);
 		const entry = usageEntryFor(index, subject);
-		const verified = entry?.kind === "main" && entry.state === "ok" && sameAuditVersion(auditFileVersion(entry.file), entry);
+		const external = entry?.kind === "main" && entry.file && !isInside(entry.file, paths.sessionsDir);
+		const verified = !external && entry?.kind === "main" && entry.state === "ok" && sameAuditVersion(auditFileVersion(entry.file), entry);
 		if (verified && subject.projectKey != null) return entry.file;
-		const result = findMainFile(subject, entry?.file ?? null, { maxBytes: remaining });
+		const result = findMainFile(subject, entry ?? null, { maxBytes: remaining });
 		remaining -= result.bytesRead;
 		if (result.pending) throw DISCOVERY_TOO_LARGE;
-		if (result.ambiguous || entry === null) ambiguous.add(id);
+		if (result.ambiguous || entry === null || (external && !result.file)) ambiguous.add(id);
 		const file = ambiguous.has(id) ? undefined : result.file ?? (verified ? entry.file : undefined);
 		discovered.set(id, file);
 		return file;

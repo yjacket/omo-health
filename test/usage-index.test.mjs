@@ -473,7 +473,7 @@ const file = paths.health.usageIndexFile;
 const now = ${T0};
 let checked = now;
 const clock = { now: () => checked };
-const transcript = path.join(dir, "session.jsonl");
+const transcript = path.join(paths.sessionsDir, projectKeyOf(dir), "2026-09-28_reviewed.jsonl");
 const oldSpace = () => getHeapSpaceStatistics()
 	.filter(({ space_name }) => !space_name.startsWith("new") && !space_name.startsWith("read_only"))
 	.reduce((sum, space) => sum + space.space_used_size, 0);
@@ -483,6 +483,7 @@ const index = createUsageIndex({ file, clock });
 let peak = oldSpace();
 const sample = () => { peak = Math.max(peak, oldSpace()); };
 if (stage === "write") {
+	fs.mkdirSync(path.dirname(transcript), { recursive: true });
 	fs.writeFileSync(transcript, '{"type":"usage","provider":"openai","model":"gpt-5-5","usage":{"input":42,"cost":{"total":0.0001}}}\\n');
 	index.update(sub("reviewed"), transcript, { kind: "main" });
 	for (let i = 0; i < 200000 && !index.full; i++) {
@@ -631,7 +632,7 @@ const put = (file, data) => {
 	fs.writeFileSync(file, data);
 };
 if (stage === "fixture") {
-	const transcript = path.join(dir, "seed.jsonl");
+	const transcript = path.join(paths.sessionsDir, projectKeyOf(dir), "2026-09-28_seed.jsonl");
 	put(transcript, '{"type":"usage","provider":"p","model":"id","usage":{"input":42}}\\n');
 	index.update(sub("seed"), transcript, { kind: "main" });
 	for (let i = 0; !index.full; i++) index.markMissing({ ...sub(id(i)), projectKey: projectKeyOf(cwd) }, { kind: "main", file: cwd + "/" + id(i) });

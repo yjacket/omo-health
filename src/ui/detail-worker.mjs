@@ -3,8 +3,9 @@ import { auditFileVersion, auditModelFacts, auditsToday, readAuditState, readAud
 import { createSessionFileLocator } from "../collect/session-files.mjs";
 import { loadConfig } from "../config.mjs";
 import { resolveAuditModel } from "../judge/audit.mjs";
+import { isInside } from "../paths.mjs";
 import { loadSessionRecord, recoverPendingAnalystModels, usageEntryOf } from "../session-record.mjs";
-import { fresh, readUsageIndex } from "../usage-index.mjs";
+import { fresh, readUsageIndex, usageEntryFor } from "../usage-index.mjs";
 import { AUDIT_TERMINATION_UNCONFIRMED_LABEL, auditReasonLabel, auditStatusLabel } from "./labels.mjs";
 import { daemonStatus, loadDaemonInputs, recordsStamp } from "./model.mjs";
 import { sessionRecordPage } from "./session-view.mjs";
@@ -18,14 +19,6 @@ const subjectOfRecord = ({ subject, session }, id) =>
 
 function detailSignature(paths, files) {
 	return JSON.stringify([files.map(auditFileVersion), recordsStamp(paths)]);
-}
-
-function auditFactsFor(paths, session, tokens) {
-	const usage = readUsageIndex(paths.health.usageIndexFile);
-	const entry = usageEntryOf(usage, session ?? {});
-	// Do not queue against an index row the daemon still has to finish or refresh.
-	if (!fresh(entry)) return { ...auditModelFacts(entry, null), sessionModelsKnown: false };
-	return auditModelFacts(entry, readAuditTimeline(entry.file, tokens));
 }
 
 function modelBlockOf(facts, session) {
@@ -50,11 +43,25 @@ export function createDetailOperations({
 	today = auditsToday, request = requestAudit, daemonInputs = loadDaemonInputs, auditDetail, maxEntries = SESSION_CACHE_MAX,
 } = {}) {
 	let at;
+	let usage;
 	const cache = new Map();
-	const locator = createSessionFileLocator({ paths, clock: { now: () => at }, probeHeaders: false });
-	const loadRecord = ({ id, row, now, liveOwners }) => load({ paths, id, row, now, locator, liveOwners });
+	const indexForJob = () => usage ??= readUsageIndex(paths.health.usageIndexFile);
+	const locator = createSessionFileLocator({
+		paths, clock: { now: () => at }, probeHeaders: false, indexedEntry: (subject) => usageEntryFor(indexForJob(), subject),
+	});
+	const loadRecord = ({ id, row, now, liveOwners }) => load({ paths, id, row, now, locator, index: indexForJob(), liveOwners });
 	const plan = (config, facts, analystModels) =>
 		resolveModel(paths, config, { ...facts, analystModels: Array.isArray(analystModels) ? analystModels : [] });
+
+	function auditFactsFor(record, id, tokens) {
+		const entry = usageEntryOf(indexForJob(), record.session ?? {});
+		// Do not queue against a stale publication or an unverified external path.
+		if (!fresh(entry) || (entry.kind === "main" && !isInside(entry.file, paths.sessionsDir) &&
+			locator.mainFile(subjectOfRecord(record, id), entry) !== entry.file)) {
+			return { ...auditModelFacts(entry, null), sessionModelsKnown: false };
+		}
+		return auditModelFacts(entry, readAuditTimeline(entry.file, tokens));
+	}
 
 	function preview(id, record) {
 		let { session, analystModels } = record;
@@ -72,7 +79,7 @@ export function createDetailOperations({
 		const state = readState(paths, subjectOfRecord(record, id));
 		const perDay = Number.isFinite(config.audit?.perDay) ? config.audit.perDay : null;
 		const usedToday = today(paths, at);
-		const facts = auditFactsFor(paths, session, config.tokens);
+		const facts = auditFactsFor(record, id, config.tokens);
 		const modelBlock = modelBlockOf(facts, session);
 		const choice = modelBlock ? null : plan(config, facts, analystModels);
 		const planned = choice && !choice.blocked ? choice : null;
@@ -96,7 +103,7 @@ export function createDetailOperations({
 		if (isAuditActive(readState(paths, subject))) return refuse(409, "running");
 		const perDay = config.audit.perDay;
 		if (Number.isFinite(perDay) && today(paths, at) >= perDay) return refuse(429, "cap");
-		const facts = auditFactsFor(paths, record.session, config.tokens);
+		const facts = auditFactsFor(record, id, config.tokens);
 		const modelBlock = modelBlockOf(facts, record.session);
 		if (modelBlock) return refuse(409, modelBlock);
 		const choice = plan(config, facts, record.analystModels);
@@ -139,7 +146,7 @@ export function createDetailOperations({
 		return entry;
 	}
 
-	return function prepare(job) {
+	function prepare(job) {
 		const { kind, id, now, pagination } = job;
 		at = now;
 		if (kind === "preview") return previewOf(job.record, id);
@@ -155,6 +162,14 @@ export function createDetailOperations({
 		const page = sessionRecordPage(record, pagination.list, pagination.offset);
 		if (pagination.list !== null) return { page };
 		return { record: page, audit: previewOf(record, id) };
+	}
+
+	return (job) => {
+		try {
+			return prepare(job);
+		} finally {
+			usage = undefined;
+		}
 	};
 }
 

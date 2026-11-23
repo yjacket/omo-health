@@ -131,12 +131,13 @@ test("(IS-4) a main header scan resumes from its cursor without rereading candid
 });
 
 test("(plan 41) mainFile uses a saved custom path only while its first line matches", (t) => {
-	const { paths, root, clock, locator, proj } = setup(t);
+	const { paths, root, clock, proj } = setup(t);
+	const index = createUsageIndex({ file: paths.health.usageIndexFile, clock });
+	const locator = createSessionFileLocator({ paths, clock, indexedEntry: (query) => index.getForSubject(query) });
 	const id = "sess-review";
 	const file = path.join(root, "review.jsonl");
 	assert.equal(locator.mainFile(sub(id, proj)), undefined, "no index yet");
 	fs.writeFileSync(file, `{"type":"session","id":"${id}"}\n`);
-	const index = createUsageIndex({ file: paths.health.usageIndexFile, clock });
 	index.update(sub(id, proj), file, { kind: "main" });
 	assert.equal(index.save(), true);
 	assert.equal(locator.mainFile(sub(id, proj)), file, "a saved custom path supersedes the cached filename miss");
@@ -150,6 +151,37 @@ test("(plan 41) mainFile uses a saved custom path only while its first line matc
 	assert.equal(locator.mainFile(sub(id, proj)), undefined, "a replacement with the same ID but no cwd has no project proof");
 	fs.writeFileSync(file, JSON.stringify({ type: "session", id, cwd: proj }) + "\n");
 	assert.equal(locator.mainFile(sub(id, proj)), file, "a replacement with the matching ID and project is accepted");
+});
+
+test("(plan 117) cwd-less external ownership uses the loaded row without reopening the index", (t) => {
+	const { paths, root, clock, proj } = setup(t);
+	const subject = sub("review.1", proj);
+	const file = path.join(root, "review.jsonl");
+	const header = '{"type":"session","id":"review.1"}\n';
+	fs.writeFileSync(file, header);
+	const indexFile = paths.health.usageIndexFile;
+	const seed = createUsageIndex({ file: indexFile, clock });
+	seed.update(subject, file, { kind: "main" });
+	assert.equal(seed.save(), true);
+	const index = createUsageIndex({ file: indexFile, clock });
+	const locator = createSessionFileLocator({ paths, clock, indexedEntry: (query) => index.getForSubject(query) });
+	const indexReads = [];
+	for (const method of ["readFileSync", "openSync"]) {
+		const original = fs[method];
+		t.mock.method(fs, method, (name, ...args) => {
+			if (name === indexFile) {
+				indexReads.push(method);
+				throw new Error("the resident index has already been loaded");
+			}
+			return original(name, ...args);
+		});
+	}
+	const unchanged = locator.mainFile(subject);
+	const replacement = `${file}.new`;
+	fs.writeFileSync(replacement, header);
+	fs.renameSync(replacement, file);
+	const replaced = locator.mainFile(subject);
+	assert.deepEqual({ unchanged, replaced, indexReads }, { unchanged: file, replaced: undefined, indexReads: [] });
 });
 
 test("mainFile finds a file created after a miss only once the fake clock passes rescanMs", (t) => {

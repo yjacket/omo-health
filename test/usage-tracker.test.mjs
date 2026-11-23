@@ -278,7 +278,7 @@ for (const spent of [0, 256]) test(`(IS-1, IS-12) an in-place longer replacement
 	writeLines(file, [prefix.slice(0, -1)]);
 	fs.appendFileSync(file, torn);
 
-	assert.equal(s.tracker.tick(world).bytesRead, prefix.length + torn.length);
+	assert.equal(s.tracker.tick(world).bytesRead, 2 * (prefix.length + torn.length), "first read includes the header probe and usage scan");
 	const { offset, scanOffset, ino, birthtimeMs } = s.index.get(key(s, id));
 	assert.equal(offset, prefix.length);
 	assert.equal(scanOffset, prefix.length + torn.length);
@@ -734,7 +734,7 @@ test("(plan 34) visible task-only board rows compete even when only one is index
 	function rowsFor(parents) {
 		const world = makeWorld({
 			now: T0,
-			sessions: parents.map((id) => sessionState({ cwd: s.cwd, id, startedMs: T0 - 5000 })),
+			sessions: parents.map((id) => sessionState({ cwd: s.cwd, id, file: mainFile(s.paths, id), startedMs: T0 - 5000 })),
 			tasks,
 			sensors: parents.map((sessionId, i) => ({ sessionId, pid: 100 + i, ts: T0 - 1000 })),
 			procsFresh: true,
@@ -796,7 +796,7 @@ test("a complete live session reads only appended bytes each tick", () => {
 	writeJsonl(file, [E.assistant({ ms: T0, usage: usage(10, 5) })]);
 	const world = () => makeWorld({ now: s.clock.now(), sessions: [sessionState({ id: "m1", file, kind: "main", cwd: s.cwd })] });
 	const first = s.tracker.tick(world());
-	assert.equal(first.bytesRead, fs.statSync(file).size, "the first tick reads the whole first record");
+	assert.equal(first.bytesRead, 2 * fs.statSync(file).size, "the first tick probes and scans the whole first record");
 	assert.equal(s.index.get(key(s, "m1")).complete, true);
 	assert.equal(compactUsage(s.index.get(key(s, "m1"))).total, 15);
 
@@ -1057,7 +1057,7 @@ test("(IS-4, IS-12) live header probes share the tick budget and deferred sessio
 	const custom = Array.from({ length: 600 }, (_, i) => {
 		const id = `live-${i}`;
 		const file = path.join(s.cwd, `custom-${i}.jsonl`);
-		writeLines(file, [JSON.stringify({ type: "session", id }).padEnd(HEADER_BYTES - 1), bigRecord(0, usage(i + 1))]);
+		writeLines(file, [JSON.stringify({ type: "session", id, cwd: s.cwd }).padEnd(HEADER_BYTES - 1), bigRecord(0, usage(i + 1))]);
 		return { id, file, total: i + 1 };
 	});
 	const named = { id: "named", file: mainFile(s.paths, "named"), total: 42 };
@@ -1123,8 +1123,8 @@ test("(IS-4, IS-12) live header probes share the tick budget and deferred sessio
 	};
 
 	tick(1);
-	assert.equal(bytesByFile.get(named.file), 3 * namedBytes, "matching filename needs only the scan and two short fingerprints");
-	assert.equal(probesByFile.has(named.file), false);
+	assert.equal(bytesByFile.get(named.file), 4 * namedBytes, "first read needs the probe, scan and two short fingerprints");
+	assert.equal(probesByFile.get(named.file), namedBytes, "a matching filename still needs a first-read ownership probe");
 	const waiting = custom.filter(({ file }) => !bytesByFile.has(file));
 	assert.ok(waiting.length > 0, "some live header probes did not fit");
 	const board = buildSessionSnapshot(world, [], [], world.now, { tokensOf: s.tracker.tokensOf });
@@ -1196,8 +1196,9 @@ for (const [label, bytes] of [["40 MiB", 40 * 1024 * 1024], ["small", 512 * 1024
 		} finally {
 			fs.closeSync(fd);
 		}
-		assert.equal(s.tracker.tick(world).bytesRead, Math.min(bytes, USAGE_TICK_BYTES));
-		if (bytes > USAGE_TICK_BYTES) assert.equal(s.tracker.tick(world).bytesRead, bytes - USAGE_TICK_BYTES);
+		const firstReadBytes = bytes + 64 * 1024; // Charge the initial header probe exactly once.
+		assert.equal(s.tracker.tick(world).bytesRead, Math.min(firstReadBytes, USAGE_TICK_BYTES));
+		if (firstReadBytes > USAGE_TICK_BYTES) assert.equal(s.tracker.tick(world).bytesRead, firstReadBytes - USAGE_TICK_BYTES);
 		assert.equal(s.tracker.tokensOf(sub(s, id)).tokens.total, 7);
 		assert.equal(s.index.get(key(s, id)).offset, 0, "the EOF overlay has not been committed");
 		assert.equal(s.index.save(), true);
@@ -1306,7 +1307,7 @@ test("(gate 10) a previously published ended file stays queued through three rea
 	const record = '{"type":"usage","usage":{"input":1}}';
 	const row = { sessionId: "ended", kind: "main", cwd: s.cwd, endedMs: T0 };
 	writeLines(file, [record]);
-	s.index.update(sub(s, row.sessionId), file);
+	s.index.update(sub(s, row.sessionId), file, { kind: "main" });
 	const previous = s.tracker.tokensOf(sub(s, row.sessionId)).tokens;
 	assert.equal(previous.total, 1);
 
@@ -1824,7 +1825,7 @@ test("tree token completeness follows pending siblings and never counts a missin
 	const world = makeWorld({
 		now: T0,
 		sessions: [
-			sessionState({ cwd: s.cwd, id: "ready", startedMs: T0 - 5000 }),
+			sessionState({ cwd: s.cwd, id: "ready", file: mainFile(s.paths, "ready"), startedMs: T0 - 5000 }),
 			sessionState({ cwd: s.cwd, id: "live-sibling", kind: "child", parentSessionId: "live", file: null }),
 		],
 		sensors: [{ sessionId: "ready", pid: 100, ts: T0 - 1000, idle: true, executingTools: 0 }],

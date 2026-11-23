@@ -35,7 +35,7 @@ function setup(t) {
 			},
 		};
 	};
-	return { dir, file, open };
+	return { dir, file, open, id, cwd };
 }
 
 const line = (input) => `${JSON.stringify({ type: "usage", provider: "p", model: "m", usage: { input } })}\n`;
@@ -54,7 +54,7 @@ test("(IS-1, IS-2, IS-12) tick two publishes a 40 MiB append amid 4,097 unrelate
 		fs.writeFileSync(path.join(dir, `${path.basename(file)}-other.torn-${i}`), "");
 	}
 	fs.writeFileSync(file, line(10));
-	assert.equal(live.tick(), Buffer.byteLength(line(10)));
+	assert.equal(live.tick(), 2 * Buffer.byteLength(line(10)), "first read includes the header probe and usage scan");
 
 	appendLarge(file, 42);
 	assert.equal(live.tick(), USAGE_TICK_BYTES);
@@ -69,7 +69,7 @@ test("(IS-1, IS-12) a new matching torn backup still rewinds a growing fragment"
 	const { file, open } = setup(t);
 	const live = open();
 	fs.writeFileSync(file, line(10));
-	assert.equal(live.tick(), Buffer.byteLength(line(10)));
+	assert.equal(live.tick(), 2 * Buffer.byteLength(line(10)), "first read includes the header probe and usage scan");
 
 	appendLarge(file, 42);
 	assert.equal(live.tick(), USAGE_TICK_BYTES);
@@ -83,14 +83,15 @@ test("(IS-1, IS-12) a new matching torn backup still rewinds a growing fragment"
 });
 
 test("(IS-1, IS-2, IS-12) a restart keeps the old total visible until a 40 MiB replacement finishes", (t) => {
-	const { file, open } = setup(t);
+	const { file, open, id, cwd } = setup(t);
 	const original = open();
 	fs.writeFileSync(file, line(10));
-	assert.equal(original.tick(), Buffer.byteLength(line(10)));
+	assert.equal(original.tick(), 2 * Buffer.byteLength(line(10)), "first read includes the header probe and usage scan");
 	assert.deepEqual(original.publication(), [10, false]);
 	assert.equal(original.index.save(), true);
 
 	const replacement = `${file}.new`;
+	fs.writeFileSync(replacement, `${JSON.stringify({ type: "session", id, cwd })}\n`);
 	appendLarge(replacement, 42);
 	fs.renameSync(replacement, file);
 	const restarted = open();

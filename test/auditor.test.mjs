@@ -31,6 +31,7 @@ import { createUsageTracker } from "../src/usage-tracker.mjs";
 import { createRecordingSpawn } from "./fakes/runner.mjs";
 import { readJsonSafe } from "../src/util/fsx.mjs";
 import { E, appendJsonl, earlyCacheStormEntries, writeJsonl, writeTask } from "./helpers/fixtures.mjs";
+import { makeWorld, sessionState } from "./helpers/world.mjs";
 import { indexLiveParentTranscript } from "./helpers/live-parent-transcript.mjs";
 
 const BASE = Date.parse("2026-11-20T12:00:00Z");
@@ -1031,6 +1032,91 @@ test("(plan 116) reload does not count or audit a different project's replacemen
 	const bundle = JSON.parse(document.split("\n").find((line) => line.startsWith('{"session":')));
 	assert.equal(bundle.tokens.total, 92);
 	assert.deepEqual(bundle.omo_health_record.messages, [{ ref: "M1", ms, kind: "self-notice" }]);
+});
+
+for (const inside of [false, true]) test(inside
+	? "(plan 118) a fresh heartbeat cannot bill or audit another project's replacement inside sessionsDir"
+	: "(plan 117) a fresh heartbeat cannot bill or audit another project's external replacement", async (t) => {
+	const h = harness({ sessions: [] });
+	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+	const id = "review.1";
+	const a = path.join(h.root, "alpha");
+	const b = path.join(h.root, "beta");
+	const dir = inside ? path.join(h.paths.sessionsDir, projectKeyOf(a)) : h.root;
+	const file = path.join(dir, `2026-11-20_${id}.jsonl`);
+	const ms = BASE - 120_000;
+	const transcript = (cwd, model, input) => [
+		E.header(id, cwd, ms - 5000),
+		E.assistant({ ms, provider: "openai", model, usage: { input, output: 2, cacheRead: 0, cacheWrite: 0 } }),
+	];
+	const index = createUsageIndex({ file: h.paths.health.usageIndexFile, clock: h.clock });
+	const tracker = createUsageTracker({ paths: h.paths, index, locator: createSessionFileLocator({ paths: h.paths, clock: h.clock }), clock: h.clock });
+	const heartbeat = { sessionId: id, sessionFile: file, cwd: a, ts: BASE, pid: 123 };
+	const tick = (sensor) => tracker.tick(makeWorld({
+		now: h.clock.now(), sensors: [sensor],
+		sessions: [sessionState({ id, cwd: sensor.cwd, file, startedMs: ms - 5000 })],
+	}));
+	const live = (cwd) => {
+		const { tokens, pending } = tracker.tokensOf(sub(id, cwd));
+		const entry = index.get(key(id, cwd));
+		return [tokens?.total, Object.keys(entry?.published?.models ?? {}), pending === true, fresh(entry)];
+	};
+	writeJsonl(file, transcript(a, "gpt-5-4", 40));
+	tick(heartbeat);
+	assert.deepEqual(live(a), [42, ["openai/gpt-5-4"], false, true]);
+
+	const replacement = `${file}.new`;
+	writeJsonl(replacement, transcript(b, "gpt-5-5", 90));
+	fs.renameSync(replacement, file);
+	h.state.now += 1000;
+	tick(heartbeat); // A still advertises the same path with its original, fresh heartbeat.
+	const afterReplacement = live(a);
+	tick({ ...heartbeat, cwd: b, ts: h.clock.now(), pid: 456 });
+	const owner = live(b);
+
+	// Supply selectable ledger rows for the real audit preparation worker.
+	for (const cwd of [a, b]) appendEnded(h.paths, {
+		sessionId: id, kind: "main", cwd, startedMs: ms - 5000, endedMs: ms + 1000, outcome: "completed",
+	}, { nowMs: h.clock.now() });
+	const auditor = h.auditor({ index });
+	h.request(id, a);
+	await h.prepare(auditor);
+	const audit = h.record(id, a);
+	assert.deepEqual({ afterReplacement, owner, audit: [audit.status, audit.reason], starts: h.runner.starts.length, budget: h.budget() }, {
+		afterReplacement: [42, ["openai/gpt-5-4"], true, false],
+		owner: [92, ["openai/gpt-5-5"], false, true],
+		audit: ["failed", "models-unknown"], starts: 0, budget: undefined,
+	});
+});
+
+test("(plan 118) a first external heartbeat read trusts a matching filename but not a foreign header cwd", (t) => {
+	const h = harness({ sessions: [] });
+	t.after(() => fs.rmSync(h.root, { recursive: true, force: true }));
+	const a = path.join(h.root, "alpha");
+	const b = path.join(h.root, "beta");
+	const index = createUsageIndex({ file: h.paths.health.usageIndexFile, clock: h.clock });
+	const tracker = createUsageTracker({ paths: h.paths, index, clock: h.clock });
+	const ms = BASE - 120_000;
+	const assistant = E.assistant({ ms, provider: "openai", model: "gpt-5-5",
+		usage: { input: 90, output: 2, cacheRead: 0, cacheWrite: 0 } });
+	const firstRead = (id, entries) => {
+		const file = path.join(h.root, `2026-11-20_${id}.jsonl`);
+		writeJsonl(file, entries);
+		tracker.tick(makeWorld({
+			now: h.clock.now(),
+			sensors: [{ sessionId: id, sessionFile: file, cwd: a, ts: BASE, pid: 123 }],
+			sessions: [sessionState({ id, cwd: a, file, startedMs: ms - 5000 })],
+		}));
+		const { tokens, pending } = tracker.tokensOf(sub(id, a));
+		return [tokens?.total, pending === true, fresh(index.get(key(id, a)))];
+	};
+	assert.deepEqual({
+		ownHeaderless: firstRead("own.1", [assistant]),
+		foreignCwd: firstRead("foreign.1", [E.header("foreign.1", b, ms - 5000), assistant]),
+	}, {
+		ownHeaderless: [92, false, true],
+		foreignCwd: [undefined, true, false],
+	});
 });
 
 test("a same-length rewrite read by a complete timeline excludes the new model before the recount", async () => {

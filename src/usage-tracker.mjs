@@ -1,22 +1,20 @@
 import path from "node:path";
-import { probeSessionHeader } from "./collect/session-files.mjs";
-import { idFromFileName } from "./collect/sessions.mjs";
+import { indexedMainIdentity, ownsLiveMain, probeSessionHeader } from "./collect/session-files.mjs";
+import { readUsageFileStamp, sameFileStamp } from "./collect/usage.mjs";
 import { childSubjectOf, ledgerParentSubject, liveSessionView, PACKED_PROJECT, packScopedText, parseSubjectKey, sessionSubjects, SubjectMap, subjectKey, subjectOf, taskParentResolver, unpackScopedText } from "./session-subject.mjs";
 import { isInside, pathKey } from "./paths.mjs";
 import { boardTaskLinks } from "./session-board.mjs";
 import { ENDED_LOCATION, locateEndedRows, readEndedCwd, streamEnded } from "./session-ledger.mjs";
 import { ledgerUsageSessionId, legacyParentOwners, retainedTreeRows, usageTreeLink } from "./session-record.mjs";
 import { USAGE_TICK_BYTES, compactUsage, fresh as isFresh, isTaskOnlyEntry, parentSubject, treeTotals, usageEntryFor } from "./usage-index.mjs";
-import { statSafe } from "./util/fsx.mjs";
 
 /**
  * The daemon's token tracker (plan todo 5): one per-tick byte budget shared by
  * live appends, first reads of live sessions and the ended-session backlog,
  * including live verification and discovery of the backlog's main-session files.
  *
- * Live sessions are indexed only from their own file: a main file name or
- * session header must carry its session id, and children use the spawning-store
- * locator rather than trusting the live collector's newest-file fallback.
+ * Live sessions are indexed only from their own file: replacements must
+ * prove ownership and children use the spawning-store locator.
  */
 const DAY_MS = 24 * 60 * 60_000;
 const ANCESTOR_DEPTH = 8;
@@ -144,7 +142,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 	const childCandidate = (query) => (locator?.childCandidate ?? locator?.childFile)?.(query);
 
 	/** Verify that the live collector's file belongs to this session before billing it. */
-	const verify = (session, file, liveSessions, cwdOf, maxBytes) => {
+	const verify = (session, file, entry, liveSessions, cwdOf, maxBytes) => {
 		const result = (matches) => ({ matches, bytesRead: 0 });
 		if (session.kind === "child" && isNonEmptyString(session.taskId)) {
 			const query = { taskId: session.taskId, sessionId: session.id, ...childStoreQuery(session, liveSessions, cwdOf) };
@@ -153,22 +151,30 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 		}
 		if (!isNonEmptyString(file)) return result(false);
 		if (session.kind === "main") {
-			if (idFromFileName(file) === session.id) return result(true);
-			const stat = statSafe(file);
+			const stamp = readUsageFileStamp(file);
 			const subject = identityOf(session);
 			const cached = liveHeaders.get(subject);
-			if (!stat?.isFile()) {
+			if (!stamp) {
 				liveHeaders.delete(subject);
-				return result(false);
+				return { ...result(false), pending: true };
 			}
-			const { size, mtimeMs, ino } = stat;
-			if (cached?.file === file && cached.size === size && cached.mtimeMs === mtimeMs && cached.ino === ino) return result(cached.matches);
+			const sameIdentity = indexedMainIdentity(file, entry, stamp);
+			if (sameIdentity === true) {
+				liveHeaders.delete(subject);
+				return result(true);
+			}
+			const owns = (probe) => ownsLiveMain(subject, file, probe, sameIdentity);
+			if (cached?.file === file && sameFileStamp(cached.stamp, stamp)) {
+				const matches = owns(cached.probe);
+				return { ...result(matches), pending: !matches };
+			}
 			liveHeaders.delete(subject);
+			const { size } = stamp;
 			const probe = probeSessionHeader(file, size, maxBytes);
-			const matches = probe.id === session.id;
+			const matches = owns(probe);
 			// Don't cache an I/O failure on a nonempty file; retry it next tick.
-			if (!probe.pending && (probe.bytesRead > 0 || size === 0)) liveHeaders.set(subject, { file, size, mtimeMs, ino, matches });
-			return { matches, pending: probe.pending, bytesRead: probe.bytesRead };
+			if (!probe.pending && (probe.bytesRead > 0 || size === 0)) liveHeaders.set(subject, { file, stamp, probe });
+			return { matches, pending: !matches, bytesRead: probe.bytesRead };
 		}
 		return result(false);
 	};
@@ -179,7 +185,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			return { file: childCandidate(query), bytesRead: 0 };
 		}
 		const subject = subjectOf(identityOf(row));
-		return locator?.findMainFile?.(subject, index.get(subjectKey(subject))?.file ?? null, { maxBytes }) ?? { bytesRead: 0 };
+		return locator?.findMainFile?.(subject, usageEntryFor(index, subject) ?? null, { maxBytes }) ?? { bytesRead: 0 };
 	};
 
 	const counts = () => {
@@ -463,7 +469,7 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 					if (pending || (file && budget === 0 && !entry)) pendingLive.set(subject, true);
 					if (!file) continue;
 				}
-				const { matches, pending, bytesRead, candidate } = verify(session, file, liveSessions, cwdOf, budget);
+				const { matches, pending, bytesRead, candidate } = verify(session, file, entry, liveSessions, cwdOf, budget);
 				if (session.kind === "child") file = candidate;
 				budget -= bytesRead;
 				if (pending || (matches && budget === 0 && !entry)) pendingLive.set(subject, true);
@@ -560,7 +566,10 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			const treeTokens = trees.get(treeId) ?? null;
 			const treeTokensComplete = !pendingLive.has(id) && trees.complete.get(treeId) === true;
 			const tree = treeTokens === null ? {} : { treeTokens, treeTokensComplete };
-			if (pendingLive.has(key)) return { pending: true, ...tree };
+			if (pendingLive.has(key)) {
+				const tokens = compactUsage(entry);
+				return { pending: true, ...tree, ...(tokens ? { tokens } : {}) };
+			}
 			if (!entry) return entry === undefined && index.full && taskId ? { state: "full", ...tree } : treeTokens === null ? null : tree;
 			if (entry.state === "full") return { state: "full", ...tree };
 			const tokens = compactUsage(entry);

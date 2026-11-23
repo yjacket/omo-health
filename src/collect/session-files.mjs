@@ -2,11 +2,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { listDirSafe, statSafe } from "../util/fsx.mjs";
 import { isInside, pathKey } from "../paths.mjs";
-import { packScopedText, projectKeyOf, SubjectMap, uniqueMatch } from "../session-subject.mjs";
-import { fresh, readUsageIndex, soleChildSessionFile } from "../usage-index.mjs";
+import { packScopedText, projectKeyOf, uniqueMatch } from "../session-subject.mjs";
+import { fresh, soleChildSessionFile } from "../usage-index.mjs";
 import { idFromFileName } from "./sessions.mjs";
 import { senpiTaskStoreDir } from "./tasks.mjs";
-import { readUsageFileStamp, sameFileIdentity, sameFileStamp } from "./usage.mjs";
+import { isExactInode, readUsageFileStamp, sameFileIdentity } from "./usage.mjs";
 
 const HEADER_BYTES = 64 * 1024;
 
@@ -32,6 +32,36 @@ export function probeSessionHeader(file, size, maxBytes) {
 	}
 }
 
+/** The saved row supplies ownership for a legacy header only for the same file identity. */
+function ownsExternal(subject, file, probe, saved) {
+	if (probe.id !== subject.sessionId) return false;
+	const headerProject = projectKeyOf(probe.cwd);
+	if (subject.projectKey != null && headerProject != null) return headerProject === subject.projectKey;
+	if (saved?.kind !== "main" || saved.file !== file || saved.projectKey == null) return false;
+	if (subject.projectKey != null && saved.projectKey !== subject.projectKey) return false;
+	return headerProject == null
+		? sameFileIdentity(readUsageFileStamp(file), saved)
+		: headerProject === saved.projectKey;
+}
+
+/** An indexed identity describes a particular path, not a heartbeat's newly reported path. */
+export function indexedMainIdentity(file, saved, stamp) {
+	if (!isExactInode(saved?.ino) || !Number.isFinite(saved.birthtimeMs) ||
+		!saved.file || (saved.file !== file && pathKey(saved.file) !== pathKey(file))) return undefined;
+	return sameFileIdentity(stamp, saved);
+}
+
+/** A new live path earns trust by name or header; a replacement has to prove both scoped keys. */
+export function ownsLiveMain(subject, file, probe, sameIdentity) {
+	if (sameIdentity === true) return true;
+	if (probe.pending) return false;
+	const { sessionId, projectKey } = subject;
+	const headerProject = projectKeyOf(probe.cwd);
+	if (sameIdentity === false) return probe.id === sessionId && headerProject != null && headerProject === projectKey;
+	if ((probe.id != null && probe.id !== sessionId) || (headerProject != null && headerProject !== projectKey)) return false;
+	return probe.id === sessionId || idFromFileName(file) === sessionId;
+}
+
 /**
  * Locate the session JSONL behind an ended-session ledger row (GAP-2).
  *
@@ -44,57 +74,13 @@ export function probeSessionHeader(file, size, maxBytes) {
  * daemon's backlog finds files that appear later without rescanning every tick.
  */
 /**
- * `indexedFile(subject)` is an optional lookup into a token index the caller already holds (the daemon's resident
- * index); without it the locator reads the index file, once per change of that file.
- * With `probeHeaders: false`, use fresh on-disk index entries instead of probing, and discover by filename only.
+ * `indexedEntry(subject)` returns a row from an index the caller already holds.
+ * With `probeHeaders: false`, use fresh index entries or filename discovery inside
+ * the sessions tree; external paths still require a header ownership check.
  */
-export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, indexedFile, probeHeaders = true } = {}) {
+export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, indexedEntry, probeHeaders = true } = {}) {
 	const nowMs = typeof clock?.now === "function" ? () => clock.now() : () => Date.now();
 	const projects = new Map();
-	let usageStamp;
-	let indexedMainEntries = new SubjectMap();
-
-	const readMainEntry = (subject) => {
-		subject = { ...subject, taskId: null };
-		const file = paths.health?.usageIndexFile;
-		const stamp = file ? readUsageFileStamp(file) : null;
-		let entry;
-		if (subject.projectKey == null) {
-			// Check uniqueness across the entire index before filtering unusable entries.
-			if (stamp === null) return undefined;
-			entry = readUsageIndex(file).getForSubject(subject);
-		} else {
-			if (stamp === null ? usageStamp !== null : !sameFileStamp(stamp, usageStamp)) {
-				usageStamp = stamp;
-				indexedMainEntries = new SubjectMap();
-				if (stamp !== null) {
-					for (const row of readUsageIndex(file).values()) {
-						if (row.kind === "main" && row.file) indexedMainEntries.set(row, row);
-					}
-				}
-			}
-			entry = indexedMainEntries.get(subject);
-		}
-		if (entry?.kind !== "main" || !entry.file) return undefined;
-		if (!probeHeaders && (entry?.readError === true || !fresh(entry))) return undefined;
-		return entry;
-	};
-
-	const readMainFile = (subject) => readMainEntry(subject)?.file;
-	const indexedMainFile = typeof indexedFile === "function" ? indexedFile : readMainFile;
-
-	const ownsExternal = (subject, file, probe) => {
-		if (probe.id !== subject.sessionId) return false;
-		const headerProject = projectKeyOf(probe.cwd);
-		if (subject.projectKey != null && headerProject != null) return headerProject === subject.projectKey;
-		const saved = readMainEntry(subject);
-		if (saved?.file !== file || saved.projectKey == null) return false;
-		// A legacy header without cwd cannot vouch for a replacement, only the
-		// same file whose ownership was already recorded.
-		return headerProject == null
-			? sameFileIdentity(readUsageFileStamp(file), saved)
-			: headerProject === saved.projectKey;
-	};
 
 	function* mainCandidates(dir) {
 		for (const name of listDirSafe(dir)) {
@@ -103,7 +89,7 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 	}
 
 	/** A header probe is atomic; leave the candidate at the cursor if its prefix won't fit. */
-	const findMainFile = (subject, indexedFile, { maxBytes = Infinity } = {}) => {
+	const findMainFile = (subject, saved, { maxBytes = Infinity } = {}) => {
 		let bytesRead = 0;
 		const result = (file, pending = false) => ({ file, pending, bytesRead });
 		const header = (file, size) => {
@@ -113,6 +99,17 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 		};
 		const { sessionId, projectKey } = subject ?? {};
 		if (!sessionId || subject.taskId != null) return result();
+		if (saved === undefined) saved = indexedEntry?.({ ...subject, taskId: null });
+		const indexedFile = saved?.kind === "main" ? saved.file : undefined;
+		const external = indexedFile && !isInside(indexedFile, paths.sessionsDir);
+		const probeIndexed = () => {
+			const stat = statSafe(indexedFile);
+			if (!stat?.isFile()) return result();
+			const probe = header(indexedFile, stat.size);
+			if (probe.pending) return result(undefined, true);
+			const matches = external ? ownsExternal(subject, indexedFile, probe, saved) : probe.id === sessionId;
+			return result(matches ? indexedFile : undefined);
+		};
 		if (projectKey == null) {
 			let pending = false;
 			const file = uniqueMatch(listDirSafe(paths.sessionsDir, { withFileTypes: true }), (entry) => {
@@ -123,32 +120,23 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 			});
 			if (file === null) return { ...result(), ambiguous: true };
 			if (pending || file) return result(file && !pending ? file : undefined, pending);
-			const custom = !probeHeaders ? readMainFile(subject) : indexedFile === undefined ? indexedMainFile(subject) : indexedFile;
-			if (!custom || isInside(custom, paths.sessionsDir)) return result();
-			if (!probeHeaders) return result(custom);
-			const stat = statSafe(custom);
-			if (!stat?.isFile()) return result();
-			const probe = header(custom, stat.size);
-			return result(ownsExternal(subject, custom, probe) ? custom : undefined, probe.pending);
+			return external ? probeIndexed() : result();
 		}
 		if (!/^--[^/\\:]*--$/.test(projectKey)) return result();
 		const dir = path.join(paths.sessionsDir, projectKey);
-		const owns = (file) => file && pathKey(path.dirname(file)) === pathKey(dir);
-		// An indexed transcript can live outside senpi’s sessions tree even if its name is conventional.
-		const custom = (file) => file && !isInside(file, paths.sessionsDir);
-		if (!probeHeaders) {
-			const verified = readMainFile(subject);
-			if (owns(verified) || custom(verified)) return result(verified);
-		} else if (indexedFile === undefined) {
-			indexedFile = indexedMainFile(subject);
-		}
-		if (probeHeaders && (owns(indexedFile) || custom(indexedFile))) {
-			const stat = statSafe(indexedFile);
-			if (stat?.isFile()) {
-				const probe = header(indexedFile, stat.size);
-				if (probe.pending) return result(undefined, true);
-				if (owns(indexedFile) ? probe.id === sessionId : ownsExternal(subject, indexedFile, probe)) return result(indexedFile);
+		const inProject = indexedFile && pathKey(path.dirname(indexedFile)) === pathKey(dir);
+		if (!probeHeaders && inProject && saved.readError !== true && fresh(saved)) return result(indexedFile);
+		if (inProject) {
+			const stamp = readUsageFileStamp(indexedFile);
+			if (stamp && indexedMainIdentity(indexedFile, saved, stamp) === false) {
+				// A scan by name (or its cached result) must not resurrect a replaced indexed file.
+				const probe = header(indexedFile, stamp.size);
+				return result(ownsLiveMain(subject, indexedFile, probe, false) ? indexedFile : undefined, probe.pending);
 			}
+		}
+		if (external || (probeHeaders && inProject)) {
+			const found = probeIndexed();
+			if (found.file || found.pending) return found;
 		}
 		const { file, pending } = scanProject(dir, projectKey, sessionId, header);
 		return result(file, pending);
@@ -191,7 +179,7 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 		return result(file && statSafe(file)?.isFile() ? file : undefined);
 	}
 
-	const mainFile = (subject, indexedFile) => findMainFile(subject, indexedFile).file;
+	const mainFile = (subject, saved) => findMainFile(subject, saved).file;
 
 	const childFiles = new Map();
 	const childMisses = new Map();

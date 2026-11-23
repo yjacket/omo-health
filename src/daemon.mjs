@@ -35,7 +35,7 @@ import { pruneHome } from "./retention.mjs";
 import { backfillOnce } from "./session-backfill.mjs";
 import { buildSessionSnapshot, detectEnded } from "./session-board.mjs";
 import { appendEndedBatch, ENDED_LOCATION, streamEnded } from "./session-ledger.mjs";
-import { subjectKey, worldLiveOwners } from "./session-subject.mjs";
+import { worldLiveOwners } from "./session-subject.mjs";
 import { createSessionFileLocator } from "./collect/session-files.mjs";
 import { createUsageIndex, USAGE_TICK_BYTES } from "./usage-index.mjs";
 import { createUsageTracker } from "./usage-tracker.mjs";
@@ -334,7 +334,7 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 	// Plan todo 5: the token index and its tracker. This process is the only writer of usage.json; the
 	// daemon shares one 32 MiB transcript budget per tick between usage tracking and reconciliation.
 	const usageIndex = createUsageIndex({ file: paths.health.usageIndexFile, clock, log });
-	const usageTracker = createUsageTracker({ paths, index: usageIndex, locator: createSessionFileLocator({ paths, clock, indexedFile: (subject) => usageIndex.get(subjectKey(subject))?.file }), clock, log });
+	const usageTracker = createUsageTracker({ paths, index: usageIndex, locator: createSessionFileLocator({ paths, clock, indexedEntry: (subject) => usageIndex.getForSubject(subject) }), clock, log });
 	// Plan todo 12: owner-requested audits (display-only, so they run in shadow mode too); one runs at a time.
 	const auditor = (overrides.createAuditor ?? createAuditor)({ paths, config, clock, log, env, index: usageIndex, runner: createRunner({ paths, clock, contracts: { audit: AUDIT_CONTRACT } }) });
 	const savedBoard = readJsonSafe(paths.health.sessionsSnapshotFile);
