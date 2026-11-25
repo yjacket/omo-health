@@ -62,6 +62,21 @@ test("audit evidence: reviewer spawns (with their round), verdicts, owner reques
 	assert.deepEqual(note, { kind: "health-note", data: { kind: "scope-check", text: "[omo-health 범위 점검] long run" } });
 });
 
+test("owner answers: an answered question-tool result or a deferred answer; a timeout, a pending ack or another user message is none (#24)", () => {
+	const question = (status, name = "ask_user_question") => {
+		const entry = E.toolResult("q1", T0, { name, text: "answer" });
+		entry.message.details = { status };
+		return entry;
+	};
+	const answers = (entry) => extractEvents(entry, ctx()).evidence.filter((e) => e.kind === "owner-answer");
+	assert.deepEqual(answers(question("answered")), [{ kind: "owner-answer", data: { via: "question-tool" } }]);
+	assert.deepEqual(answers(question("answered", "mcp__custom-tools__ask_user_question")).length, 1);
+	for (const status of ["timed_out", "pending", "unavailable"]) assert.deepEqual(answers(question(status)), [], status);
+	const deferred = extractEvents(E.user("[Answer to question toolu_1]\n계속: (see below)\n[The user's answer to 계속 for question toolu_1]\n계속해", T0), ctx());
+	assert.deepEqual(deferred.evidence.map((e) => e.kind), ["request", "owner-answer"]);
+	assert.deepEqual(answers(E.user("[LEAD] your work thread has had no update for 17 min.", T0)), []);
+});
+
 test("usage id is <session>:<entry.id> when the entry has an id", () => {
 	const entry = E.assistant({ ms: T0, id: "e42", text: "ok" });
 	const out = extractEvents(entry, ctx());

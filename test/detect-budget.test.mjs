@@ -37,6 +37,7 @@ test("owner-call: a project past the ladder's last tier raises one human-needed 
 	assert.equal(finding.subject.key, `budget:owner-call:s:g:${NOW}`);
 	assert.match(finding.detailKo, /4\.2배/);
 	assert.equal(budget.detect({ budget: { enabled: true, projects: [{ id: "s:g", ownerCall: { ...call, basis: "rounds", ratio: null, rounds: 41 } }] } })[0].detailKo.includes("41차"), true);
+	assert.deepEqual(budget.detect({ budget: { enabled: true, projects: [{ id: "s:g", ownerCall: { ...call, answeredMs: LATER } }] } }), [], "an answered call needs no human (#24)");
 });
 
 const snapshot = (partial = {}) => ({

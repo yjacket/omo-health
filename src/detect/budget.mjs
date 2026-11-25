@@ -10,7 +10,8 @@ import { makeFinding } from "./finding.mjs";
  *   treasury-short  warn, human needed - a window reaches its reserve by reset
  *   treasury-tight  info               - a window is close to the reserve
  *   audit-opinion   info               - the auditor judged spend waste-likely
- *   owner-call      warn, human needed - past the review ladder's last tier the session was asked to call the owner
+ *   owner-call      warn, human needed - past the review ladder's last tier the session was asked to call the owner;
+ *                                        gone once the office records the owner's answer (`ownerCall.answeredMs`)
  * An unknown or stale reading emits nothing: the snapshot has no basis yet.
  */
 export const id = "D26";
@@ -112,7 +113,7 @@ function auditFinding(audit) {
 
 function ownerCallFinding(project) {
         const call = project?.ownerCall;
-        if (!call || !Number.isFinite(call.ms)) return null;
+        if (!call || !Number.isFinite(call.ms) || Number.isFinite(call.answeredMs)) return null;
         const projectId = String(project.id ?? "");
         const why = call.basis === "budget" && Number.isFinite(call.ratio) ? `승인 예산의 ${call.ratio.toFixed(1)}배를 썼습니다` : `리뷰가 ${call.rounds ?? "?"}차까지 갔습니다`;
         return makeFinding({
