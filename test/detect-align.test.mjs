@@ -278,6 +278,8 @@ test("long-run: reviewer spawn summaries like 'Plan review r19' count as rounds"
 	const [finding] = detect(world, {});
 	assert.equal(finding?.cls, "long-run");
 	assert.match(finding.data.evidence, /rounds 19\.\.26 \(8 rounds\)/);
+	session.steps = session.steps.map((s, i) => ({ ...s, text: `preview r${i + 1}: layout` }));
+	assert.deepEqual(detect(world, {}), [], "'preview r5' is not a review round");
 });
 
 test("the daily note budget counts one delivery once, though the ledger and the transcript both hold it", () => {

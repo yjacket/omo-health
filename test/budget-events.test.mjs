@@ -50,6 +50,12 @@ test("audit evidence: reviewer spawns (with their round), verdicts, owner reques
 	assert.ok(request.data.text.length <= 4000);
 	assert.ok(request.data.text.endsWith("OWNER: plan approval is granted"), "the tail, where a skill wrapper leaves the owner's words, is kept");
 
+	// Gate review B3: a credential that straddles the head/tail cut is redacted before the cut drops its prefix.
+	const secret = `sk-ant-api03-${"Q".repeat(90)}`;
+	const straddle = `${"x".repeat(9000 - 2500 - 4)}${secret} and ${"y".repeat(2400)}`;
+	const cut = extractEvents(E.user(straddle, T0), ctx()).evidence[0].data.text;
+	assert.equal(cut.includes("Q".repeat(20)), false, "no secret body survives the cut");
+
 	assert.deepEqual(extractEvents(E.toolResult("c", T0, { text: "pr 0 https://github.com/o/r/pull/21 | ok" }), ctx()).evidence, [{ kind: "pr", data: { url: "https://github.com/o/r/pull/21" } }]);
 	assert.deepEqual(extractEvents(E.toolResult("c", T0, { text: "no link" }), ctx()).evidence, []);
 	const note = extractEvents({ type: "custom_message", customType: "omo-health", timestamp: iso(T0), content: "[omo-health 범위 점검] long run", details: { kind: "scope-check" } }, ctx()).evidence[0];

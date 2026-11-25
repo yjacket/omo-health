@@ -444,7 +444,9 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 			const ladderDue = step.tier >= 1 && step.tier <= 3 && step.tier > lastTier;
 			const ruleReasons = out.actions.filter((a) => a.type === "audit").flatMap((a) => a.reasons);
 			const reasons = [...(ladderDue ? [`ladder-${step.basis}`] : []), ...ruleReasons];
+			// The effort of this audit; only a ladder audit spends its tier (a rule audit below 1x leaves tier 1 for 1x).
 			const tier = Math.max(1, Math.min(step.tier, 3));
+			const ladderOf = () => (ladderDue ? { ...step } : { tier, basis: "rule", reasons: ruleReasons, ratio: step.ratio, rounds: step.rounds });
 
 			if (shadow) {
 				for (const action of out.actions) {
@@ -539,7 +541,7 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 					if (allowed.allowed && model) {
 						const audit = {
 							auditId: `budget-${createHash("sha256").update(project.id).digest("hex").slice(0, 10)}-${now}`,
-							ms: now, status: "digesting", model, tier, ladder: { ...step, tier }, triggers: reasons,
+							ms: now, status: "digesting", model, tier: ladderDue ? step.tier : null, ladder: ladderOf(), triggers: reasons,
 							costUsd: null, costStatus: null, spentUsd: projectSpend.costUsd, roundsCount: rounds.length,
 						};
 						const digestModel = laneModels(paths, auditCfg.digestLane)[0] ?? null;
@@ -548,7 +550,7 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 							try {
 								startDigest({ runner, paths, model: digestModel, input: buildDigestInput(raw()), auditId: audit.auditId, timeoutMs: auditCfg.timeoutMs });
 								record = { ...audit, digestModel };
-								appendEvent({ projectId: project.id, kind: "audit-digest-started", data: { auditId: audit.auditId, model: digestModel, tier } });
+								appendEvent({ projectId: project.id, kind: "audit-digest-started", data: { auditId: audit.auditId, model: digestModel, tier: audit.tier } });
 							} catch (error) {
 								record = launch({ ...audit, digest: "start-failed" }, null);
 							}

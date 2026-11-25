@@ -5,10 +5,14 @@
 // tool result shows, each capped here so a long transcript never grows the ledger without bound.
 
 import { REVIEW_AGENTS } from "../align/steps.mjs";
+import { redact } from "../util/text.mjs";
 import { ROUND } from "../detect/align.mjs";
 import { extractBlocks } from "./protocol.mjs";
 
-/** Characters kept per evidence item; a request keeps its head and tail (a skill wrapper puts the owner's words last). */
+/**
+ * Characters kept per evidence item; a request keeps its head and tail (a skill wrapper puts the owner's words last).
+ * Every text is redacted before it is cut: a cut can drop the prefix (`sk-ant-`, `Bearer `) the redaction matches on.
+ */
 export const REQUEST_CHARS = 4000;
 export const VERDICT_CHARS = 1500;
 export const NOTE_CHARS = 1200;
@@ -46,7 +50,7 @@ function reviewVerdicts(entry, evidence) {
 		for (const done of Array.isArray(producer.details) ? producer.details : []) {
 			if (!REVIEW_AGENTS.has(done?.agent_type)) continue;
 			const at = done.name ? content.indexOf(`name:${done.name}`) : -1;
-			const text = (at >= 0 ? content.slice(at) : content).slice(0, VERDICT_CHARS);
+			const text = redact(at >= 0 ? content.slice(at) : content).slice(0, VERDICT_CHARS);
 			evidence.push({ kind: "review-verdict", data: { agent: done.agent_type, name: done.name ?? null, model: done.model ?? null, status: done.status ?? null, text } });
 		}
 	}
@@ -104,12 +108,12 @@ export function extractEvents(entry, ctx = {}) {
 	}
 	if (entry.type === "custom_message" && entry.customType === "omo-health") {
 		const text = textOf(entry.content);
-		if (text) evidence.push({ kind: "health-note", data: { kind: entry.details?.kind ?? entry.details?.actionKind ?? null, text: text.slice(0, NOTE_CHARS) } });
+		if (text) evidence.push({ kind: "health-note", data: { kind: entry.details?.kind ?? entry.details?.actionKind ?? null, text: redact(text).slice(0, NOTE_CHARS) } });
 		return result;
 	}
 	if (entry.type === "message" && entry.message?.role === "user") {
 		const text = textOf(entry.message.content).trim();
-		if (text) evidence.push({ kind: "request", data: { text: headTail(text, REQUEST_CHARS) } });
+		if (text) evidence.push({ kind: "request", data: { text: headTail(redact(text), REQUEST_CHARS) } });
 		return result;
 	}
 	if (entry.type === "message" && entry.message?.role === "toolResult") {

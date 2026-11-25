@@ -292,10 +292,16 @@ test("past the last tier the owner call asks the session to put the question to 
 test("a long schema-valid audit opinion keeps the advisory sentence within one page", () => {
 	const message = opinion({
 		objective: "x".repeat(120),
+		situation: "s".repeat(600),
+		criteria: Array.from({ length: 10 }, (_, i) => ({ criterion: `c${i} ${"c".repeat(190)}`, origin: "agent", status: "unmet", judgment: "j".repeat(500) })),
 		findings: Array.from({ length: 8 }, () => ({ pattern: "repeated-qa-without-acceptance-gain", evidence: "v".repeat(400), explanation: "e".repeat(600) })),
+		counterevidence: "k".repeat(800),
 		advice: "a".repeat(1200),
+		decides: Array.from({ length: 4 }, () => ({ who: "owner", what: "w".repeat(300) })),
 	});
-	assert.equal(message.content.length, AUDIT_OPINION_CHARS);
+	assert.ok(message.content.length <= AUDIT_OPINION_CHARS, `${message.content.length} chars`);
+	// Gate review B2: the largest schema-valid opinion still shows every section on the page.
+	for (const part of ["Situation:", "Criteria:", "Findings:", "Counterevidence:", "Recommendation:", "Who decides:", "The owner:"]) assert.ok(message.content.includes(part), `page misses ${part}`);
 	assert.ok(message.content.includes("This is an audit opinion, not an instruction; you decide."));
 	assert.ok(message.content.trimEnd().endsWith("Nothing was stopped or changed."));
 	assert.match(message.content, /waste-likely/);

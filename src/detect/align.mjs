@@ -71,7 +71,7 @@ const GOAL_ACTIVE = new Set(["active", "running", "in_progress", "pending"]);
 const HOUR_MS = 3600_000;
 // A round number written next to a step: "26차 QA", "회귀 점검 25", "QA round 7", "3회차" (not 차이, 차원, 차례, 차단...),
 // and a reviewer spawn's short form "Plan review r19" / "리뷰 R3".
-export const ROUND = /(\d+)\s*(?:차|회차)(?![이원례단량선트])|(?:round|라운드|회귀 점검)\s*#?(\d+)|(?:review|리뷰)[\s-]*r(\d+)\b/gi;
+export const ROUND = /(\d+)\s*(?:차|회차)(?![이원례단량선트])|(?:round|라운드|회귀 점검)\s*#?(\d+)|(?:\breview|리뷰)[\s-]*r(\d+)\b/gi;
 
 /** Time spent working: the sum of gaps between consecutive steps that are shorter than idleGapMs. */
 export function activeTime(steps, idleGapMs) {

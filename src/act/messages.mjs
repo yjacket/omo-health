@@ -783,6 +783,7 @@ export const AUDIT_OPINION_CHARS = 4000;
 /** Why this tier of the ladder looked: spend against the approved budget, or review rounds where there is none. */
 function ladderText(ladder) {
 	if (!ladder || !Number.isFinite(ladder.tier)) return "";
+	if (ladder.basis === "rule") return ` (effort tier ${ladder.tier}, asked by rule: ${(ladder.reasons ?? []).join(", ") || "rule"})`;
 	const why = ladder.basis === "budget" && Number.isFinite(ladder.ratio)
 		? `spend is ${ladder.ratio.toFixed(1)}x the approved budget`
 		: `${ladder.rounds ?? "?"} review rounds`;
@@ -797,22 +798,22 @@ export function composeAuditOpinion({ sessionId, now, projectId, revision = 0, a
 	const assessment = opinion.assessment ?? "insufficient-evidence";
 	const verdict = AUDIT_OPINION_TEXT[assessment] ?? AUDIT_OPINION_TEXT["insufficient-evidence"];
 	const confidenceText = Number.isFinite(Number(opinion.confidence)) ? `, confidence ${Number(opinion.confidence).toFixed(2)}` : "";
-	const criteria = (opinion.criteria ?? []).map((c) => `- [${c.origin ?? "unknown"}-given, ${c.status ?? "unknown"}] ${c.criterion}: ${c.judgment}`);
-	const findings = (opinion.findings ?? []).map((f) => `- ${f.pattern ?? "other"}: ${f.explanation ?? ""} Evidence: ${f.evidence ?? ""}`);
-	const decides = (opinion.decides ?? []).map((d) => `- ${d.who === "owner" ? "The owner" : "You (the agent)"}: ${d.what}`);
+	// Every section gets its own share of the page (redacted first: redaction can lengthen text), so a long criteria or
+	// findings list never pushes the recommendation and who-decides off the page. The shares sum to under the cap.
+	const part = (lines, max) => truncate(redact(lines.join("\n")), max);
+	const list = (title, items, max) => (items.length ? ["", part([title, ...items], max)] : []);
+	const one = (label, text, max) => (text ? ["", part([`${label}: ${text}`], max)] : []);
 	const body = [
-		`${BUDGET_PREFIX} Review opinion for project "${projectId}" (revision ${revision}, "${truncate(objective, 120)}"): ${assessment}${confidenceText}. The auditor found ${verdict}`,
-		`Auditor: ${model ?? "unknown model"}${ladderText(ladder)}.`,
-		...(opinion.situation ? ["", `Situation: ${opinion.situation}`] : []),
-		...(criteria.length ? ["", "Criteria:", ...criteria] : []),
-		...(findings.length ? ["", "Findings:", ...findings] : []),
-		...(opinion.counterevidence ? ["", `Counterevidence: ${opinion.counterevidence}`] : []),
-		...(opinion.advice ? ["", `Recommendation: ${opinion.advice}`] : []),
-		...(decides.length ? ["", "Who decides:", ...decides] : []),
+		part([`${BUDGET_PREFIX} Review opinion for project "${projectId}" (revision ${revision}, "${truncate(objective, 120)}"): ${assessment}${confidenceText}. The auditor found ${verdict}`, `Auditor: ${model ?? "unknown model"}${ladderText(ladder)}.`], 420),
+		...one("Situation", opinion.situation, 420),
+		...list("Criteria:", (opinion.criteria ?? []).map((c) => `- [${c.origin ?? "unknown"}-given, ${c.status ?? "unknown"}] ${c.criterion}: ${c.judgment}`), 950),
+		...list("Findings:", (opinion.findings ?? []).map((f) => `- ${f.pattern ?? "other"}: ${f.explanation ?? ""} Evidence: ${f.evidence ?? ""}`), 700),
+		...one("Counterevidence", opinion.counterevidence, 380),
+		...one("Recommendation", opinion.advice, 650),
+		...list("Who decides:", (opinion.decides ?? []).map((d) => `- ${d.who === "owner" ? "The owner" : "You (the agent)"}: ${d.what}`), 380),
 	].join("\n");
-	// The body is redacted, then truncated, then the contract sentence is appended: redaction can lengthen text, so it
-	// must happen before the cap or the final cap in budgetMessage would cut the sentence.
-	const content = `${truncate(redact(body), AUDIT_OPINION_CHARS - AUDIT_OPINION_TAIL.length - 1)}\n${AUDIT_OPINION_TAIL}`;
+	// The contract sentence is appended after the cap, so a long opinion can never lose it.
+	const content = `${truncate(body, AUDIT_OPINION_CHARS - AUDIT_OPINION_TAIL.length - 1)}\n${AUDIT_OPINION_TAIL}`;
 	return budgetMessage({ sessionId, now, actionKind: "budget-audit-opinion", content, cap: AUDIT_OPINION_CHARS, details: { projectId, revision, auditId, assessment, tier: ladder?.tier ?? null } });
 }
 

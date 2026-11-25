@@ -55,6 +55,7 @@ export const AUDIT_INSTRUCTION = [
 	'"advice":"40..1200 chars",',
 	'"allocationOpinion":{"assessment":"support"|"revise"|"insufficient-evidence"|"not-applicable","reason":"<=400 chars"}}.',
 	"A waste-likely answer carries at least one finding.",
+	"The whole opinion is one page: keep all text fields together under about 3,500 characters, most important first.",
 ].join(" ");
 
 const ASSESSMENTS = Object.freeze(["justified", "waste-likely", "insufficient-evidence"]);

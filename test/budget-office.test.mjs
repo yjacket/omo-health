@@ -183,11 +183,13 @@ test("(c)-(f), (h): request at $10, estimate -> decision, 100% checkpoint, stage
 	assert.equal(out.messages[0].details.staged, true);
 	assert.equal(out.messages[0].details.nextCheckpoint, "integration done");
 	assert.match(out.messages[0].content, /funds the work up to the next checkpoint "integration done"/);
-	assert.equal(runner.starts.length, 1, "the change review starts one audit");
+	assert.equal(runner.starts.length, 1, "one audit runs");
 	assert.equal(runner.starts[0].kind, "budget-audit");
 	assert.ok(runner.starts[0].args.includes("--no-tools"));
 	const auditId = runner.starts[0].jobId;
 	project = c.store.getProject(pid);
+	// Spend had already passed 1x when the change came in, so the one audit running is the tier-1 ladder audit.
+	assert.deepEqual([project.data.audits.at(-1).tier, project.data.audits.at(-1).triggers], [1, ["ladder-budget"]]);
 	assert.equal(project.status, "approved");
 	assert.equal(project.data.pending, null);
 	assert.equal(project.revision, 2);
@@ -769,6 +771,27 @@ test("(r3) past 40 review rounds the session is asked once to call the owner, an
 	assert.match(calls[0].content, /41 review rounds/);
 	const row = outs.at(-1).snapshot.projects.find((p) => p.id === `${c.sid}:g1`);
 	assert.equal(row.ownerCall.rounds, 41);
+});
+
+test("(r4) a rule audit below 1x spends no tier: tier 1 still audits when spend passes the approved budget (gate review B1)", (t) => {
+	const c = setup(t);
+	const pid = `${c.sid}:g1`;
+	c.writeGoal({ id: "g1", objective: "approved work", createdAt: secs(T0 - 30 * HOUR), updatedAt: secs(T0 - 30 * HOUR) });
+	writeJsonl(c.file, [E.header(c.sid, c.cwd, T0 - 30 * HOUR), spendEntry(T0 - 29 * HOUR, 35.11)]);
+	const runner = createFakeRunner({ outcomes: { "budget-audit": { status: "running" } } });
+	const office = c.office({ runner });
+	office.tick({ shadow: false });
+	// $30.01 approved earlier, and a change-review audit already ran below 1x a day ago.
+	const project = c.store.getProject(pid);
+	project.data.approvals = [{ requestId: "est-1", ms: T0 - 28 * HOUR, approvedUsd: 30.01, by: "rule" }];
+	project.data.audits = [{ auditId: "rule-1", ms: T0 - 26 * HOUR, status: "done", tier: null, ladder: { tier: 1, basis: "rule", reasons: ["change-review"] }, triggers: ["change-review"], endedMs: T0 - 26 * HOUR }];
+	project.status = "approved";
+	c.store.upsertProject(project);
+	c.clock.advance(MIN);
+	office.tick({ shadow: false });
+	assert.equal(runner.starts.length, 1, "passing 1x opens the tier-1 audit");
+	const audit = c.store.getProject(pid).data.audits.at(-1);
+	assert.deepEqual([audit.tier, audit.ladder.basis, audit.triggers], [1, "budget", ["ladder-budget"]]);
 });
 
 test("disabled budget: tick returns the empty result and writes no snapshot", (t) => {
