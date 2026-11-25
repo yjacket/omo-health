@@ -3,9 +3,9 @@ import path from "node:path";
 import { listDirSafe, statSafe } from "../util/fsx.mjs";
 import { isInside, pathKey } from "../paths.mjs";
 import { packScopedText, projectKeyOf, uniqueMatch } from "../session-subject.mjs";
-import { fresh, soleChildSessionFile } from "../usage-index.mjs";
+import { fresh } from "../usage-index.mjs";
 import { idFromFileName } from "./sessions.mjs";
-import { senpiTaskStoreDir } from "./tasks.mjs";
+import { findChildSessionFile, senpiTaskStoreDir } from "./tasks.mjs";
 import { HEADER_BYTES, isExactInode, readUsageFileStamp, sameFileIdentity, sessionHeader, SESSION_HEADER_LIMIT } from "./usage.mjs";
 
 /** A header probe is atomic; callers defer the candidate if its prefix won't fit. */
@@ -213,13 +213,7 @@ export function createSessionFileLocator({ paths, clock, rescanMs = 60_000, inde
 	const locateChild = ({ taskId, sessionId, cwds }, owner) => {
 		if (!taskId) return undefined;
 		const wantId = sessionId && sessionId !== taskId ? sessionId : undefined;
-		const inStore = (storeDir) => {
-			const dir = path.join(storeDir, "children", taskId, "sessions", taskId);
-			if (!wantId) return soleChildSessionFile(dir);
-			const exact = listDirSafe(dir).find((name) =>
-				idFromFileName(name) === wantId && statSafe(path.join(dir, name))?.isFile());
-			return exact && path.join(dir, exact);
-		};
+		const inStore = (storeDir) => findChildSessionFile(storeDir, taskId, wantId);
 		if (owner) return inStore(owner);
 		const seen = new Set();
 		let match;
