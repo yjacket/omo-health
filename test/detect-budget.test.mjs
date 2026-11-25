@@ -141,7 +141,7 @@ test("a new account window reset is a new fp", () => {
 });
 
 test("a reset time that jitters by a few hundred ms keeps one fp per window cycle (#27)", () => {
-	// Real Claude 7d readings on 2026-11-25, around the top of the hour; the last one crosses it.
+	// Two real Claude 7d readings on 2026-11-25, just before the hour, and one that crosses it.
 	const jittered = [1796126399725, 1796126399969, 1796126400050];
 	for (const state of ["short", "tight"]) {
 		const fps = jittered.map((resetsAtMs) => budget.detect(world(snapshot({ treasury: { state, windows: [windowEntry({ state, resetsAtMs })] } })))[0].fp);
