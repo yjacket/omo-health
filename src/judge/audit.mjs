@@ -129,6 +129,7 @@ export const DETECTOR_CHECKS = Object.freeze([
 	{ id: "D23", checks: "Watches work lost across daemon downtime." },
 	{ id: "D24", checks: "Watches goal sessions stopped by a provider policy refusal with unanswered tool calls; it has no threshold key." },
 	{ id: "D25", checks: "Watches omo login age and Claude CLI refresh expiry." },
+	{ id: "D26", checks: "Watches the budget snapshot for subscription windows near their reserve and for spend audit opinions." },
 ]);
 
 // Numeric config inputs to each finding kind's rules, not switches or the
