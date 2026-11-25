@@ -4,6 +4,12 @@ import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { clearPause, setSwitch, writePause } from "../control.mjs";
+import { safeSubjectId } from "../session-id.mjs";
+import { resolveLedgerSubject } from "../session-record.mjs";
+import { boardLiveOwners } from "../session-subject.mjs";
+import { writeUiPrefs } from "./prefs.mjs";
+import { SESSION_LISTS } from "./session-view.mjs";
+import { auditReasonLabel } from "./labels.mjs";
 
 const DEFAULT_STATIC_DIR = fileURLToPath(new URL("./static", import.meta.url));
 const MAX_BODY_BYTES = 4096;
@@ -32,9 +38,13 @@ const API_ROUTES = Object.freeze({
 	"/api/resume": "POST",
 	"/api/switch": "POST",
 	"/api/diagnose": "GET",
+	"/api/session": "GET",
+	"/api/audit": "POST",
+	"/api/prefs": "POST",
 });
-/** A task id or session id, as `omo-health diagnose` takes it. */
-const SUBJECT_ID = /^[A-Za-z0-9_-]{4,80}$/;
+const SESSION_QUERY_KEYS = Object.freeze(new Set(["id", "row", "list", "offset"]));
+const SESSION_ROW = /^[0-9a-f]{16}$/;
+const NON_NEGATIVE_INT = /^\d+$/;
 
 const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 const hasExactKeys = (obj, keys) => {
@@ -54,9 +64,18 @@ class HttpFailure extends Error {
 const SWITCH_STATUS = Object.freeze({ "unknown-key": 422, "invalid-value": 422, unreadable: 409 });
 
 /** Validates a parsed POST body for its route and runs the control action: returns [status, body]. */
-function runAction(paths, route, body, nowMs) {
+function runAction(paths, route, body, nowMs, startAudit) {
 	const invalid = new HttpFailure(422, { error: "invalid" });
 	switch (route) {
+		case "/api/audit": {
+			const id = safeSubjectId(body.sessionId);
+			const { row } = body;
+			const selected = Object.hasOwn(body, "row");
+			if (!hasExactKeys(body, selected ? ["sessionId", "row"] : ["sessionId"]) || id === null ||
+				(selected && (typeof row !== "string" || !SESSION_ROW.test(row)))) throw invalid;
+			if (!startAudit) throw new HttpFailure(404, { error: "not-found" });
+			return startAudit(id, row);
+		}
 		case "/api/pause": {
 			if (!hasExactKeys(body, ["minutes"]) || ![15, 60, null].includes(body.minutes)) throw invalid;
 			return [200, { ok: true, pause: writePause(paths, { minutes: body.minutes ?? undefined, now: nowMs }) }];
@@ -65,6 +84,11 @@ function runAction(paths, route, body, nowMs) {
 			if (!hasExactKeys(body, [])) throw invalid;
 			clearPause(paths);
 			return [200, { ok: true }];
+		}
+		case "/api/prefs": {
+			if (!hasExactKeys(body, ["hideChildren"]) || typeof body.hideChildren !== "boolean") throw invalid;
+			if (!writeUiPrefs(paths, body).ok) throw invalid;
+			return [200, { ok: true, hideChildren: body.hideChildren }];
 		}
 		case "/api/switch": {
 			if (!hasExactKeys(body, ["key", "value"])) throw invalid;
@@ -97,7 +121,7 @@ function readBody(req) {
 	});
 }
 
-export function createUiServer({ paths, token, getState, diagnose, idleMs = 30 * 60_000, now = Date.now, staticDir = DEFAULT_STATIC_DIR, log = () => {} }) {
+export function createUiServer({ paths, token, getState, diagnose, sessionDetail, startAudit, idleMs = 30 * 60_000, now = Date.now, staticDir = DEFAULT_STATIC_DIR, log = () => {} }) {
 	const expectedDigest = digest(token);
 	let lastRequestMs = now();
 	let port = 0;
@@ -122,7 +146,7 @@ export function createUiServer({ paths, token, getState, diagnose, idleMs = 30 *
 			throw error;
 		}
 		if (!isPlainObject(body)) throw new HttpFailure(400, { error: "bad-json" });
-		const [status, payload] = runAction(paths, route, body, now());
+		const [status, payload] = await runAction(paths, route, body, now(), startAudit);
 		send(res, status, payload);
 	}
 
@@ -130,9 +154,49 @@ export function createUiServer({ paths, token, getState, diagnose, idleMs = 30 *
 	async function serveDiagnose(req, res) {
 		const query = req.url.includes("?") ? req.url.slice(req.url.indexOf("?") + 1) : "";
 		const id = new URLSearchParams(query).get("id");
-		if (id !== null && !SUBJECT_ID.test(id)) throw new HttpFailure(422, { error: "invalid" });
+		if (id !== null && safeSubjectId(id) === null) throw new HttpFailure(422, { error: "invalid" });
 		if (!diagnose) throw new HttpFailure(404, { error: "not-found" });
-		send(res, 200, await diagnose(id ?? undefined));
+		if (id !== null && paths?.health?.sessionsDir &&
+			resolveLedgerSubject(paths, id, { liveOwners: boardLiveOwners(paths) }).error === "ambiguous-session") throw ambiguousSession();
+		const result = await diagnose(id ?? undefined);
+		if (result?.error === "ambiguous-session") throw ambiguousSession();
+		send(res, 200, result);
+	}
+
+	/** `/api/session` params: exact id, optional ended row selector, and optional list pagination. */
+	function parseSessionQuery(url) {
+		const query = url.includes("?") ? url.slice(url.indexOf("?") + 1) : "";
+		const params = new URLSearchParams(query);
+		for (const key of params.keys()) if (!SESSION_QUERY_KEYS.has(key)) throw new HttpFailure(422, { error: "invalid" });
+		const id = safeSubjectId(params.get("id"));
+		if (id === null) throw new HttpFailure(422, { error: "invalid" });
+		const row = params.get("row") ?? undefined;
+		if (row !== undefined && (!SESSION_ROW.test(row) || params.getAll("row").length !== 1)) {
+			throw new HttpFailure(422, { error: "invalid" });
+		}
+		const list = params.get("list");
+		const offsetText = params.get("offset");
+		if (list === null) {
+			if (offsetText !== null) throw new HttpFailure(422, { error: "invalid" });
+			return { id, row, list: null, offset: 0 };
+		}
+		if (!SESSION_LISTS.includes(list)) throw new HttpFailure(422, { error: "invalid" });
+		if (offsetText !== null && !NON_NEGATIVE_INT.test(offsetText)) throw new HttpFailure(422, { error: "invalid" });
+		return { id, row, list, offset: offsetText === null ? 0 : Number(offsetText) };
+	}
+
+	/** GET /api/session?id=<task|session>[&row=<selector>][&list=<name>&offset=<n>]. */
+	async function serveSession(req, res) {
+		const { id, row, ...pagination } = parseSessionQuery(req.url);
+		if (!sessionDetail) throw new HttpFailure(404, { error: "not-found" });
+		const detail = await sessionDetail(id, row, pagination);
+		if (detail?.error === "ambiguous-session") throw ambiguousSession();
+		if (!isPlainObject(detail) || detail.found === false) throw new HttpFailure(404, { error: "not-found" });
+		send(res, 200, detail);
+	}
+
+	function ambiguousSession() {
+		return new HttpFailure(409, { error: "ambiguous-session", reasonKo: auditReasonLabel("ambiguous-session") });
 	}
 
 	async function serveStatic(req, res, pathname) {
@@ -160,11 +224,13 @@ export function createUiServer({ paths, token, getState, diagnose, idleMs = 30 *
 		const provided = req.headers["x-omo-health-token"] ?? "";
 		if (!crypto.timingSafeEqual(digest(provided), expectedDigest)) throw new HttpFailure(401, { error: "unauthorized" });
 		const isAutoRefresh = req.method === "GET" && pathname === "/api/state" && req.headers["x-omo-health-auto"] === "1";
-		if (!isAutoRefresh) lastRequestMs = now();
+		const isSessionAuto = req.method === "GET" && pathname === "/api/session" && req.headers["x-omo-health-auto"] === "1";
+		if (!isAutoRefresh && !isSessionAuto) lastRequestMs = now();
 		const method = Object.hasOwn(API_ROUTES, pathname) ? API_ROUTES[pathname] : undefined;
 		if (!method) throw new HttpFailure(404, { error: "not-found" });
 		if (req.method !== method) throw new HttpFailure(405, { error: "method-not-allowed" });
 		if (pathname === "/api/diagnose") return serveDiagnose(req, res);
+		if (pathname === "/api/session") return serveSession(req, res);
 		if (method === "GET") return send(res, 200, getState());
 		return servePost(req, res, pathname);
 	}
@@ -197,12 +263,14 @@ export function createUiServer({ paths, token, getState, diagnose, idleMs = 30 *
 				});
 			});
 		},
-		close() {
-			if (!server.listening) return Promise.resolve();
-			return new Promise((resolve, reject) => {
+		async close() {
+			const httpClosed = new Promise((resolve, reject) => {
+				if (!server.listening) return resolve();
 				server.close((error) => (error ? reject(error) : resolve()));
 				server.closeAllConnections();
 			});
+			const closeHandlers = new Set([sessionDetail?.close, startAudit?.close]);
+			await Promise.all([httpClosed, ...Array.from(closeHandlers, (close) => close?.())]);
 		},
 		checkIdle(nowMs = now()) {
 			return nowMs - lastRequestMs >= idleMs;

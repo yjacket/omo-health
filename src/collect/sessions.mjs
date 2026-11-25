@@ -3,6 +3,7 @@ import path from "node:path";
 import { promotedTodo } from "../align/steps.mjs";
 import { redirectTargets } from "../detect/classify.mjs";
 import { refreshFailureOf } from "../detect/provider.mjs";
+import { safeSubjectId } from "../session-id.mjs";
 import { listDirSafe, statSafe } from "../util/fsx.mjs";
 import { JsonlTail } from "../util/tail.mjs";
 import { redact, sha1, truncate } from "../util/text.mjs";
@@ -144,6 +145,25 @@ export function commandText(name, args) {
 	return "";
 }
 
+/** Track the image load D4 sees: base64 characters in context since compaction. */
+export function applyImageLoad(state, entry) {
+	if (entry.type === "compaction") {
+		// The summary replaces the earlier messages, images included.
+		state.images = 0;
+		state.imageBytes = 0;
+		return;
+	}
+	if (entry.type !== "message" || !entry.message) return;
+	const { role, content } = entry.message;
+	if (role !== "assistant" && Array.isArray(content)) {
+		for (const item of content) {
+			if (item?.type !== "image") continue;
+			state.images += 1;
+			state.imageBytes += typeof item.data === "string" ? item.data.length : 0;
+		}
+	}
+}
+
 /**
  * Incremental state of one senpi session JSONL (F-6). Entries are queued as
  * they are read and applied only up to the clock, so replay and scan reuse the
@@ -265,23 +285,14 @@ export class SessionTracker {
 			}
 			return;
 		}
+		applyImageLoad(s, entry);
 		if (entry.type === "compaction") {
-			// The summary replaces the earlier messages, images included.
-			s.images = 0;
-			s.imageBytes = 0;
 			s.imagesPartial = false;
 			return;
 		}
 		if (entry.type !== "message" || !entry.message) return;
 		const m = entry.message;
 		const role = m.role;
-		if (role !== "assistant" && Array.isArray(m.content)) {
-			for (const item of m.content) {
-				if (item?.type !== "image") continue;
-				s.images += 1;
-				s.imageBytes += typeof item.data === "string" ? item.data.length : 0;
-			}
-		}
 		if (role === "assistant") this.applyAssistant(entry, m, ms);
 		else if (role === "toolResult") this.applyToolResult(m, ms);
 		else if (role === "user") {
@@ -468,10 +479,11 @@ export function entryMs(entry) {
 	return toMs(entry?.timestamp) ?? (Number.isFinite(entry?.message?.timestamp) ? entry.message.timestamp : undefined);
 }
 
+// Accept a date alone or Senpi's ISO timestamp with ":" and "." replaced by "-".
+const SESSION_FILE_NAME = /^\d{4}-\d{2}-\d{2}(?:T\d{2}-\d{2}-\d{2}-\d{3}Z)?_(.+)\.jsonl$/;
+
 export function idFromFileName(file) {
-	const base = path.basename(file, ".jsonl");
-	const index = base.lastIndexOf("_");
-	return index >= 0 ? base.slice(index + 1) : base;
+	return safeSubjectId(SESSION_FILE_NAME.exec(path.basename(file))?.[1]) ?? undefined;
 }
 
 /**

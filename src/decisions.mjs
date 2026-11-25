@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { appendJsonl, listDirSafe } from "./util/fsx.mjs";
@@ -8,10 +9,48 @@ import { redact } from "./util/text.mjs";
  * healthHome/decisions/<YYYY-MM-DD>.jsonl. Machine-readable evidence of every
  * action, would-action, skip and judge call.
  */
+const isRecord = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+const detail = (parts) => parts.filter(Boolean).join("; ").slice(0, 200);
+
+export const redactedIdKey = (id) => `redacted-id-${createHash("sha256").update(id).digest("hex").slice(0, 12)}`;
+
+/** Only a masked ID can use the stored reference; never treat a key as an exact ID. */
+export function maskedSubjectKey(id, key) {
+	return typeof id === "string" && /\[REDACTED(?:-JWT)?\]/.test(id) &&
+		typeof key === "string" && /^redacted-id-[a-f0-9]{12}$/.test(key) ? key : null;
+}
+
+/** Match the writer's redaction of a JSON string, not the detail's display scrub. */
+export function subjectIdJoinKey(id) {
+	if (typeof id !== "string") return null;
+	const serialized = JSON.stringify(id);
+	return redact(serialized) !== serialized ? redactedIdKey(id) : null;
+}
+
+export function redactSubjectRecord(record) {
+	const { subject } = record;
+	let keys;
+	if (isRecord(subject)) {
+		for (const field of ["session", "task"]) {
+			const key = subjectIdJoinKey(subject[`${field}Id`]);
+			if (key) (keys ??= {})[`${field}Key`] = key;
+		}
+	}
+	const stored = keys ? { ...record, subject: { ...subject, ...keys } } : record;
+	return JSON.parse(redact(JSON.stringify(stored)));
+}
+
+/** The one-line outcome of an action decision, as the history samples and the session record show it. */
+export function actionDetail(entry) {
+	const o = isRecord(entry.outcome) ? entry.outcome : {};
+	const pids = (list) => (Array.isArray(list) && list.length ? list.map((p) => p?.pid ?? p).join(",") : null);
+	return detail([pids(o.killed) && `killed ${pids(o.killed)}`, pids(o.survived) && `survived ${pids(o.survived)}`, o.delivered !== undefined && `delivered ${o.delivered}`, o.via && `via ${o.via}`, o.error && `error ${o.error}`, entry.rule && `rule ${isRecord(entry.rule) ? entry.rule.id : entry.rule}`]);
+}
+
 export function appendDecision(paths, entry) {
 	const ts = entry.ts ?? new Date().toISOString();
 	const file = path.join(paths.health.decisionsDir, `${ts.slice(0, 10)}.jsonl`);
-	appendJsonl(file, JSON.parse(redact(JSON.stringify({ ...entry, ts }))));
+	appendJsonl(file, redactSubjectRecord({ ...entry, ts }));
 	return file;
 }
 
@@ -30,4 +69,44 @@ export function readDecisions(paths, sinceMs = 0) {
 		}
 	}
 	return out;
+}
+
+function parseDecision(line, sinceMs) {
+	try {
+		const entry = JSON.parse(line.toString("utf8"));
+		return Date.parse(entry?.ts) >= sinceMs ? entry : null;
+	} catch {
+		return null;
+	}
+}
+
+/** Stream retained decisions oldest day first, in append order within each day. */
+export function* streamDecisions(paths, sinceMs = -Infinity) {
+	const dir = paths.health.decisionsDir;
+	const chunk = Buffer.allocUnsafe(64 * 1024);
+	for (const name of listDirSafe(dir).filter((n) => n.endsWith(".jsonl")).sort()) {
+		if (Date.parse(`${name.slice(0, 10)}T23:59:59Z`) < sinceMs) continue;
+		let fd;
+		try {
+			fd = fs.openSync(path.join(dir, name), "r");
+			let parts = [];
+			for (let n; (n = fs.readSync(fd, chunk, 0, chunk.length, null));) {
+				const bytes = chunk.subarray(0, n);
+				let start = 0;
+				for (let end; (end = bytes.indexOf(10, start)) !== -1; start = end + 1) {
+					const tail = bytes.subarray(start, end);
+					const entry = parseDecision(parts.length ? Buffer.concat([...parts, tail]) : tail, sinceMs);
+					parts = [];
+					if (entry) yield entry;
+				}
+				if (start < n) parts.push(Buffer.from(bytes.subarray(start)));
+			}
+			const last = parts.length ? parseDecision(Buffer.concat(parts), sinceMs) : null;
+			if (last) yield last;
+		} catch {
+			// A retained file may disappear or be unreadable during a scan.
+		} finally {
+			if (fd !== undefined) fs.closeSync(fd);
+		}
+	}
 }

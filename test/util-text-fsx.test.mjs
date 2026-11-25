@@ -72,6 +72,15 @@ test("paths honour redirection env vars and encode claude project dirs", () => {
 	assert.equal(isInside("C:/dev/omo-other", "C:/dev/omo"), false);
 });
 
+test("usage index, audit and prefs paths resolve under OMO_HEALTH_HOME", () => {
+	const p = resolvePaths({ OMO_HEALTH_HOME: "C:/tmp/h", USERPROFILE: "C:/Users/u" });
+	assert.equal(p.health.usageIndexFile, path.join("C:/tmp/h", "sessions", "usage.json"));
+	assert.equal(p.health.auditsDir, path.join("C:/tmp/h", "audits"));
+	assert.equal(p.health.auditRequestsDir, path.join("C:/tmp/h", "audits", "requests"));
+	assert.equal(p.health.auditBudgetFile, path.join("C:/tmp/h", "audits", "_budget.json"));
+	assert.equal(p.health.uiPrefsFile, path.join("C:/tmp/h", "ui-prefs.json"));
+});
+
 test("kst renders UTC+9", () => {
 	assert.equal(kst(Date.parse("2026-09-23T15:47:05Z")), "2026-09-24 00:47:05 KST");
 });

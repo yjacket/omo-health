@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { ACTIVE_TASK_STATUSES, TERMINAL_TASK_STATUSES } from "../src/collect/tasks.mjs";
+import { AUDIT_JUDGMENTS, AUDIT_OVERALL, AUDIT_TOKEN_JUDGMENTS } from "../src/judge/audit.mjs";
 import * as labels from "../src/ui/labels.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -72,4 +73,43 @@ test("diagnose verdicts and advice, and every wait class of the D1 classifier, h
 	}
 	assert.equal(labels.verdictLabel("nope"), "nope");
 	assert.equal(labels.adviceLabel(undefined), "-");
+});
+
+test("every audit status maps to its Korean label, including a request that is still queued", () => {
+	assert.deepEqual(labels.AUDIT_STATUS_LABELS, { queued: "대기 중", launching: "조사 중", running: "조사 중", done: "완료", failed: "실패" });
+	for (const [status, ko] of Object.entries(labels.AUDIT_STATUS_LABELS)) assert.equal(labels.auditStatusLabel(status), ko);
+	assert.equal(labels.auditStatusLabel("requested"), "대기 중");
+	assert.equal(labels.auditStatusLabel("weird"), "weird");
+	assert.equal(labels.auditStatusLabel(null), "-");
+});
+
+test("every audit reason prefix has its Korean sentence, and an unavailable detail is ignored", () => {
+	for (const [prefix, ko] of Object.entries(labels.AUDIT_REASON_LABELS)) {
+		assert.equal(labels.auditReasonLabel(prefix), ko, prefix);
+		assert.equal(labels.auditReasonLabel(`${prefix}:detail`), ko, prefix);
+	}
+	assert.equal(labels.auditReasonLabel("unavailable:no-key"), "모델을 쓸 수 없습니다");
+	assert.equal(labels.auditReasonLabel("unknown-reason"), "unknown-reason");
+	assert.equal(labels.auditReasonLabel(null), "-");
+});
+
+test("failure reasons the runner and the audit preparation produce render in Korean, never raw", () => {
+	for (const reason of ["exit-1", "exit-3221225786", "no-result", "pid-reused", "spawn-error:ENOENT", "prepare-error", "failed"]) {
+		const ko = labels.auditReasonLabel(reason);
+		assert.notEqual(ko, reason, reason);
+		assert.match(ko, /[\uAC00-\uD7A3]/, reason);
+	}
+	assert.equal(labels.auditReasonLabel("exit-1"), labels.auditReasonLabel("exit-2"));
+	assert.equal(labels.auditReasonLabel("exited"), "exited");
+});
+
+test("every overall, check and token enum of the audit contract has a Korean label", () => {
+	for (const overall of AUDIT_OVERALL) assert.ok(labels.AUDIT_OVERALL_LABELS[overall], overall);
+	for (const judgment of AUDIT_JUDGMENTS) assert.ok(labels.AUDIT_JUDGMENT_LABELS[judgment], judgment);
+	for (const judgment of AUDIT_TOKEN_JUDGMENTS) assert.ok(labels.AUDIT_TOKEN_LABELS[judgment], judgment);
+	assert.equal(labels.auditOverallLabel("exaggerated"), "과장");
+	assert.equal(labels.auditJudgmentLabel("unverifiable"), "확인 불가");
+	assert.equal(labels.auditJudgmentLabel("missed"), "놓침");
+	assert.equal(labels.auditTokenLabel("wasteful"), "낭비");
+	assert.equal(labels.auditOverallLabel("nope"), "nope");
 });

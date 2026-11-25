@@ -18,6 +18,7 @@ import { createBaseline } from "../src/baseline.mjs";
 import { createEngine } from "../src/engine.mjs";
 import { createAnalyst } from "../src/judge/analyst.mjs";
 import { createInvestigations } from "../src/investigations.mjs";
+import { buildSessionRecord } from "../src/session-record.mjs";
 import { createFakeRunner } from "./fakes/runner.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 import { createFakeClock } from "../src/util/time.mjs";
@@ -183,7 +184,10 @@ test("F3 flow: runaway grep is killed at 10 min quietly, the incident is recorde
 	assert.deepEqual(h.sent, [], "a child release is recorded, never sent to the parent");
 	assert.ok(h.decisions.some((d) => d.event === "opened" && d.cls === "runaway-readonly"));
 	assert.ok(h.decisions.some((d) => d.action?.kind === "kill-pids" && d.result === "execute" && d.outcome.quiet));
+	const kill = h.decisions.find((d) => d.action?.kind === "kill-pids" && d.result === "execute");
+	assert.equal(kill.subject.sessionId, "c1", "the executed action names its session");
 	const [inv] = h.investigations.list();
+	assert.equal(kill.subject.taskId, inv.subject.taskId);
 	assert.deepEqual([inv.status, inv.cls, inv.actions[0].kind, inv.actions[0].rule, inv.actions[0].quiet], ["released", "runaway-readonly", "kill-pids", "R8", true]);
 	// the tool result arrives: pending call disappears
 	h.child.pending.clear();
@@ -289,21 +293,35 @@ test("a finding that disappears and comes back is logged opened, resolved, reope
 	assert.equal(lifecycle[2].severity, "crit");
 });
 
-test("an info finding that never logged opened does not log resolved", async () => {
+test("an info finding logs opened and resolved but no action", async () => {
 	let present = true;
 	const h = harness({ extraDetectors: [{ name: "flap", detect: () => (present ? [unknownEvents()] : []) }] });
 	await h.engine.tick();
 	present = false;
 	h.clock.advance(20_000);
 	await h.engine.tick();
-	assert.deepEqual(h.decisions.filter((d) => d.fp === unknownEvents().fp), []);
+	const rows = h.decisions.filter((d) => d.fp === unknownEvents().fp);
+	assert.deepEqual(rows.map((d) => d.event), ["opened", "resolved"]);
+	assert.equal(rows.some((d) => d.action), false, "an info finding runs no action");
+});
+
+test("an info finding's lifecycle reaches the session record", async () => {
+	const commit = () => makeFinding({ detector: "D2", kind: "machine-commit", severity: "info", subject: { key: "machine" }, evidence: [], titleKo: "메모리 커밋 94% 사용 중", detailKo: "d" });
+	const h = harness({ taskStatus: "completed", taskTerminalAtMs: CALL_MS, extraDetectors: [fixed(commit)] });
+	await h.engine.tick();
+	const row = { sessionId: "p1", kind: "main", parentSessionId: null, taskId: null, title: "main", startedMs: CALL_MS, endedMs: CALL_MS + 30 * 60_000 };
+	const record = buildSessionRecord({ id: "p1", row, ledger: [row], decisions: h.decisions, investigations: h.investigations.list() });
+	const finding = record.health.findings.find((item) => item.detector === "D2");
+	assert.equal(finding?.event, "opened");
+	assert.equal(finding?.scope, "machine");
 });
 
 test("shadow mode records would-kill and never kills", async () => {
 	const h = harness({ mode: "shadow" });
 	await runUntil(h, CALL_MS + 10 * 60_000 + 10_000);
 	assert.deepEqual(h.killed, []);
-	assert.ok(h.decisions.some((d) => d.action?.kind === "kill-pids" && d.result === "would"));
+	const killDecision = h.decisions.find((d) => d.action?.kind === "kill-pids" && d.result === "would");
+	assert.equal(killDecision.subject.sessionId, "c1", "a gate decision names its session too");
 	assert.equal(h.sent.length, 0);
 });
 

@@ -4,6 +4,7 @@ import path from "node:path";
 import { writeLedgers } from "./align/ledger.mjs";
 import { isOurDaemon, killHungHolder } from "./death.mjs";
 import { acceptReports, importLegacyIntake } from "./reports/intake.mjs";
+import { appendDecision } from "./decisions.mjs";
 import { VERSION } from "./version.mjs";
 import { createLogger } from "./log.mjs";
 import { createNotifier } from "./act/notify.mjs";
@@ -16,12 +17,13 @@ import { currentDowntime } from "./collect/downtime.mjs";
 import { SessionRegistry } from "./collect/sessions.mjs";
 import { createTranscriptIndex } from "./collect/transcripts.mjs";
 import { createConfigTracker } from "./collect/config-files.mjs";
-import { createConfigReloader } from "./config-reload.mjs";
+import { createConfigReloader, detectorThresholdsHash } from "./config-reload.mjs";
 import { readAuthBlocks } from "./collect/secrets.mjs";
 import { createOmoLoginSource } from "./collect/omo-login.mjs";
 import { createEngine, loadDetectors } from "./engine.mjs";
 import { createEvidence } from "./evidence.mjs";
 import { createAnalyst, parseAnalystOutput, unavailableReason } from "./judge/analyst.mjs";
+import { AUDIT_CONTRACT, createAuditor } from "./auditor.mjs";
 import { createRunner } from "./runner.mjs";
 import { countTempFiles, createBaseline } from "./baseline.mjs";
 import { closeDb, createMaintainer, openDb } from "./db/db.mjs";
@@ -32,7 +34,11 @@ import { createInvestigations } from "./investigations.mjs";
 import { pruneHome } from "./retention.mjs";
 import { backfillOnce } from "./session-backfill.mjs";
 import { buildSessionSnapshot, detectEnded } from "./session-board.mjs";
-import { appendEnded } from "./session-ledger.mjs";
+import { appendEndedBatch, ENDED_LOCATION, streamEnded } from "./session-ledger.mjs";
+import { worldLiveOwners } from "./session-subject.mjs";
+import { createSessionFileLocator } from "./collect/session-files.mjs";
+import { createUsageIndex, USAGE_TICK_BYTES } from "./usage-index.mjs";
+import { createUsageTracker } from "./usage-tracker.mjs";
 import { atomicWriteJson, ensureDir, readJsonSafe, statSafe } from "./util/fsx.mjs";
 import { pathKey } from "./paths.mjs";
 import { defaultRegRunner, RUN_KEY, runValueName } from "./install.mjs";
@@ -237,6 +243,13 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 		log.error("downtime_error", { error: String(error?.message ?? error) });
 	}
 	pruneDeaths(paths, clock.now(), config.history.retentionDays);
+	// Plan todo 7: every start of this version records info-level findings, so a session record can tell whether
+	// the period it covers had that history (coverage.infoFindings). Logging only; no action depends on it.
+	try {
+		appendDecision(paths, { event: "coverage", infoFindings: true });
+	} catch (error) {
+		log.error("coverage_decision_failed", { error: String(error?.message ?? error) });
+	}
 	runRetention(paths, clock.now(), log);
 	let lastRetentionMs = clock.now();
 	// Reports queued under the old layout (care/intake) join the intake queue once; the legacy directory goes.
@@ -318,9 +331,16 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 	let stopping = false;
 	const ledgerCache = new Map();
 	const boardInvestigations = createInvestigations({ paths, clock });
+	// Plan todo 5: the token index and its tracker. This process is the only writer of usage.json; the
+	// daemon shares one 32 MiB transcript budget per tick between usage tracking and reconciliation.
+	const usageIndex = createUsageIndex({ file: paths.health.usageIndexFile, clock, log });
+	const usageTracker = createUsageTracker({ paths, index: usageIndex, locator: createSessionFileLocator({ paths, clock, indexedEntry: (subject) => usageIndex.getForSubject(subject) }), clock, log });
+	// Plan todo 12: owner-requested audits (display-only, so they run in shadow mode too); one runs at a time.
+	const auditor = (overrides.createAuditor ?? createAuditor)({ paths, config, clock, log, env, index: usageIndex, runner: createRunner({ paths, clock, contracts: { audit: AUDIT_CONTRACT } }) });
 	const savedBoard = readJsonSafe(paths.health.sessionsSnapshotFile);
 	let prevBoard = savedBoard?.v === 1 && clock.now() - (savedBoard.ts ?? 0) <= BOARD_RESUME_MS ? savedBoard : undefined;
 	let backfilled = false;
+	const backfillProgress = {};
 	const daemonStartedMs = clock.now();
 	let lastHostSeenMs = clock.now();
 	const lastElevate = readJsonSafe(elevateFile)?.atMs;
@@ -342,6 +362,14 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 	let packageSourceMissingMs;
 	let heartbeat;
 	try {
+		try {
+			appendDecision(paths, {
+				ts: new Date(daemonStartedMs).toISOString(), event: "config", result: "startup",
+				thresholdsHash: detectorThresholdsHash(config),
+			});
+		} catch (error) {
+			log.error("config_start_decision_failed", { error: error.message });
+		}
 		while (!stopping) {
 			const started = clock.now();
 			if (statSafe(paths.health.stoppedFile)) {
@@ -395,43 +423,78 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 				log.error("evidence_failed", { error: error.message, stack: String(error.stack).slice(0, 800) });
 			}
 			// The session board: the live snapshot, and the sessions that ended since the last one.
+			let usageBytes = 0;
+			const liveOwners = result?.world ? worldLiveOwners(result.world) : undefined;
 			if (result?.world) {
 				try {
 					const boardNow = clock.now();
-					const board = buildSessionSnapshot(result.world, result.findings ?? [], boardInvestigations.list({ sinceMs: boardNow - 7 * DAY_MS }), boardNow);
+					try {
+						usageBytes = usageTracker.tick(result.world, { maxBytes: USAGE_TICK_BYTES }).bytesRead;
+					} catch (error) {
+						usageBytes = USAGE_TICK_BYTES;
+						log.error("usage_tick_failed", { error: error.message, stack: String(error.stack).slice(0, 800) });
+					}
+					const board = buildSessionSnapshot(result.world, result.findings ?? [], boardInvestigations.list({ sinceMs: boardNow - 7 * DAY_MS }), boardNow, {
+						tokensOf: usageTracker.tokensOf,
+						liveOwners,
+					});
 					atomicWriteJson(paths.health.sessionsSnapshotFile, board);
 					if (result.world.procsFresh !== false) {
-						for (const record of detectEnded(prevBoard, board, result.world, boardNow)) {
-							try {
-								appendEnded(paths, record);
-							} catch (error) {
-								log.error("session_ended_write_failed", { sessionId: record.sessionId, error: error.message });
-							}
+						const records = detectEnded(prevBoard, board, result.world, boardNow);
+						const queued = [];
+						for (const [i, { appended, location, error, row }] of appendEndedBatch(paths, records, { nowMs: boardNow, liveRows: result.world.sessions.values() }).entries()) {
+							const record = records[i];
+							if (error) log.error("session_ended_write_failed", { sessionId: record.sessionId, error: error.message });
+							if (appended) queued.push({ ...row, [ENDED_LOCATION]: location });
 						}
+						if (queued.length) usageTracker.queueLedger(queued);
 						prevBoard = board;
 					}
 				} catch (error) {
 					log.error("session_board_failed", { error: error.message, stack: String(error.stack).slice(0, 800) });
 				}
 			}
-			// One-time reconstruction of the last 30 days, after the first tick so the board is up first.
+			try {
+				auditor.tick(clock.now(), liveOwners);
+			} catch (error) {
+				log.error("audit_tick_failed", { error: error.message, stack: String(error.stack).slice(0, 800) });
+			}
+			// Publish first; reconciliation gets only the transcript bytes the tracker didn't use.
 			if (!backfilled) {
-				backfilled = true;
 				try {
-					const summary = backfillOnce(paths, clock.now());
-					if (!summary.skipped) log.info("session_backfill", { counts: summary.counts, errors: summary.errors.length, firstError: summary.errors[0] });
+					const summary = backfillOnce(paths, clock.now(), { maxBytes: USAGE_TICK_BYTES - usageBytes, progress: backfillProgress });
+					backfilled = !summary.pending;
+					if (summary.counts) log.info("session_backfill", { counts: summary.counts, errors: summary.errors.length, firstError: summary.errors[0] });
 				} catch (error) {
 					log.error("session_backfill_failed", { error: error.message });
+				}
+				if (backfilled) {
+					try {
+						usageTracker.queueLedger(streamEnded(paths, { sinceMs: clock.now() - 30 * DAY_MS, withLocation: true }));
+					} catch (error) {
+						log.error("usage_queue_failed", { error: error.message });
+					}
 				}
 			}
 			if (clock.now() - lastRetentionMs >= DAY_MS) {
 				lastRetentionMs = clock.now();
 				runRetention(paths, lastRetentionMs, log);
+				try {
+					usageIndex.prune(lastRetentionMs);
+					usageTracker.queueLedger(streamEnded(paths, { sinceMs: lastRetentionMs - 30 * DAY_MS, withLocation: true }));
+				} catch (error) {
+					log.error("usage_queue_failed", { error: error.message });
+				}
 			}
 			dbMaintainer?.tick(clock.now());
 			if (clock.now() - lastStateSaveMs >= 60_000) {
 				lastStateSaveMs = clock.now();
 				saveEngineState();
+				try {
+					usageIndex.save();
+				} catch (error) {
+					log.error("usage_save_failed", { error: error.message });
+				}
 			}
 			const hosts = engine.table.all().filter(isSenpiHost).length;
 			if (hosts > 0) lastHostSeenMs = clock.now();
@@ -453,7 +516,7 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 				...(reloader ? { config: reloader.state() } : {}),
 			};
 			atomicWriteJson(paths.health.daemonJson, heartbeat);
-			if (clock.now() - lastHostSeenMs > config.idleExitMs && !hasPendingParks(paths)) {
+			if (clock.now() - lastHostSeenMs > config.idleExitMs && !hasPendingParks(paths) && !auditor.busy()) {
 				exitReason = "idle-no-omo-hosts";
 				break;
 			}
@@ -474,6 +537,12 @@ export async function runDaemon({ paths, config: injectedConfig, mode, clock = {
 		// during cleanup must still be logged, not crash the daemon. An injected proc (tests) must not keep them.
 		if (proc !== process) for (const [event, handler] of Object.entries(processHandlers)) proc.off(event, handler);
 		saveEngineState();
+		try {
+			usageIndex.save();
+		} catch (error) {
+			log.error("usage_save_failed", { error: error.message });
+		}
+		await auditor.close?.();
 		engine.close();
 		closeDb(db);
 		releaseLock(paths);

@@ -1,11 +1,12 @@
 import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { EventEmitter } from "node:events";
+import { EventEmitter, once } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
-import { childEnv, createRunner, processIdentity } from "../src/runner.mjs";
+import { childEnv, createRunner, findJobProcess, processIdentity } from "../src/runner.mjs";
+import { laneArgs } from "../src/judge/lane.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 import { sha1 } from "../src/util/text.mjs";
 import { createFakeClock } from "../src/util/time.mjs";
@@ -17,12 +18,13 @@ const DEAD_PID = () => false;
 /** The job's own process: the same creation time and command line at every lookup. */
 const SAME_PROCESS = () => ({ ctimeMs: T - 500, cmdSha1: "job-process" });
 
-function setup({ env = { PATH: "C:/bin" }, onSpawn, isAlive, identify = SAME_PROCESS, contracts, home = tmpDir("omoh-runner-") } = {}) {
+function setup({ env = { PATH: "C:/bin" }, onSpawn, isAlive, identify = SAME_PROCESS, contracts, home = tmpDir("omoh-runner-"), findProcess, spawnImpl: injectedSpawn, writeJson } = {}) {
 	const paths = resolvePaths({ USERPROFILE: home, OMO_HEALTH_HOME: path.join(home, ".omo-health") });
 	const clock = createFakeClock(T);
-	const { spawnImpl, calls } = createRecordingSpawn({ onSpawn });
-	const runner = createRunner({ paths, spawnImpl, clock, env, isAlive, identify, contracts });
-	return { runner, calls, clock, paths, home };
+	const recording = createRecordingSpawn({ onSpawn });
+	const spawnImpl = injectedSpawn ?? recording.spawnImpl;
+	const runner = createRunner({ paths, spawnImpl, clock, env, isAlive, identify, contracts, ...(findProcess ? { findJobProcess: findProcess } : {}), ...(writeJson ? { writeJson } : {}) });
+	return { runner, calls: recording.calls, clock, paths, home };
 }
 
 const baseJob = { jobId: "j1", kind: "analyze", command: "C:/fake/tool.exe", args: ["-p", "two words", 'say "hi"'], cwd: "C:/work", timeoutMs: 600_000 };
@@ -106,6 +108,28 @@ test("the child env drops agent, provider and GitHub credentials", () => {
 	assert.deepEqual(childEnv(env), expected);
 });
 
+test("IS-9: only audit child processes disable senpi model fallback", () => {
+	const { runner, calls } = setup({ env: { PATH: "C:/bin", SENPI_NO_FALLBACK: "0", OMO_NO_FALLBACK: "0", PI_NO_FALLBACK: "0" } });
+	const args = laneArgs({ model: "p/reviewer", bundleFile: "C:/work/bundle.md" });
+	runner.start({ ...baseJob, kind: "analyst", args });
+	runner.start({ ...baseJob, kind: "audit", jobId: "j2", args });
+	assert.deepEqual(calls.map((call) => call.args), [args, args]);
+	assert.deepEqual(calls.map((call) => call.options.env), [
+		{ PATH: "C:/bin" },
+		{ PATH: "C:/bin", SENPI_NO_FALLBACK: "1" },
+	]);
+});
+
+test("IS-9: a restarted runner rejects a fallback verdict already finalized by an older runner", () => {
+	const { runner } = setup({ isAlive: DEAD_PID });
+	runner.start({ ...baseJob, kind: "audit", args: laneArgs({ model: "p/reviewer", bundleFile: "C:/work/bundle.md" }) });
+	writeJob(runner, "err.log", "Model fallback: p/reviewer -> p/audited (provider refused)\n");
+	writeJob(runner, "meta.json", JSON.stringify({ ...readMeta(runner), final: { status: "done", result: { overall: "sound" }, exitCode: 0 } }));
+	const rejected = { status: "failed", reason: "model-fallback", result: null, exitCode: 0 };
+	assert.deepEqual(runner.poll("j1"), rejected);
+	assert.deepEqual(readMeta(runner).final, rejected);
+});
+
 test("a finished process's stdout and stderr land in out.txt and err.log and poll parses the stdout", { timeout: 15_000 }, async () => {
 	const { onSpawn, closed } = realNode("process.stdout.write('{\"ok\":true}'); process.stderr.write('warn');");
 	const { runner } = setup({ onSpawn, isAlive: DEAD_PID });
@@ -184,12 +208,30 @@ test("a non-zero exit is unavailable when unavailableReason names a reason for s
 	assert.equal(runner.poll("j3").reason, "exit-3", "no unavailableReason given: a plain failure");
 });
 
-test("a spawn error exit (the process never started) is failed with spawn-error", () => {
+test("an error from a child with a pid is failed with spawn-error but is not a confirmed non-launch", () => {
 	const { runner } = setup({ isAlive: DEAD_PID });
 	runner.start({ ...baseJob, unavailableReason: (text) => (text.includes("not logged in") ? "auth" : null) });
 	writeExit(runner, { code: null, error: "spawn C:/fake/tool.exe ENOENT" });
 	const polled = runner.poll("j1");
 	assert.deepEqual([polled.status, polled.reason, polled.exitCode], ["failed", "spawn-error:spawn C:/fake/tool.exe ENOENT", null]);
+	assert.notEqual(polled.spawned, false);
+});
+
+test("(IS-10) a real missing executable is a confirmed non-launch, also on a restarted runner", async () => {
+	let spawnError;
+	const { runner, home } = setup({ identify: () => null, spawnImpl: (...args) => {
+		const child = spawn(...args);
+		spawnError = once(child, "error");
+		return child;
+	} });
+	const command = path.join(home, "missing-tool.exe");
+	const started = runner.start({ ...baseJob, command, cwd: undefined });
+	assert.equal(started.pid, undefined);
+	const [error] = await spawnError;
+	assert.equal(error.code, "ENOENT");
+	const polled = runner.poll("j1");
+	assert.deepEqual(polled, { status: "failed", reason: `spawn-error:${error.message}`, spawned: false, detail: "", result: null, exitCode: null });
+	assert.deepEqual(setup({ home }).runner.poll("j1"), polled);
 });
 
 test("a process that is gone without exit.json is done when the stdout parses, else unavailable or failed with no-result", () => {
@@ -275,22 +317,20 @@ test("a job pid that now names another process (reused after a reboot) is finish
 	assert.deepEqual(calls.map((call) => call.command), ["C:/fake/tool.exe"], "no taskkill");
 });
 
-test("a job from an older version (no recorded identity) counts as running until its timeout, then ends as timeout without a kill", () => {
-	const { runner, calls, clock } = setup({ isAlive: () => true });
+test("a job from an older version (no recorded identity) whose argv is not found ends without a kill", () => {
+	const { runner, calls, clock } = setup({ isAlive: () => true, findProcess: () => null });
 	runner.start(baseJob);
 	const metaFile = path.join(runner.jobDir("j1"), "meta.json");
 	const { ctimeMs, cmdSha1, ...legacy } = JSON.parse(fs.readFileSync(metaFile, "utf8"));
 	fs.writeFileSync(metaFile, JSON.stringify(legacy));
 	clock.advance(baseJob.timeoutMs);
-	assert.deepEqual(runner.poll("j1"), { status: "running", result: null, exitCode: null });
-	clock.advance(1);
-	assert.deepEqual(runner.poll("j1"), { status: "timeout", reason: "unverified", result: null, exitCode: null });
+	assert.equal(runner.poll("j1").status, "failed", "no process carries the job's argv");
 	assert.equal(calls.some((call) => call.command === "taskkill"), false);
 });
 
 test("a failed identity lookup keeps a live job running and never kills; the next poll retries", () => {
 	let lookup = SAME_PROCESS;
-	const { runner, calls, clock } = setup({ isAlive: () => true, identify: (pid) => lookup(pid) });
+	const { runner, calls, clock } = setup({ isAlive: () => true, identify: (pid) => lookup(pid), findProcess: () => null });
 	const job = runner.start(baseJob);
 	clock.advance(baseJob.timeoutMs + 1);
 	lookup = () => {
@@ -304,15 +344,15 @@ test("a failed identity lookup keeps a live job running and never kills; the nex
 	assert.equal(runner.poll("j1").status, "timeout", "the next poll verifies the job and ends it");
 	assert.deepEqual(calls.at(-1).args, ["/F", "/T", "/PID", String(job.pid)]);
 
-	// A lookup that already fails at start leaves the job unverifiable: never killed, ended at its timeout.
+	// A lookup that already fails at start leaves the job unverifiable; poll finds no process with its argv and ends it.
 	lookup = () => {
 		throw new Error("no powershell");
 	};
 	runner.start({ ...baseJob, jobId: "j2" });
 	assert.match(readMeta(runner, "j2").identityError, /no powershell/);
-	lookup = SAME_PROCESS;
 	clock.advance(baseJob.timeoutMs + 1);
-	assert.deepEqual(runner.poll("j2"), { status: "timeout", reason: "unverified", result: null, exitCode: null });
+	const unverified = runner.poll("j2");
+	assert.deepEqual([unverified.status, unverified.reason], ["failed", "no-result"]);
 	assert.equal(calls.filter((call) => call.command === "taskkill").length, 1);
 });
 
@@ -381,4 +421,447 @@ test("the fake runner applies the job's parse and unavailableReason to scripted 
 	assert.deepEqual(fake.poll("a").result, { n: 2 });
 	fake.start({ jobId: "b", kind: "limit", unavailableReason: (text) => (text.includes("usage limit") ? "usage-limit" : null) });
 	assert.deepEqual([fake.poll("b").status, fake.poll("b").reason], ["unavailable", "usage-limit"]);
+});
+
+const laneArgsFor = (jobId, sessionId) => ["-p", "--no-session", "-ne", "-ns", "-nc", "--no-tools", "--session-id", sessionId, "@" + path.join("C:/h/jobs", jobId, "bundle.md")];
+const cimLine = (pid, parentPid, ctimeMs, commandLine) => pid + "\t" + parentPid + "\t" + ctimeMs + "\t" + commandLine;
+
+test("start refuses an audit argv missing a guard flag and spawns nothing", () => {
+	const { runner, calls } = setup();
+	const args = ["-p", "--no-session", "-ne", "-ns", "-nc", "@C:/h/jobs/j1/bundle.md"];
+	assert.throws(
+		() => runner.start({ ...baseJob, kind: "audit", args }),
+		(error) => {
+			assert.match(error.message, /--no-tools/);
+			assert.equal(error.spawned, false);
+			return true;
+		},
+	);
+	assert.equal(calls.length, 0);
+});
+
+test("start writes meta.json with the child pid before the identity lookup", () => {
+	let seen;
+	const { runner } = setup({
+		identify: () => {
+			seen = JSON.parse(fs.readFileSync(path.join(runner.jobDir("j1"), "meta.json"), "utf8"));
+			return SAME_PROCESS();
+		},
+	});
+	runner.start(baseJob);
+	assert.equal(seen.pid, 70000);
+	assert.equal(seen.ctimeMs, null);
+	assert.equal(seen.cmdSha1, null);
+});
+
+test("an identify failure at start leaves meta.json behind; poll adopts the process found through the job argv and kills its tree at the timeout", () => {
+	let lookup = () => {
+		throw new Error("no powershell");
+	};
+	const found = { pid: 70000, ctimeMs: T - 1000, cmdSha1: "job-process" };
+	const { runner, calls, clock } = setup({ isAlive: () => true, identify: () => lookup(), findProcess: () => found });
+	runner.start(baseJob);
+	assert.equal(readMeta(runner).ctimeMs, null);
+	assert.match(readMeta(runner).identityError, /no powershell/);
+	lookup = () => ({ ctimeMs: T - 1000, cmdSha1: "job-process" });
+	assert.equal(runner.poll("j1").status, "running");
+	assert.equal(readMeta(runner).ctimeMs, T - 1000, "the found identity is kept");
+	clock.advance(baseJob.timeoutMs + 1);
+	assert.deepEqual(runner.poll("j1"), { status: "timeout", result: null, exitCode: null });
+	assert.deepEqual(calls.at(-1), { command: "taskkill", args: ["/F", "/T", "/PID", "70000"], options: { windowsHide: true, stdio: "ignore" } });
+});
+
+test("poll ends a job whose argv names no process, and stays running when the lookup throws", () => {
+	let lookup = () => {
+		throw new Error("no powershell");
+	};
+	let find = () => null;
+	const { runner } = setup({ isAlive: () => true, identify: () => lookup(), findProcess: () => find() });
+	runner.start(baseJob);
+	lookup = () => ({ ctimeMs: T - 1000, cmdSha1: "job-process" });
+	assert.deepEqual([runner.poll("j1").status, runner.poll("j1").reason], ["failed", "no-result"]);
+	lookup = () => {
+		throw new Error("no powershell");
+	};
+	runner.start({ ...baseJob, jobId: "j2" });
+	find = () => {
+		throw new Error("CIM timed out");
+	};
+	const running = runner.poll("j2");
+	assert.equal(running.status, "running");
+	assert.match(running.detail, /CIM timed out/);
+});
+
+test("without an initial identity, failed argv lookups past the deadline keep only the audit running", () => {
+	const lookups = [];
+	const { runner, calls, clock } = setup({
+		isAlive: () => true,
+		identify: () => null,
+		findProcess: (jobId) => {
+			lookups.push(jobId);
+			throw new Error("CIM timed out");
+		},
+	});
+	for (const kind of ["audit", "analyst"]) {
+		runner.start({ ...baseJob, jobId: kind, kind, args: laneArgsFor(kind, `lane-${kind}`) });
+		assert.equal(readMeta(runner, kind).ctimeMs, null);
+		assert.equal(runner.poll(kind).status, "running");
+	}
+
+	clock.advance(baseJob.timeoutMs + 1);
+	const timeout = { status: "timeout", reason: "unverified", result: null, exitCode: null };
+	for (let i = 0; i < 6; i++) {
+		assert.equal(runner.poll("audit").status, "running");
+		assert.deepEqual(runner.poll("analyst"), timeout);
+	}
+	assert.deepEqual(readMeta(runner, "analyst").final, timeout);
+	assert.equal(readMeta(runner, "audit").final, undefined);
+	assert.equal(lookups.filter((id) => id === "audit").length, 7, "every audit poll retries");
+	assert.equal(calls.length, 2, "neither unverified process is killed");
+});
+
+test("adoptJob writes meta.json from the found process, or reports absent", () => {
+	const found = { pid: 72000, ctimeMs: T - 1000, cmdSha1: "job-process" };
+	const args = laneArgsFor("j1", "lane-1");
+	const { runner } = setup({ findProcess: () => found });
+	assert.equal(runner.adoptJob("j1", { command: "omo", args, startedMs: T, timeoutMs: 900_000, kind: "audit" }), "running");
+	assert.deepEqual(readMeta(runner), { pid: 72000, ctimeMs: T - 1000, cmdSha1: "job-process", startedMs: T, timeoutMs: 900_000, kind: "audit", command: "omo", args });
+	const absent = setup({ findProcess: () => null });
+	assert.equal(absent.runner.adoptJob("j1", { command: "omo", args }), "absent");
+});
+
+test("findJobProcess keeps only the process carrying the job's full argv and returns the root of its parent-child chain", () => {
+	const jobsDir = "C:/h/jobs";
+	const jobId = "j1";
+	const bundle = path.join(jobsDir, jobId, "bundle.md");
+	const args = laneArgsFor(jobId, "lane-1");
+	const query = (rows) => () => rows.join("\n");
+	const argv = "cmd.exe /c omo -p --no-tools --session-id lane-1 @" + bundle;
+	assert.equal(findJobProcess({ jobsDir, jobId, args, exec: query([cimLine(9, 1, T, "notepad.exe " + bundle)]) }), null, "a bare bundle path is no job");
+	const root = findJobProcess({
+		jobsDir,
+		jobId,
+		args,
+		exec: query([cimLine(10, 5, T, argv), cimLine(11, 10, T, "node.exe " + argv.slice(8))]),
+	});
+	assert.equal(root.pid, 10, "the chain root is the job tree");
+	assert.equal(root.ctimeMs, T);
+	const other = "omo -p --no-tools --session-id lane-1 @" + bundle;
+	assert.throws(
+		() => findJobProcess({ jobsDir, jobId, args, exec: query([cimLine(12, 5, T, argv), cimLine(13, 7, T, other)]) }),
+		/ambiguous/,
+		"two independent roots are never adopted",
+	);
+	assert.throws(
+		() =>
+			findJobProcess({
+				jobsDir,
+				jobId,
+				args,
+				exec: () => {
+					throw new Error("winmgmt unavailable");
+				},
+			}),
+		/winmgmt unavailable/,
+	);
+});
+
+test("an audit job past its timeout stays running through failed identity lookups, then kills its verified tree on the first success", () => {
+	let lookup = SAME_PROCESS;
+	const { runner, calls, clock } = setup({ isAlive: () => true, identify: () => lookup() });
+	runner.start({ ...baseJob, kind: "audit", args: laneArgsFor("j1", "lane-1") });
+	clock.advance(baseJob.timeoutMs + 1);
+	lookup = () => {
+		throw new Error("ETIMEDOUT");
+	};
+	for (let i = 0; i < 5; i++) assert.equal(runner.poll("j1").status, "running");
+	assert.equal(readMeta(runner).final, undefined, "nothing is finalized on a failed lookup");
+	assert.equal(readMeta(runner).identityFailures, 5);
+	lookup = SAME_PROCESS;
+	assert.deepEqual(runner.poll("j1"), { status: "running", result: null, exitCode: null, terminationUnconfirmed: true, deadlineMs: T + baseJob.timeoutMs });
+	assert.deepEqual(calls.at(-1).args, ["/F", "/T", "/PID", "70000"]);
+	lookup = () => null;
+	assert.deepEqual(runner.poll("j1"), { status: "timeout", result: null, exitCode: null, exitConfirmed: true });
+});
+
+test("IS-10 transition: a verified audit kill is not an exit and fallback cannot finalize it", () => {
+	let alive = true;
+	const identity = () => alive ? SAME_PROCESS() : null;
+	const findJobProcess = () => null;
+	const isAlive = () => alive;
+	const recording = createRecordingSpawn();
+	let taskkill;
+	const spawnImpl = (command, args, options) => {
+		const child = recording.spawnImpl(command, args, options);
+		if (command === "taskkill") taskkill = child;
+		return child;
+	};
+	const { runner, clock, paths } = setup({ isAlive, identify: identity, findProcess: findJobProcess, spawnImpl });
+	const restart = () => createRunner({ paths, clock, isAlive, identify: identity, findJobProcess, spawnImpl });
+	runner.start({ ...baseJob, kind: "audit", args: laneArgsFor("j1", "lane-1") });
+	writeJob(runner, "err.log", "Model fallback: p/reviewer -> p/audited (provider refused)\n");
+	clock.advance(baseJob.timeoutMs + 1);
+	const pending = runner.poll("j1");
+	taskkill.emit("exit", 1, null);
+	const next = restart();
+	const retried = next.poll("j1");
+	assert.deepEqual([pending.status, pending.terminationUnconfirmed, retried.status, retried.terminationUnconfirmed, readMeta(next).final],
+		["running", true, "running", true, undefined]);
+	assert.equal(recording.calls.filter(({ command }) => command === "taskkill").length, 2);
+	alive = false;
+	assert.deepEqual(next.poll("j1"), { status: "timeout", result: null, exitCode: null, exitConfirmed: true });
+});
+
+test("start errors carry whether a process was spawned", () => {
+	const refused = setup({ onSpawn: () => { throw new Error("spawn boom"); } });
+	assert.throws(
+		() => refused.runner.start(baseJob),
+		(error) => {
+			assert.equal(error.spawned, false);
+			assert.match(error.message, /spawn boom/);
+			return true;
+		},
+	);
+	const metaWriteFailed = setup({ writeJson: () => { throw new Error("disk full"); } });
+	assert.throws(
+		() => metaWriteFailed.runner.start(baseJob),
+		(error) => {
+			assert.equal(error.spawned, true);
+			assert.equal(error.pid, 70000);
+			assert.match(error.message, /disk full/);
+			return true;
+		},
+	);
+	const noPid = setup({
+		writeJson: () => { throw new Error("disk full"); },
+		spawnImpl: () => {
+			const child = new EventEmitter();
+			child.unref = () => {};
+			return child;
+		},
+	});
+	assert.throws(
+		() => noPid.runner.start(baseJob),
+		(error) => {
+			assert.equal(error.spawned, false, "a post-spawn failure with no pid never claims a process");
+			return true;
+		},
+	);
+});
+
+test("alive and terminate re-verify pid, creation time and command hash", () => {
+	let lookup = () => ({ ctimeMs: T - 500, cmdSha1: "job-process" });
+	const { runner, calls } = setup({ identify: () => lookup() });
+	runner.start(baseJob);
+	assert.equal(runner.alive("j1"), true);
+	assert.equal(runner.terminate("j1"), "sent");
+	assert.deepEqual(calls.at(-1), { command: "taskkill", args: ["/F", "/T", "/PID", "70000"], options: { windowsHide: true, stdio: "ignore" } });
+	lookup = () => ({ ctimeMs: T, cmdSha1: "job-process" });
+	assert.equal(runner.alive("j1"), false);
+	const before = calls.length;
+	assert.equal(runner.terminate("j1"), "gone", "a reused pid is never killed");
+	assert.equal(calls.length, before);
+	lookup = () => {
+		throw new Error("ETIMEDOUT");
+	};
+	assert.throws(() => runner.alive("j1"), /ETIMEDOUT/);
+	assert.throws(() => runner.terminate("j1"), /ETIMEDOUT/);
+});
+
+test("a timed-out job stays ours while its verified process lives, and a failed kill is retried", () => {
+	let lookup = SAME_PROCESS;
+	const { runner, calls, clock } = setup({ isAlive: () => true, identify: () => lookup() });
+	runner.start(baseJob);
+	clock.advance(baseJob.timeoutMs + 1);
+	assert.deepEqual(runner.poll("j1"), { status: "timeout", result: null, exitCode: null });
+	assert.equal(readMeta(runner).final.status, "timeout");
+	assert.equal(runner.alive("j1"), true, "a persisted timeout is not proof that the process exited");
+	const kills = () => calls.filter((call) => call.command === "taskkill").length;
+	assert.equal(kills(), 1);
+	assert.equal(runner.terminate("j1"), "sent");
+	assert.equal(kills(), 2, "the kill is retried while the verified process lives");
+	lookup = () => null;
+	assert.equal(runner.alive("j1"), false);
+	assert.equal(runner.terminate("j1"), "gone");
+});
+
+test("IS-10: only audit liveness looks for a surviving model child after launcher exit", () => {
+	let identify = SAME_PROCESS;
+	let rows = "";
+	let queryError;
+	let queries = 0;
+	const { runner, paths } = setup({
+		identify: () => identify(),
+		findProcess: (jobId, args) => findJobProcess({ jobsDir: paths.health.jobsDir, jobId, args, exec: () => {
+			queries++;
+			if (queryError) throw queryError;
+			return rows;
+		} }),
+	});
+	const argsFor = (jobId) => laneArgs({ model: "p/reviewer", bundleFile: path.join(runner.jobDir(jobId), "bundle.md"), sessionId: `lane-${jobId}` });
+	const auditArgs = argsFor("j1");
+	runner.start({ ...baseJob, kind: "audit", args: auditArgs });
+	runner.start({ ...baseJob, jobId: "analyst", kind: "analyst", args: argsFor("analyst") });
+	identify = () => null;
+	const matching = cimLine(71000, 70000, T, `omo.exe ${auditArgs.join(" ")}`);
+	const wrongSession = cimLine(71001, 70000, T, `omo.exe ${auditArgs.join(" ").replace("lane-j1", "lane-other")}`);
+	const wrongBundle = cimLine(71002, 70000, T, `omo.exe ${auditArgs.join(" ").replace("bundle.md", "other.md")}`);
+	rows = [matching, wrongSession, wrongBundle].join("\n");
+	queryError = new Error("CIM unavailable");
+	writeExit(runner, { code: 1 }, "analyst");
+	assert.equal(runner.alive("analyst"), false);
+	assert.equal(runner.poll("analyst").reason, "exit-1");
+	assert.equal(queries, 0, "the analyst does not query argv on launcher exit");
+
+	queryError = undefined;
+	assert.equal(runner.alive("j1"), true, "the matching child keeps the audit alive");
+	queryError = new Error("CIM unavailable");
+	assert.throws(() => runner.alive("j1"), /CIM unavailable/);
+	queryError = undefined;
+	rows = [wrongSession, wrongBundle].join("\n");
+	assert.equal(runner.alive("j1"), false, "neither a different bundle nor a different lane holds the slot");
+});
+
+test("IS-10 deadline: a verified surviving audit child is targeted each poll until disappearance", () => {
+	const child = { pid: 71000, ctimeMs: T + 1, cmdSha1: "model-child" };
+	let launcherAlive = true;
+	let childAlive = true;
+	let childLookups = 0;
+	const { runner, calls, clock } = setup({
+		isAlive: (pid) => pid === child.pid ? childAlive : launcherAlive,
+		identify(pid) {
+			if (pid !== child.pid) return launcherAlive ? SAME_PROCESS() : null;
+			childLookups++;
+			return childAlive ? child : null;
+		},
+		findProcess: () => childAlive ? child : null,
+	});
+	runner.start({ ...baseJob, kind: "audit", args: laneArgsFor("j1", "lane-1") });
+	launcherAlive = false;
+	writeExit(runner, { code: 0 });
+	const kills = () => calls.filter(({ command }) => command === "taskkill").map(({ args }) => args);
+	assert.equal(runner.poll("j1").status, "running");
+	assert.deepEqual(kills(), []);
+	const beforeDeadline = childLookups;
+
+	clock.advance(baseJob.timeoutMs + 1);
+	assert.equal(runner.poll("j1").status, "running", "a termination request is not proof of exit");
+	assert.deepEqual(kills(), [["/F", "/T", "/PID", "71000"]]);
+	assert.ok(childLookups > beforeDeadline, "the kill uses a fresh identity lookup");
+	const { pid, ctimeMs, cmdSha1, adopted, startedMs, timeoutMs, final } = readMeta(runner);
+	assert.deepEqual({ pid, ctimeMs, cmdSha1, adopted, startedMs, timeoutMs, final },
+		{ ...child, adopted: true, startedMs: T, timeoutMs: baseJob.timeoutMs, final: undefined });
+	assert.equal(runner.poll("j1").status, "running");
+	childAlive = false;
+	assert.equal(runner.poll("j1").status, "timeout");
+	assert.deepEqual(kills(), [["/F", "/T", "/PID", "71000"], ["/F", "/T", "/PID", "71000"]]);
+});
+
+test("IS-10 retry: every attempt re-verifies the adopted identity and records the attempt", (t) => {
+	const child = { pid: 71000, ctimeMs: T + 1, cmdSha1: "model-child" };
+	let found = child;
+	let seen = child;
+	let ambiguous = false;
+	let snapshot = 0;
+	let verifiedAt = 0;
+	const { runner, calls, clock, home } = setup({
+		isAlive: DEAD_PID,
+		identify(pid) {
+			if (pid === 70000) return SAME_PROCESS();
+			verifiedAt = snapshot;
+			return seen?.pid === pid ? seen : null;
+		},
+		findProcess(_jobId, _args, options) {
+			assert.equal(options.requireSingle, true);
+			snapshot++;
+			if (ambiguous) throw new Error("ambiguous job process lookup");
+			return found;
+		},
+	});
+	t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+	runner.start({ ...baseJob, kind: "audit", args: laneArgsFor("j1", "lane-1") });
+	clock.advance(baseJob.timeoutMs + 1);
+	const kills = () => calls.filter(({ command }) => command === "taskkill").map(({ args }) => args);
+	const ownTree = ["/F", "/T", "/PID", "71000"];
+	for (let attempt = 1; attempt <= 2; attempt++) {
+		assert.equal(runner.poll("j1").status, "running");
+		assert.deepEqual(kills(), Array(attempt).fill(ownTree), `verified attempt ${attempt}`);
+		assert.equal(verifiedAt, snapshot, "the attempt used a fresh PID identity snapshot");
+	}
+
+	ambiguous = true;
+	assert.equal(runner.poll("j1").status, "running");
+	ambiguous = false;
+	for (const mismatch of [{ ctimeMs: T + 2 }, { cmdSha1: "different-command" }, { pid: 71001 }]) {
+		seen = { ...child, ...mismatch };
+		assert.equal(runner.poll("j1").status, "running");
+		found = seen;
+		assert.equal(runner.poll("j1").status, "running", "a different matching process must not replace the adopted child");
+		found = child;
+	}
+	assert.deepEqual(kills(), [ownTree, ownTree], "ambiguity and mismatches do not send taskkill");
+	assert.equal(readMeta(runner).adoptedTerminationAttempts, 2);
+
+	found = seen = child;
+	assert.equal(runner.poll("j1").status, "running");
+	assert.deepEqual(kills(), [ownTree, ownTree, ownTree]);
+	found = seen = null;
+	assert.deepEqual(runner.poll("j1"), { status: "timeout", result: null, exitCode: null, exitConfirmed: true });
+	assert.equal(readMeta(runner).adoptedTerminationAttempts, 3);
+});
+
+test("IS-10 deadline: multiple matches or failed verification hold the audit without killing", () => {
+	let rows = [];
+	let failQuery = false;
+	let identity;
+	const { runner, paths, calls, clock } = setup({
+		isAlive: DEAD_PID,
+		identify: (pid) => pid === 70000 ? SAME_PROCESS() : identity,
+		findProcess: (jobId, args, options) => findJobProcess({ jobsDir: paths.health.jobsDir, jobId, args, ...options, exec: () => {
+			if (failQuery) throw new Error("CIM unavailable");
+			return rows.join("\n");
+		} }),
+	});
+	const args = laneArgs({ model: "p/reviewer", bundleFile: path.join(runner.jobDir("j1"), "bundle.md"), sessionId: "lane-j1" });
+	runner.start({ ...baseJob, kind: "audit", args });
+	const argv = `omo.exe ${args.join(" ")}`;
+	const child = cimLine(71000, 70000, T + 1, argv);
+	clock.advance(baseJob.timeoutMs + 1);
+	identity = { ctimeMs: T + 1, cmdSha1: sha1(argv) };
+	for (const parentPid of [71000, 70000]) {
+		rows = [child, cimLine(71001, parentPid, T + 2, argv)];
+		assert.equal(runner.poll("j1").status, "running");
+		assert.equal(readMeta(runner).pid, 70000);
+		assert.equal(calls.length, 1);
+	}
+	rows = [child];
+	failQuery = true;
+	assert.equal(runner.poll("j1").status, "running");
+	failQuery = false;
+	identity.cmdSha1 = "reused-command";
+	assert.equal(runner.poll("j1").status, "running");
+	assert.equal(readMeta(runner).pid, 70000);
+	assert.equal(calls.length, 1);
+});
+
+test("a process that only mentions the bundle path is not adopted and nothing is killed", () => {
+	let box;
+	const finder = (jobId, args) => findJobProcess({ jobsDir: box.paths.health.jobsDir, jobId, args, exec: () => cimLine(9, 1, T, "notepad.exe " + path.join(box.paths.health.jobsDir, jobId, "bundle.md")) });
+	box = setup({ isAlive: () => true, identify: () => { throw new Error("no powershell"); }, findProcess: finder });
+	box.runner.start(baseJob);
+	const polled = box.runner.poll("j1");
+	assert.deepEqual([polled.status, polled.reason], ["failed", "no-result"]);
+	assert.deepEqual(box.calls.map((call) => call.command), ["C:/fake/tool.exe"], "no taskkill");
+});
+
+test("an ambiguous job lookup is not adopted and leaves no meta.json", () => {
+	const { runner } = setup({
+		findProcess: () => {
+			const error = new Error("job process lookup is ambiguous: two independent roots");
+			error.code = "ambiguous";
+			throw error;
+		},
+	});
+	assert.throws(() => runner.adoptJob("j1", { command: "omo", args: laneArgsFor("j1", "lane-1") }), /ambiguous/);
+	assert.equal(fs.existsSync(path.join(runner.jobDir("j1"), "meta.json")), false);
 });

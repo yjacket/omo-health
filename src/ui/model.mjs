@@ -1,13 +1,17 @@
+import { ledgerParentSubject, sessionSubjects, subjectKey, subjectOf } from "../session-subject.mjs";
 import path from "node:path";
 import { DEFAULT_CONFIG, loadConfig, SWITCH_KEYS } from "../config.mjs";
 import { getPath, pauseState, SWITCHES } from "../control.mjs";
 import { readDecisions } from "../decisions.mjs";
 import { createInvestigations, RESOLVED } from "../investigations.mjs";
-import { readEnded } from "../session-ledger.mjs";
+import { endedSelector, readEnded } from "../session-ledger.mjs";
+import { ambiguousLedgerTaskIds, displayLedgerId, usageEntryOf, usageTreeLink } from "../session-record.mjs";
+import { compactUsage, parentSubject, publishedUsageView, readUsageIndex, treeTotals } from "../usage-index.mjs";
 import { listDirSafe, readJsonSafe, statSafe } from "../util/fsx.mjs";
 import { redact, truncate } from "../util/text.mjs";
 import { VERSION } from "../version.mjs";
 import { buildHistory, historyStart } from "./history.mjs";
+import { readUiPrefs } from "./prefs.mjs";
 import { actionLabel, analystVerdictLabel, causeLabel, daemonStateLabel, exitReasonLabel, findingLabel, goalStatusLabel, investigationStatusLabel, OUTCOME_LABELS, outcomeLabel, sessionStateLabel, severityLabel, taskStatusLabel, terminalLabel, triggerLabel, waitClassLabel } from "./labels.mjs";
 
 /** Read model of the local dashboard: one I/O loader, pure section builders. */
@@ -41,9 +45,47 @@ function pidAlive(pid) {
 	}
 }
 
-export function loadUiInputs({ paths, env, now = Date.now() }) {
+export function loadDaemonInputs({ paths, env, now }) {
 	const heartbeat = readJsonSafe(paths.health.daemonJson) ?? null;
-	const loaded = loadConfig({ env, paths });
+	return {
+		now,
+		stopped: Boolean(statSafe(paths.health.stoppedFile)),
+		heartbeat,
+		pidAlive: pidAlive(heartbeat?.pid),
+		loaded: loadConfig({ env, paths }),
+	};
+}
+
+export function fileStamp(file) {
+	const stat = statSafe(file);
+	return stat?.isFile() ? { size: stat.size, mtimeMs: stat.mtimeMs } : null;
+}
+
+/** A file can change without changing its directory's mtime. */
+function newestFileMs(dir) {
+	let newest = null;
+	for (const name of listDirSafe(dir)) {
+		const stamp = fileStamp(path.join(dir, name));
+		if (stamp && (newest === null || stamp.mtimeMs > newest)) newest = stamp.mtimeMs;
+	}
+	return newest;
+}
+
+/** Shared by state polling and the detail cache; no record contents are read. */
+export function recordsStamp({ health }) {
+	const investigations = statSafe(health.investigationsDir);
+	return JSON.stringify([
+		newestFileMs(health.decisionsDir),
+		investigations?.isDirectory() ? investigations.mtimeMs : null,
+		newestFileMs(health.investigationsDir),
+		newestFileMs(health.sessionsDir),
+		fileStamp(health.usageIndexFile)?.mtimeMs ?? null,
+	]);
+}
+
+export function loadUiInputs({ paths, env, now = Date.now() }) {
+	const stamp = recordsStamp(paths);
+	const { heartbeat, stopped, pidAlive: alive, loaded } = loadDaemonInputs({ paths, env, now });
 	let decisions;
 	let decisionsReadMs = null;
 	const started = performance.now();
@@ -59,16 +101,25 @@ export function loadUiInputs({ paths, env, now = Date.now() }) {
 	} catch (error) {
 		ended = { error: error.message };
 	}
+	let usage;
+	try {
+		usage = readUsageIndex(paths.health.usageIndexFile);
+	} catch (error) {
+		usage = { error: error.message };
+	}
 	return {
 		now,
 		version: VERSION,
+		recordsStamp: stamp,
 		paths,
 		heartbeat,
 		// Read-only: the daemon writes the board snapshot each tick and the ledger when a session ends.
 		sessionsSnapshot: readJsonSafe(paths.health.sessionsSnapshotFile) ?? null,
 		ended,
-		stopped: Boolean(statSafe(paths.health.stoppedFile)),
-		pidAlive: pidAlive(heartbeat?.pid),
+		usage,
+		prefs: readUiPrefs(paths),
+		stopped,
+		pidAlive: alive,
 		pause: pauseState(paths, now),
 		global: readJsonSafe(path.join(paths.health.statusDir, "_global.json")) ?? null,
 		deaths: listDeathRecords(paths.health.deathsDir),
@@ -91,7 +142,12 @@ function listDeathRecords(dir) {
 }
 
 const short = (id) => (typeof id === "string" && id ? id.slice(0, 8) : null);
+const shortLedgerId = (id) => {
+	const display = displayLedgerId(id);
+	return display === id ? short(id) : display;
+};
 const text = (v, max = LINE_MAX) => (typeof v === "string" && v ? v.slice(0, max) : null);
+const exactId = (v) => typeof v === "string" && v ? v : null;
 const lines = (list) => (Array.isArray(list) ? list.filter((line) => typeof line === "string" && line).slice(0, MAX_LINES).map((line) => line.slice(0, LINE_MAX)) : []);
 /** Free text from the snapshot or the ledger as the page shows it: whitespace folded, credentials masked, bounded. */
 const clean = (v, max = LINE_MAX) => {
@@ -99,6 +155,27 @@ const clean = (v, max = LINE_MAX) => {
 	return folded ? truncate(redact(folded), max) : null;
 };
 const num = (v) => (Number.isFinite(v) ? v : null);
+const TOKEN_NUM_KEYS = ["total", "input", "output", "cacheRead", "cacheWrite", "cost", "turns"];
+
+/** A compact token total as the page shows it: every numeric field through `num`, so a bad value reads null. */
+function boardTokens(tokens) {
+	if (!isRecord(tokens)) return null;
+	const out = {};
+	for (const key of TOKEN_NUM_KEYS) out[key] = num(tokens[key]);
+	out.costUnknown = tokens.costUnknown === true;
+	return out;
+}
+
+function boardTokenFields(row) {
+	return {
+		tokens: boardTokens(row.tokens),
+		treeTokens: num(row.treeTokens),
+		treeTokensComplete: row.treeTokensComplete === true,
+		tokensPending: row.tokensPending === true,
+		...(["full", "overflow"].includes(row.tokensState) ? { tokensState: row.tokensState } : {}),
+		...(row.treeTokensState === "overflow" ? { treeTokensState: "overflow" } : {}),
+	};
+}
 
 /** A folder as the board shows it: the whole path when short, else its last two segments after an ellipsis. */
 function shortPath(cwd) {
@@ -135,7 +212,7 @@ function childRow(c, depth = 0) {
 	const children = depth < CHILD_DEPTH_MAX && Array.isArray(c.children) ? c.children.filter(isRecord).map((child) => childRow(child, depth + 1)) : [];
 	return {
 		taskId: text(c.taskId, 80),
-		sessionId: text(c.sessionId, 80),
+		sessionId: exactId(c.sessionId),
 		sessionShort: short(c.sessionId),
 		name: clean(c.name, 120) ?? text(c.taskId, 80) ?? "?",
 		category: clean(c.category, 60),
@@ -145,6 +222,7 @@ function childRow(c, depth = 0) {
 		startedMs: num(c.startedMs),
 		endedMs: num(c.endedMs),
 		health: healthOf(c.health),
+		...boardTokenFields(c),
 		children,
 	};
 }
@@ -156,7 +234,7 @@ function sessionRow(s) {
 	const cwd = clean(s.cwd, 300);
 	const children = (Array.isArray(s.children) ? s.children : []).filter(isRecord).map((c) => childRow(c));
 	return {
-		sessionId: text(s.sessionId, 80),
+		sessionId: exactId(s.sessionId),
 		sessionShort: short(s.sessionId),
 		title: clean(s.title, TITLE_MAX) ?? short(s.sessionId) ?? "(제목 없음)",
 		titleSource: typeof s.titleSource === "string" ? s.titleSource.slice(0, 20) : "none",
@@ -170,6 +248,7 @@ function sessionRow(s) {
 		todo: isRecord(s.todo) ? { open: num(s.todo.open), total: num(s.todo.total) } : null,
 		lastInputMs: num(s.lastInputMs),
 		health: healthOf(s.health),
+		...boardTokenFields(s),
 		children,
 		childCount: children.length,
 	};
@@ -198,19 +277,27 @@ export function buildSessions(inputs) {
  * One EndedRecord of the ledger as the history table shows it. `childRows` is the number of ended child rows in the
  * window that name this session as parent: a session recorded before its children were visible keeps childCount 0.
  */
-function endedRow(r, childRows = 0) {
+export function endedRow(r, childRows = 0, usage = null, trees = null, full = usage?.full === true, ambiguous) {
 	const outcome = typeof r.outcome === "string" && Object.hasOwn(OUTCOME_LABELS, r.outcome) ? r.outcome : "unknown";
 	const startedMs = num(r.startedMs);
 	const endedMs = num(r.endedMs);
 	const cwd = clean(r.cwd, 300);
+	const entry = usage && usageEntryOf(publishedUsageView(usage), r, ambiguous);
+	const compact = compactUsage(entry);
+	const tokens = compact && { ...compact, models: Object.entries(entry.published.models ?? {}).map(([key, { tokens, cost }]) => ({ key, tokens, cost })) };
+	const treeId = subjectKey(subjectOf(entry?.id ? entry : r));
+	const tree = trees?.get(treeId) ?? null;
+	const overflow = tokens !== null && !Number.isFinite(tokens.total);
+	const treeOverflow = tree !== null && !Number.isFinite(tree);
+	const sessionShort = shortLedgerId(r.sessionId);
 	return {
-		sessionId: text(r.sessionId, 80),
-		sessionShort: short(r.sessionId),
+		sessionId: exactId(r.sessionId),
+		sessionShort,
 		kind: r.kind === "child" ? "child" : "main",
-		parentSessionId: text(r.parentSessionId, 80),
-		parentShort: short(r.parentSessionId),
-		taskId: text(r.taskId, 80),
-		title: clean(r.title, TITLE_MAX) ?? short(r.sessionId) ?? "(제목 없음)",
+		parentSessionId: exactId(r.parentSessionId),
+		parentShort: shortLedgerId(r.parentSessionId),
+		taskId: text(displayLedgerId(r.taskId), 80),
+		title: clean(displayLedgerId(r.title), TITLE_MAX) ?? sessionShort ?? "(제목 없음)",
 		cwd,
 		cwdShort: shortPath(cwd),
 		terminal: terminalOf(r.terminal),
@@ -224,26 +311,66 @@ function endedRow(r, childRows = 0) {
 		childCount: Math.max(num(r.childCount) ?? 0, childRows),
 		estimated: r.estimated === true,
 		source: r.source === "backfill" ? "backfill" : "live",
+		tokens: overflow ? { ...tokens, total: null } : tokens,
+		tokensState: overflow ? "overflow" : tokens ? "ok" : entry?.state === "missing" ? "missing" : entry?.state === "full" || (!entry && full) ? "full" : "pending",
+		tokensGone: entry?.gone === true,
+		treeTokens: treeOverflow ? null : tree,
+		treeTokensComplete: trees?.complete?.get(treeId) === true,
+		...(treeOverflow ? { treeTokensState: "overflow" } : {}),
 	};
 }
 
 /** The ended-session history: the last 30 days newest first (as `readEnded` returns them), capped, with counts per outcome over the whole window. */
 export function buildEnded(inputs) {
 	if (isRecord(inputs.ended) && "error" in inputs.ended) throw new Error(inputs.ended.error);
-	const all = (Array.isArray(inputs.ended) ? inputs.ended : []).filter((r) => isRecord(r) && Number.isFinite(r.endedMs));
+	const rows = (Array.isArray(inputs.ended) ? inputs.ended : []).filter((r) => isRecord(r) && Number.isFinite(r.endedMs));
+	const resolve = sessionSubjects(rows);
+	const all = rows.map((row) => ({ ...row, ...resolve(row) }));
 	const tally = new Map(Object.keys(OUTCOME_LABELS).map((outcome) => [outcome, 0]));
+	const idCounts = new Map();
 	for (const r of all) {
 		const outcome = typeof r.outcome === "string" && tally.has(r.outcome) ? r.outcome : "unknown";
 		tally.set(outcome, tally.get(outcome) + 1);
+		idCounts.set(r.sessionId, (idCounts.get(r.sessionId) ?? 0) + 1);
 	}
+	// Main and child rows are capped separately, then put back in the ledger's newest-first order.
+	const mains = all.filter((r) => r.kind !== "child");
+	const children = all.filter((r) => r.kind === "child");
+	const shownMains = mains.slice(0, ENDED_LIMIT);
+	const shownChildren = children.slice(0, ENDED_LIMIT);
+	const selected = new Set([...shownMains, ...shownChildren]);
+	const usage = typeof inputs.usage?.get === "function" && typeof inputs.usage?.values === "function" ? inputs.usage : new Map();
+	const ambiguous = ambiguousLedgerTaskIds(all, { scoped: true });
+	const published = publishedUsageView(usage);
 	const childRows = new Map();
-	for (const r of all) if (r.kind === "child" && typeof r.parentSessionId === "string") childRows.set(r.parentSessionId, (childRows.get(r.parentSessionId) ?? 0) + 1);
+	// The daemon resolves bare parent IDs against the retained ledger. History
+	// only trusts a published link or the visible row's explicit parent scope.
+	const links = all.map((row) => {
+		let parent = ledgerParentSubject(row);
+		if (row.parentSessionId && row.parentTaskId == null) {
+			const entry = usageEntryOf(published, row, ambiguous);
+			if (entry?.parentSessionId === row.parentSessionId && (entry.parentKey || !parent)) parent = parentSubject(entry);
+		}
+		const parentKey = subjectKey(parent);
+		if (row.kind === "child" && parentKey) childRows.set(parentKey, (childRows.get(parentKey) ?? 0) + 1);
+		return { ...usageTreeLink(published, row, ambiguous), parentKey };
+	});
+	const trees = treeTotals(usage, links);
 	return {
 		sinceMs: inputs.now - ENDED_WINDOW_MS,
 		limit: ENDED_LIMIT,
+		limits: { main: ENDED_LIMIT, child: ENDED_LIMIT },
 		total: all.length,
 		counts: [...tally].map(([outcome, count]) => ({ outcome, outcomeKo: outcomeLabel(outcome), count })),
-		rows: all.slice(0, ENDED_LIMIT).map((r) => endedRow(r, childRows.get(r.sessionId))),
+		shown: { main: shownMains.length, child: shownChildren.length },
+		totals: { main: mains.length, child: children.length },
+		rows: all.filter((r) => selected.has(r)).map((r) => {
+			const row = endedRow(r, childRows.get(subjectKey(subjectOf(r))), usage, trees, usage.full === true, ambiguous);
+			row.rowSelector = endedSelector(r);
+			// Only shared IDs need a suffix in the browser's DOM and cache keys.
+			if (idCounts.get(r.sessionId) > 1) row.detailRow = row.rowSelector;
+			return row;
+		}),
 	};
 }
 
@@ -255,7 +382,7 @@ function actionDetailOf(action) {
 }
 
 /** One investigation file as a list row: the six columns, then what the expanded row shows. */
-function investigationRow(inv) {
+export function investigationRow(inv) {
 	const subject = isRecord(inv.subject) ? inv.subject : {};
 	const child = Boolean(subject.taskId || subject.parentSessionId);
 	const verdict = isRecord(inv.verdict) ? inv.verdict : null;
@@ -303,7 +430,7 @@ function daemonStateOf({ stopped, heartbeat: hb, pidAlive: alive, loaded }, ageM
 	return "crashed";
 }
 
-function daemonStatus(inputs) {
+export function daemonStatus(inputs) {
 	const hb = inputs.heartbeat;
 	const heartbeatAgeMs = Number.isFinite(hb?.ts) ? inputs.now - hb.ts : null;
 	const state = daemonStateOf(inputs, heartbeatAgeMs);
@@ -405,12 +532,14 @@ export function buildUiState(inputs) {
 	return {
 		generatedMs: inputs.now,
 		version: inputs.version,
+		recordsStamp: inputs.recordsStamp,
 		sessions: section(() => buildSessions(inputs)),
 		ended: section(() => buildEnded(inputs)),
 		overview: section(() => buildOverview(inputs)),
 		investigations: section(() => buildInvestigations(inputs)),
 		history: section(() => ({ ...buildHistory(inputs.decisions, inputs.now), readMs: inputs.decisionsReadMs })),
 		settings: section(() => buildSettings(inputs)),
+		prefs: section(() => inputs.prefs ?? { hideChildren: false }),
 	};
 }
 

@@ -1,3 +1,4 @@
+import { actionDetail } from "../decisions.mjs";
 import { actionLabel, findingLabel, resultLabel } from "./labels.mjs";
 
 /** The 7-day decision-log history of the local dashboard: pure functions, no I/O. */
@@ -35,12 +36,6 @@ function countResults(row, result) {
 	const key = clip(typeof result === "string" ? result : undefined);
 	row.total++;
 	row.results.set(key, (row.results.get(key) ?? 0) + 1);
-}
-
-function actionDetail(entry) {
-	const o = isRecord(entry.outcome) ? entry.outcome : {};
-	const pids = (list) => (Array.isArray(list) && list.length ? list.map((p) => p?.pid ?? p).join(",") : null);
-	return detail([pids(o.killed) && `killed ${pids(o.killed)}`, pids(o.survived) && `survived ${pids(o.survived)}`, o.delivered !== undefined && `delivered ${o.delivered}`, o.via && `via ${o.via}`, o.error && `error ${o.error}`, entry.rule && `rule ${isRecord(entry.rule) ? entry.rule.id : entry.rule}`]);
 }
 
 function sampleOf(entry, ts, kind) {

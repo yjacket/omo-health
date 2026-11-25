@@ -56,7 +56,7 @@ function sameCallLoops(session, cfg) {
 	return out;
 }
 
-function errorStorms(session, cfg) {
+export function errorStormGroups(session) {
 	const groups = new Map();
 	const add = (text, ms, source) => {
 		const head = String(text ?? "").trim().slice(0, ERROR_HEAD_CHARS);
@@ -68,13 +68,32 @@ function errorStorms(session, cfg) {
 	};
 	for (const error of session.errors ?? []) add(error.text, error.ms, "assistant");
 	for (const item of session.toolHistory ?? []) if (item.isError && item.errHead) add(item.errHead, item.ms, `tool:${item.name}`);
+	return groups;
+}
+
+function errorStormWindow(timestamps, cfg, now) {
+	const hit = densest([...timestamps].sort((a, b) => a - b), cfg.errorStormWindowMs);
+	if (!hit.count || (now !== undefined && !(now - hit.endMs <= RECENT_EVIDENCE_MS))) return { count: 0, detected: false };
+	return { ...hit, detected: hit.count >= cfg.errorStormCount };
+}
+
+/** A text-free projection of the same prefix groups and window rule used by D10. */
+export function errorStormFact(timingGroups, cfg, now) {
+	let maxMatchingCount = 0;
+	let detected = false;
+	for (const timestamps of timingGroups) {
+		const hit = errorStormWindow(timestamps, cfg, now);
+		maxMatchingCount = Math.max(maxMatchingCount, hit.count);
+		detected ||= hit.detected;
+	}
+	return { detected, maxMatchingCount };
+}
+
+function errorStorms(session, cfg, now) {
 	const out = [];
-	for (const [head, group] of groups) {
-		const hit = densest(
-			group.ms.sort((a, b) => a - b),
-			cfg.errorStormWindowMs,
-		);
-		if (hit.count < cfg.errorStormCount) continue;
+	for (const [head, group] of errorStormGroups(session)) {
+		const hit = errorStormWindow(group.ms, cfg, now);
+		if (!hit.detected) continue;
 		out.push(
 			makeFinding({
 				detector: id,
@@ -93,7 +112,7 @@ function errorStorms(session, cfg) {
 export function detect(world) {
 	const cfg = world.config.loops;
 	const out = [];
-	for (const session of world.sessions.values()) out.push(...sameCallLoops(session, cfg), ...errorStorms(session, cfg));
+	for (const session of world.sessions.values()) out.push(...sameCallLoops(session, cfg), ...errorStorms(session, cfg, world.now));
 	// Only incidents whose last occurrence is recent; old history is not news (engine drops stale atMs).
 	for (const finding of out) finding.data.atMs = finding.data.endMs;
 	return out.filter((finding) => world.now - finding.data.endMs <= RECENT_EVIDENCE_MS);

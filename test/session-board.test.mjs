@@ -196,6 +196,122 @@ test("detectEnded decides nothing without a previous snapshot or a fresh process
 	assert.deepEqual(detectEnded(prev, snap(NOW, []), makeWorld({ now: NOW, procsFresh: false }), NOW), []);
 });
 
+test("live end detection keeps shared task IDs isolated by parent", () => {
+	const parents = ["a", "b"];
+	const prev = snap(NOW - 60_000, parents.map((parent) =>
+		mainRow(parent, { children: [childRow("st_x", { sessionId: null, name: `child ${parent}` })] })));
+	const tasks = parents.map((parent, i) => taskRecord({
+		taskId: "st_x", parentSessionId: parent, spawnCwd: `C:/project-${parent}`,
+		status: "completed", hasFinalResponse: true, terminalAtMs: NOW - i,
+	}));
+	const world = makeWorld({ now: NOW, paths: tmpPaths(), tasks, procsFresh: true });
+	const facts = (current) => detectEnded(prev, current, world, NOW)
+		.map((r) => [r.sessionId, r.parentSessionId, r.title, r.cwd, r.endedMs]);
+	const ended = parents.map((parent, i) => ["st_x", parent, `child ${parent}`, `C:/project-${parent}`, NOW - i]);
+	assert.deepEqual(facts(snap(NOW, parents.map((parent) => mainRow(parent)))), ended);
+	const stillRunning = snap(NOW, [
+		mainRow("a"), mainRow("b", { children: [childRow("st_x", { sessionId: "child-b-now-known" })] }),
+	]);
+	assert.deepEqual(facts(stillRunning), [ended[0]]);
+});
+
+test("live end detection passes the nearest known project cwd to the ledger", () => {
+	const parent = childRow("parent-task", { sessionId: "review.1", cwd: "C:/child-project", children: [
+		childRow("check-task", { sessionId: "check.1" }),
+	] });
+	const prev = snap(NOW - 1, [mainRow("root", { cwd: "C:/root-project", children: [parent] })]);
+	const liveParent = sessionState({ id: "review.1", cwd: "C:/live-project" });
+	const world = makeWorld({ now: NOW, sessions: [liveParent], procsFresh: true });
+	const childCwd = (snapshot) => detectEnded(snapshot, snap(NOW, []), world, NOW)
+		.find(({ sessionId }) => sessionId === "check.1").cwd;
+	assert.equal(childCwd(prev), "C:/child-project");
+	assert.equal(childCwd(snap(NOW - 1, [mainRow("root", { cwd: null, children: [{ ...parent, cwd: null }] })])), "C:/live-project");
+});
+
+test("buildSessionSnapshot puts the injected token totals on every main and child row", () => {
+	const seen = new Map([
+		["m1", { tokens: { total: 1200, input: 900, output: 300 }, treeTokens: 20_000 }],
+		["c1", { tokens: { total: 800, input: 600, output: 200 }, treeTokens: 5000 }],
+		["c0", { tokens: { total: 40, input: 30, output: 10 }, treeTokens: null }],
+		["no-session", { tokens: { total: 7, input: 5, output: 2 }, treeTokens: null }],
+	]);
+	const asked = [];
+	const tokensOf = ({ sessionId }, taskId) => {
+		asked.push([sessionId, taskId]);
+		return seen.get(sessionId ?? taskId);
+	};
+	const world = boardWorld({
+		tasks: [
+			taskRecord({ taskId: "t0", childSessionId: "c0", parentSessionId: "m1", name: "child zero", startedAtMs: NOW - 4500 }),
+			taskRecord({ taskId: "t1", childSessionId: "c1", parentSessionId: "m1", name: "child one", startedAtMs: NOW - 4000 }),
+			taskRecord({ taskId: "no-session", childSessionId: null, parentSessionId: "m1", name: "no session", startedAtMs: NOW - 3500 }),
+			taskRecord({ taskId: "t2", childSessionId: "c2", parentSessionId: "c1", name: "grandchild", startedAtMs: NOW - 3000 }),
+		],
+	});
+	const rows = rowsOf(buildSessionSnapshot(world, [], [], NOW, { tokensOf }));
+	const m1 = rows.get("m1");
+	assert.deepEqual(m1.tokens, { total: 1200, input: 900, output: 300 });
+	assert.equal(m1.treeTokens, 20_000);
+	assert.equal(m1.tokensPending, false);
+	const child = (taskId) => m1.children.find((c) => c.taskId === taskId);
+	assert.deepEqual(child("t1").tokens, { total: 800, input: 600, output: 200 });
+	assert.equal(child("t1").treeTokens, 5000);
+	assert.deepEqual(child("t0").tokens, { total: 40, input: 30, output: 10 });
+	assert.equal(child("t0").treeTokens, null);
+	assert.deepEqual(child("no-session").tokens, { total: 7, input: 5, output: 2 }, "a child without a session id is looked up by task id");
+	assert.equal(child("t1").children[0].tokens, null, "a child the stub does not know carries null tokens");
+	assert.deepEqual(asked.filter(([sessionId]) => !["m2", "m3", "m4", "m5"].includes(sessionId)), [
+		["m1", null], ["c0", "t0"], ["c1", "t1"], ["c2", "t2"], [null, "no-session"],
+	], "main and child lookups pass session and task ids in separate slots");
+	assert.equal(rows.get("m2").tokens, null);
+});
+
+test("buildSessionSnapshot flags a row whose first token read has not finished", () => {
+	const tokensOf = ({ sessionId: id }) => (id === "m1" ? { pending: true } : { tokens: { total: 5, input: 3, output: 2 }, treeTokens: null });
+	const m1 = rowsOf(buildSessionSnapshot(boardWorld(), [], [], NOW, { tokensOf })).get("m1");
+	assert.equal(m1.tokensPending, true);
+	assert.equal(m1.tokens, null);
+	assert.equal(m1.treeTokens, null);
+	assert.equal(m1.children[0].tokens.total, 5, "siblings of a pending row still carry their totals");
+});
+
+test("buildSessionSnapshot keeps the tokensState full of a refused lookup on the main and the child row", () => {
+	const full = new Set(["m1", "c1"]);
+	const tokensOf = ({ sessionId: id }) => (full.has(id) ? { state: "full" } : id.startsWith("c") ? { tokens: { total: 5, input: 3, output: 2 }, treeTokens: null } : null);
+	const m1 = rowsOf(buildSessionSnapshot(boardWorld(), [], [], NOW, { tokensOf })).get("m1");
+	assert.equal(m1.tokensState, "full");
+	assert.equal(m1.tokens, null);
+	assert.equal(m1.treeTokens, null);
+	assert.equal(m1.tokensPending, false);
+	const t1 = m1.children.find((c) => c.taskId === "t1");
+	assert.equal(t1.tokensState, "full", "a refused child lookup carries its own full state");
+	assert.equal(t1.tokens, null);
+	assert.equal(t1.tokensPending, false);
+	assert.equal(m1.children.find((c) => c.taskId === "t0").tokensState, undefined, "an indexed child is not marked full");
+	assert.equal(rowsOf(buildSessionSnapshot(boardWorld(), [], [], NOW, { tokensOf })).get("m2").tokensState, undefined, "an unknown main lookup is not marked full");
+});
+
+test("buildSessionSnapshot applies the full state per lookup, so an indexed main keeps its full child", () => {
+	const tokensOf = ({ sessionId: id }) => (id === "c1" ? { state: "full" } : { tokens: { total: 7, input: 5, output: 2 }, treeTokens: null });
+	const m1 = rowsOf(buildSessionSnapshot(boardWorld(), [], [], NOW, { tokensOf })).get("m1");
+	assert.equal(m1.tokensState, undefined);
+	assert.deepEqual(m1.tokens, { total: 7, input: 5, output: 2 });
+	assert.equal(m1.children.find((c) => c.taskId === "t1").tokensState, "full");
+});
+
+test("buildSessionSnapshot leaves every token field null without the tokensOf option", () => {
+	const snapshot = buildSessionSnapshot(boardWorld(), [], [], NOW);
+	const all = snapshot.groups.flatMap((g) => g.sessions);
+	const walk = (rows) => rows.flatMap((row) => [row, ...walk(row.children)]);
+	const every = walk(all);
+	assert.ok(every.length > 5);
+	for (const row of every) {
+		assert.equal(row.tokens, null);
+		assert.equal(row.treeTokens, null);
+		assert.equal(row.tokensPending, false);
+	}
+});
+
 test("buildSessionSnapshot takes the name from omo's session list when the tracker never saw the session_info entry", () => {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "board-names-"));
 	const file = path.join(dir, "2026-09-23T15-00-00-000Z_m3.jsonl");

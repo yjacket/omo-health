@@ -1,5 +1,6 @@
 import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
@@ -51,6 +52,18 @@ test("the signature round-trips: it is stored at open, masked like every other f
 	const long = investigations.open({ id: "fp-long", signature: "x".repeat(900) });
 	assert.equal(long.signature.length, 500);
 	assert.equal(investigations.open({ id: "fp-none" }).signature, null, "a finding without a signature stores null, not undefined");
+});
+
+test("investigation open and attach store keys only for redacted subject IDs", (t) => {
+	const { root, investigations } = sandbox();
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const id = "sk-ant-abcdefgh";
+	const key = `redacted-id-${createHash("sha256").update(id).digest("hex").slice(0, 12)}`;
+	const masked = "sk-ant-[REDACTED]";
+	investigations.open({ id: "fp-key", subject: { sessionId: id, taskId: "ordinary" } });
+	assert.deepEqual(investigations.get("fp-key").subject, { sessionId: masked, sessionKey: key, taskId: "ordinary" });
+	investigations.attach("fp-key", { subject: { taskId: id } });
+	assert.deepEqual(investigations.get("fp-key").subject, { taskId: masked, taskKey: key });
 });
 
 test("an investigation opened for a release takes a sticky why flag on the look that starts later (C7)", () => {
