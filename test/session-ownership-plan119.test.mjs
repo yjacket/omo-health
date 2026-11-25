@@ -183,6 +183,92 @@ test("plan119 headerless external transcript keeps its final append after reload
 	assert.deepEqual([replaced?.tokens?.total, replaced?.tokensGone], [52, true]);
 });
 
+for (const conflict of ["session ID", "project"]) {
+	test(`plan124 an in-place main recount refuses a foreign ${conflict} without another open`, async (t) => {
+		const { paths, a, b } = setup(t);
+		const alice = main("review.1", a);
+		const foreign = conflict === "project" ? main(alice.sessionId, b) : main("review.2", a);
+		const subject = subjectOf(alice);
+		const file = path.join(paths.sessionsDir, subject.projectKey, reviewName);
+		const { index, tracker } = openTracker(paths);
+		const live = { ...world, sessions: new Map([[alice.sessionId, { ...alice, id: alice.sessionId, file }]]) };
+		writeJsonl(file, [E.header(alice.sessionId, a, now - 1000), usageLine(17)]);
+		tracker.tick(live);
+		assert.equal(tracker.tokensOf(subject)?.tokens.total, 17);
+		assert.ok(appendEnded(paths, alice, { nowMs: now }));
+		const { ino, birthtimeMs } = fs.statSync(file);
+		const foreignUsage = E.assistant({
+			ms: now - 50, provider: "openai", model: "gpt-5-5", usage: { input: 99, output: 0, cacheRead: 0, cacheWrite: 0 },
+		});
+		writeJsonl(file, [E.header(foreign.sessionId, foreign.cwd, now - 1000), foreignUsage]);
+		const rewritten = fs.statSync(file);
+		assert.deepEqual([rewritten.ino, rewritten.birthtimeMs], [ino, birthtimeMs]);
+		const open = fs.openSync;
+		const spy = t.mock.method(fs, "openSync", (...args) => open(...args));
+		tracker.tick(live);
+		spy.mock.restore();
+		assert.equal(spy.mock.calls.filter(({ arguments: [name] }) => name === file).length, 1);
+		const display = tracker.tokensOf(subject);
+		assert.deepEqual([display?.tokens.total, display?.pending, fresh(usageEntryFor(index, subject))], [17, true, false]);
+		assert.equal(index.save(), true);
+		fs.writeFileSync(paths.omoJsonc, JSON.stringify({ "[native]": { categories: { ultrabrain: { models: ["openai/gpt-5-5"] } } } }));
+		fs.writeFileSync(paths.authFile, JSON.stringify({ openai: {} }));
+		let launches = 0;
+		const auditor = createAuditor({ paths, index, clock, config: DEFAULT_CONFIG, env: {}, runner: {
+			start() { launches++; return { pid: 5001 }; },
+		} });
+		t.after(() => auditor.close());
+		assert.equal(requestAudit(paths, subject, now).created, true);
+		await auditor.tick(now);
+		await auditor.preparing();
+		await auditor.tick(now);
+		assert.deepEqual([launches, auditsToday(paths, now)], [0, 0]);
+	});
+}
+
+function paddedHeader(row, bytes = 96 * 1024 - 1) {
+	const header = E.header(row.sessionId, row.cwd, now - 1000);
+	const base = { type: header.type, metadata: "", id: header.id, cwd: header.cwd };
+	return JSON.stringify({ ...base, metadata: "x".repeat(bytes - Buffer.byteLength(JSON.stringify(base))) });
+}
+
+for (const [label, foreign] of [["resolves its owner", false], ["refuses a foreign project at the exact filename", true]]) {
+	test(`plan124 a 96 KiB header ${label}`, (t) => {
+		const { paths, a, b } = setup(t);
+		const alice = main("review.1", a);
+		const subject = subjectOf(alice);
+		const file = path.join(paths.sessionsDir, subject.projectKey, foreign ? reviewName : "custom.jsonl");
+		const header = paddedHeader(foreign ? main(alice.sessionId, b) : alice);
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, `${header}\n${JSON.stringify(usageLine(99))}\n`);
+		const locator = createSessionFileLocator({ paths, clock });
+		const clipped = locator.findMainFile(subject, null, { maxBytes: 80 * 1024 });
+		const found = locator.findMainFile(subject);
+		assert.deepEqual([clipped.file, clipped.pending, clipped.bytesRead, found.file, found.pending],
+			[undefined, true, 80 * 1024, foreign ? undefined : file, false]);
+	});
+}
+
+test("plan124 a session header at EOF without its newline is pending until it is finished", (t) => {
+	const { paths, a } = setup(t);
+	const alice = main("review.1", a);
+	const subject = subjectOf(alice);
+	const file = path.join(paths.sessionsDir, subject.projectKey, reviewName);
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	fs.writeFileSync(file, paddedHeader(alice));
+	const locator = createSessionFileLocator({ paths, clock });
+	const { tracker } = openTracker(paths);
+	const live = { ...world, sessions: new Map([[alice.sessionId, { ...alice, id: alice.sessionId, file }]]) };
+	const found = locator.findMainFile(subject);
+	tracker.tick(live);
+	const display = tracker.tokensOf(subject);
+	assert.deepEqual([found.file, found.pending, display?.tokens?.total, display?.pending], [undefined, true, undefined, true]);
+	fs.appendFileSync(file, `\n${JSON.stringify(usageLine(99))}\n`);
+	assert.equal(locator.mainFile(subject), file);
+	tracker.tick(live);
+	assert.equal(tracker.tokensOf(subject)?.tokens.total, 99);
+});
+
 test("plan119 detail accepts an unchanged saved child but refuses a same-ID child replacement from another project", (t) => {
 	const { paths, a, b } = setup(t);
 	const child = { ...main("review.1", a), kind: "child", taskId: "st_review" };

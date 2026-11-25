@@ -6,9 +6,7 @@ import { packScopedText, projectKeyOf, uniqueMatch } from "../session-subject.mj
 import { fresh, soleChildSessionFile } from "../usage-index.mjs";
 import { idFromFileName } from "./sessions.mjs";
 import { senpiTaskStoreDir } from "./tasks.mjs";
-import { isExactInode, readUsageFileStamp, sameFileIdentity } from "./usage.mjs";
-
-export const HEADER_BYTES = 64 * 1024;
+import { HEADER_BYTES, isExactInode, readUsageFileStamp, sameFileIdentity, sessionHeader, SESSION_HEADER_LIMIT } from "./usage.mjs";
 
 /** A header probe is atomic; callers defer the candidate if its prefix won't fit. */
 export function probeSessionHeader(file, size, maxBytes) {
@@ -21,12 +19,24 @@ export function probeSessionHeader(file, size, maxBytes) {
 		fd = fs.openSync(file, "r");
 		const buf = Buffer.alloc(length);
 		bytesRead = fs.readSync(fd, buf, 0, length, 0);
-		const text = buf.toString("utf8", 0, bytesRead);
-		const end = text.indexOf("\n");
-		const entry = JSON.parse(end >= 0 ? text.slice(0, end) : text);
-		return entry?.type === "session" ? { id: entry.id, cwd: entry.cwd, bytesRead } : { bytesRead };
+		if (bytesRead !== length) return { pending: true, bytesRead };
+		let probe = sessionHeader(buf);
+		const limit = Math.min(size, maxBytes, SESSION_HEADER_LIMIT);
+		if (probe.pending && bytesRead < limit) {
+			const prefix = Buffer.allocUnsafe(limit);
+			buf.copy(prefix);
+			while (bytesRead < limit) {
+				const start = bytesRead;
+				const n = fs.readSync(fd, prefix, start, Math.min(4096, limit - start), start);
+				if (n === 0) break;
+				bytesRead += n;
+				if (prefix.subarray(start, bytesRead).includes(0x0a)) break;
+			}
+			probe = sessionHeader(prefix.subarray(0, bytesRead));
+		}
+		return { ...probe, bytesRead };
 	} catch {
-		return { bytesRead };
+		return { pending: true, bytesRead };
 	} finally {
 		if (fd !== undefined) fs.closeSync(fd);
 	}

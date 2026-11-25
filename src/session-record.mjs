@@ -1,9 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import { idFromFileName } from "./collect/sessions.mjs";
-import { createSessionFileLocator, HEADER_BYTES, isSavedTranscriptVersion, mainHeaderConflicts, ownsLiveMain, probeSessionHeader } from "./collect/session-files.mjs";
+import { createSessionFileLocator, isSavedTranscriptVersion, mainHeaderConflicts, ownsLiveMain, probeSessionHeader } from "./collect/session-files.mjs";
 import { senpiTaskStoreDir } from "./collect/tasks.mjs";
-import { isExactInode, readUsageFileStamp } from "./collect/usage.mjs";
+import { isExactInode, readUsageFileStamp, sessionHeader } from "./collect/usage.mjs";
 import { DEFAULT_CONFIG } from "./config.mjs";
 import { maskedSubjectKey, streamDecisions, subjectIdJoinKey } from "./decisions.mjs";
 import { streamInvestigations } from "./investigations.mjs";
@@ -1090,15 +1090,6 @@ function* streamOmoHealthMessages(file, bounded = false, rejectsHeader) {
 			return;
 		}
 	};
-	const rejected = (bytes) => {
-		let header;
-		try {
-			header = JSON.parse(bytes.toString("utf8", 0, Math.min(bytes.length, HEADER_BYTES)));
-		} catch {
-			return false;
-		}
-		return header?.type === "session" && rejectsHeader(header);
-	};
 	try {
 		const chunk = Buffer.allocUnsafe(SCAN_CHUNK);
 		let carry = null;
@@ -1107,15 +1098,14 @@ function* streamOmoHealthMessages(file, bounded = false, rejectsHeader) {
 			const n = fs.readSync(fd, chunk, 0, SCAN_CHUNK, null);
 			if (n === 0) break;
 			const view = chunk.subarray(0, n);
+			if (rejectsHeader) {
+				if (rejectsHeader(sessionHeader(view))) return;
+				rejectsHeader = undefined;
+			}
 			let pos = 0;
 			while (pos < n) {
 				const newline = view.indexOf(SCAN_NEWLINE, pos);
 				const piece = view.subarray(pos, newline === -1 ? n : newline);
-				if (rejectsHeader && (newline !== -1 || (carry?.length ?? 0) + piece.length >= HEADER_BYTES)) {
-					const prefix = piece.subarray(0, HEADER_BYTES - (carry?.length ?? 0));
-					if (rejected(carry ? Buffer.concat([carry, prefix]) : prefix)) return;
-					rejectsHeader = undefined;
-				}
 				if (!oversized && (carry?.length ?? 0) + piece.length > SCAN_LINE_MAX) {
 					oversized = oversizedMessageScanner(bounded);
 					if (carry) oversized.push(carry);
@@ -1132,7 +1122,6 @@ function* streamOmoHealthMessages(file, bounded = false, rejectsHeader) {
 				pos = newline + 1;
 			}
 		}
-		if (rejectsHeader && carry && rejected(carry)) return;
 		const message = oversized ? project(oversized.finish()) : carry && consume(carry);
 		if (message) yield message;
 	} catch {
@@ -1194,7 +1183,7 @@ function findRecordFiles(paths, nodes, ancestors, locator, usage, ambiguous, aud
 				const projectKey = subject.projectKey ?? (isInside(file, paths.sessionsDir)
 					? path.basename(path.dirname(file)) : usageEntryOf(usage, node, ambiguous)?.projectKey);
 				const probe = probeSessionHeader(file, stat.size, Infinity);
-				if (mainHeaderConflicts({ ...subject, projectKey }, probe)) {
+				if (probe.pending || mainHeaderConflicts({ ...subject, projectKey }, probe)) {
 					node.usageStoreUnresolved = true;
 					return { sessionId };
 				}
@@ -1232,7 +1221,7 @@ function findRecordFiles(paths, nodes, ancestors, locator, usage, ambiguous, aud
 		}
 		const subject = { ...subjectOf(node, subjectOf(entry)), sessionId: ledgerUsageSessionId(node.ledgerIds ?? node) ?? entry?.id ?? sessionId };
 		const rejectsHeader = (header) => {
-			if (!childHeaderConflicts(subject, file, header)) return false;
+			if (!header.pending && !childHeaderConflicts(subject, file, header)) return false;
 			node.usageStoreUnresolved = true;
 			return true;
 		};

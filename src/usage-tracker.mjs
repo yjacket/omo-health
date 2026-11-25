@@ -144,13 +144,17 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 
 	const updateUsage = (subject, file, source, options, saved) => {
 		const update = () => index.update(subject, file, metaOf(source), options);
+		if (source.kind === "main" && saved?.file && pathKey(saved.file) === pathKey(file)) {
+			return withUsageRecountCheck(file, saved, (probe, sameIdentity) => sameIdentity
+				? !mainHeaderConflicts(subject, probe) : ownsLiveMain(subject, file, probe, false), update, { everyRecount: true });
+		}
 		// A different sole candidate after a legacy task-only entry went missing
 		// is a new claim, not a recount of that task's previous transcript.
 		if (source.kind !== "child" ||
 			(saved?.file && isTaskOnlyEntry(saved) && pathKey(saved.file) !== pathKey(file))) return update();
 		const owner = subject.sessionId === subject.taskId ? { ...subject, sessionId: idFromFileName(file) } : subject;
 		return withUsageRecountCheck(file, saved, (probe) => ownsLiveMain(owner, file, probe, false), update,
-			(probe) => mainHeaderConflicts(owner, probe));
+			{ rejectsFirstHeader: (probe) => mainHeaderConflicts(owner, probe) });
 	};
 
 	/** Verify that the live collector's file belongs to this session before billing it. */

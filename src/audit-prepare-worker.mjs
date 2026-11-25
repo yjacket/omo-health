@@ -2,7 +2,7 @@ import path from "node:path";
 import { subjectKey, subjectOf } from "./session-subject.mjs";
 import { parentPort, workerData } from "node:worker_threads";
 import { auditFileVersion, auditIndexVersion, readVersionedAuditTimeline, sameAuditVersion } from "./auditor.mjs";
-import { createSessionFileLocator, HEADER_BYTES, mainHeaderConflicts, probeSessionHeader } from "./collect/session-files.mjs";
+import { createSessionFileLocator, mainHeaderConflicts, probeSessionHeader } from "./collect/session-files.mjs";
 import { isInside } from "./paths.mjs";
 import { childHeaderConflicts, loadSessionRecord, usageEntryOf } from "./session-record.mjs";
 import { usageEntryFor } from "./usage-index.mjs";
@@ -56,16 +56,15 @@ export function prepareAudit({ subject, now, bounds, indexEntries, indexFull, li
 				const version = auditFileVersion(file);
 				if (!sameAuditVersion(version, entry)) return { modelsAmbiguous: true };
 				const probe = probeSessionHeader(file, version.size, remaining);
-				if (probe.pending || probe.bytesRead !== Math.min(version.size, HEADER_BYTES) ||
-					!sameAuditVersion(version, auditFileVersion(file))) return { modelsAmbiguous: true };
+				if (!sameAuditVersion(version, auditFileVersion(file))) return { modelsAmbiguous: true };
 				header = probe;
 				report.timelineSource = { file, version, changedDuringScan: false };
 			}
 			const projectKey = owner.projectKey ?? (!child && isInside(file, paths.sessionsDir)
 				? path.basename(path.dirname(file)) : entry?.projectKey);
-			if (header && (child
+			if (header?.pending || (header && (child
 				? childHeaderConflicts({ ...owner, projectKey }, file, header)
-				: mainHeaderConflicts({ ...owner, projectKey }, header))) return { modelsAmbiguous: true };
+				: mainHeaderConflicts({ ...owner, projectKey }, header)))) return { modelsAmbiguous: true };
 		}
 		return { loaded, selectedFps, auditSubjectIds, indexVersion, ...report, warning };
 	} catch (error) {
