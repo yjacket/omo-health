@@ -300,6 +300,9 @@ test("a long schema-valid audit opinion keeps the advisory sentence within one p
 		decides: Array.from({ length: 4 }, () => ({ who: "owner", what: "w".repeat(300) })),
 	});
 	assert.ok(message.content.length <= AUDIT_OPINION_CHARS, `${message.content.length} chars`);
+	// Gate review B4: the auditor line keeps its own share; a real project id and a long objective never cut it.
+	const real = composeAuditOpinion({ sessionId: SESSION, now: NOW, projectId: "01a1ffcb-59fb-7563-8d59-9710650ec377:01a1ffcb-59fb-7563-8d59-9710650ec377-goal", objective: "o".repeat(400), model: "anthropic-subscription/claude-fable-5-2:xhigh", ladder: { tier: 2, basis: "budget", ratio: 2.17, rounds: 3 }, opinion: { assessment: "waste-likely", situation: "s" } });
+	assert.ok(real.content.includes("Auditor: anthropic-subscription/claude-fable-5-2:xhigh (review tier 2 of 3: spend is 2.2x the approved budget)."));
 	// Gate review B2: the largest schema-valid opinion still shows every section on the page.
 	for (const part of ["Situation:", "Criteria:", "Findings:", "Counterevidence:", "Recommendation:", "Who decides:", "The owner:"]) assert.ok(message.content.includes(part), `page misses ${part}`);
 	assert.ok(message.content.includes("This is an audit opinion, not an instruction; you decide."));

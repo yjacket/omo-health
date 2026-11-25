@@ -804,12 +804,13 @@ export function composeAuditOpinion({ sessionId, now, projectId, revision = 0, a
 	const list = (title, items, max) => (items.length ? ["", part([title, ...items], max)] : []);
 	const one = (label, text, max) => (text ? ["", part([`${label}: ${text}`], max)] : []);
 	const body = [
-		part([`${BUDGET_PREFIX} Review opinion for project "${projectId}" (revision ${revision}, "${truncate(objective, 120)}"): ${assessment}${confidenceText}. The auditor found ${verdict}`, `Auditor: ${model ?? "unknown model"}${ladderText(ladder)}.`], 420),
-		...one("Situation", opinion.situation, 420),
+		part([`${BUDGET_PREFIX} Review opinion for project "${projectId}" (revision ${revision}, "${truncate(objective, 120)}"): ${assessment}${confidenceText}. The auditor found ${verdict}`], 420),
+		part([`Auditor: ${model ?? "unknown model"}${ladderText(ladder)}.`], 220),
+		...one("Situation", opinion.situation, 400),
 		...list("Criteria:", (opinion.criteria ?? []).map((c) => `- [${c.origin ?? "unknown"}-given, ${c.status ?? "unknown"}] ${c.criterion}: ${c.judgment}`), 950),
-		...list("Findings:", (opinion.findings ?? []).map((f) => `- ${f.pattern ?? "other"}: ${f.explanation ?? ""} Evidence: ${f.evidence ?? ""}`), 700),
+		...list("Findings:", (opinion.findings ?? []).map((f) => `- ${f.pattern ?? "other"}: ${f.explanation ?? ""} Evidence: ${f.evidence ?? ""}`), 650),
 		...one("Counterevidence", opinion.counterevidence, 380),
-		...one("Recommendation", opinion.advice, 650),
+		...one("Recommendation", opinion.advice, 600),
 		...list("Who decides:", (opinion.decides ?? []).map((d) => `- ${d.who === "owner" ? "The owner" : "You (the agent)"}: ${d.what}`), 380),
 	].join("\n");
 	// The contract sentence is appended after the cap, so a long opinion can never lose it.
