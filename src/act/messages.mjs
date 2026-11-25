@@ -799,7 +799,8 @@ export function composeAuditOpinion({ sessionId, now, projectId, revision = 0, a
 	const verdict = AUDIT_OPINION_TEXT[assessment] ?? AUDIT_OPINION_TEXT["insufficient-evidence"];
 	const confidenceText = Number.isFinite(Number(opinion.confidence)) ? `, confidence ${Number(opinion.confidence).toFixed(2)}` : "";
 	// Every section gets its own share of the page (redacted first: redaction can lengthen text), so a long criteria or
-	// findings list never pushes the recommendation and who-decides off the page. The shares sum to under the cap.
+	// findings list never pushes the recommendation and who-decides off the page. With every section at its maximum the
+	// page cap trims the end of who-decides; the closing sentence is appended after the cap and always kept.
 	const part = (lines, max) => truncate(redact(lines.join("\n")), max);
 	const list = (title, items, max) => (items.length ? ["", part([title, ...items], max)] : []);
 	const one = (label, text, max) => (text ? ["", part([`${label}: ${text}`], max)] : []);
