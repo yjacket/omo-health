@@ -2,7 +2,7 @@ import path from "node:path";
 import { pathKey } from "../paths.mjs";
 import { kst } from "../util/time.mjs";
 import { parkedSessionIds } from "../act/park-resume.mjs";
-import { makeFinding } from "./finding.mjs";
+import { makeFinding, RECENT_EVIDENCE_MS } from "./finding.mjs";
 
 /**
  * D18 host crashes (issue #46): an omo host that died without a clean shutdown, and whether its run must be resumed.
@@ -16,6 +16,7 @@ import { makeFinding } from "./finding.mjs";
  *
  * Engine-provided inputs relied on:
  *   world.hostExits     { heartbeats: [{ hb, file, mtimeMs, dagRuns? }], crashRecords: [{ atMs, kind, detection }], liveMarkers: Map<pid, { mtimeMs }> }
+ *   world.events        `hostRestartResumeFailed` from the successor RPC host's session log
  *   world.config.crashResume  { maxAgeMs, perHour, loopCount, loopWindowMs, startupMs }
  *   session.anchor (goal / ulw status), session.todoState (senpi.todo-state), session.activity.lastTodo, world.tasks
  *
@@ -292,13 +293,33 @@ function prune(memory, now) {
 	}
 }
 
+function restartFailureFindings(world) {
+	const out = [];
+	for (const { sessionId, ms, error } of world.events.since(world.now - RECENT_EVIDENCE_MS, "hostRestartResumeFailed")) {
+		if (!sessionId || !Number.isFinite(ms) || ms > world.now) continue;
+		out.push(makeFinding({
+			detector: id,
+			kind: "host-restart-resume-failed",
+			severity: "warn",
+			humanNeeded: true,
+			subject: { sessionId, key: `restart-resume-failed:${ms}` },
+			evidence: ["log:host_restart_resume_failed", `atMs:${ms}`],
+			titleKo: "omo 호스트 재시작 후 세션 자동 재개 실패",
+			detailKo: `호스트 재시작 뒤 다시 열린 세션 ${sessionId}이(가) 자동 재개에 실패했습니다. 해당 세션을 확인해 주세요.${error ? `\n오류: ${error}` : ""}`,
+			data: { toastTag: `restart-resume-failed-${sessionId}` },
+		}));
+	}
+	return out;
+}
+
 export function detect(world, memory = {}) {
+	// The successor already reopened the session; warn without launching a second copy.
+	const out = restartFailureFindings(world);
 	const cfg = world.config.crashResume;
 	const exits = world.hostExits;
-	if (!cfg || !exits) return [];
+	if (!cfg || !exits) return out;
 	for (const key of ["alive", "seen", "crashes", "resumes", "pending", "stopped"]) memory[key] ??= {};
 	const now = world.now;
-	const out = [];
 	// An empty or stale process table would make every host look dead.
 	if (world.procsFresh) {
 		const stale = [];

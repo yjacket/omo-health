@@ -47,6 +47,13 @@ export const E = {
 	},
 };
 
+export function earlyCacheStormEntries(startMs, cacheStormWrite) {
+	const ordinary = { input: cacheStormWrite, output: 100, cacheRead: 0, cacheWrite: 0 };
+	const rewrite = { input: 10, output: 100, cacheRead: 0, cacheWrite: cacheStormWrite };
+	return [ordinary, rewrite, rewrite, ...Array(201).fill(ordinary)].map((usage, i) =>
+		E.assistant({ ms: startMs + i * 1000, usage }));
+}
+
 export function writeJsonl(file, entries) {
 	fs.mkdirSync(path.dirname(file), { recursive: true });
 	fs.writeFileSync(file, entries.map((e) => JSON.stringify(e)).join("\n") + (entries.length ? "\n" : ""));

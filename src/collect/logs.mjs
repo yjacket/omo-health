@@ -9,6 +9,7 @@ export const KNOWN_EVENTS = {
 		"claude_sdk_oauth_session_close",
 		"claude_sdk_oauth_session_auth",
 		"provider_error",
+		"host_restart_resume_failed", // Normalized below and reported by D18, not format drift.
 		"queue_enqueue",
 		"compaction_start",
 		"compaction_decision",
@@ -89,6 +90,14 @@ export const KNOWN_EVENTS = {
 		"model_config_error",
 		// senpi 2026.11.6-3 (omo 5.1.65), info: which model family a weekly usage limit with no family named applies to.
 		"usage_limit_scope_probe",
+		// senpi 2026.11.10-3 (omo 5.1.70), warn: the one-time removal of fallback logs written before the shared redaction
+		// registry dropped queued lines or failed (retry-fallback/log.js createFallbackLogger, senpi#6334).
+		"queued_lines_dropped",
+		"retire_generations_failed",
+		// senpi 2026.11.15 (omo 5.1.71), warn: the account list that keeps billing- or sign-in-blocked accounts from
+		// releasing a usage-limit hold could not be read, so the unfiltered usage was used (agent-session.js
+		// _usageOfSelectableAccounts, senpi#6536).
+		"usage_accounts_unread",
 	]),
 	"config-reload.log": new Set([
 		"reload_deferred",
@@ -141,6 +150,8 @@ export function normalizeLogRecord(source, record) {
 			return { ...base, type: "close", reason: record.reason };
 		case "provider_error":
 			return { ...base, type: "providerError", error: String(record.error ?? "") };
+		case "host_restart_resume_failed":
+			return { ...base, type: "hostRestartResumeFailed", error: String(record.error ?? "") };
 		case "cooldown_noted":
 			return { ...base, type: "cooldown", selector: record.selector, error: String(record.errorMessage ?? "") };
 		case "fallback_applied":

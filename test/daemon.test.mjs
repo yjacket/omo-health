@@ -1,15 +1,27 @@
 import "./helpers/tmp-root.mjs";
+import { projectKeyOf, subjectOf, subjectKey } from "../src/session-subject.mjs";
+const sub = (sessionId, cwd) => subjectOf({ sessionId, cwd });
+const key = (sessionId, cwd) => subjectKey(sub(sessionId, cwd));
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
 import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import { setImmediate } from "node:timers/promises";
+import { createAuditor, requestAudit } from "../src/auditor.mjs";
 import { runDaemon } from "../src/daemon.mjs";
 import { DEFAULT_CONFIG } from "../src/config.mjs";
+import { laneArgs } from "../src/judge/lane.mjs";
 import { resolvePaths } from "../src/paths.mjs";
+import { auditFileKey } from "../src/session-subject.mjs";
 import { queueReport } from "../src/reports/intake.mjs";
 import { RUN_KEY } from "../src/install.mjs";
+import { BACKFILL_MARKER } from "../src/session-backfill.mjs";
+import { createUsageIndex } from "../src/usage-index.mjs";
 import { makeWorld, sessionState, taskRecord } from "./helpers/world.mjs";
+import { E, writeJsonl } from "./helpers/fixtures.mjs";
 import { fakeProc, guardProcessListeners } from "./helpers/fake-proc.mjs";
 
 guardProcessListeners();
@@ -396,4 +408,349 @@ test("a pinned daemon never uninstalls when its source path is missing", async (
 	});
 	assert.equal(result.reason, "idle-no-omo-hosts");
 	assert.deepEqual(removed, []);
+});
+
+test("a pending v3 reconciliation does not delay the next board for a verified 31.5 MiB live append", async (t) => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "daemon-usage-budget-"));
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health") });
+	const start = Date.now();
+	const cwd = path.join(root, "proj");
+	const dir = path.join(paths.sessionsDir, projectKeyOf(cwd));
+	const file = path.join(dir, "2026-09-28T12-00-00-000Z_m1.jsonl");
+	const assistant = (input) => E.assistant({ ms: start, usage: { input, output: 0, cacheRead: 0, cacheWrite: 0 } });
+	const header = (id, timestamp) => ({ type: "session", version: 3, id, cwd, timestamp: new Date(timestamp).toISOString() });
+	writeJsonl(file, [header("m1", start), assistant(10)]);
+	let ticks = 0;
+	const clock = { now: () => start + ticks * 60_000 };
+	const index = createUsageIndex({ file: paths.health.usageIndexFile, clock });
+	index.update(sub("m1", cwd), file, { kind: "main" });
+	assert.equal(index.get(key("m1", cwd)).published.total, 10);
+	index.save();
+	const marker = path.join(paths.health.sessionsDir, BACKFILL_MARKER);
+	fs.writeFileSync(marker, JSON.stringify({ v: 2 }));
+	for (let i = 0; i < 6; i++) {
+		writeJsonl(path.join(dir, `old-${i}.jsonl`), [header(`old-${i}`, start - 3_600_000), " ".repeat(320 * 1024)]);
+	}
+	const initialSize = fs.statSync(file).size;
+	const finalLine = `${JSON.stringify(assistant(20))}\n`;
+	const appendBytes = 31.5 * 1024 * 1024;
+	const padding = Buffer.alloc(1024 * 1024, 32);
+	padding[padding.length - 1] = 10;
+	for (let i = 0; i < 31; i++) fs.appendFileSync(file, padding);
+	fs.appendFileSync(file, padding.subarray(0, appendBytes - 31 * padding.length - finalLine.length - 1));
+	fs.appendFileSync(file, `\n${finalLine}`);
+	assert.equal(fs.statSync(file).size - initialSize, appendBytes);
+
+	const read = (f) => JSON.parse(fs.readFileSync(f, "utf8"));
+	const boards = [];
+	const versions = [];
+	const result = await runDaemon({
+		proc: fakeProc(), paths, clock, config: DEFAULT_CONFIG,
+		overrides: {
+			procs: { kind: "fake" }, env: {},
+			createEngine: () => ({
+				async tick() {
+					ticks++;
+					return { findings: [], world: makeWorld({ now: clock.now(), procsFresh: true,
+						sessions: [sessionState({ id: "m1", file, kind: "main", cwd, startedMs: start })],
+						sensors: [{ sessionId: "m1", pid: 4321, ts: clock.now(), idle: true }] }) };
+				},
+				table: { all: () => [] }, close() {},
+			}),
+			sleep: async () => {
+				boards.push(read(paths.health.sessionsSnapshotFile).groups.flatMap((g) => g.sessions).find((row) => row.sessionId === "m1"));
+				versions.push(read(marker).v);
+				if (ticks === 2) fs.writeFileSync(paths.health.stoppedFile, "");
+			},
+		},
+	});
+	assert.equal(result.reason, "stopped-file");
+	assert.equal(boards[0].tokens.total, 30, "the next board includes every token in the live append");
+	assert.equal(boards[0].tokensPending, false);
+	assert.deepEqual(versions, [2, 3], "reconciliation stays pending on the busy tick and completes on the idle tick");
+});
+
+test("the daemon indexes a live session's tokens into sessions/usage.json and puts them on the board", async () => {
+	const start = Date.parse("2026-09-28T12:00:00Z");
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "daemon-usage-"));
+	const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health") });
+	const file = path.join(paths.sessionsDir, projectKeyOf("C:/dev/proj"), "2026-09-28T12-00-00-000Z_m1.jsonl");
+	writeJsonl(file, [E.assistant({ ms: start, usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } })]);
+	let ticks = 0;
+	const clock = { now: () => start + ticks * 60_000 };
+	const reader = () =>
+		makeWorld({
+			now: clock.now(),
+			procsFresh: true,
+			sessions: [sessionState({ id: "m1", file, kind: "main", cwd: "C:\\dev\\proj", startedMs: start - 1000 })],
+			sensors: [{ sessionId: "m1", pid: 4321, ts: clock.now(), idle: true }],
+		});
+	const engine = () => ({
+		async tick() {
+			ticks++;
+			return { findings: [], world: reader() };
+		},
+		table: { all: () => [] }, close() {},
+	});
+	await runDaemon({ proc: fakeProc(), paths, config: { ...DEFAULT_CONFIG, idleExitMs: 2 * 60_000 }, clock, overrides: { procs: { kind: "fake" }, createEngine: engine, env: {} } });
+
+	const entry = (await import("../src/usage-index.mjs")).readUsageIndex(paths.health.usageIndexFile).get(key("m1", "C:/dev/proj"));
+	assert.equal(entry.complete, true);
+	assert.equal(entry.published.total, 15);
+	assert.equal(entry.published.input, 10);
+	const board = JSON.parse(fs.readFileSync(paths.health.sessionsSnapshotFile, "utf8"));
+	const row = board.groups.flatMap((g) => g.sessions).find((session) => session.sessionId === "m1");
+	assert.equal(row.tokens.total, 15, "status/_sessions.json carries the token total");
+	assert.equal(row.tokensPending, false);
+});
+
+test("128 simultaneous live ends read at most one ledger day plus their appended lines", async (t) => {
+	const { paths } = fixture();
+	const start = Date.UTC(2026, 8, 28, 12);
+	const dayFile = path.join(paths.health.sessionsDir, "ended-2026-09-28.jsonl");
+	const seed = `${JSON.stringify({ sessionId: "seed", endedMs: start, reason: "x".repeat(128 * 1024) })}\n`;
+	const seedBytes = Buffer.byteLength(seed);
+	const cwd = path.join(path.dirname(paths.healthHome), "project");
+	const parent = sessionState({ id: "parent", cwd, startedMs: start });
+	const tasks = Array.from({ length: 128 }, (_, i) => taskRecord({
+		taskId: `st_burst_${i}`, childSessionId: `child-${i}`, parentSessionId: parent.id,
+		rootSessionId: parent.id, spawnCwd: cwd,
+	}));
+	const fds = new Set();
+	const { openSync, readSync, closeSync } = fs;
+	let tick = 0;
+	const ledgerBytes = [0, 0, 0, 0];
+	t.mock.method(fs, "openSync", (file, flags, ...args) => {
+		const fd = openSync(file, flags, ...args);
+		if (file === dayFile && flags === "r") fds.add(fd);
+		return fd;
+	});
+	t.mock.method(fs, "readSync", (fd, ...args) => {
+		const n = readSync(fd, ...args);
+		if (fds.has(fd)) ledgerBytes[tick] += n;
+		return n;
+	});
+	t.mock.method(fs, "closeSync", (fd) => {
+		fds.delete(fd);
+		return closeSync(fd);
+	});
+	const clock = { now: () => start + tick * 60_000 };
+	t.mock.method(Date, "now", clock.now);
+	const transcripts = tasks.map(({ taskId, childSessionId }) => path.join(cwd, ".omo", "senpi-task", "children", taskId,
+		"sessions", taskId, `2026-09-28T12-00-00-000Z_${childSessionId}.jsonl`));
+	const createEngine = () => ({
+		async tick() {
+			tick++;
+			if (tick === 2) {
+				fs.mkdirSync(paths.health.sessionsDir, { recursive: true });
+				fs.writeFileSync(dayFile, seed);
+			}
+			if (tick === 3) {
+				for (const [i, file] of transcripts.entries()) {
+					writeJsonl(file, [E.assistant({ ms: start, usage: { input: i + 1, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } })]);
+				}
+			}
+			const world = makeWorld({
+				now: clock.now(), procsFresh: true, sessions: [parent],
+				sensors: [{ sessionId: parent.id, pid: 4321, ts: clock.now(), idle: true }],
+				tasks: tick === 1 ? tasks : tick === 2 ? tasks.map((task) => ({
+					...task, status: "completed", terminal: true, active: false, terminalAtMs: clock.now(),
+				})) : [],
+			});
+			return { findings: [], world };
+		},
+		table: { all: () => [] }, close() {},
+	});
+	await runDaemon({
+		paths, clock, proc: fakeProc(), config: { ...DEFAULT_CONFIG, idleExitMs: 2 * 60_000 },
+		overrides: { createEngine, env: {}, procs: { kind: "fake" }, sleep: async () => {} },
+	});
+	t.mock.restoreAll();
+	const appended = fs.readFileSync(dayFile).subarray(seedBytes);
+	const rows = appended.toString("utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+	assert.deepEqual(rows.map((row) => row.sessionId).sort(), tasks.map((task) => task.childSessionId).sort());
+	t.diagnostic(`append=${ledgerBytes[2]} B, drain=${ledgerBytes[3]} B, seed=${seedBytes} B, appended=${appended.length} B`);
+	assert.ok(ledgerBytes[2] <= seedBytes + appended.length, `append read ${ledgerBytes[2]} ledger bytes`);
+	assert.ok(ledgerBytes[3] <= appended.length, `drain read ${ledgerBytes[3]} ledger bytes`);
+	const index = (await import("../src/usage-index.mjs")).readUsageIndex(paths.health.usageIndexFile);
+	for (const [i, task] of tasks.entries()) {
+		const entry = index.get(subjectKey(subjectOf(rows.find((row) => row.sessionId === task.childSessionId))));
+		assert.equal(entry?.published?.total, i + 1, task.childSessionId);
+		assert.equal(entry.file, transcripts[i]);
+	}
+});
+
+test("a bad live end logs its own append failure without discarding valid siblings", async () => {
+	const { paths } = fixture();
+	const start = Date.UTC(2026, 8, 28, 12);
+	let tick = 0;
+	const clock = { now: () => start + tick * 60_000 };
+	const parent = sessionState({ id: "parent", startedMs: start });
+	const tasks = ["good1", "bad", "good2"].map((id) => taskRecord({
+		taskId: `st_${id}`, childSessionId: id, parentSessionId: parent.id, rootSessionId: parent.id,
+	}));
+	const createEngine = () => ({
+		async tick() {
+			tick++;
+			return { findings: [], world: makeWorld({
+				now: clock.now(), procsFresh: true, sessions: [parent],
+				sensors: [{ sessionId: parent.id, pid: 4321, ts: clock.now(), idle: true }],
+				tasks: tick === 1 ? tasks : tick === 2 ? tasks.map((task) => ({
+					...task, status: "completed", terminal: true, active: false,
+					terminalAtMs: task.childSessionId === "bad" ? 1e20 : clock.now(),
+				})) : [],
+			}) };
+		},
+		table: { all: () => [] }, close() {},
+	});
+	await runDaemon({
+		paths, clock, proc: fakeProc(), config: { ...DEFAULT_CONFIG, idleExitMs: 2 * 60_000 },
+		overrides: { createEngine, env: {}, procs: { kind: "fake" }, sleep: async () => {} },
+	});
+	const log = fs.readFileSync(path.join(paths.health.logsDir, "daemon.log"), "utf8");
+	assert.match(log, /session_ended_write_failed[^\n]*"sessionId":"bad"[^\n]*Invalid time value/);
+	assert.doesNotMatch(log, /session_board_failed/);
+	const { readEnded } = await import("../src/session-ledger.mjs");
+	assert.deepEqual(readEnded(paths).map(({ sessionId }) => sessionId), ["good1", "good2"]);
+});
+
+test("the idle exit is held while the auditor is busy, and the auditor ticks on the daemon clock in every mode", async () => {
+	const f = fixture();
+	const ticked = [];
+	let factoryOptions;
+	const createAuditor = (options) => {
+		factoryOptions = options;
+		return { tick: (now) => ticked.push(now), busy: () => f.ticks < 5 };
+	};
+	const result = await runDaemon({ proc: fakeProc(), paths: f.paths, mode: "shadow", config: { ...DEFAULT_CONFIG, idleExitMs: 2 * 60_000 }, clock: f.clock, overrides: { procs: { kind: "fake" }, createEngine: f.fakeEngine, createAuditor, env: {} } });
+	assert.equal(result.reason, "idle-no-omo-hosts");
+	assert.equal(f.ticks, 5, "without the hold the daemon would leave after 3 ticks");
+	assert.equal(ticked.length, 5);
+	assert.deepEqual(ticked, ticked.toSorted((a, b) => a - b));
+	assert.equal(factoryOptions.paths, f.paths);
+	assert.equal(typeof factoryOptions.runner.poll, "function");
+});
+
+test("a throwing audit tick is logged as audit_tick_failed and the daemon keeps running", async () => {
+	const f = fixture();
+	const createAuditor = () => ({
+		tick() {
+			throw new Error("audit boom");
+		},
+		busy: () => false,
+	});
+	const result = await runDaemon({ proc: fakeProc(), paths: f.paths, config: { ...DEFAULT_CONFIG, idleExitMs: 2 * 60_000 }, clock: f.clock, overrides: { procs: { kind: "fake" }, createEngine: f.fakeEngine, createAuditor, env: {} } });
+	assert.equal(result.reason, "idle-no-omo-hosts");
+	assert.equal(f.ticks, 3);
+	const log = fs.readFileSync(path.join(f.paths.health.logsDir, "daemon.log"), "utf8");
+	assert.match(log, /audit_tick_failed/);
+});
+
+test("audit survivor lookup does not stall token publication or release the audit slot", { timeout: 10_000 }, async (t) => {
+	const { paths } = fixture();
+	const start = Date.UTC(2026, 8, 28, 12);
+	const file = path.join(paths.sessionsDir, projectKeyOf("C:/dev/proj"), "2026-09-28T12-00-00-000Z_m1.jsonl");
+	const line = (input) => E.assistant({ ms: start, usage: { input, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } });
+	writeJsonl(file, [line(10)]);
+	const jobId = "prior-audit";
+	const jobDir = path.join(paths.health.jobsDir, jobId);
+	const recordFile = path.join(paths.health.auditsDir, `${auditFileKey(sub("m1", "C:/dev/proj"))}.json`);
+	const read = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
+	const write = (file, value) => fs.writeFileSync(file, JSON.stringify(value));
+	fs.mkdirSync(jobDir, { recursive: true });
+	fs.mkdirSync(paths.health.auditsDir, { recursive: true });
+	write(recordFile, { v: 1, ...sub("m1", "C:/dev/proj"), status: "running", jobId, startedMs: start, launchMs: start });
+	write(path.join(jobDir, "meta.json"), {
+		kind: "audit", pid: 70000, startedMs: start, timeoutMs: 900_000,
+		args: laneArgs({ model: "p/reviewer", bundleFile: path.join(jobDir, "bundle.md"), sessionId: "prior-lane" }),
+	});
+	write(path.join(jobDir, "exit.json"), { code: 1 });
+	const budget = { day: "2026-09-28", count: 1, jobs: [jobId] };
+	write(paths.health.auditBudgetFile, budget);
+	requestAudit(paths, sub("next", "C:/dev/proj"), start);
+
+	const signal = new Int32Array(new SharedArrayBuffer(4));
+	const entered = Promise.withResolvers();
+	const release = Promise.withResolvers();
+	let syncWait;
+	let lookups = 0;
+	const lookup = (command, args) => {
+		assert.equal(command, "powershell.exe");
+		assert.match(args.at(-1), /Get-CimInstance.*CommandLine/);
+		lookups++;
+		entered.resolve();
+	};
+	t.mock.method(childProcess, "execFileSync", (command, args) => {
+		lookup(command, args);
+		// The baseline cannot get back to the code that signals this gate.
+		syncWait = Atomics.wait(signal, 0, 0, 750);
+		return "";
+	});
+	t.mock.method(childProcess, "execFile", (command, args, options, callback) => {
+		lookup(command, args);
+		assert.equal(options.timeout, 15_000);
+		void release.promise.then(() => callback(null, "", ""));
+	});
+	syncBuiltinESMExports();
+	t.after(() => {
+		t.mock.restoreAll();
+		syncBuiltinESMExports();
+	});
+
+	let ticks = 0;
+	let preparations = 0;
+	const clock = { now: () => start + ticks * 60_000 };
+	const createEngine = () => ({
+		async tick() {
+			ticks++;
+			return { findings: [], world: makeWorld({
+				now: clock.now(), procsFresh: true,
+				sessions: [sessionState({ id: "m1", file, kind: "main", cwd: "C:\\dev\\proj", startedMs: start - 1000 })],
+				sensors: [{ sessionId: "m1", pid: 4321, ts: clock.now(), idle: true }],
+			}) };
+		},
+		table: { all: () => [] }, close() {},
+	});
+	const result = await runDaemon({
+		proc: fakeProc(), paths, clock, config: { ...DEFAULT_CONFIG, audit: { ...DEFAULT_CONFIG.audit, enabled: true } },
+		overrides: {
+			procs: { kind: "fake" }, createEngine, env: {},
+			createAuditor: (options) => createAuditor({
+				...options, createWorker() {
+					preparations++;
+					return { on() {}, ref() {}, postMessage() {}, terminate() {} };
+				},
+			}),
+			sleep: async () => {
+				if (ticks <= 2) {
+					await entered.promise;
+					assert.equal(syncWait, undefined, "the daemon reached its next tick boundary before the lookup gate timed out");
+					const board = read(paths.health.sessionsSnapshotFile);
+					const row = board.groups.flatMap((g) => g.sessions).find((session) => session.sessionId === "m1");
+					assert.equal(row.tokens.total, ticks === 1 ? 10 : 30);
+					assert.equal(read(recordFile).status, "running");
+					assert.equal(read(path.join(paths.health.auditsDir, `${auditFileKey(sub("next", "C:/dev/proj"))}.json`)).status, "queued");
+					assert.deepEqual(read(paths.health.auditBudgetFile), budget);
+					assert.equal(preparations, 0);
+					assert.equal(lookups, 1, "a pending lookup is not repeated even after the next poll interval");
+					if (ticks === 1) fs.appendFileSync(file, `${JSON.stringify(line(20))}\n`);
+					else {
+						Atomics.store(signal, 0, 1);
+						Atomics.notify(signal, 0);
+						release.resolve();
+						await setImmediate();
+						assert.equal(read(recordFile).status, "running", "only a tick consumes the result");
+					}
+				} else if (ticks === 3) {
+					assert.deepEqual([read(recordFile).status, read(recordFile).reason], ["failed", "exit-1"]);
+					assert.deepEqual(read(paths.health.auditBudgetFile), budget);
+				} else {
+					assert.equal(preparations, 1, "confirmed absence lets the second audit proceed");
+					fs.writeFileSync(paths.health.stoppedFile, "");
+				}
+			},
+		},
+	});
+	assert.equal(result.reason, "stopped-file");
 });

@@ -20,7 +20,7 @@ const CLAUDE = "anthropic-subscription/default";
 const CODEX = "chatgpt-subscription/default";
 const STAGED_PROJECT = "sid-main:goal-1";
 const DENIED_PROJECT = "sid-denied:goal-1";
-const BUDGET_MAPS = ["BUDGET_STATE_LABELS", "BUDGET_ACCOUNT_LABELS", "BUDGET_PROJECT_STATUS_LABELS", "AUDIT_ASSESSMENT_LABELS", "AUDIT_STATUS_LABELS", "BUDGET_TRIGGER_LABELS", "BUDGET_AUDIT_DEFERRED_LABELS", "BUDGET_DENIAL_LABELS"];
+const BUDGET_MAPS = ["BUDGET_STATE_LABELS", "BUDGET_ACCOUNT_LABELS", "BUDGET_PROJECT_STATUS_LABELS", "AUDIT_ASSESSMENT_LABELS", "BUDGET_AUDIT_STATUS_LABELS", "BUDGET_TRIGGER_LABELS", "BUDGET_AUDIT_DEFERRED_LABELS", "BUDGET_DENIAL_LABELS"];
 
 /* ---------- fake DOM ---------- */
 
@@ -141,18 +141,22 @@ class FakeElement extends FakeNode {
 	querySelectorAll(selector) {
 		return descendants(this).filter((n) => matches(n, selector));
 	}
+	querySelector(selector) {
+		return this.querySelectorAll(selector)[0] ?? null;
+	}
 }
 
 function descendants(node) {
 	return node.childNodes.filter((n) => n instanceof FakeElement).flatMap((n) => [n, ...descendants(n)]);
 }
 
-/** The selectors app.js uses: tag, .class, [attr] and :not(.class) compounds, descendant chains and comma lists. */
+/** The selectors app.js uses: tag, #id, .class, [attr] and :not(.class) compounds, descendant chains and comma lists. */
 function matchesCompound(node, compound) {
-	const parsed = /^([a-z][a-z0-9]*)?((?:\.[\w-]+|\[[\w-]+\]|:not\(\.[\w-]+\))*)$/i.exec(compound);
+	const parsed = /^([a-z][a-z0-9]*)?((?:#[\w-]+|\.[\w-]+|\[[\w-]+\]|:not\(\.[\w-]+\))*)$/i.exec(compound);
 	if (!parsed) throw new Error(`unsupported selector ${compound}`);
 	if (parsed[1] && node.localName !== parsed[1].toLowerCase()) return false;
-	return (parsed[2].match(/\.[\w-]+|\[[\w-]+\]|:not\(\.[\w-]+\)/g) ?? []).every((part) => {
+	return (parsed[2].match(/#[\w-]+|\.[\w-]+|\[[\w-]+\]|:not\(\.[\w-]+\)/g) ?? []).every((part) => {
+		if (part.startsWith("#")) return node.id === part.slice(1);
 		if (part.startsWith(".")) return node.classList.contains(part.slice(1));
 		if (part.startsWith("[")) return node.hasAttribute(part.slice(1, -1));
 		return !node.classList.contains(part.slice(6, -1));
@@ -191,6 +195,7 @@ function createDocument(html) {
 	doc.activeElement = doc.body;
 	doc.getElementById = (id) => descendants(top).find((n) => n.id === id) ?? null;
 	doc.querySelectorAll = (selector) => top.querySelectorAll(selector);
+	doc.querySelector = (selector) => top.querySelector(selector);
 	return doc;
 }
 
@@ -391,7 +396,7 @@ describe("dashboard budget tab", { timeout: 20_000 }, () => {
 		const statuses = Object.keys(labels.BUDGET_PROJECT_STATUS_LABELS);
 		const denialReasons = Object.keys(labels.BUDGET_DENIAL_LABELS);
 		const assessed = Object.keys(labels.AUDIT_ASSESSMENT_LABELS);
-		const unassessed = Object.keys(labels.AUDIT_STATUS_LABELS);
+		const unassessed = Object.keys(labels.BUDGET_AUDIT_STATUS_LABELS);
 		const accounts = Object.keys(labels.BUDGET_ACCOUNT_LABELS);
 		const page = await openPage(
 			snapshot({
@@ -418,7 +423,7 @@ describe("dashboard budget tab", { timeout: 20_000 }, () => {
 		const auditRows = rowsOf(page, "budget-audits");
 		assert.deepEqual(
 			auditRows.map((row) => chipText(row)[0]),
-			[...Object.values(labels.AUDIT_ASSESSMENT_LABELS), ...Object.values(labels.AUDIT_STATUS_LABELS)],
+			[...Object.values(labels.AUDIT_ASSESSMENT_LABELS), ...Object.values(labels.BUDGET_AUDIT_STATUS_LABELS)],
 		);
 		const appJs = fs.readFileSync(path.join(STATIC, "app.js"), "utf8");
 		for (const name of BUDGET_MAPS) assert.equal((appJs.match(new RegExp(`const ${name} = `, "g")) ?? []).length, 1, name);
@@ -434,7 +439,7 @@ describe("dashboard budget tab", { timeout: 20_000 }, () => {
 		cover("BUDGET_PROJECT_STATUS_LABELS", sourceLiterals("src/budget/projects.mjs", /const STATUS_[A-Z]+ = "([a-z-]+)"/g), "project status");
 		cover("BUDGET_DENIAL_LABELS", sourceLiterals("src/budget/projects.mjs", /reason: "([a-z-]+)"/g), "denial reason");
 		cover("AUDIT_ASSESSMENT_LABELS", JSON.parse(`[${sourceLiterals("src/budget/audit.mjs", /const ASSESSMENTS = Object\.freeze\(\[([^\]]+)\]\)/g)[0]}]`), "assessment");
-		cover("AUDIT_STATUS_LABELS", sourceLiterals("src/budget/audit-job.mjs", /status: "([a-z-]+)"/g), "audit status");
+		cover("BUDGET_AUDIT_STATUS_LABELS", sourceLiterals("src/budget/audit-job.mjs", /status: "([a-z-]+)"/g), "audit status");
 	});
 
 	it("shows spent (main/sub), approved, estimate p50 and the staged chip per project, and the audit row's time, project, advice line, model and cost", async () => {

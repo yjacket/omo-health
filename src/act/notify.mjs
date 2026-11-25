@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { atomicWriteJson, readJsonSafe } from "../util/fsx.mjs";
+import { appendJsonl, atomicWriteJson, readJsonSafe } from "../util/fsx.mjs";
 import { truncate } from "../util/text.mjs";
 
 export const TOAST_SCRIPT = path.resolve(fileURLToPath(new URL("../../scripts/toast.ps1", import.meta.url)));
@@ -72,18 +72,36 @@ export function powershellToastRunner({ title, body, tag }) {
 }
 
 /**
+ * Isolated runs (staging, replays, QA) set OMO_HEALTH_TOAST_LOG and every toast is recorded there instead of
+ * reaching the operator's desktop. An empty value means the normal PowerShell runner.
+ */
+export function resolveToastRunner(env = {}) {
+	const file = env?.OMO_HEALTH_TOAST_LOG;
+	return typeof file === "string" && file.length > 0 ? recordingToastRunner(file) : powershellToastRunner;
+}
+
+/** Records one JSON line per toast in `file`; never spawns a process. */
+export function recordingToastRunner(file) {
+	return ({ title, body, tag }) => {
+		appendJsonl(file, { ts: Date.now(), title, body, tag });
+		return { ok: true, status: 0, stderr: "" };
+	};
+}
+
+/**
  * Toast with a per-tag cooldown persisted in healthHome/toast-state.json, so
  * the same human-needed condition does not nag (IS-10c, notify.toastCooldownMs).
  */
-export function createNotifier({ paths, clock, config, runner = powershellToastRunner, log }) {
+export function createNotifier({ paths, clock, config, runner, env = process.env, log }) {
 	const stateFile = path.join(paths.healthHome, "toast-state.json");
+	const toastRunner = runner ?? resolveToastRunner(env);
 	return {
 		toast({ title, body, tag }) {
 			const now = clock.now();
 			const state = readJsonSafe(stateFile, {});
 			const last = state[tag];
 			if (last && now - last < config.notify.toastCooldownMs) return { ok: false, skipped: "cooldown" };
-			const result = runner({ title, body: truncate(body, 240), tag });
+			const result = toastRunner({ title, body: truncate(body, 240), tag });
 			if (result.ok) {
 				state[tag] = now;
 				atomicWriteJson(stateFile, state);

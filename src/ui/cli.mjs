@@ -2,16 +2,109 @@ import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { Worker } from "node:worker_threads";
 import { loadConfig } from "../config.mjs";
 import { listSubjectsNow, runDiagnose } from "../diagnose.mjs";
 import { createLogger } from "../log.mjs";
+import { createDetailOperations } from "./detail-worker.mjs";
 import { uiState } from "./model.mjs";
 import { createUiServer } from "./server.mjs";
+import { buildSessionListView, buildSessionView } from "./session-view.mjs";
 
 const DEFAULT_IDLE_MINUTES = 30;
 /** Env keys that mean "tests or staging": the launcher must not open a browser on the operator's desktop. OMO_HEALTH_CONFIG is a real user setting, so it is not one. */
 const SANDBOX_MARKERS = new Set(["OMO_HEALTH_HOME", "OMO_HEALTH_OMO_HOME", "OMO_HEALTH_CLAUDE_HOME", "NODE_TEST_CONTEXT"]);
 const DEFAULT_BIN_PATH = fileURLToPath(new URL("../../bin/omo-health.mjs", import.meta.url));
+const DETAIL_WORKER_URL = new URL("./detail-worker.mjs", import.meta.url);
+
+/** One lazy worker, shared by the two dashboard routes. Replies follow postMessage order. */
+export function createDetailWorker({ paths, env = process.env, workerUrl = DETAIL_WORKER_URL, workerData } = {}) {
+	let current;
+	let closed = false;
+	let closing;
+
+	function start() {
+		const worker = new Worker(workerUrl, { workerData: { ...workerData, detailWorker: true, paths, env: { OMO_HEALTH_CONFIG: env.OMO_HEALTH_CONFIG } } });
+		const pending = new Set();
+		const instance = { worker, pending };
+		const fail = (error) => {
+			if (current === instance) current = undefined;
+			for (const job of pending) job.reject(error);
+			pending.clear();
+		};
+		worker.on("message", ({ result, error }) => {
+			const job = pending.values().next().value;
+			if (!job) return;
+			pending.delete(job);
+			if (!pending.size) worker.unref();
+			if (error !== undefined) job.reject(new Error(error));
+			else job.resolve(result);
+		});
+		worker.on("error", fail);
+		worker.on("messageerror", (error) => {
+			fail(error);
+			void worker.terminate();
+		});
+		worker.on("exit", (code) => fail(new Error(`Detail worker exited (code ${code})`)));
+		worker.unref();
+		return instance;
+	}
+
+	return {
+		run(job) {
+			return new Promise((resolve, reject) => {
+				if (closed) throw new Error("Detail worker is closed");
+				const { worker, pending } = current ??= start();
+				const entry = { resolve, reject };
+				pending.add(entry);
+				try {
+					// A caller awaiting a reply without an HTTP socket still needs the result.
+					worker.ref();
+					worker.postMessage(job);
+				} catch (error) {
+					pending.delete(entry);
+					if (!pending.size) worker.unref();
+					throw error;
+				}
+			});
+		},
+		close() {
+			closed = true;
+			return closing ??= current?.worker.terminate() ?? Promise.resolve();
+		},
+	};
+}
+
+/** Keep the explicitly injected synchronous operations used by unit tests. */
+export function createAuditDetail({ now = Date.now, ...options } = {}) {
+	const prepare = createDetailOperations(options);
+	return (record, id) => prepare({ kind: "preview", id, now: now(), record });
+}
+
+const attachClose = (handler, worker) => Object.assign(handler, { close: worker?.close });
+
+/** POST /api/audit returns `[status, body]` and only writes the daemon's request file. */
+export function createStartAudit({ paths, env = process.env, now = Date.now, worker, ...options } = {}) {
+	const local = Object.keys(options).length ? createDetailOperations({ paths, env, ...options }) : null;
+	const detailWorker = worker ?? (local ? null : createDetailWorker({ paths, env }));
+	return attachClose((id, row) => {
+		const job = { kind: "audit", id, row, now: now() };
+		return detailWorker ? detailWorker.run(job) : local(job);
+	}, detailWorker);
+}
+
+/** The worker owns the historical cache; label only the page it returns. */
+export function createSessionDetail({ paths, env = process.env, now = Date.now, load, maxEntries, auditDetail, worker } = {}) {
+	const local = load || auditDetail ? createDetailOperations({ paths, env, load, auditDetail, maxEntries }) : null;
+	const detailWorker = worker ?? (local ? null : createDetailWorker({ paths, env, workerData: { maxEntries } }));
+	const view = ({ record, audit, page }) => page ? buildSessionListView(page) : buildSessionView(record, { audit });
+
+	function sessionDetail(id, row, pagination = { list: null, offset: 0 }) {
+		const job = { kind: "detail", id, row, now: now(), pagination };
+		return detailWorker ? detailWorker.run(job).then(view) : view(local(job));
+	}
+	return attachClose(sessionDetail, detailWorker);
+}
 
 /** Opens url in the default browser without waiting for it: resolves to { ok, error? }. */
 export function defaultOpenBrowser(url, { platform = process.platform, spawnImpl = spawn } = {}) {
@@ -103,7 +196,8 @@ async function runServer(options, { paths, env, proc }) {
 		const { config } = loadConfig({ env, paths });
 		return id ? runDiagnose({ paths, config, id }) : listSubjectsNow({ paths, config });
 	};
-	const server = createUiServer({ paths, token, idleMs, getState: () => uiState({ paths, env, now: Date.now() }), diagnose, log: (event, data) => logger.error(event, data) });
+	const worker = createDetailWorker({ paths, env });
+	const server = createUiServer({ paths, token, idleMs, getState: () => uiState({ paths, env, now: Date.now() }), diagnose, sessionDetail: createSessionDetail({ paths, env, worker }), startAudit: createStartAudit({ paths, env, worker }), log: (event, data) => logger.error(event, data) });
 	const { port } = await server.listen();
 	proc.send?.({ type: "listening", port }, () => proc.disconnect?.());
 	return new Promise((resolve) => {

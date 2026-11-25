@@ -45,7 +45,7 @@ export function providerOf(session) {
 }
 
 /** `trim`, `warn` or null: the size or the count, whichever reaches its threshold first. A Claude subagent warns at its own line. */
-function imageLevel(images, bytes, cfg, child = false) {
+export function imageLevel(images, bytes, cfg, child = false) {
 	if (bytes >= cfg.imageTrimBytes || images >= cfg.imageTrimCount) return "trim";
 	const warnBytes = child ? cfg.imageWarnChildBytes : cfg.imageWarnBytes;
 	const warnCount = child ? cfg.imageWarnChildCount : cfg.imageWarnCount;
@@ -69,21 +69,24 @@ function sessionSubject(session, key) {
 	return { sessionId: session.id, taskId: session.taskId, parentSessionId: session.parentSessionId, key };
 }
 
+export function isCacheStormTurn(turn, previous, cfg) {
+	return turn.cacheWrite >= cfg.cacheStormWrite && turn.cacheRead < cfg.cacheStormReadFrac * contextOf(previous);
+}
+
 /** 4a: the latest run of >= 2 consecutive storm turns. */
-function cacheStorm(session, cfg) {
+export function cacheStorm(session, cfg) {
 	const turns = session.turns ?? [];
 	let run = [];
 	let best;
 	let prevContext;
 	for (let i = 1; i < turns.length; i += 1) {
 		const turn = turns[i];
-		const context = contextOf(turns[i - 1]);
-		const storm = turn.cacheWrite >= cfg.cacheStormWrite && turn.cacheRead < cfg.cacheStormReadFrac * context;
-		if (!storm) {
+		const previous = turns[i - 1];
+		if (!isCacheStormTurn(turn, previous, cfg)) {
 			run = [];
 			continue;
 		}
-		if (!run.length) prevContext = context;
+		if (!run.length) prevContext = contextOf(previous);
 		run.push(turn);
 		if (run.length >= 2) best = { turns: [...run], prevContext };
 	}

@@ -1,6 +1,8 @@
+import fs from "node:fs";
 import path from "node:path";
+import { redactSubjectRecord } from "./decisions.mjs";
 import { atomicWriteJson, ensureDir, listDirSafe, readJsonSafe, removeSafe } from "./util/fsx.mjs";
-import { redact, truncate } from "./util/text.mjs";
+import { truncate } from "./util/text.mjs";
 
 /**
  * The investigation list (plan todo 8): one JSON file per suspicion in `paths.health.investigationsDir`, named by the
@@ -22,8 +24,22 @@ const DAY_MS = 24 * 3600_000;
 const MAX_ACTIONS = 20;
 const MAX_SIGNALS = 20;
 
-/** Masked like the decision log: an investigation file holds command text and verdict words. */
-const masked = (value) => JSON.parse(redact(JSON.stringify(value)));
+/** Unordered, one retained investigation at a time; callers select as they read. */
+export function* streamInvestigations(paths) {
+	let dir;
+	try {
+		dir = fs.opendirSync(paths.health.investigationsDir);
+		for (let entry; (entry = dir.readSync());) {
+			if (!entry.name.endsWith(".json")) continue;
+			const record = readJsonSafe(path.join(dir.path, entry.name));
+			if (typeof record?.id === "string" && record.id) yield record;
+		}
+	} catch {
+		// The directory may be absent or removed during retention.
+	} finally {
+		dir?.closeSync();
+	}
+}
 
 export function createInvestigations({ paths, clock }) {
 	const dir = paths.health.investigationsDir;
@@ -50,7 +66,7 @@ export function createInvestigations({ paths, clock }) {
 			const existing = get(id);
 			if (existing) return existing;
 			const now = clock.now();
-			const record = masked({ id, openedMs: now, trigger, subject: subject ?? {}, detector: detector ?? null, cls: cls ?? null, rule: rule ?? null, signature: signature === undefined || signature === null ? null : truncate(String(signature), 500), evidence, signals, status: "open", lane: lane ?? null, model: model ?? null, jobId: null, verdict: null, actions: [], failures: 0, retryAtMs: null, updatedMs: now });
+			const record = redactSubjectRecord({ id, openedMs: now, trigger, subject: subject ?? {}, detector: detector ?? null, cls: cls ?? null, rule: rule ?? null, signature: signature === undefined || signature === null ? null : truncate(String(signature), 500), evidence, signals, status: "open", lane: lane ?? null, model: model ?? null, jobId: null, verdict: null, actions: [], failures: 0, retryAtMs: null, updatedMs: now });
 			ensureDir(dir);
 			write(record);
 			return record;
@@ -62,7 +78,7 @@ export function createInvestigations({ paths, clock }) {
 		attach(id, patch = {}) {
 			const record = get(id);
 			if (!record) return undefined;
-			const { action, signal, failures, ...rest } = masked(patch);
+			const { action, signal, failures, ...rest } = redactSubjectRecord(patch);
 			Object.assign(record, rest);
 			if (failures === "+1") record.failures = (record.failures ?? 0) + 1;
 			else if (Number.isFinite(failures)) record.failures = failures;

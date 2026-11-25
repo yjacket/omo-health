@@ -1,4 +1,7 @@
+import { childSubjectOf, liveSessionView, subjectKey, subjectOf, taskParentResolver, uniqueMatch, worldLiveOwners } from "./session-subject.mjs";
 import path from "node:path";
+import { endedKey } from "./session-ledger.mjs";
+import { ambiguousLedgerTaskIds } from "./session-record.mjs";
 import { listDirSafe, readTextSafe, statSafe } from "./util/fsx.mjs";
 import { redact, truncate } from "./util/text.mjs";
 import { toMs } from "./util/time.mjs";
@@ -127,48 +130,68 @@ function countChildren(rows) {
  * @param {object[]} findings open findings of this tick
  * @param {object[]} investigations investigation records (createInvestigations().list())
  * @param {number} nowMs
+ * @param {{tokensOf?: (subject: { projectKey: string | null, sessionId: string | null }, taskId: string | null) => ({tokens?: object, treeTokens?: number | null, treeTokensComplete?: boolean, pending?: boolean, state?: "full"} | null | undefined)}} [options]
+ *   tokensOf is the injected token index lookup: `{tokens, treeTokens, treeTokensComplete}` for an indexed session, `{state:"full"}` when the
+ *   index refused the session, `{pending:true}` while its first read has not reached the end of the file, null when it is
+ *   unknown. Task id is a fallback only for an unambiguous visible row without a session id. Rows carry `tokensState: "full"` for refusal
+ *   or `tokensState` / `treeTokensState` of `"overflow"` for a non-finite total. A tree total can exist without an own total.
  */
-export function buildSessionSnapshot(world, findings = [], investigations = [], nowMs = world.now) {
+export function buildSessionSnapshot(world, findings = [], investigations = [], nowMs = world.now, { tokensOf, liveOwners = worldLiveOwners(world) } = {}) {
+	const tokenFields = (entry) => {
+		const tokens = entry?.tokens ?? null;
+		const tree = entry?.treeTokens ?? null;
+		const overflow = typeof tokens?.total === "number" && !Number.isFinite(tokens.total);
+		const treeOverflow = typeof tree === "number" && !Number.isFinite(tree);
+		return {
+			tokens: overflow ? { ...tokens, total: null } : tokens,
+			treeTokens: treeOverflow ? null : tree,
+			treeTokensComplete: entry?.treeTokensComplete === true,
+			tokensPending: entry?.pending === true,
+			...(overflow ? { tokensState: "overflow" } : entry?.state === "full" ? { tokensState: "full" } : {}),
+			...(treeOverflow ? { treeTokensState: "overflow" } : {}),
+		};
+	};
 	const openInvestigations = (investigations ?? []).filter((inv) => !RESOLVED_INVESTIGATIONS.has(inv.status));
 	const healthFor = ({ sessionId, taskId }) => {
 		const own = (subject) => (taskId ? subject?.taskId === taskId || (sessionId && subject?.sessionId === sessionId) : subject?.sessionId === sessionId && !subject?.taskId);
 		return healthOf((findings ?? []).filter((f) => own(f.subject)), openInvestigations.filter((inv) => own(inv.subject)));
 	};
 
-	// Children by parent session id; a task seen in two stores counts once.
-	const byParent = new Map();
-	const seen = new Set();
-	for (const task of world.tasks ?? []) {
-		const key = task.uid ?? task.taskId;
-		if (!task.parentSessionId || seen.has(key)) continue;
-		const recent = TERMINAL_STATUSES.has(task.status) && nowMs - (task.terminalAtMs ?? task.updatedAtMs ?? 0) <= RECENT_END_MS;
-		if (!ACTIVE_STATUSES.has(task.status) && !recent) continue;
-		seen.add(key);
-		if (!byParent.has(task.parentSessionId)) byParent.set(task.parentSessionId, []);
-		byParent.get(task.parentSessionId).push(task);
-	}
-	const childrenOf = (parentId, depth, trail) => {
-		if (depth > 8 || trail.has(parentId)) return [];
-		const next = new Set(trail).add(parentId);
-		return (byParent.get(parentId) ?? [])
-			.map((task) => ({
-				taskId: task.taskId,
-				sessionId: task.childSessionId ?? null,
-				name: clean(task.name ?? task.summary ?? task.taskId),
-				category: task.category ?? null,
-				model: task.model ?? null,
-				status: task.status,
-				startedMs: finite(task.startedAtMs ?? task.createdAtMs),
-				endedMs: finite(task.terminalAtMs),
-				health: healthFor({ sessionId: task.childSessionId, taskId: task.taskId }),
-				children: task.childSessionId ? childrenOf(task.childSessionId, depth + 1, next) : [],
-			}))
+	const { tasksOf, ambiguous } = boardTaskLinks(world, nowMs);
+	const childrenOf = (parent, depth, trail) => {
+		const parentKey = subjectKey(parent);
+		if (depth > 8 || trail.has(parentKey)) return [];
+		const next = new Set(trail).add(parentKey);
+		return tasksOf(parent)
+			.map((task) => {
+				const sessionId = task.childSessionId || null;
+				const taskId = task.taskId ?? null;
+				const subject = childSubjectOf({ sessionId, task, world, parent });
+				const cwd = world.sessions?.get(sessionId)?.cwd || task.spawnCwd;
+				const row = {
+					taskId: task.taskId,
+					sessionId,
+					...(cwd ? { cwd } : {}),
+					name: clean(task.name ?? task.summary ?? task.taskId),
+					category: task.category ?? null,
+					model: task.model ?? null,
+					status: task.status,
+					startedMs: finite(task.startedAtMs ?? task.createdAtMs),
+					endedMs: finite(task.terminalAtMs),
+					health: healthFor({ sessionId, taskId }),
+					...tokenFields(!sessionId && ambiguous.has(subjectKey({ ...subject, sessionId: taskId })) ? null : tokensOf?.(subject, taskId)),
+					children: sessionId ? childrenOf(subject, depth + 1, next) : [],
+				};
+				return row;
+			})
 			.sort((a, b) => (a.startedMs ?? 0) - (b.startedMs ?? 0));
 	};
 
 	const groups = new Map();
-	for (const session of world.sessions?.values?.() ?? []) {
-		if (session.kind !== "main" || !world.isSessionLive(session)) continue;
+	for (const raw of world.sessions?.values?.() ?? []) {
+		if (raw.kind !== "main" || !world.isSessionLive(raw)) continue;
+		const session = liveSessionView(raw, world);
+		const subject = subjectOf(session);
 		const hb = world.sensors?.get?.(session.id);
 		const hostPid = Number.isFinite(hb?.pid) ? hb.pid : session.hostPid;
 		const omoVersion = Number.isFinite(hostPid) ? (world.hostExits?.liveMarkers?.get?.(hostPid)?.omoVersion ?? null) : null;
@@ -186,7 +209,8 @@ export function buildSessionSnapshot(world, findings = [], investigations = [], 
 			todo,
 			lastInputMs: finite(toMs(hb?.lastInputAt)),
 			health: healthFor({ sessionId: session.id }),
-			children: childrenOf(session.id, 1, new Set()),
+			...tokenFields(tokensOf?.(subject, null)),
+			children: childrenOf(subject, 1, new Set()),
 		};
 		if (!groups.has(omoVersion)) groups.set(omoVersion, []);
 		groups.get(omoVersion).push(row);
@@ -194,10 +218,52 @@ export function buildSessionSnapshot(world, findings = [], investigations = [], 
 	return {
 		v: 1,
 		ts: nowMs,
+		liveOwners,
 		groups: [...groups.entries()]
 			.sort(([a], [b]) => compareVersionsDesc(a, b))
 			.map(([omoVersion, sessions]) => ({ omoVersion, sessions: sessions.sort((a, b) => (a.startedMs ?? 0) - (b.startedMs ?? 0)) })),
 	};
+}
+
+/** Only rows reached from live main sessions compete, including across groups. */
+export function boardTaskLinks(world, nowMs = world?.now) {
+	const byParent = new Map();
+	const seen = new Set();
+	const taskParent = taskParentResolver(world);
+	for (const task of world?.tasks ?? []) {
+		const key = task.uid ?? task.taskId;
+		if (!task.parentSessionId || seen.has(key)) continue;
+		const recent = TERMINAL_STATUSES.has(task.status) && nowMs - (task.terminalAtMs ?? task.updatedAtMs ?? 0) <= RECENT_END_MS;
+		if (!ACTIVE_STATUSES.has(task.status) && !recent) continue;
+		seen.add(key);
+		const parentKey = subjectKey(taskParent(task));
+		if (!parentKey) continue;
+		if (!byParent.has(parentKey)) byParent.set(parentKey, []);
+		byParent.get(parentKey).push(task);
+	}
+	const tasksOf = (parent) => {
+		const scoped = byParent.get(subjectKey(parent)) ?? [];
+		const legacy = parent.projectKey == null ? null : byParent.get(subjectKey({ sessionId: parent.sessionId }));
+		return legacy ? [...scoped, ...legacy] : scoped;
+	};
+	const rows = [];
+	const visit = (parent, depth, trail) => {
+		const parentKey = subjectKey(parent);
+		if (depth > 8 || trail.has(parentKey)) return;
+		const next = new Set(trail).add(parentKey);
+		for (const task of tasksOf(parent)) {
+			const sessionId = task.childSessionId || null;
+			const subject = childSubjectOf({ sessionId, task, world, parent });
+			rows.push({ ...subject, taskId: task.taskId, parentSessionId: parent.sessionId, parentKey });
+			if (sessionId) visit(subject, depth + 1, next);
+		}
+	};
+	for (const session of world?.sessions?.values?.() ?? []) {
+		if (session.kind === "main" && world.isSessionLive?.(session)) visit(subjectOf(liveSessionView(session, world)), 1, new Set());
+	}
+	// The board already has authoritative child session IDs, even when one equals a task ID.
+	const ambiguous = ambiguousLedgerTaskIds(rows.filter((row) => !row.sessionId), { scoped: true });
+	return { tasksOf, rows, ambiguous };
 }
 
 /** Executed release decisions of the last two decision files, keyed by task and session id. */
@@ -237,17 +303,9 @@ function crashFor(world, host, sinceMs, nowMs) {
 	return undefined;
 }
 
-function flatten(rows, parentSessionId, out = new Map()) {
-	for (const row of rows ?? []) {
-		out.set(row.taskId, { row, parentSessionId });
-		flatten(row.children, row.sessionId, out);
-	}
-	return out;
-}
-
 function mainsOf(snapshot) {
 	const out = new Map();
-	for (const group of snapshot?.groups ?? []) for (const row of group.sessions ?? []) out.set(row.sessionId, { row, omoVersion: group.omoVersion ?? null });
+	for (const group of snapshot?.groups ?? []) for (const row of group.sessions ?? []) out.set(endedKey(row), { row, omoVersion: group.omoVersion ?? null });
 	return out;
 }
 
@@ -260,8 +318,34 @@ export function detectEnded(prevSnapshot, snapshot, world, nowMs = world.now) {
 	const out = [];
 	const prevMains = mainsOf(prevSnapshot);
 	const curMains = mainsOf(snapshot);
-	const curChildren = new Map();
-	for (const { row } of curMains.values()) flatten(row.children, row.sessionId, curChildren);
+	const currentByTask = new Map();
+	const flatten = (mains, byTask) => {
+		const children = new Map();
+		const visit = (parent, root, inheritedCwd) => {
+			const parentSessionId = parent.sessionId;
+			const cwd = parent.cwd || inheritedCwd;
+			for (const row of parent.children ?? []) {
+				const sessionId = row.sessionId || row.taskId;
+				// The root already scopes both the child ID and the task alias.
+				const key = JSON.stringify([endedKey(root), parentSessionId, sessionId, row.taskId ?? null]);
+				children.set(key, { row, sessionId, parentSessionId, parentTaskId: parent.taskId, root, parentCwd: cwd, parentProjectKey: subjectOf({ cwd }).projectKey });
+				if (byTask && row.sessionId) byTask.set(JSON.stringify([endedKey(root), parentSessionId, row.taskId, row.taskId ?? null]), row);
+				visit(row, root, cwd);
+			}
+		};
+		for (const { row } of mains.values()) visit(row, row);
+		return children;
+	};
+	const curChildren = flatten(curMains, currentByTask);
+	const prevChildren = flatten(prevMains);
+	const taskParent = taskParentResolver(world, world.paths?.agentDir, [...prevChildren.values()].map(({ parentCwd }) => parentCwd));
+	const tasksByPair = new Map();
+	const pairKey = (parentId, taskId) => JSON.stringify([parentId, taskId]);
+	for (const task of world.tasks ?? []) {
+		const key = pairKey(task.parentSessionId, task.taskId);
+		if (!tasksByPair.has(key)) tasksByPair.set(key, []);
+		tasksByPair.get(key).push(task);
+	}
 	let releases;
 	const releaseOf = (...ids) => {
 		releases ??= recentReleases(world.paths);
@@ -270,9 +354,11 @@ export function detectEnded(prevSnapshot, snapshot, world, nowMs = world.now) {
 	};
 	const mainOutcome = new Map();
 
-	for (const [sessionId, { row, omoVersion }] of prevMains) {
-		if (curMains.has(sessionId)) continue;
-		const session = world.sessions?.get?.(sessionId);
+	for (const [key, { row, omoVersion }] of prevMains) {
+		if (curMains.has(key)) continue;
+		const { sessionId } = row;
+		const live = world.sessions?.get?.(sessionId);
+		const session = live && subjectKey(subjectOf(live)) === subjectKey(subjectOf(row)) ? live : undefined;
 		const goal = session?.anchor?.source === "goal" ? session.anchor : row.goal;
 		const crash = crashFor(world, row.host, prevSnapshot.ts ?? nowMs, nowMs);
 		let outcome;
@@ -290,7 +376,7 @@ export function detectEnded(prevSnapshot, snapshot, world, nowMs = world.now) {
 			outcome = "unknown";
 			reason = "세션이 보드에서 사라졌지만 끝난 이유를 알려 줄 기록이 없습니다.";
 		}
-		mainOutcome.set(sessionId, outcome);
+		mainOutcome.set(key, outcome);
 		out.push({
 			v: 1,
 			sessionId,
@@ -311,24 +397,22 @@ export function detectEnded(prevSnapshot, snapshot, world, nowMs = world.now) {
 		});
 	}
 
-	const prevChildren = new Map();
-	const rootOf = new Map();
-	for (const [sessionId, { row }] of prevMains) {
-		const flat = flatten(row.children, sessionId);
-		for (const [taskId, item] of flat) {
-			prevChildren.set(taskId, item);
-			rootOf.set(taskId, sessionId);
-		}
-	}
-	for (const [taskId, { row, parentSessionId }] of prevChildren) {
+	for (const [key, { row, sessionId, parentSessionId, parentTaskId, root, parentCwd, parentProjectKey }] of prevChildren) {
 		if (TERMINAL_STATUSES.has(row.status)) continue;
-		const current = curChildren.get(taskId)?.row;
+		// A running task-only child may acquire its session ID between snapshots.
+		const current = curChildren.get(key)?.row ?? (!row.sessionId ? currentByTask.get(key) : undefined);
 		if (current && !TERMINAL_STATUSES.has(current.status)) continue;
-		const task = (world.tasks ?? []).find((t) => t.taskId === taskId && t.parentSessionId === parentSessionId) ?? (world.tasks ?? []).find((t) => t.taskId === taskId);
+		const taskId = row.taskId;
+		const candidates = tasksByPair.get(pairKey(parentSessionId, taskId)) ?? [];
+		const task = uniqueMatch(candidates, (candidate) => {
+			if (!candidate.storeDir) return candidates.length === 1 ? candidate : undefined;
+			return taskParent(candidate)?.projectKey === parentProjectKey ? candidate : undefined;
+		});
 		const status = task?.status ?? current?.status;
 		let outcome;
 		let reason;
-		const release = releaseOf(taskId, row.sessionId);
+		// The decision log is raw-ID keyed and cannot distinguish this pair across stores.
+		const release = candidates.length <= 1 && (!candidates.length || task) ? releaseOf(taskId, row.sessionId) : undefined;
 		if (status === "completed" && task?.hasFinalResponse !== false) {
 			outcome = "answered";
 			reason = "작업이 최종 응답과 함께 완료되었습니다.";
@@ -341,10 +425,10 @@ export function detectEnded(prevSnapshot, snapshot, world, nowMs = world.now) {
 		} else if (FAILED_STATUSES.has(status)) {
 			outcome = "failed";
 			reason = `작업이 오류로 끝났습니다${task?.errorMessage ? `: ${clean(task.errorMessage, 160)}` : "."}`;
-		} else if (mainOutcome.get(rootOf.get(taskId)) === "crash") {
+		} else if (mainOutcome.get(endedKey(root)) === "crash") {
 			outcome = "crash";
 			reason = "부모 세션의 omo 호스트가 비정상 종료되었습니다.";
-		} else if (mainOutcome.has(rootOf.get(taskId)) && !TERMINAL_STATUSES.has(status)) {
+		} else if (mainOutcome.has(endedKey(root)) && !TERMINAL_STATUSES.has(status)) {
 			outcome = "closed";
 			reason = "부모 세션이 끝나면서 작업도 함께 끝났습니다.";
 		} else {
@@ -353,12 +437,14 @@ export function detectEnded(prevSnapshot, snapshot, world, nowMs = world.now) {
 		}
 		out.push({
 			v: 1,
-			sessionId: row.sessionId ?? taskId,
+			sessionId,
 			kind: "child",
 			parentSessionId: parentSessionId ?? null,
+			...(parentProjectKey ? { parentProjectKey } : {}),
+			...(parentTaskId ? { parentTaskId } : {}),
 			taskId,
 			title: row.name,
-			cwd: task?.spawnCwd ?? null,
+			cwd: row.cwd || current?.cwd || task?.spawnCwd || parentCwd || world.sessions?.get(parentSessionId)?.cwd || null,
 			terminal: null,
 			omoVersion: null,
 			startedMs: row.startedMs ?? null,

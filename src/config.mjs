@@ -213,6 +213,11 @@ export const DEFAULT_CONFIG = Object.freeze({
 		repeatWindowMs: 30 * MIN,
 		reports: { perDay: 3 },
 	},
+	/**
+	 * Owner-requested audits of one session by a third model (src/auditor.mjs): the lanes are tried in order, at most one audit
+	 * runs at a time, perDay is charged at launch, and timeoutMs is enforced by the daemon's poll. Display-only: no result acts.
+	 */
+	audit: { enabled: true, lanes: ["ultrabrain", "architect", "deep-high"], timeoutMs: 15 * MIN, perDay: 20 },
 	history: { retentionDays: 90, baselineDays: 7, checkpointMs: 60 * MIN },
 	anomaly: { enabled: true, minShapeSamples: 20, outlierQuantile: 0.99, outlierFactor: 3, perHour: 6, windowSignal: true },
 	/**

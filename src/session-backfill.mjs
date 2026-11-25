@@ -1,8 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
-import { entryMs, idFromFileName, readSessionHeader } from "./collect/sessions.mjs";
+import { createSessionFileLocator } from "./collect/session-files.mjs";
+import { entryMs, idFromFileName } from "./collect/sessions.mjs";
 import { normalizeTask, senpiTaskStoreDir, taskStoreDir } from "./collect/tasks.mjs";
-import { appendEnded, readEnded } from "./session-ledger.mjs";
+import { pathKey } from "./paths.mjs";
+import { appendEndedBatch, endedKey, streamEnded } from "./session-ledger.mjs";
+import { projectKeyOf, subjectKey, subjectOf } from "./session-subject.mjs";
 import { atomicWriteJson, ensureDir, listDirSafe, readJsonSafe, readTextSafe, statSafe } from "./util/fsx.mjs";
 import { redact, truncate } from "./util/text.mjs";
 import { kst, toMs } from "./util/time.mjs";
@@ -11,6 +14,7 @@ const DAY_MS = 86_400_000;
 const LIVE_MS = 10 * 60_000;
 const CRASH_WINDOW_MS = 2 * 60_000;
 const MAX_SESSION_FILES = 2000;
+const MAX_REPORTED_ERRORS = 100;
 const HEAD_BYTES = 64 * 1024;
 const TAIL_BYTES = 256 * 1024;
 const INDEX_MAX_BYTES = 64 * 1024 * 1024;
@@ -19,7 +23,7 @@ const RELEASE_KINDS = new Set(["kill-pids", "release-shell"]);
 const FAILED_STATUSES = new Set(["error", "failed"]);
 
 export const BACKFILL_MARKER = ".backfilled";
-export const BACKFILL_VERSION = 2;
+export const BACKFILL_VERSION = 3;
 
 function clean(value, max) {
 	return truncate(redact(String(value ?? "")).replace(/\s+/g, " ").trim(), max);
@@ -34,20 +38,24 @@ function parseLine(line) {
 }
 
 /** Head and tail of a session file without loading a huge file: last entry time and last session name. */
-function scanSessionFile(file, size) {
+function scanSessionFile(file, size, budget, headerOnly = false) {
 	const fd = fs.openSync(file, "r");
 	try {
 		const read = (offset, length) => {
 			const buf = Buffer.alloc(length);
 			const n = fs.readSync(fd, buf, 0, length, offset);
-			return buf.subarray(0, n).toString("utf8");
+			budget.remaining -= n;
+			return buf.subarray(0, n);
 		};
-		const chunks = [];
-		if (size <= HEAD_BYTES + TAIL_BYTES) chunks.push({ text: read(0, size), partialStart: false });
-		else {
-			chunks.push({ text: read(0, HEAD_BYTES), partialStart: false });
-			chunks.push({ text: read(size - TAIL_BYTES, TAIL_BYTES), partialStart: true });
-		}
+		const whole = !headerOnly && size <= HEAD_BYTES + TAIL_BYTES;
+		const head = read(0, whole ? size : Math.min(size, HEAD_BYTES));
+		const headerBytes = head.subarray(0, HEAD_BYTES);
+		const newline = headerBytes.indexOf(10);
+		const header = parseLine(headerBytes.subarray(0, newline === -1 ? headerBytes.length : newline).toString("utf8"));
+		if (header?.type !== "session" || typeof header.id !== "string") return {};
+		if (headerOnly) return { header };
+		const chunks = [{ text: head.toString("utf8"), partialStart: false }];
+		if (!whole) chunks.push({ text: read(size - TAIL_BYTES, TAIL_BYTES).toString("utf8"), partialStart: true });
 		let lastMs;
 		let name;
 		for (const { text, partialStart } of chunks) {
@@ -62,7 +70,7 @@ function scanSessionFile(file, size) {
 				if (entry.type === "session_info" && typeof entry.name === "string" && entry.name.trim()) name = entry.name;
 			}
 		}
-		return { lastMs, name };
+		return { header, lastMs, name };
 	} finally {
 		fs.closeSync(fd);
 	}
@@ -109,9 +117,23 @@ function readCrashes(paths, sinceMs, errors) {
 	return out.sort((a, b) => a.atMs - b.atMs);
 }
 
-/** Executed kill-pids / release-shell decisions, keyed by the task and session ids they name. */
-function readReleases(paths, sinceMs, errors) {
-	const byId = new Map();
+/** Resolve each executed release to at most one child across the scanned stores. */
+function readReleases(paths, sinceMs, errors, tasks) {
+	const owners = { taskId: new Map(), sessionId: new Map() };
+	const remember = (index, id, projectKey, task) => {
+		if (typeof id !== "string" || !id) return;
+		for (const scope of projectKey ? [null, projectKey] : [null]) {
+			const key = subjectKey({ projectKey: scope, sessionId: id });
+			index.set(key, index.has(key) ? null : task);
+		}
+	};
+	// Even children outside the write window can make a legacy ID ambiguous.
+	for (const task of tasks) {
+		const projectKey = projectKeyOf(task.cwd);
+		remember(owners.taskId, task.taskId, projectKey, task);
+		remember(owners.sessionId, task.childSessionId, projectKey, task);
+	}
+	const byChild = new Map();
 	for (const name of listDirSafe(paths.health.decisionsDir).filter((n) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(n))) {
 		if (Date.parse(`${name.slice(0, 10)}T23:59:59.999Z`) < sinceMs) continue;
 		let text;
@@ -126,31 +148,74 @@ function readReleases(paths, sinceMs, errors) {
 			const entry = parseLine(line);
 			const kind = entry?.action?.kind;
 			if (!RELEASE_KINDS.has(kind) || (entry.result !== undefined && entry.result !== "execute")) continue;
-			const ms = toMs(entry.ts);
-			const hit = { kind, ms };
-			for (const id of [entry.subject?.taskId, entry.subject?.sessionId, entry.action?.params?.taskId, entry.action?.params?.sessionId]) {
-				if (typeof id === "string" && id && !byId.has(id)) byId.set(id, hit);
+			const subjectProject = subjectOf(entry.subject).projectKey;
+			const paramsProject = subjectOf(entry.action.params).projectKey;
+			if (subjectProject != null && paramsProject != null && subjectProject !== paramsProject) continue;
+			const projectKey = subjectProject ?? paramsProject;
+			const matches = new Set();
+			for (const source of [entry.subject, entry.action.params]) {
+				for (const field of ["taskId", "sessionId"]) {
+					const id = source?.[field];
+					if (typeof id !== "string" || !id) continue;
+					const owner = owners[field].get(subjectKey({ projectKey, sessionId: id }));
+					if (owner) matches.add(owner);
+				}
 			}
+			if (matches.size !== 1) continue;
+			const [child] = matches;
+			if (!byChild.has(child)) byChild.set(child, { kind, ms: toMs(entry.ts) });
 		}
 	}
-	return byId;
+	return byChild;
 }
 
-function readTasks(cwd, errors, agentDir) {
-	const storeDir = agentDir ? senpiTaskStoreDir(cwd, agentDir) : taskStoreDir(cwd);
+/** Read new traversal edges within the tick's allowance, with no open fd across ticks. */
+function* readTaskRecord(file, budget) {
+	const stat = fs.statSync(file);
+	if (!stat.isFile()) throw new Error("not a regular file");
+	const chunks = [];
+	let offset = 0;
+	while (offset < stat.size) {
+		while (budget.remaining < 1) yield;
+		const fd = fs.openSync(file, "r");
+		try {
+			while (offset < stat.size && budget.remaining >= 1) {
+				const chunk = Buffer.allocUnsafe(Math.min(stat.size - offset, budget.remaining, HEAD_BYTES));
+				const n = fs.readSync(fd, chunk, 0, chunk.length, offset);
+				if (!n) throw new Error("incomplete task record");
+				budget.remaining -= n;
+				offset += n;
+				chunks.push(chunk.subarray(0, n));
+			}
+		} finally {
+			fs.closeSync(fd);
+		}
+	}
+	return Buffer.concat(chunks, offset).toString("utf8");
+}
+
+function* taskStep(budget) {
+	while (budget.remaining < 1 || budget.taskSteps === 0) yield;
+	budget.taskSteps--;
+}
+
+function* readTasks(cwd, storeDir, errors, budget) {
 	const tasksDir = path.join(storeDir, "tasks");
-	const out = [];
+	const parentProjectKey = projectKeyOf(cwd);
+	const tasks = [];
 	for (const name of listDirSafe(tasksDir).filter((n) => n.endsWith(".json"))) {
+		if (budget) yield* taskStep(budget);
 		const file = path.join(tasksDir, name);
 		try {
-			const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+			const raw = JSON.parse(budget ? yield* readTaskRecord(file, budget) : fs.readFileSync(file, "utf8"));
 			if (!raw || typeof raw.task_id !== "string") throw new Error("no task_id");
-			out.push({ ...normalizeTask(raw, storeDir), projectCwd: cwd });
+			const task = normalizeTask(raw, storeDir);
+			tasks.push({ ...task, cwd: typeof task.spawnCwd === "string" ? task.spawnCwd : cwd, parentProjectKey });
 		} catch (error) {
 			errors.push(`task ${file}: ${error.message}`);
 		}
 	}
-	return out;
+	return tasks;
 }
 
 function childOutcome(task, releases) {
@@ -160,27 +225,16 @@ function childOutcome(task, releases) {
 		const detail = task.errorMessage ? `: ${clean(task.errorMessage, 160)}` : ".";
 		return { outcome: "failed", reason: `작업이 오류로 끝났습니다${detail}` };
 	}
-	const release = releases.get(task.taskId) ?? (task.childSessionId ? releases.get(task.childSessionId) : undefined);
+	const release = releases.get(task);
 	if (release) return { outcome: "released", reason: `omo-health가 ${release.kind} 조치로 호출을 종료했습니다${Number.isFinite(release.ms) ? ` (${kst(release.ms)})` : ""}.` };
 	return { outcome: "unknown", reason: `작업 상태가 ${clean(task.status ?? "없음", 30)}이고 끝난 이유를 알려 줄 기록이 없습니다.` };
 }
 
-/**
- * One-time reconstruction of the last `days` of ended sessions into the ended-session ledger (estimated:true,
- * source:"backfill"). A `.backfilled` marker with v >= BACKFILL_VERSION makes every later call a no-op; a missing,
- * unreadable or older marker re-runs the backfill, and the ledger's existing duplicate check keeps prior entries.
- * Never throws on a bad source file: problems are collected into the returned summary.
- */
-export function backfillOnce(paths, nowMs, { days = 30 } = {}) {
-	const markerFile = path.join(paths.health.sessionsDir, BACKFILL_MARKER);
-	const marker = readJsonSafe(markerFile);
-	if (Number(marker?.v) >= BACKFILL_VERSION) return { skipped: true };
+function startScan(paths, nowMs, days, reconcile) {
 	const sinceMs = nowMs - days * DAY_MS;
-	const liveCutMs = nowMs - LIVE_MS;
 	const errors = [];
-	const counts = { main: 0, child: 0, written: 0, duplicate: 0, live: 0, outcomes: {} };
 
-	// Main session files, newest first, bounded.
+	// Keep only file metadata for the window; parsed transcripts stay in one batch.
 	const files = [];
 	const slugDirs = [];
 	for (const slug of listDirSafe(paths.sessionsDir)) {
@@ -194,60 +248,209 @@ export function backfillOnce(paths, nowMs, { days = 30 } = {}) {
 		}
 	}
 	files.sort((a, b) => b.mtimeMs - a.mtimeMs);
-	if (files.length > MAX_SESSION_FILES) errors.push(`session files capped at ${MAX_SESSION_FILES} of ${files.length}`);
+	if (!reconcile && files.length > MAX_SESSION_FILES) errors.push(`session files capped at ${MAX_SESSION_FILES} of ${files.length}`);
+	return {
+		sinceMs, liveCutMs: nowMs - LIVE_MS, days, errors,
+		sessionFiles: files.length, sessionDirs: slugDirs.length,
+		files: reconcile ? files : files.slice(0, MAX_SESSION_FILES),
+		census: reconcile && files.length > MAX_SESSION_FILES ? 0 : null,
+		cwds: new Map(), cursor: 0, indexes: new Map(), mains: [],
+		counts: emptyCounts(), errorCount: 0, reportedErrors: [],
+	};
+}
 
-	const indexes = new Map();
-	const mains = [];
-	for (const item of files.slice(0, MAX_SESSION_FILES)) {
+function addCwd(cwds, cwd) {
+	if (typeof cwd === "string" && cwd) cwds.set(cwd.toLowerCase(), cwd);
+}
+
+function emptyCounts() {
+	return { main: 0, child: 0, written: 0, duplicate: 0, live: 0, outcomes: {} };
+}
+
+/**
+ * Reconcile only missing project-scoped rows. Pass the same `progress` object
+ * across ticks, with a fresh `maxBytes` allowance for transcripts and
+ * records in newly discovered task stores each time. The
+ * scan is only in memory; an interrupted append is retried against the ledger.
+ */
+export function backfillOnce(paths, nowMs, { days = 30, maxBytes = Infinity, progress = {} } = {}) {
+	const markerFile = path.join(paths.health.sessionsDir, BACKFILL_MARKER);
+	if (!progress.scan) {
+		const marker = readJsonSafe(markerFile);
+		if (Number(marker?.v) >= BACKFILL_VERSION) return { skipped: true };
+		progress.scan = startScan(paths, nowMs, days, marker != null);
+	}
+	const scan = progress.scan;
+	const { files, indexes, mains, errors } = scan;
+	const budget = scan.budget ??= {};
+	budget.remaining = maxBytes;
+	budget.taskSteps = Number.isFinite(maxBytes) ? MAX_SESSION_FILES : Infinity;
+	// A child transcript in an early batch can belong to a task store discovered
+	// in a later batch. For multi-batch upgrades, discover all task-store cwd
+	// values from the heads before classifying any transcript. This pass shares
+	// the same byte allowance as the full scan.
+	while (scan.census !== null && scan.census < files.length) {
+		const item = files[scan.census];
+		if (Math.min(item.size, HEAD_BYTES) > budget.remaining) return { pending: true };
+		scan.census++;
 		try {
-			const header = readSessionHeader(item.file);
-			if (!header || typeof header.id !== "string") {
-				errors.push(`bad session header: ${item.file}`);
-				continue;
-			}
-			const { lastMs: scannedMs, name } = scanSessionFile(item.file, item.size);
-			if (!indexes.has(item.dir)) indexes.set(item.dir, readSummaryIndex(item.dir, errors));
-			const summary = indexes.get(item.dir).get(header.id);
-			const lastMs = scannedMs ?? summary?.lastActivityTime ?? toMs(header.timestamp) ?? item.mtimeMs;
-			mains.push({ dir: item.dir, header, lastMs, name, summary });
-		} catch (error) {
-			errors.push(`session ${item.file}: ${error.message}`);
+			addCwd(scan.cwds, scanSessionFile(item.file, item.size, budget, true).header?.cwd);
+		} catch {
+			// Report unreadable transcripts in the full scan.
 		}
 	}
+	while (!scan.complete) {
+		const batchEnd = scan.batchEnd ??= Math.min(scan.cursor + MAX_SESSION_FILES, files.length);
+		while (scan.cursor < batchEnd) {
+			const item = files[scan.cursor];
+			if (Math.min(item.size, HEAD_BYTES + TAIL_BYTES) > budget.remaining) return { pending: true };
+			scan.cursor++;
+			try {
+				const { header, lastMs: scannedMs, name } = scanSessionFile(item.file, item.size, budget);
+				if (!header) {
+					errors.push(`bad session header: ${item.file}`);
+					continue;
+				}
+				if (scan.census === null) addCwd(scan.cwds, header.cwd);
+				if (!indexes.has(item.dir)) indexes.set(item.dir, readSummaryIndex(item.dir, errors));
+				const summary = indexes.get(item.dir).get(header.id);
+				const lastMs = scannedMs ?? summary?.lastActivityTime ?? toMs(header.timestamp) ?? item.mtimeMs;
+				mains.push({ dir: item.dir, file: item.file, header, lastMs, name, summary });
+			} catch (error) {
+				errors.push(`session ${item.file}: ${error.message}`);
+			}
+		}
+		if (!scan.related) {
+			scan.relatedScan ??= readRelated(paths, scan, budget);
+			const step = scan.relatedScan.next();
+			if (!step.done) return { pending: true };
+			scan.related = step.value;
+			delete scan.relatedScan;
+		}
+		const lastBatch = batchEnd === files.length;
+		const batch = writeBatch(paths, nowMs, scan, lastBatch);
+		if (batch.pending) return { ...scanSummary(scan, [...errors, ...batch.errors]), pending: true };
+		for (const key of ["main", "child", "written", "duplicate", "live"]) scan.counts[key] += batch.counts[key];
+		for (const [outcome, count] of Object.entries(batch.counts.outcomes)) {
+			scan.counts.outcomes[outcome] = (scan.counts.outcomes[outcome] ?? 0) + count;
+		}
+		scan.errorCount += errors.length;
+		for (const error of errors.slice(0, MAX_REPORTED_ERRORS - scan.reportedErrors.length)) {
+			scan.reportedErrors.push(clean(error, 300));
+		}
+		errors.length = 0;
+		mains.length = 0;
+		indexes.clear();
+		delete scan.batchEnd;
+		scan.complete = lastBatch;
+	}
 
-	// Child tasks from every project a session ran in.
-	const cwds = new Map();
-	for (const m of mains) if (typeof m.header.cwd === "string" && m.header.cwd) cwds.set(m.header.cwd.toLowerCase(), m.header.cwd);
+	const summary = scanSummary(scan);
+	try {
+		ensureDir(paths.health.sessionsDir);
+		atomicWriteJson(markerFile, { v: BACKFILL_VERSION, ts: nowMs, days: scan.days, counts: scan.counts, errorCount: scan.errorCount });
+		delete progress.scan;
+	} catch (error) {
+		summary.errors.push(clean(`marker: ${error.message}`, 300));
+		summary.pending = true;
+	}
+	return summary;
+}
+
+function scanSummary({ sinceMs, sessionFiles, sessionDirs, counts, reportedErrors }, extraErrors = []) {
+	return { skipped: false, sinceMs, sessionFiles, sessionDirs, counts,
+		errors: [...reportedErrors, ...extraErrors.slice(0, MAX_REPORTED_ERRORS - reportedErrors.length).map((e) => clean(e, 300))] };
+}
+
+function fileIdentity(file) {
+	try {
+		const stat = fs.statSync(file, { bigint: true });
+		if (stat.isFile() && stat.ino > 0n) return `${stat.dev}:${stat.ino}`;
+	} catch {
+		// A missing or unreadable file is not evidence of a duplicate.
+	}
+}
+
+const transcriptPath = process.platform === "win32" ? pathKey : path.resolve;
+
+function* readRelated(paths, { cwds, sinceMs, errors }, budget) {
 	const tasks = [];
-	for (const cwd of cwds.values()) tasks.push(...readTasks(cwd, errors, paths.agentDir));
-	const childSessionIds = new Set(tasks.map((t) => t.childSessionId).filter(Boolean));
+	const { childCandidate } = createSessionFileLocator({ paths });
+	const childPaths = new Set();
+	const childIdentities = new Set();
+	const childOwners = new Map();
 	const childCount = new Map();
-	for (const t of tasks) if (t.parentSessionId) childCount.set(t.parentSessionId, (childCount.get(t.parentSessionId) ?? 0) + 1);
+	const visited = new Set();
+	const queue = new Set(cwds.values());
+	function remember(t) {
+		tasks.push(t);
+		if (typeof t.spawnCwd === "string" && t.spawnCwd) queue.add(t.spawnCwd);
+		const file = childCandidate({ taskId: t.taskId, sessionId: t.childSessionId, storeDir: t.storeDir });
+		if (file) {
+			childPaths.add(transcriptPath(file));
+			const identity = fileIdentity(file);
+			if (identity) childIdentities.add(identity);
+		}
+		const projectKey = projectKeyOf(t.cwd);
+		if (projectKey && typeof t.childSessionId === "string" && t.childSessionId && t.taskId) {
+			const key = subjectKey({ projectKey, sessionId: t.childSessionId });
+			childOwners.set(key, childOwners.has(key) ? null : t);
+		}
+	}
+	// Process the transcript seed stores first, as before. Extra store visits
+	// share the transcript byte allowance and a per-tick metadata step cap.
+	let seedCount = queue.size;
+	for (const cwd of queue) {
+		const taskBudget = seedCount-- > 0 ? undefined : budget;
+		if (taskBudget) yield* taskStep(taskBudget);
+		const storeDir = paths.agentDir ? senpiTaskStoreDir(cwd, paths.agentDir) : taskStoreDir(cwd);
+		const key = pathKey(storeDir);
+		if (visited.has(key)) continue;
+		visited.add(key);
+		for (const task of yield* readTasks(cwd, storeDir, errors, taskBudget)) remember(task);
+	}
 
-	const crashes = readCrashes(paths, sinceMs, errors);
-	const releases = readReleases(paths, sinceMs, errors);
-	const recorded = new Set(readEnded(paths, { sinceMs }).map((r) => r.sessionId));
+	const parents = new Map();
+	for (const t of tasks) {
+		if (!t.parentSessionId) continue;
+		// The spawning store supplies the parent's project; the candidate
+		// parent's own spawn cwd must match it, even across stores.
+		const parent = { projectKey: t.parentProjectKey, sessionId: t.parentSessionId };
+		const key = subjectKey(parent);
+		const task = childOwners.get(key);
+		const mainParent = t.depth === 1 || t.rootSessionId === t.parentSessionId;
+		const nested = t.depth > 1 || Boolean(t.rootSessionId && t.rootSessionId !== t.parentSessionId);
+		if (!mainParent && task && task !== t &&
+			(!t.rootSessionId || !task.rootSessionId || t.rootSessionId === task.rootSessionId)) {
+			parent.taskId = task.taskId;
+		} else if (!mainParent && (nested || childOwners.has(key))) {
+			// A partial project + ID link could be read as a main parent.
+			continue;
+		}
+		parents.set(t, parent);
+		const parentKey = subjectKey(parent);
+		childCount.set(parentKey, (childCount.get(parentKey) ?? 0) + 1);
+	}
 
+	return { tasks, childPaths, childIdentities, parents, childCount, crashes: readCrashes(paths, sinceMs, errors), releases: readReleases(paths, sinceMs, errors, tasks) };
+}
+
+function writeBatch(paths, nowMs, { sinceMs, liveCutMs, mains, related }, lastBatch) {
+	const { tasks, childPaths, childIdentities, parents, childCount, crashes, releases } = related;
+	const errors = [];
+	const counts = emptyCounts();
+	const pending = [];
 	const write = (record) => {
 		counts[record.kind] += 1;
 		counts.outcomes[record.outcome] = (counts.outcomes[record.outcome] ?? 0) + 1;
-		if (recorded.has(record.sessionId)) {
-			counts.duplicate += 1;
-			return;
-		}
-		try {
-			if (appendEnded(paths, record)) {
-				counts.written += 1;
-				recorded.add(record.sessionId);
-			} else counts.duplicate += 1;
-		} catch (error) {
-			errors.push(`append ${record.sessionId}: ${error.message}`);
-		}
+		pending.push(record);
 	};
 
 	for (const m of mains) {
 		const sessionId = m.header.id;
-		if (childSessionIds.has(sessionId) || m.lastMs < sinceMs) continue;
+		const key = subjectKey({ projectKey: projectKeyOf(m.header.cwd), sessionId });
+		if (m.lastMs < sinceMs || childPaths.has(transcriptPath(m.file)) ||
+			(childIdentities.size && childIdentities.has(fileIdentity(m.file)))) continue;
 		if (m.lastMs > liveCutMs) {
 			counts.live += 1;
 			continue;
@@ -282,13 +485,13 @@ export function backfillOnce(paths, nowMs, { days = 30 } = {}) {
 			endedMs: m.lastMs,
 			outcome,
 			reason,
-			childCount: childCount.get(sessionId) ?? 0,
+			childCount: childCount.get(key) ?? 0,
 			estimated: true,
 			source: "backfill",
 		});
 	}
 
-	for (const t of tasks) {
+	for (const t of lastBatch ? tasks : []) {
 		if (!t.terminal) continue;
 		const endedMs = t.terminalAtMs ?? t.updatedAtMs;
 		if (!Number.isFinite(endedMs) || endedMs < sinceMs) continue;
@@ -297,32 +500,72 @@ export function backfillOnce(paths, nowMs, { days = 30 } = {}) {
 			continue;
 		}
 		const { outcome, reason } = childOutcome(t, releases);
+		const parent = parents.get(t);
 		write({
 			v: 1,
 			sessionId: t.childSessionId || t.taskId,
 			kind: "child",
-			parentSessionId: t.parentSessionId ?? null,
+			parentSessionId: parent?.sessionId ?? null,
+			...(parent?.projectKey ? { parentProjectKey: parent.projectKey } : {}),
+			...(parent?.taskId ? { parentTaskId: parent.taskId } : {}),
+			...(!parent ? { storeDir: t.storeDir } : {}),
 			taskId: t.taskId,
 			title: clean(t.name ?? t.summary ?? t.taskId, TITLE_MAX) || t.taskId,
-			cwd: typeof t.spawnCwd === "string" ? t.spawnCwd : t.projectCwd,
+			cwd: t.cwd,
 			terminal: null,
 			omoVersion: null,
 			startedMs: t.startedAtMs ?? t.createdAtMs ?? null,
 			endedMs,
 			outcome,
 			reason,
-			childCount: childCount.get(t.childSessionId) ?? 0,
+			childCount: childCount.get(subjectKey({ projectKey: projectKeyOf(t.cwd), sessionId: t.childSessionId, taskId: t.taskId })) ?? 0,
 			estimated: true,
 			source: "backfill",
 		});
 	}
 
-	const summary = { skipped: false, sinceMs, sessionFiles: files.length, sessionDirs: slugDirs.length, counts, errors: errors.map((e) => clean(e, 300)) };
-	try {
-		ensureDir(paths.health.sessionsDir);
-		atomicWriteJson(markerFile, { v: BACKFILL_VERSION, ts: nowMs, days, counts, errorCount: errors.length });
-	} catch (error) {
-		summary.errors.push(clean(`marker: ${error.message}`, 300));
+	const childPair = (row) => JSON.stringify([row.sessionId, row.parentSessionId ?? null]);
+	const childCandidates = new Map();
+	for (const row of pending) {
+		if (row.kind !== "child") continue;
+		const key = childPair(row);
+		const candidates = childCandidates.get(key) ?? [];
+		candidates.push(row);
+		childCandidates.set(key, candidates);
 	}
-	return summary;
+	// Keep only ledger keys and identity evidence relevant to this batch.
+	const wanted = new Set(pending.map(endedKey));
+	const recorded = new Set();
+	const existingChildren = new Map();
+	for (const row of streamEnded(paths, { sinceMs })) {
+		const keyOfRow = endedKey(row);
+		if (wanted.has(keyOfRow)) recorded.add(keyOfRow);
+		if (row.kind !== "child") continue;
+		const key = childPair(row);
+		if (!childCandidates.has(key)) continue;
+		existingChildren.set(key, existingChildren.has(key) ? null : {
+			projectKey: subjectOf(row).projectKey, parentProjectKey: row.parentProjectKey, taskId: row.taskId,
+		});
+	}
+	const matches = (existing, candidate) =>
+		(!existing.projectKey || existing.projectKey === projectKeyOf(candidate.cwd)) &&
+		(!existing.parentProjectKey || existing.parentProjectKey === candidate.parentProjectKey) &&
+		(!existing.taskId || existing.taskId === candidate.taskId);
+	const matchedChildren = new Set();
+	for (const [key, existing] of existingChildren) {
+		if (!existing) continue;
+		const matchesForPair = childCandidates.get(key).filter((row) => matches(existing, row));
+		if (matchesForPair.length === 1) matchedChildren.add(matchesForPair[0]);
+	}
+	counts.duplicate += matchedChildren.size;
+	const missing = pending.filter((row) => !matchedChildren.has(row));
+	let appendFailed = false;
+	for (const [i, { appended, error }] of appendEndedBatch(paths, missing, { nowMs, recorded }).entries()) {
+		if (error) {
+			appendFailed = true;
+			errors.push(`append ${missing[i].sessionId}: ${error.message}`);
+		} else if (appended) counts.written += 1;
+		else counts.duplicate += 1;
+	}
+	return { counts, errors, pending: appendFailed };
 }

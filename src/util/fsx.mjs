@@ -10,27 +10,44 @@ export function ensureDir(dir) {
 
 /** Write via temp file + rename so readers never see a partial file. */
 export function atomicWriteFile(file, data) {
+	atomicWriteWith(file, (tmp) => fs.writeFileSync(tmp, data));
+}
+
+/** Publish a file only after every chunk is written and the descriptor is closed. */
+export function atomicWriteChunks(file, chunks) {
+	atomicWriteWith(file, (tmp) => {
+		const fd = fs.openSync(tmp, "w");
+		try {
+			for (const chunk of chunks) fs.writeFileSync(fd, chunk);
+		} finally {
+			fs.closeSync(fd);
+		}
+	});
+}
+
+function atomicWriteWith(file, write) {
 	ensureDir(path.dirname(file));
 	const tmp = `${file}.${process.pid}.${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}.tmp`;
-	fs.writeFileSync(tmp, data);
-	let lastError;
-	for (let attempt = 0; attempt < 6; attempt++) {
-		try {
-			fs.renameSync(tmp, file);
-			return;
-		} catch (error) {
-			lastError = error;
-			if (!RETRY_CODES.has(error.code)) break;
-			// Windows: a reader holding the target open blocks the rename briefly.
-			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15 * (attempt + 1));
-		}
-	}
 	try {
-		fs.unlinkSync(tmp);
-	} catch {
-		// temp file already gone
+		write(tmp);
+		for (let attempt = 0; ; attempt++) {
+			try {
+				fs.renameSync(tmp, file);
+				return;
+			} catch (error) {
+				if (attempt === 5 || !RETRY_CODES.has(error.code)) throw error;
+				// Windows: a reader holding the target open blocks the rename briefly.
+				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15 * (attempt + 1));
+			}
+		}
+	} catch (error) {
+		try {
+			fs.unlinkSync(tmp);
+		} catch {
+			// temp file already gone
+		}
+		throw error;
 	}
-	throw lastError;
 }
 
 export function atomicWriteJson(file, value) {

@@ -5,13 +5,17 @@ import path from "node:path";
 import { test } from "node:test";
 import { DEFAULT_CONFIG } from "../src/config.mjs";
 import { makeFinding } from "../src/detect/finding.mjs";
+import { createAnomalyWatch } from "../src/anomaly/watch.mjs";
+import { LogCollector } from "../src/collect/logs.mjs";
+import { closeDb, openDb } from "../src/db/db.mjs";
 import { ANALYST_SCHEMA, bundleDocument, createAnalyst, parseAnalystOutput, unavailableReason, validateAnalyst } from "../src/judge/analyst.mjs";
-import { assertGuardFlags, laneArgs, resolveLaneModel } from "../src/judge/lane.mjs";
+import { assertGuardFlags, laneArgs, laneModels, modelFamily, modelName, resolveLaneModel } from "../src/judge/lane.mjs";
 import { buildBundle } from "../src/judge/triage.mjs";
 import { resolvePaths } from "../src/paths.mjs";
+import { createRunner } from "../src/runner.mjs";
 import { createFakeClock } from "../src/util/time.mjs";
 import { tmpDir } from "./helpers/fixtures.mjs";
-import { createFakeRunner } from "./fakes/runner.mjs";
+import { createFakeRunner, createRecordingSpawn } from "./fakes/runner.mjs";
 
 const T = Date.parse("2026-10-07T12:00:00Z");
 const MODEL = DEFAULT_CONFIG.analyst.fallbackModel;
@@ -49,7 +53,15 @@ const answer = (over = {}) => ({
 function setup(opts = {}) {
 	const box = sandbox(opts.config);
 	const runner = createFakeRunner({ outcomes: opts.outcomes });
-	const analyst = createAnalyst({ config: box.config, paths: box.paths, clock: box.clock, runner, env: opts.env ?? {} });
+	const analyst = createAnalyst({
+		config: box.config,
+		paths: box.paths,
+		clock: box.clock,
+		runner,
+		env: opts.env ?? {},
+		...(opts.readdir ? { readdir: opts.readdir } : {}),
+		...(opts.stat ? { stat: opts.stat } : {}),
+	});
 	return { ...box, runner, analyst };
 }
 
@@ -57,6 +69,23 @@ test("resolveLaneModel takes the first rung whose provider is logged in", () => 
 	const { paths, config } = sandbox();
 	writeLane(paths, { models: ["devin/swe-2-max", "anthropic-subscription/claude-opus-5-5:medium", "nvidia/x"], providers: ["anthropic-subscription", "nvidia"] });
 	assert.equal(resolveLaneModel(paths, "deep-low", config), "anthropic-subscription/claude-opus-5-5:medium");
+});
+
+test("laneModels returns the logged-in rungs of the lane in order, and nothing for an unreadable lane", () => {
+	const { paths } = sandbox();
+	assert.deepEqual(laneModels(paths, "deep-low"), []);
+	writeLane(paths, { models: ["devin/swe-2-max", "nobody/none-1", "anthropic-subscription/claude-opus-5-5:medium", "nvidia/x"], providers: ["devin", "anthropic-subscription", "nvidia"] });
+	assert.deepEqual(laneModels(paths, "deep-low"), ["devin/swe-2-max", "anthropic-subscription/claude-opus-5-5:medium", "nvidia/x"]);
+	assert.deepEqual(laneModels(paths, "missing-lane"), []);
+	fs.writeFileSync(paths.omoJsonc, "{ not json");
+	assert.deepEqual(laneModels(paths, "deep-low"), []);
+});
+
+test("modelName drops the provider path and level; modelFamily is its first dash segment, lowercased", () => {
+	assert.equal(modelName("opengateway/anthropic/claude-opus-5-5:max"), "claude-opus-5-5");
+	assert.equal(modelName("gpt-5"), "gpt-5");
+	assert.equal(modelFamily("opengateway/anthropic/claude-opus-5-5:max"), "claude");
+	assert.equal(modelFamily("openai/gpt-5-5:high"), "gpt");
 });
 
 test("resolveLaneModel falls back when no rung is logged in, the lane is missing or the files are unreadable", () => {
@@ -83,6 +112,14 @@ test("parseAnalystOutput finds the verdict object after a preamble and inside a 
 	const text = `> I read this as a judgment ask {not json}\n\n\`\`\`json\n${JSON.stringify(answer())}\n\`\`\`\n`;
 	assert.equal(parseAnalystOutput(text).verdict, "stuck");
 	assert.equal(parseAnalystOutput("no json here"), null);
+});
+
+test("parseAnalystOutput takes the last top-level object carrying the requested key", () => {
+	const review = { overall: "fair", check: { overall: "nested" } };
+	const text = `preamble ${JSON.stringify(review)}\n${JSON.stringify({ overall: "replace" })}`;
+	assert.deepEqual(parseAnalystOutput(text, "overall"), { overall: "replace" });
+	assert.deepEqual(parseAnalystOutput(`x ${JSON.stringify(review)}`, "overall"), review);
+	assert.equal(parseAnalystOutput(`x ${JSON.stringify({ check: { token: "nested" } })}`, "token"), null, "only top-level keys count");
 });
 
 test("validateAnalyst: a confident stuck verdict with evidence acts on release-shell", () => {
@@ -252,6 +289,59 @@ test("maxConcurrent queues the rest; a finished job frees the slot for the next"
 	assert.equal(t.runner.starts[1].jobId, second.jobId);
 });
 
+for (const code of [0, 1]) test(`IS-9 provenance: analyst records fallback models on exit ${code}`, () => {
+	const t = sandbox();
+	writeLane(t.paths, { models: ["p/a"], providers: ["p"] });
+	const { spawnImpl } = createRecordingSpawn();
+	const runner = createRunner({ paths: t.paths, clock: t.clock, spawnImpl, identify: () => null });
+	t.analyst = createAnalyst({ ...t, runner, env: {} });
+	const job = ask(t, finding());
+	const dir = runner.jobDir(job.jobId);
+	fs.writeFileSync(path.join(dir, "err.log"), [
+		"Model fallback: p/a -> p/b (transient)",
+		"Model fallback: p/b -> p/c:high (rate limit)",
+		"Model fallback: p/c:high -> p/b (transient)",
+		"Model fallback: p/b -> not a model",
+		"",
+	].join("\r\n"));
+	fs.writeFileSync(path.join(dir, "out.txt"), JSON.stringify(answer()));
+	fs.writeFileSync(path.join(dir, "exit.json"), JSON.stringify({ code }));
+	const verdict = poll(t, job);
+	assert.equal(Boolean(verdict.failed), code !== 0);
+	assert.deepEqual(verdict.usedModels, ["p/a", "p/b", "p/c:high"]);
+});
+
+test("failed argv lookups for an unverified analyst free its slot at the deadline", () => {
+	const t = sandbox({ maxConcurrent: 1, perFinding: 5, perHour: 5 });
+	const { spawnImpl, calls } = createRecordingSpawn();
+	const runner = createRunner({
+		paths: t.paths,
+		clock: t.clock,
+		spawnImpl,
+		isAlive: () => true,
+		identify: () => null,
+		findJobProcess: () => {
+			throw new Error("CIM timed out");
+		},
+	});
+	t.analyst = createAnalyst({ ...t, runner, env: {} });
+	const first = ask(t, finding(1));
+	const second = ask(t, finding(2));
+	const secondMeta = path.join(runner.jobDir(second.jobId), "meta.json");
+	assert.equal(second.queued, true);
+	assert.equal(poll(t, first), undefined);
+	assert.equal(poll(t, first), undefined);
+	assert.equal(calls.length, 1);
+	assert.equal(fs.existsSync(secondMeta), false);
+
+	t.clock.advance(t.config.analyst.timeoutMs + 1);
+	const verdict = poll(t, first);
+	assert.equal(fs.existsSync(secondMeta), true, "the queued analyst starts in the freed slot");
+	assert.deepEqual([verdict?.verdict, verdict?.reason, verdict?.failed], ["escalate", "timeout", true]);
+	assert.deepEqual([runner.poll(first.jobId).status, runner.poll(first.jobId).reason], ["timeout", "unverified"]);
+	assert.equal(calls.length, 2, "the only additional spawn is the queued analyst");
+});
+
 test("budgets: perFinding, perHour and perDay stop new jobs and are not spent by a refused start", () => {
 	const t = setup({ config: { maxConcurrent: 9, perFinding: 2, perHour: 3, perDay: 4 } });
 	const f1 = finding(1);
@@ -303,6 +393,54 @@ test("a D6 partial account block leaves the analyst running (issue #5)", () => {
 	const blocked = makeFinding({ detector: "D6", kind: "accounts-blocked", subject: { key: "provider:anthropic-subscription" } });
 	assert.ok(ask(t, finding(1), { openFindings: [partial] }).jobId);
 	assert.equal(ask(t, finding(2), { openFindings: [blocked] }).reason, "provider-limit");
+});
+
+test("laneSessionIds picks up a job dir created after construction and does not read the directory again without a change", () => {
+	let mtime = 1;
+	let reads = 0;
+	const names = [];
+	const t = setup({ readdir: () => { reads += 1; return [...names]; }, stat: () => ({ mtimeMs: mtime }) });
+	assert.equal(reads, 1, "construction scans once");
+	const dir = path.join(t.paths.health.analystJobsDir, "audit-late");
+	fs.mkdirSync(dir, { recursive: true });
+	fs.writeFileSync(path.join(dir, "analyst.json"), JSON.stringify({ jobId: "audit-late", sessionId: "lane-late" }));
+	names.push("audit-late");
+	mtime = 2;
+	assert.ok(t.analyst.laneSessionIds().has("lane-late"));
+	assert.equal(reads, 2);
+	assert.ok(t.analyst.laneSessionIds().has("lane-late"));
+	assert.equal(reads, 2, "an unchanged jobs dir is not read again");
+});
+
+test("an audit lane session is excluded from the log events and the tool-call history", () => {
+	const t = setup();
+	const laneId = "lane-audit-1";
+	const controlId = "control-1";
+	// The audit job's marker appears after construction, as a daemon started later would see it.
+	const jobDir = path.join(t.paths.health.analystJobsDir, "audit-1");
+	fs.mkdirSync(jobDir, { recursive: true });
+	fs.writeFileSync(path.join(jobDir, "analyst.json"), JSON.stringify({ jobId: "audit-1", sessionId: laneId }));
+	fs.utimesSync(t.paths.health.analystJobsDir, new Date(T + 1000), new Date(T + 1000));
+	assert.ok(t.analyst.laneSessionIds().has(laneId));
+
+	const logs = tmpDir("omoh-analyst-logs-");
+	const record = (sessionId) => JSON.stringify({ ts: new Date(T).toISOString(), level: "warn", event: "provider_error", error: "429", sessionId });
+	fs.writeFileSync(path.join(logs, "session.log"), [record(laneId), record(controlId)].join("\n") + "\n");
+
+	const db = openDb({ file: ":memory:" });
+	try {
+		const collector = new LogCollector({ logsDir: logs });
+		collector.setExcludedSessions(t.analyst.laneSessionIds());
+		collector.read();
+		assert.deepEqual(collector.drain().map((event) => [event.type, event.sessionId]), [["providerError", controlId]]);
+
+		const watch = createAnomalyWatch({ db, config: t.config, clock: t.clock, laneSessionIds: () => t.analyst.laneSessionIds() });
+		const base = { tool: "bash", startMs: T, endMs: T + 1000, commandHead: "echo hi" };
+		assert.equal(watch.record([{ ...base, id: "a", sessionId: laneId }, { ...base, id: "b", sessionId: controlId }]), 1);
+		assert.deepEqual(db.prepare("SELECT id FROM tool_calls").all().map((row) => row.id), ["b"]);
+	} finally {
+		closeDb(db);
+	}
 });
 
 test("analyst.enabled false starts nothing", () => {

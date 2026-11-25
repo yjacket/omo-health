@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { after, afterEach, test } from "node:test";
 import { DEFAULT_CONFIG, loadConfig } from "../src/config.mjs";
-import { createConfigReloader } from "../src/config-reload.mjs";
+import { createConfigReloader, detectorThresholdsHash } from "../src/config-reload.mjs";
 import { readDecisions } from "../src/decisions.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 
@@ -47,6 +47,7 @@ function setup({ mode, env = {}, initial = "{}" } = {}) {
 
 test("an edited config.json is applied in place once, with a receipt and an applied decision", () => {
 	const s = setup();
+	const before = structuredClone(s.config);
 	const actions = s.config.actions;
 	s.reloader.check();
 	assert.equal(s.loads, 1, "the first check always reads");
@@ -66,6 +67,7 @@ test("an edited config.json is applied in place once, with a receipt and an appl
 	const applied = readDecisions(s.paths).filter((d) => d.event === "config" && d.result === "applied");
 	assert.equal(applied.length, 1);
 	assert.deepEqual(applied[0].changed, [{ key: "actions.kill", from: true, to: false }]);
+	assert.equal(applied[0].thresholdsHash, detectorThresholdsHash(before), "an action switch does not change detector thresholds");
 	assert.equal(applied[0].fileMtimeMs, mtimeMs);
 });
 

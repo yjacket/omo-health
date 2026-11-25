@@ -64,6 +64,14 @@ export function resolvePaths(env = process.env) {
 			sessionsSnapshotFile: path.join(healthHome, "status", "_sessions.json"),
 			/** Ended-session ledger: one ended-YYYY-MM-DD.jsonl per UTC day. */
 			sessionsDir: path.join(healthHome, "sessions"),
+			/** Token index written only by the daemon (src/usage-index.mjs). */
+			usageIndexFile: path.join(healthHome, "sessions", "usage.json"),
+			/** Audit records; requests are the dashboard's only write under it. */
+			auditsDir: path.join(healthHome, "audits"),
+			auditRequestsDir: path.join(healthHome, "audits", "requests"),
+			auditBudgetFile: path.join(healthHome, "audits", "_budget.json"),
+			/** Dashboard preferences (hide child rows), written by the UI server. */
+			uiPrefsFile: path.join(healthHome, "ui-prefs.json"),
 			reportsDir: path.join(healthHome, "reports"),
 			decisionsDir: path.join(healthHome, "decisions"),
 			lkgDir: path.join(healthHome, "lkg"),
