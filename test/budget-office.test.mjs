@@ -776,21 +776,42 @@ test("(r3) past 40 review rounds the session is asked once to call the owner, an
 test("(r4) a rule audit below 1x spends no tier: tier 1 still audits when spend passes the approved budget (gate review B1)", (t) => {
 	const c = setup(t);
 	const pid = `${c.sid}:g1`;
-	c.writeGoal({ id: "g1", objective: "approved work", createdAt: secs(T0 - 30 * HOUR), updatedAt: secs(T0 - 30 * HOUR) });
-	writeJsonl(c.file, [E.header(c.sid, c.cwd, T0 - 30 * HOUR), spendEntry(T0 - 29 * HOUR, 35.11)]);
-	const runner = createFakeRunner({ outcomes: { "budget-audit": { status: "running" } } });
+	c.writeGoal({ id: "g1", objective: "approved work", createdAt: secs(T0 - 2 * HOUR), updatedAt: secs(T0 - 2 * HOUR) });
+	writeJsonl(c.file, [E.header(c.sid, c.cwd, T0 - 2 * HOUR), spendEntry(T0 - HOUR, 9.99)]);
+	const job = { status: "running" };
+	const runner = createFakeRunner({ outcomes: { "budget-audit": job } });
 	const office = c.office({ runner });
+	const step = (entries) => {
+		if (entries) appendJsonl(c.file, entries);
+		c.clock.advance(MIN);
+		const out = office.tick({ shadow: false });
+		office.delivered(out.messages.map((message) => ({ messageId: message.id, delivered: true })));
+		return out;
+	};
 	office.tick({ shadow: false });
-	// $30.01 approved earlier, and a change-review audit already ran below 1x a day ago.
-	const project = c.store.getProject(pid);
-	project.data.approvals = [{ requestId: "est-1", ms: T0 - 28 * HOUR, approvedUsd: 30.01, by: "rule" }];
-	project.data.audits = [{ auditId: "rule-1", ms: T0 - 26 * HOUR, status: "done", tier: null, ladder: { tier: 1, basis: "rule", reasons: ["change-review"] }, triggers: ["change-review"], endedMs: T0 - 26 * HOUR }];
-	project.status = "approved";
-	c.store.upsertProject(project);
-	c.clock.advance(MIN);
-	office.tick({ shadow: false });
-	assert.equal(runner.starts.length, 1, "passing 1x opens the tier-1 audit");
-	const audit = c.store.getProject(pid).data.audits.at(-1);
+	assert.deepEqual(c.kinds(step([spendEntry(T0 - 50 * MIN, 0.02)]).messages), ["budget-request"]);
+	// $18.01 approved on the estimate; $10.01 spent, below 1x.
+	step([E.assistant({ ms: T0 - 40 * MIN, usage: usage(0), text: estimateBlock({ projectId: pid, revision: 0 }) })]);
+	// A large change below 1x is approved staged ($10.01 + $20 = $30.01) and opens the change-review rule audit.
+	step([E.assistant({ ms: T0 - 30 * MIN, usage: usage(0), text: changeBlock({ projectId: pid, revision: 1 }) })]);
+	let project = c.store.getProject(pid);
+	assert.ok(Math.abs(project.data.approvals.at(-1).approvedUsd - 30.01) < 1e-9, `staged ${project.data.approvals.at(-1).approvedUsd}`);
+	assert.equal(runner.starts.length, 1, "the change review runs");
+	const rule = project.data.audits.at(-1);
+	assert.deepEqual([rule.tier, rule.ladder.basis, rule.triggers], [null, "rule", ["change-review"]], "the office records the rule audit without a tier");
+	Object.assign(job, {
+		status: "done",
+		stdout: `${JSON.stringify({ type: "message_end", message: { role: "assistant", model: "claude-fable-5-2", content: [{ type: "text", text: JSON.stringify({ v: 2, auditId: rule.auditId, projectId: pid, assessment: "waste-likely", confidence: 0.8, criteriaStatus: "unknown", situation: "Rounds reran the same QA pass.", criteria: [], counterevidence: "", decides: [{ who: "agent", what: "Whether to stop the reruns." }], findings: [{ pattern: "repeated-qa-without-acceptance-gain", evidence: "the same QA reran", explanation: "no new acceptance evidence" }], advice: "Stop rerunning the full QA pass; verify only the two new failure paths.", allocationOpinion: { assessment: "revise", reason: "a cheaper path keeps every criterion" } }) }], usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: { total: 0.4 } } } })}\n`,
+	});
+	assert.deepEqual(c.kinds(step().messages), ["budget-audit-opinion"]);
+	assert.equal(c.store.getProject(pid).data.audits.at(-1).status, "done");
+	// A day later spend passes the $30.01 approval: tier 1 is still unspent, so its audit opens.
+	c.clock.advance(25 * HOUR);
+	Object.assign(job, { status: "running" });
+	step([spendEntry(T0 + 25 * HOUR, 25)]);
+	assert.equal(runner.starts.length, 2, "passing 1x opens the tier-1 audit");
+	project = c.store.getProject(pid);
+	const audit = project.data.audits.at(-1);
 	assert.deepEqual([audit.tier, audit.ladder.basis, audit.triggers], [1, "budget", ["ladder-budget"]]);
 });
 
