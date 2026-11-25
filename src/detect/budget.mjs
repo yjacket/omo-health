@@ -18,13 +18,17 @@ export const id = "D26";
 
 const pct = (value) => (Number.isFinite(value) ? `${Math.round(value * 10) / 10}%` : "?");
 const hours = (value) => (Number.isFinite(value) ? `${Math.round(value * 10) / 10}시간` : "?");
+const HOUR_MS = 3600_000;
 
 function windowFinding(window) {
         const account = String(window.account ?? "");
         const windowId = String(window.windowId ?? "");
         if (!account || !windowId) return null;
         const resetsAtMs = Number.isFinite(window.resetsAtMs) ? window.resetsAtMs : "none";
-        const subject = { key: `budget:${window.state}:${account}:${windowId}:${resetsAtMs}` };
+        // The key names the window cycle, not the reading: Claude reports resetsAtMs a few hundred ms off on each read,
+        // just before the hour, so it is rounded to the nearest hour (#27). The next cycle resets a whole window later.
+        const cycle = Number.isFinite(window.resetsAtMs) ? Math.round(window.resetsAtMs / HOUR_MS) * HOUR_MS : "none";
+        const subject = { key: `budget:${window.state}:${account}:${windowId}:${cycle}` };
         const evidence = [
                 `window:${account}:${windowId}`,
                 `state:${window.state}`,

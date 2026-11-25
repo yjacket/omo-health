@@ -140,6 +140,17 @@ test("a new account window reset is a new fp", () => {
 	assert.notEqual(before[0].fp, after[0].fp);
 });
 
+test("a reset time that jitters by a few hundred ms keeps one fp per window cycle (#27)", () => {
+	// Real Claude 7d readings on 2026-11-25, around the top of the hour; the last one crosses it.
+	const jittered = [1796126399725, 1796126399969, 1796126400050];
+	for (const state of ["short", "tight"]) {
+		const fps = jittered.map((resetsAtMs) => budget.detect(world(snapshot({ treasury: { state, windows: [windowEntry({ state, resetsAtMs })] } })))[0].fp);
+		assert.equal(new Set(fps).size, 1, `${state}: one fp for one cycle`);
+		const nextCycle = budget.detect(world(snapshot({ treasury: { state, windows: [windowEntry({ state, resetsAtMs: jittered[0] + 7 * 24 * 3600_000 })] } })))[0].fp;
+		assert.notEqual(nextCycle, fps[0], `${state}: the next 7d cycle is a new fp`);
+	}
+});
+
 test("an unknown treasury emits nothing", () => {
 	assert.deepEqual(budget.detect(world(snapshot({ treasury: { state: "unknown", windows: [windowEntry({ state: "unknown", projectedAtResetPercent: null, freePercent: null })] } }))), []);
 	assert.deepEqual(budget.detect(world(snapshot({ treasury: { state: "unknown", windows: [windowEntry({ state: "ok" })] } }))), []);
