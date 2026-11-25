@@ -4,7 +4,7 @@
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
 		<meta name="color-scheme" content="light dark" />
-		<meta name="description" content="omo-health 로컬 대시보드: 세션 현황, 세션 기록, 감시기 관리" />
+		<meta name="description" content="omo-health 로컬 대시보드: 세션 현황, 세션 기록, 감시기 관리, 예산" />
 		<meta name="referrer" content="no-referrer" />
 		<title>omo-health</title>
 		<link rel="stylesheet" href="/app.css" />
@@ -28,6 +28,7 @@
 					<button type="button" class="tab" role="tab" id="tab-sessions" data-tab="sessions" aria-selected="true" aria-controls="panel-sessions">세션 현황</button>
 					<button type="button" class="tab" role="tab" id="tab-ended" data-tab="ended" aria-selected="false" aria-controls="panel-ended" tabindex="-1">세션 기록</button>
 					<button type="button" class="tab" role="tab" id="tab-admin" data-tab="admin" aria-selected="false" aria-controls="panel-admin" tabindex="-1">관리</button>
+					<button type="button" class="tab" role="tab" id="tab-budget" data-tab="budget" aria-selected="false" aria-controls="panel-budget" tabindex="-1">예산</button>
 				</nav>
 
 				<div class="panel" id="panel-sessions" role="tabpanel" aria-labelledby="tab-sessions" data-panel="sessions">
@@ -72,6 +73,25 @@
 						<section class="card" id="settings" hidden>
 							<h2 class="card__title">설정</h2>
 							<div class="card__body" id="settings-body"></div>
+						</section>
+					</div>
+				</div>
+
+				<div class="panel" id="panel-budget" role="tabpanel" aria-labelledby="tab-budget" data-panel="budget" hidden>
+					<div class="sections">
+						<section class="card" id="budget-limits" hidden>
+							<h2 class="card__title">한도</h2>
+							<div class="card__body" id="budget-limits-body"></div>
+						</section>
+
+						<section class="card" id="budget-projects" hidden>
+							<h2 class="card__title">프로젝트</h2>
+							<div class="card__body" id="budget-projects-body"></div>
+						</section>
+
+						<section class="card" id="budget-audits" hidden>
+							<h2 class="card__title">감사</h2>
+							<div class="card__body" id="budget-audits-body"></div>
 						</section>
 					</div>
 				</div>

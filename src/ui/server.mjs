@@ -4,6 +4,7 @@ import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { clearPause, setSwitch, writePause } from "../control.mjs";
+import { writeCommand } from "../budget/commands.mjs";
 import { safeSubjectId } from "../session-id.mjs";
 import { resolveLedgerSubject } from "../session-record.mjs";
 import { boardLiveOwners } from "../session-subject.mjs";
@@ -37,6 +38,7 @@ const API_ROUTES = Object.freeze({
 	"/api/pause": "POST",
 	"/api/resume": "POST",
 	"/api/switch": "POST",
+	"/api/budget/coupons": "POST",
 	"/api/diagnose": "GET",
 	"/api/session": "GET",
 	"/api/audit": "POST",
@@ -47,6 +49,7 @@ const SESSION_ROW = /^[0-9a-f]{16}$/;
 const NON_NEGATIVE_INT = /^\d+$/;
 
 const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+const isText = (v) => typeof v === "string" && v.trim().length > 0;
 const hasExactKeys = (obj, keys) => {
 	const own = Object.keys(obj);
 	return own.length === keys.length && keys.every((k) => Object.hasOwn(obj, k));
@@ -62,6 +65,8 @@ class HttpFailure extends Error {
 }
 
 const SWITCH_STATUS = Object.freeze({ "unknown-key": 422, "invalid-value": 422, unreadable: 409 });
+/** The dashboard's budget routes answer a malformed body with 400; the command queue validates again before writing. */
+const BUDGET_BAD_BODY = () => new HttpFailure(400, { error: "invalid" });
 
 /** Validates a parsed POST body for its route and runs the control action: returns [status, body]. */
 function runAction(paths, route, body, nowMs, startAudit) {
@@ -96,6 +101,12 @@ function runAction(paths, route, body, nowMs, startAudit) {
 			if (result.ok) return [200, { ok: true, value: result.value, isDefault: result.isDefault }];
 			const payload = result.message === undefined ? { error: result.reason } : { error: result.reason, message: result.message };
 			return [SWITCH_STATUS[result.reason] ?? 500, payload];
+		}
+		case "/api/budget/coupons": {
+			if (!hasExactKeys(body, ["account", "count"])) throw BUDGET_BAD_BODY();
+			if (!isText(body.account) || !Number.isInteger(body.count) || body.count < 0 || body.count > 20) throw BUDGET_BAD_BODY();
+			writeCommand(paths, { kind: "coupons", account: body.account, count: body.count }, { now: nowMs });
+			return [200, { ok: true }];
 		}
 		default:
 			throw new HttpFailure(404, { error: "not-found" });

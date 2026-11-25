@@ -1,0 +1,25 @@
+{
+  "findings": [],
+  "actions": [
+    {
+      "kind": "message:self-notice"
+    }
+  ],
+  "forbiddenActions": [
+    "budget-audit-start",
+    "budget-audit-end",
+    "kill-pids",
+    "release-shell",
+    "detach-server"
+  ],
+  "forbiddenFindings": [
+    {
+      "detector": "D26",
+      "severity": "warn"
+    },
+    {
+      "detector": "D26",
+      "severity": "crit"
+    }
+  ]
+}

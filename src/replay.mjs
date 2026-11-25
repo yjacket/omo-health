@@ -8,6 +8,9 @@ import { createConfigTracker } from "./collect/config-files.mjs";
 import { loadConfig } from "./config.mjs";
 import { createBaseline } from "./baseline.mjs";
 import { createEngine, loadDetectors } from "./engine.mjs";
+import { parseOutput } from "./budget/audit.mjs";
+import { createBudgetOffice } from "./budget/office.mjs";
+import { closeDb, openDb } from "./db/db.mjs";
 import { createAnalyst } from "./judge/analyst.mjs";
 import { createInvestigations } from "./investigations.mjs";
 import { resolvePaths } from "./paths.mjs";
@@ -22,6 +25,12 @@ import { createFakeClock, toMs } from "./util/time.mjs";
  *                   analyst's JSON answer, validated like a real one) or ends with `status`/`reason` (failed, unavailable,
  *                   timeout), durationMs after it started. Without it the replay has no analyst, so a suspicion is only recorded.
  *                   A `config` override such as {"analyst": {"perDay": 0}} makes the analyst refuse to start (unavailable).
+ *                   budgetAudit?: {result?: <audit opinion>, durationMs?, status?, reason?}
+ *                   The budget audit job's answer, used only when the fixture's own `config.budget.enabled` is true
+ *                   (the replay then runs the real budget office on an in-memory db: fake budget runner on the fixture
+ *                   clock, no process spawned). `result` is the audit opinion, validated by the real C-audit parser
+ *                   (its auditId is filled from the started job), or the job ends with `status`/`reason` (`done`
+ *                   default) durationMs after it started (60 s default). Without it a started audit answers nothing.
  *                   baseline?: {spanMs, count, values: {births|cpu|mem|writes|temp: [v, ...]}} seeds this machine's usual
  *                   rates (#55 C): `count` samples per metric cycling through its values, spread over the spanMs before
  *                   clockStart. Without it the replay has no baseline.
@@ -119,6 +128,41 @@ export async function runReplay(fixtureDir, { detectors, keep = false } = {}) {
 			return status === "done" ? { status, result: meta.analyst.result ?? null, costUsd: 0 } : { status, reason: meta.analyst.reason ?? status, result: null };
 		},
 	};
+	// Todo 22: the fixture opts into the budget office itself. DEFAULT_CONFIG has budget.enabled true, so the check is
+	// on the fixture's own override; every existing fixture (no budget key in meta.config) stays office-free.
+	const budgetAudit = meta.budgetAudit ?? null;
+	const budgetJobs = [];
+	let budgetDb = null;
+	let budgetOffice = null;
+	if (meta.config?.budget?.enabled === true) {
+		/** The runner as the budget office sees it: the real C-audit parser reads the answer, no process is started. */
+		const budgetRunner = {
+			start: (opts) => {
+				const model = opts.args?.[opts.args.indexOf("--model") + 1];
+				budgetJobs.push({ jobId: opts.jobId, startedMs: clock.now(), model, args: opts.args });
+				actions.push({ kind: "budget-audit-start", atMs: clock.now(), jobId: opts.jobId });
+				return { jobId: opts.jobId, pid: 0, dir: opts.cwd ?? "" };
+			},
+			poll: (jobId) => {
+				const job = budgetJobs.find((j) => j.jobId === jobId);
+				if (!job) return { status: "failed", reason: "no-job", result: null };
+				if (clock.now() - job.startedMs < (budgetAudit?.durationMs ?? 60_000)) return { status: "running", result: null };
+				if (!job.endedMs) {
+					job.endedMs = clock.now();
+					actions.push({ kind: "budget-audit-end", atMs: clock.now(), jobId });
+				}
+				const status = budgetAudit?.status ?? "done";
+				if (status !== "done") return { status, reason: budgetAudit?.reason ?? status, result: null };
+				// The opinion leaves through a json-mode event line, so the real parser (and validateOpinion behind it) judges it.
+				const opinion = { ...(budgetAudit?.result ?? {}), auditId: jobId };
+				const stdout = JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: JSON.stringify(opinion) }], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } });
+				return { status: "done", result: parseOutput(stdout) };
+			},
+			jobDir: (jobId) => path.join(paths.health.jobsDir, jobId),
+		};
+		budgetDb = openDb({ file: ":memory:" });
+		budgetOffice = createBudgetOffice({ paths, db: budgetDb, clock, config, runner: budgetRunner });
+	}
 	const procsFile = path.join(dir, "procs.ndjson");
 	const procs = fs.existsSync(procsFile) ? createFixtureSource({ file: procsFile, clock }) : createFixtureSource({ records: [], clock });
 	const engine = createEngine({
@@ -151,7 +195,7 @@ export async function runReplay(fixtureDir, { detectors, keep = false } = {}) {
 			},
 			send: (message) => {
 				sent.push({ ...message, atMs: clock.now() });
-				actions.push({ kind: `message:${message.kind}`, atMs: clock.now(), sessionId: message.sessionId });
+				actions.push({ kind: `message:${message.kind}`, atMs: clock.now(), sessionId: message.sessionId, actionKind: message.details?.actionKind });
 				return "replay";
 			},
 			notifier: {
@@ -162,6 +206,7 @@ export async function runReplay(fixtureDir, { detectors, keep = false } = {}) {
 				},
 			},
 			...(meta.analyst ? { analyst: createAnalyst({ config, paths, clock, runner: analystRunner, env: {} }) } : {}),
+			...(budgetOffice ? { budget: budgetOffice } : {}),
 			...(meta.baseline ? { baseline: createBaseline({ paths, config, clock }) } : {}),
 			revert: ({ fromSha1, toSha1 }) => {
 				actions.push({ kind: "revert-settings", atMs: clock.now(), fromSha1, toSha1 });
@@ -196,9 +241,10 @@ export async function runReplay(fixtureDir, { detectors, keep = false } = {}) {
 		clock.advance(tickMs);
 	}
 	engine.close();
+	closeDb(budgetDb);
 	const investigations = createInvestigations({ paths, clock }).list();
 	if (!keep) fs.rmSync(dir, { recursive: true, force: true });
-	return { findings: [...firstSeen.values()], actions, decisions, sent, toasts, analystJobs, investigations, meta };
+	return { findings: [...firstSeen.values()], actions, decisions, sent, toasts, analystJobs, budgetJobs, investigations, meta };
 }
 
 /** baseline.json with `count` samples per metric, cycling through `values`, evenly spread over the `spanMs` before `endMs`. */
@@ -217,8 +263,8 @@ const subset = (actual, partial) => Object.entries(partial ?? {}).every(([k, v])
 /**
  * expected.json:
  *   findings: [{detector, kind, cls?, severity?, subject?: {...}, at?: [fromIso, toIso]}]   each must appear
- *   actions: [{kind, targets?: [pid...], at?: [fromIso, toIso]}]                            each must happen
- *   forbiddenActions: ["kill-pids", ...]                                                     must not happen
+ *   actions: [{kind, actionKind?, targets?: [pid...], at?: [fromIso, toIso]}]               each must happen (actionKind: same actionKind)
+ *   forbiddenActions: ["kill-pids", {kind, actionKind?}, ...]                                must not happen
  *   forbiddenFindings: [{detector?, kind?, cls?, severity?}]                                 must not appear
  *   investigations: [{status, trigger?, cls?, failed?: true, retryAtMs?: true}]               each must exist (retryAtMs: true = set)
  *   decisions: [{event, status?, result?}]                                                   each must be logged
@@ -231,12 +277,13 @@ export function compareExpected(result, expected) {
 		if (!hit) problems.push(`missing finding ${JSON.stringify(want)}`);
 	}
 	for (const want of expected.actions ?? []) {
-		const hit = result.actions.find((a) => a.kind === want.kind && inRange(a.atMs, want.at) && (!want.targets || JSON.stringify([...a.targets].sort()) === JSON.stringify([...want.targets].sort())));
+		const hit = result.actions.find((a) => a.kind === want.kind && (!want.actionKind || a.actionKind === want.actionKind) && inRange(a.atMs, want.at) && (!want.targets || JSON.stringify([...a.targets].sort()) === JSON.stringify([...want.targets].sort())));
 		if (!hit) problems.push(`missing action ${JSON.stringify(want)} (got ${JSON.stringify(result.actions.map((a) => ({ kind: a.kind, at: new Date(a.atMs).toISOString(), targets: a.targets })))})`);
 	}
-	for (const kind of expected.forbiddenActions ?? []) {
-		const hit = result.actions.find((a) => a.kind === kind);
-		if (hit) problems.push(`forbidden action ${kind} at ${new Date(hit.atMs).toISOString()}`);
+	for (const want of expected.forbiddenActions ?? []) {
+		const bad = typeof want === "string" ? { kind: want } : want;
+		const hit = result.actions.find((a) => a.kind === bad.kind && (!bad.actionKind || a.actionKind === bad.actionKind));
+		if (hit) problems.push(`forbidden action ${bad.kind} at ${new Date(hit.atMs).toISOString()}`);
 	}
 	for (const want of expected.investigations ?? []) {
 		const hit = (result.investigations ?? []).find((inv) => inv.status === want.status && (!want.trigger || inv.trigger === want.trigger) && (!want.cls || inv.cls === want.cls) && (want.retryAtMs === undefined || Number.isFinite(inv.retryAtMs) === want.retryAtMs));
