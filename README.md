@@ -328,7 +328,7 @@ omo -p --no-session -ne -ns -nc --no-tools --model <모델> --session-id <id> "<
 
 - 세션: 예산이 필요하면 `estimate`나 `change` 블록 하나를 답장 끝에 붙입니다.
 - 재정(데몬의 예산 사무소): 매 틱 세션 로그에서 지출을 장부(`omo-health.db`)에 옮기고, `subscription-usage.json`의 구독 창을 읽어 창마다 `budget.reservePercent` + `budget.auditReservePercent`를 비워 둘 수 있는지 계산합니다. 승인과 거절은 재정만 합니다. 처음 승인 대비 누적으로 `budget.autoChangePercent`(20%) 이내인 작은 증액은 요청한 금액 그대로 승인합니다. 그 밖의 큰 증액은 `progress`(마지막 승인 뒤 끝낸 확인 가능한 결과 1-5개)가 없으면 `no-progress-evidence`로 거절하고, 있으면 지금까지 쓴 금액에 남은 작업의 중앙값(p50)을 더한 만큼, 한 단계만 승인합니다(`staged: true`, `nextCheckpoint`). 그 단계 총액이 처음 승인 금액보다 `budget.maxChangePercent`(100%) 넘게 많으면(기본값이면 처음 승인의 2배 초과) `cumulative-cap`으로 거절하고, 여유가 없으면 `insufficient-capacity`로 거절하며 결정 메시지에 가장 이른 리셋 시각을 적어 그 뒤에 다시 요청하라고 안내합니다. 큰 첫 견적도 같은 방식으로 한 단계만 승인합니다.
-- 감사: 승인 관계 밖의 제삼자입니다. 큰 견적과 큰 증액마다, 그리고 회차 반복, 리뷰어 실행 `budget.audit.reviewsAudit`(6)회, PR 링크가 처음 보인 뒤 `budget.audit.afterDeliveryUsd`($5) 지출 같은 발동 조건이 걸리면 감사 모델(`budget.audit.models`)로 감사를 따로 엽니다. 감사 모델은 그 프로젝트(메인, 자식, 리뷰어)가 쓰지 않은 계열에서 고르고, 없으면 쓰지 않은 이름의 모델을 고른 뒤 의견에 계열 독립이 아니라고 적습니다. 감사는 사용자 요청 원문(처음 2개와 최근 3개), goal 문장, 기준별 상태, 리뷰어 판정, 앞선 omo-health 알림과 감사 의견, 열린 PR을 읽고, 기준마다 사용자가 준 것인지 에이전트가 넣은 것인지, 남은 예산과 시간으로 끝낼 수 있는지 판단합니다. 결과는 한 쪽(4,000자) 의견으로 세션에 갑니다: 상황, 기준별 판정, 발견과 근거, 반대 증거, 권고, 누가 정하는지. 감사 결과는 승인이나 거절에 쓰이지 않고 세션 알림, 대시보드, 앞으로의 견적 보정에만 쓰입니다. 마지막 감사 의견이 `waste-likely`인 끝난 프로젝트는 견적 기준 집단에서 빠집니다.
+- 감사: 승인 관계 밖의 제삼자입니다. 언제 보는지는 사다리가 정합니다. 승인된 예산의 1배, 2배, 3배를 넘을 때마다 한 번씩(1-3단계), 승인 예산이 없으면 리뷰 회차(번호 붙은 회차와 리뷰어 실행 중 큰 값)가 10, 20, 30을 넘을 때마다 한 번씩입니다. 예산이 있어도 리뷰가 10차를 넘으면 1단계를 한 번 봅니다. 큰 증액과 견적 이탈도 지금 단계로 감사를 엽니다. 4배(예산이 없으면 40차)를 넘으면 감사 대신 세션에 계속할지 질문 도구로 사용자에게 물어보라는 알림을 한 번 보내고, D26이 사람이 필요한 감지(`owner-call`)를 냅니다. 감사관은 메인 세션과 같은 계열의 최상위 모델(`budget.audit.topModels`)이고 단계마다 `high`, `xhigh`, `max`로 생각을 깊게 합니다. 그 계열 계정이 로그인돼 있지 않거나 한도에 걸리면 다른 모델로 바꾸지 않고 `no-model`로 미룹니다. 먼저 quick 레인(`budget.audit.digestLane`)의 첫 모델이 리뷰어 판정, 최근 작업, 앞선 알림을 요약하고, 감사관은 그 요약을 읽습니다. 둘 다 도구 없이 돕니다. 감사는 사용자 요청 원문(처음 2개와 최근 3개), goal 문장, 기준별 상태, 리뷰어 판정, 앞선 omo-health 알림과 감사 의견, 열린 PR을 읽고, 기준마다 사용자가 준 것인지 에이전트가 넣은 것인지, 남은 예산과 시간으로 끝낼 수 있는지 판단합니다. 결과는 한 쪽(4,000자) 의견으로 세션에 갑니다: 상황, 기준별 판정, 발견과 근거, 반대 증거, 권고, 누가 정하는지. 감사 결과는 승인이나 거절에 쓰이지 않고 세션 알림, 대시보드, 앞으로의 견적 보정에만 쓰입니다. 마지막 감사 의견이 `waste-likely`인 끝난 프로젝트는 견적 기준 집단에서 빠집니다.
 
 설치 직후 감시기는 최근 `budget.backfillDays`(8일) 동안의 대화 기록을 읽어 장부를 채우고, 그동안 대시보드와 CLI에 `수집 중 n%`를 보여 줍니다. 견적 요청, 체크포인트, 감사는 진행 중인 목표에만 적용되고, 이미 끝난 목표에는 적용되지 않습니다.
 
@@ -346,7 +346,7 @@ omo -p --no-session -ne -ns -nc --no-tools --model <모델> --session-id <id> "<
 
 ### D26 예산
 
-D26은 예산 사무소가 쓴 `budget/snapshot.json`만 읽는 조언용 탐지기입니다. `treasury-short`(창이 리셋 전에 예비분에 닿음, 경고), `treasury-tight`(예비분에 가까움, 정보), `audit-opinion`(감사가 낭비 가능성을 지적, 정보)을 냅니다. 구독 값이 없거나 `budget.staleMs`보다 오래되면 아무것도 내지 않습니다.
+D26은 예산 사무소가 쓴 `budget/snapshot.json`만 읽는 조언용 탐지기입니다. `treasury-short`(창이 리셋 전에 예비분에 닿음, 경고), `treasury-tight`(예비분에 가까움, 정보), `audit-opinion`(감사가 낭비 가능성을 지적, 정보), `owner-call`(사다리 끝을 넘어 사용자 판단이 필요, 경고)을 냅니다. 구독 값이 없거나 `budget.staleMs`보다 오래되면 아무것도 내지 않습니다.
 
 ### 설정 키
 
@@ -371,9 +371,11 @@ D26은 예산 사무소가 쓴 `budget/snapshot.json`만 읽는 조언용 탐지
 | `budget.providerAliases` | `claude-sdk-oauth=anthropic-subscription` | 공급자 별칭 |
 | `budget.calibration.*` | | 구독 % 대비 달러 보정 조건 |
 | `budget.audit.enabled` | true | 지출 감사 스위치 |
-| `budget.audit.models` | | 감사 모델 목록. 프로젝트가 쓴 계열을 먼저 피하고, 다음에 쓴 이름을 피함 |
-| `budget.audit.reviewsRecord`, `budget.audit.reviewsAudit` | 3, 6 | 리뷰어 실행 횟수: 기록, 감사 |
-| `budget.audit.afterDeliveryUsd` | 5 | PR 링크가 처음 보인 뒤 이만큼 쓰면 감사 |
+| `budget.audit.topModels` | claude: Fable 5.2, gpt: GPT 6.2 Astra | 계열별 감사관 모델 |
+| `budget.audit.efforts` | high, xhigh, max | 단계별 생각 깊이 |
+| `budget.audit.digestLane` | quick | 감사 전 요약 모델을 고를 레인 |
+| `budget.audit.ladderMultiples`, `budget.audit.ownerMultiple` | 1, 2, 3 / 4 | 승인 예산 배수: 감사 단계, 사용자 호출 |
+| `budget.audit.ladderRounds`, `budget.audit.ownerRounds` | 10, 20, 30 / 40 | 예산이 없을 때의 리뷰 회차 |
 | `budget.audit.perProjectDay`, `budget.audit.perDay`, `budget.audit.minGapMs`, `budget.audit.timeoutMs` | 2, 4, 6시간, 15분 | 감사 횟수와 간격 |
 
 `budget.enabled`와 `budget.audit.enabled`는 대시보드 스위치입니다. 대시보드 예산 탭은 한도, 프로젝트, 감사 카드를 보여 주고, 증액은 화면이 아니라 규칙이 정합니다. 쿠폰 명령은 장부 기록이며 승인이 아닙니다. CLI는 `omo-health budget [--json]`, `status --json`에서는 `budget` 필드입니다. 그림자 모드에서는 계산과 스냅숏만 하고 알림, 감사, 명령 처리는 하지 않습니다.

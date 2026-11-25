@@ -3,7 +3,7 @@
 // rounds are [{round, firstMs}] (ascending by round, durable across todo closures).
 
 const DAY = 24 * 60 * 60 * 1000;
-const INFLIGHT = new Set(["started", "running", "pending"]);
+const INFLIGHT = new Set(["started", "digesting", "running", "pending"]);
 
 function dataOf(project) {
 	return project && typeof project.data === "object" && project.data !== null ? project.data : {};
@@ -122,24 +122,6 @@ export function triggers(ind, cfg, { child24hUsd = 0 } = {}) {
 		});
 	}
 
-	const reviewSpawns = num(ind?.reviewSpawns);
-	if (Number.isFinite(a.reviewsRecord) && reviewSpawns >= a.reviewsRecord) {
-		out.push({
-			kind: "reviews",
-			heavy: Number.isFinite(a.reviewsAudit) && reviewSpawns >= a.reviewsAudit,
-			detail: `${reviewSpawns} reviewer runs`,
-		});
-	}
-
-	const afterDeliveryUsd = ind?.afterDeliveryUsd;
-	if (Number.isFinite(afterDeliveryUsd) && Number.isFinite(a.afterDeliveryUsd) && afterDeliveryUsd >= a.afterDeliveryUsd) {
-		out.push({
-			kind: "after-delivery",
-			heavy: true,
-			detail: `$${afterDeliveryUsd.toFixed(2)} spent after a PR link first appeared`,
-		});
-	}
-
 	const threshold = Math.max(num(a.descendantUsd), num(a.descendantFraction) * num(ind?.approvedUsd));
 	if (num(child24hUsd) >= threshold) {
 		out.push({
@@ -150,6 +132,27 @@ export function triggers(ind, cfg, { child24hUsd = 0 } = {}) {
 	}
 
 	return out;
+}
+
+/**
+ * The review-opinion ladder (owner decision 2026-11-25, Review 261125-18gd). Money is the control: past 1x, 2x and 3x of
+ * the approved budget the auditor looks at tiers 1, 2 and 3 (effort high, xhigh, max), past 4x the owner is called
+ * (tier 4). A project with no approved budget climbs by review rounds instead (10, 20, 30, then 40 calls the owner);
+ * with a budget, more than the first round step still earns one tier-1 look. Rounds are the larger of the distinct
+ * numbered rounds and the reviewer runs. Returns { tier: 0..4, basis: "budget" | "rounds" | null, ratio, rounds }.
+ */
+export function ladder(ind, cfg) {
+	const a = limitsOf(cfg);
+	const multiples = [...listOf(a.ladderMultiples), a.ownerMultiple].filter(Number.isFinite);
+	const steps = [...listOf(a.ladderRounds), a.ownerRounds].filter(Number.isFinite);
+	const rounds = Math.max(num(ind?.roundsCount), num(ind?.reviewSpawns));
+	const ratio = Number.isFinite(ind?.budgetRatio) ? ind.budgetRatio : null;
+	const over = (value, limits) => limits.filter((limit) => value > limit).length;
+	const roundsTier = over(rounds, steps);
+	if (ratio === null) return { tier: roundsTier, basis: roundsTier ? "rounds" : null, ratio, rounds };
+	const budgetTier = over(ratio, multiples);
+	const tier = Math.max(budgetTier, Math.min(roundsTier, 1));
+	return { tier, basis: tier === 0 ? null : budgetTier >= tier ? "budget" : "rounds", ratio, rounds };
 }
 
 // IS-9 caps: one audit in flight per project, perProjectDay per rolling day, perDay

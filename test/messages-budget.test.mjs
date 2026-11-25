@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
 	AUDIT_OPINION_CHARS,
 	composeAuditOpinion,
+	composeBudgetOwnerCall,
 	composeBudgetCheckpoint,
 	composeBudgetCorrection,
 	composeBudgetDecision,
@@ -75,7 +76,7 @@ function checkpoint(overrides = {}) {
 }
 
 /** A C-audit v2 opinion; `objective`, `model` and `independence` go to the message, everything else into the opinion. */
-function opinion({ objective = OBJECTIVE, model = "anthropic-subscription/claude-opus-5-5:high", independence = "family", ...overrides } = {}) {
+function opinion({ objective = OBJECTIVE, model = "anthropic-subscription/claude-fable-5-2:high", ladder = { tier: 1, basis: "rounds", ratio: null, rounds: 24 }, ...overrides } = {}) {
 	return composeAuditOpinion({
 		sessionId: SESSION,
 		now: NOW,
@@ -84,7 +85,7 @@ function opinion({ objective = OBJECTIVE, model = "anthropic-subscription/claude
 		auditId: "audit-1",
 		objective,
 		model,
-		independence,
+		ladder,
 		opinion: {
 			assessment: "waste-likely",
 			confidence: 0.8,
@@ -270,11 +271,21 @@ test("content stays within 1600 characters with long inputs", () => {
 
 test("the one-page opinion carries every section, the criterion origin and who decides", () => {
 	const message = opinion();
-	for (const part of ["Situation: Three QA rounds", "[agent-given, unmet] plan-reviewer approval", "Findings:", "Evidence: rounds 3-5", "Counterevidence: round 4", "Recommendation: Cover", "Who decides:", "You (the agent): drop the self-added", "The owner: whether the edge-case", "a model family this project did not use"]) {
+	for (const part of ["Situation: Three QA rounds", "[agent-given, unmet] plan-reviewer approval", "Findings:", "Evidence: rounds 3-5", "Counterevidence: round 4", "Recommendation: Cover", "Who decides:", "You (the agent): drop the self-added", "The owner: whether the edge-case", "(review tier 1 of 3: 24 review rounds)"]) {
 		assert.ok(message.content.includes(part), `opinion misses ${part}`);
 	}
-	assert.match(opinion({ independence: "name" }).content, /not family-independent/);
-	assert.equal(message.details.independence, "family");
+	assert.match(opinion({ ladder: { tier: 2, basis: "budget", ratio: 2.34, rounds: 3 } }).content, /review tier 2 of 3: spend is 2\.3x the approved budget/);
+	assert.equal(message.details.tier, 1);
+});
+
+test("past the last tier the owner call asks the session to put the question to the owner, and stops nothing", () => {
+	const byBudget = composeBudgetOwnerCall({ sessionId: SESSION, now: NOW, projectId: PROJECT, revision: 4, objective: OBJECTIVE, ladder: { tier: 4, basis: "budget", ratio: 4.2, rounds: 5 }, spentUsd: 126, approvedUsd: 30 });
+	assert.equal(byBudget.details.actionKind, "budget-owner-call");
+	assert.match(byBudget.content, /\$126\.00 is spent, 4\.2x the approved \$30\.00/);
+	assert.match(byBudget.content, /ask the owner with the question tool/);
+	assert.match(byBudget.content, /Nothing was stopped or changed/);
+	const byRounds = composeBudgetOwnerCall({ sessionId: SESSION, now: NOW, projectId: PROJECT, ladder: { tier: 4, basis: "rounds", ratio: null, rounds: 41 } });
+	assert.match(byRounds.content, /41 review rounds without an approved budget/);
 });
 
 // Gate review B4: schema-valid but verbose opinion. The body is truncated first, the advisory sentence is kept.

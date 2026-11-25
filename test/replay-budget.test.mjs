@@ -18,12 +18,16 @@ const SID = "01a0e000-0022-7000-8000-000000000022";
 const PROJECT_ID = `${SID}:goal-budget-22`;
 
 const OPINION = {
-	v: 1,
+	v: 2,
 	auditId: "filled-by-the-replay",
 	projectId: PROJECT_ID,
 	assessment: "waste-likely",
 	confidence: 0.85,
 	criteriaStatus: "unknown",
+	situation: "Eleven rounds reran the same check.",
+	criteria: [],
+	counterevidence: "",
+	decides: [{ who: "agent", what: "Whether to stop rerunning the check." }],
 	findings: [
 		{
 			pattern: "repeated-qa-without-acceptance-gain",
@@ -40,7 +44,7 @@ const OPINION = {
  * chatgpt-subscription provider (the default audit model). `budgetEnabled` decides whether meta.config opts into the
  * office at all; `budgetAudit` is the fake audit job's answer.
  */
-function makeFixture({ budgetEnabled, rounds = 4, budgetAudit = { result: OPINION, durationMs: 0 } } = {}) {
+function makeFixture({ budgetEnabled, rounds = 11, budgetAudit = { result: OPINION, durationMs: 0 } } = {}) {
 	const dir = tmpDir("omoh-budget-22-");
 	const cwd = path.join(dir, "project");
 	const sessionDir = path.join(dir, "omo", "agent", "sessions", "proj");

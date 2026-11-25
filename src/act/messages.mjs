@@ -780,16 +780,20 @@ const AUDIT_OPINION_TAIL = "This is an audit opinion, not an instruction; you de
 /** One page: the whole audit opinion fits, so the agent reads the reasoning and the counterevidence, not a summary. */
 export const AUDIT_OPINION_CHARS = 4000;
 
-const INDEPENDENCE_TEXT = {
-	family: "a model family this project did not use",
-	name: "a model this project did not use, but of a family it used (not family-independent)",
-};
+/** Why this tier of the ladder looked: spend against the approved budget, or review rounds where there is none. */
+function ladderText(ladder) {
+	if (!ladder || !Number.isFinite(ladder.tier)) return "";
+	const why = ladder.basis === "budget" && Number.isFinite(ladder.ratio)
+		? `spend is ${ladder.ratio.toFixed(1)}x the approved budget`
+		: `${ladder.rounds ?? "?"} review rounds`;
+	return ` (review tier ${ladder.tier} of 3: ${why})`;
+}
 
 /**
  * IS-8: the auditor's one-page opinion (C-audit v2), delivered as an opinion the session may weigh. Never an instruction:
  * it names who decides each point (an agent-added criterion the agent, an owner-given one the owner).
  */
-export function composeAuditOpinion({ sessionId, now, projectId, revision = 0, auditId = null, objective = "", opinion = {}, model = null, independence = null }) {
+export function composeAuditOpinion({ sessionId, now, projectId, revision = 0, auditId = null, objective = "", opinion = {}, model = null, ladder = null }) {
 	const assessment = opinion.assessment ?? "insufficient-evidence";
 	const verdict = AUDIT_OPINION_TEXT[assessment] ?? AUDIT_OPINION_TEXT["insufficient-evidence"];
 	const confidenceText = Number.isFinite(Number(opinion.confidence)) ? `, confidence ${Number(opinion.confidence).toFixed(2)}` : "";
@@ -798,7 +802,7 @@ export function composeAuditOpinion({ sessionId, now, projectId, revision = 0, a
 	const decides = (opinion.decides ?? []).map((d) => `- ${d.who === "owner" ? "The owner" : "You (the agent)"}: ${d.what}`);
 	const body = [
 		`${BUDGET_PREFIX} Review opinion for project "${projectId}" (revision ${revision}, "${truncate(objective, 120)}"): ${assessment}${confidenceText}. The auditor found ${verdict}`,
-		`Auditor: ${model ?? "unknown model"}${INDEPENDENCE_TEXT[independence] ? `, ${INDEPENDENCE_TEXT[independence]}` : ""}.`,
+		`Auditor: ${model ?? "unknown model"}${ladderText(ladder)}.`,
 		...(opinion.situation ? ["", `Situation: ${opinion.situation}`] : []),
 		...(criteria.length ? ["", "Criteria:", ...criteria] : []),
 		...(findings.length ? ["", "Findings:", ...findings] : []),
@@ -809,5 +813,21 @@ export function composeAuditOpinion({ sessionId, now, projectId, revision = 0, a
 	// The body is redacted, then truncated, then the contract sentence is appended: redaction can lengthen text, so it
 	// must happen before the cap or the final cap in budgetMessage would cut the sentence.
 	const content = `${truncate(redact(body), AUDIT_OPINION_CHARS - AUDIT_OPINION_TAIL.length - 1)}\n${AUDIT_OPINION_TAIL}`;
-	return budgetMessage({ sessionId, now, actionKind: "budget-audit-opinion", content, cap: AUDIT_OPINION_CHARS, details: { projectId, revision, auditId, assessment, independence } });
+	return budgetMessage({ sessionId, now, actionKind: "budget-audit-opinion", content, cap: AUDIT_OPINION_CHARS, details: { projectId, revision, auditId, assessment, tier: ladder?.tier ?? null } });
+}
+
+/**
+ * Past the ladder's last tier (4x the approved budget, or 40 review rounds without one) the owner decides: the session
+ * is asked once to put the question to them. Nothing is stopped; the owner's answer is the session's to act on.
+ */
+export function composeBudgetOwnerCall({ sessionId, now, projectId, revision = 0, objective = "", ladder = {}, spentUsd = 0, approvedUsd = 0 }) {
+	const why = ladder.basis === "budget" && Number.isFinite(ladder.ratio)
+		? `${budgetUsd(spentUsd)} is spent, ${ladder.ratio.toFixed(1)}x the approved ${budgetUsd(approvedUsd)}`
+		: `the work has run ${ladder.rounds ?? "?"} review rounds without an approved budget`;
+	const content = [
+		`${BUDGET_PREFIX} Owner decision needed for project "${projectId}" (revision ${revision}, "${truncate(objective, 120)}"): ${why}, past the last review tier.`,
+		"Before your next step, ask the owner with the question tool whether to continue, narrow the goal, or stop. Say what is already delivered, what remains, and what it has cost; include the latest review opinion's recommendation if there is one.",
+		"Nothing was stopped or changed; the owner's answer decides.",
+	].join("\n");
+	return budgetMessage({ sessionId, now, actionKind: "budget-owner-call", content, details: { projectId, revision, basis: ladder.basis ?? null, ratio: ladder.ratio ?? null, rounds: ladder.rounds ?? null } });
 }

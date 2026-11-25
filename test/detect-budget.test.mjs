@@ -27,6 +27,18 @@ const windowEntry = (partial = {}) => ({
 	...partial,
 });
 
+test("owner-call: a project past the ladder's last tier raises one human-needed finding per call", () => {
+	const call = { ms: NOW, basis: "budget", ratio: 4.2, rounds: 3 };
+	const world = { budget: { enabled: true, treasury: { windows: [] }, audits: [], projects: [{ id: "s:g", objective: "build the board", ownerCall: call }, { id: "s:h", ownerCall: null }] } };
+	const findings = budget.detect(world);
+	assert.equal(findings.length, 1);
+	const [finding] = findings;
+	assert.deepEqual([finding.kind, finding.severity, finding.humanNeeded], ["owner-call", "warn", true]);
+	assert.equal(finding.subject.key, `budget:owner-call:s:g:${NOW}`);
+	assert.match(finding.detailKo, /4\.2배/);
+	assert.equal(budget.detect({ budget: { enabled: true, projects: [{ id: "s:g", ownerCall: { ...call, basis: "rounds", ratio: null, rounds: 41 } }] } })[0].detailKo.includes("41차"), true);
+});
+
 const snapshot = (partial = {}) => ({
 	v: 1,
 	updatedMs: NOW,

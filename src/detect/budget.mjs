@@ -1,3 +1,4 @@
+import { truncate } from "../util/text.mjs";
 import { makeFinding } from "./finding.mjs";
 
 /**
@@ -9,7 +10,7 @@ import { makeFinding } from "./finding.mjs";
  *   treasury-short  warn, human needed - a window reaches its reserve by reset
  *   treasury-tight  info               - a window is close to the reserve
  *   audit-opinion   info               - the auditor judged spend waste-likely
- * Nothing needs a human: there is no owner route.
+ *   owner-call      warn, human needed - past the review ladder's last tier the session was asked to call the owner
  * An unknown or stale reading emits nothing: the snapshot has no basis yet.
  */
 export const id = "D26";
@@ -109,6 +110,24 @@ function auditFinding(audit) {
         });
 }
 
+function ownerCallFinding(project) {
+        const call = project?.ownerCall;
+        if (!call || !Number.isFinite(call.ms)) return null;
+        const projectId = String(project.id ?? "");
+        const why = call.basis === "budget" && Number.isFinite(call.ratio) ? `승인 예산의 ${call.ratio.toFixed(1)}배를 썼습니다` : `리뷰가 ${call.rounds ?? "?"}차까지 갔습니다`;
+        return makeFinding({
+                detector: id,
+                kind: "owner-call",
+                severity: "warn",
+                humanNeeded: true,
+                subject: { key: `budget:owner-call:${projectId}:${call.ms}` },
+                evidence: [`project:${projectId}`, `basis:${call.basis ?? "?"}`, `ratio:${call.ratio ?? "?"}`, `rounds:${call.rounds ?? "?"}`],
+                titleKo: `작업 계속 여부 확인: ${truncate(project.objective ?? projectId, 40)}`,
+                detailKo: `${why}. 세션에 계속할지 질문 도구로 물어보라고 전했습니다. 아무것도 멈추지 않았습니다.`,
+                data: { projectId, ...call },
+        });
+}
+
 export function detect(world) {
         const budget = world?.budget;
         if (!budget || budget.enabled === false) return [];
@@ -119,6 +138,10 @@ export function detect(world) {
         }
         for (const audit of budget.audits ?? []) {
                 const finding = auditFinding(audit ?? {});
+                if (finding) out.push(finding);
+        }
+        for (const project of budget.projects ?? []) {
+                const finding = ownerCallFinding(project ?? {});
                 if (finding) out.push(finding);
         }
         return out;

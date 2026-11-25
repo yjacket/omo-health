@@ -7,8 +7,10 @@ import {
 	MAX_BUNDLE_CHARS,
 	MAX_RECENT_STEP_CHARS,
 	auditArgs,
+	auditModel,
 	buildBundle,
-	chooseModel,
+	buildDigestInput,
+	digestArgs,
 	parseOutput,
 	validateOpinion,
 } from "../src/budget/audit.mjs";
@@ -133,39 +135,30 @@ test("validateOpinion enforces advice length and identity", () => {
 	assert.ok(wrong.errors.some((error) => error.includes("does not match")));
 });
 
-test("chooseModel skips not-logged-in and short accounts", () => {
-	const models = ["anthropic-subscription/claude-opus-5-5:high", "chatgpt-subscription/gpt-6-astra:high"];
-	const states = { "anthropic-subscription/default": "short", "chatgpt-subscription/default": "ok" };
-	const chosen = chooseModel({
-		models,
-		loggedIn: new Set(["anthropic-subscription", "chatgpt-subscription"]),
-		accountState: (account) => states[account],
-	});
-	assert.deepEqual(chosen, { model: "chatgpt-subscription/gpt-6-astra:high", independence: "family" });
-
-	assert.equal(chooseModel({ models, loggedIn: new Set(), accountState: () => "ok" }), null);
-	assert.equal(
-		chooseModel({ models: [models[0]], loggedIn: new Set(["anthropic-subscription"]), accountState: () => "short" }),
-		null,
-	);
-	// A provider without a subscription account has no window that could be short.
-	assert.deepEqual(
-		chooseModel({ models: ["opengateway/cheap"], loggedIn: new Set(["opengateway"]), accountState: () => "short" }),
-		{ model: "opengateway/cheap", independence: "family" },
-	);
+test("auditModel is the main session family's top model at the tier's effort, or null when that family cannot run", () => {
+	const topModels = { claude: "anthropic-subscription/claude-fable-5-2", gpt: "chatgpt-subscription/gpt-6.2-astra" };
+	const efforts = ["high", "xhigh", "max"];
+	const loggedIn = new Set(["anthropic-subscription", "chatgpt-subscription"]);
+	const pick = (mainModel, tier, extra = {}) => auditModel({ topModels, efforts, mainModel, tier, loggedIn, ...extra });
+	assert.deepEqual([1, 2, 3].map((tier) => pick("claude-opus-5-5", tier)), ["anthropic-subscription/claude-fable-5-2:high", "anthropic-subscription/claude-fable-5-2:xhigh", "anthropic-subscription/claude-fable-5-2:max"]);
+	assert.equal(pick("gpt-6-astra", 2), "chatgpt-subscription/gpt-6.2-astra:xhigh");
+	// The family's own account short or logged out: deferred, never handed to another family.
+	assert.equal(pick("gpt-6-astra", 1, { accountState: (a) => (a.startsWith("chatgpt") ? "short" : "ok") }), null);
+	assert.equal(pick("claude-opus-5-5", 1, { loggedIn: new Set(["chatgpt-subscription"]) }), null);
+	assert.equal(pick("deepseek-v4", 1), null, "a family with no top model");
+	assert.equal(pick(null, 1), null);
 });
 
-test("chooseModel skips families the project used, then falls back to an unused name", () => {
-	const models = ["chatgpt-subscription/gpt-6-astra:high", "anthropic-subscription/claude-opus-5-5:high", "anthropic-subscription/claude-fable-5-2:xhigh"];
-	const loggedIn = new Set(["anthropic-subscription", "chatgpt-subscription"]);
-	// The reviewer was a GPT model: the first choice is a Claude model the session did not use.
-	assert.deepEqual(chooseModel({ models, loggedIn, usedModels: ["gpt-6.2-astra"] }), { model: "anthropic-subscription/claude-opus-5-5:high", independence: "family" });
-	// The 01a1ffcb mix (main Claude Opus, reviewer GPT): no third family, so the first unused name, marked as name-only.
-	assert.deepEqual(chooseModel({ models, loggedIn, usedModels: ["claude-opus-5-5", "chatgpt-subscription/gpt-6.2-astra"] }), { model: "chatgpt-subscription/gpt-6-astra:high", independence: "name" });
-	// ChatGPT short: only the Claude name the project did not use is left.
-	const states = { "chatgpt-subscription/default": "short" };
-	assert.deepEqual(chooseModel({ models, loggedIn, accountState: (a) => states[a] ?? "ok", usedModels: ["claude-opus-5-5", "gpt-6.2-astra"] }), { model: "anthropic-subscription/claude-fable-5-2:xhigh", independence: "name" });
-	assert.equal(chooseModel({ models: [models[1]], loggedIn, usedModels: ["claude-opus-5-5"] }), null);
+test("the digest reads the raw verdicts, notes and steps with every guard flag; the bundle with a digest drops them", () => {
+	const reviews = { spawns: 3, verdictTotal: 3, verdicts: [{ agent: "plan-reviewer", model: "m", status: "completed", text: "**[REJECT]** edge" }] };
+	const input = buildDigestInput({ reviews, healthNotes: [{ kind: "scope-check", text: "note sk-ant-abcdefgh12345" }], recentSteps: ["edit a.mjs"] });
+	for (const part of ["# Raw evidence", "**[REJECT]** edge", "note sk-ant-[REDACTED]", "- edit a.mjs"]) assert.ok(input.includes(part), `digest input misses ${part}`);
+	assert.ok(!input.includes("## Question"), "the digest never sees the audit question");
+	const args = digestArgs({ model: "opengateway/q:low", inputFile: "raw.md" });
+	for (const flag of GUARD_FLAGS) assert.ok(args.includes(flag), flag);
+	const withDigest = buildBundle({ reviews, digest: "SUMMARY text", recentSteps: ["edit a.mjs"] });
+	assert.ok(withDigest.includes("SUMMARY text") && withDigest.includes("3 reviewer spawns"));
+	assert.ok(!withDigest.includes("**[REJECT]** edge") && !withDigest.includes("## Recent steps"));
 });
 
 test("auditArgs carries json mode and every guard flag", () => {
