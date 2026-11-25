@@ -9,6 +9,7 @@ export const KNOWN_EVENTS = {
 		"claude_sdk_oauth_session_close",
 		"claude_sdk_oauth_session_auth",
 		"provider_error",
+		"host_restart_resume_failed", // Normalized below and reported by D18, not format drift.
 		"queue_enqueue",
 		"compaction_start",
 		"compaction_decision",
@@ -149,6 +150,8 @@ export function normalizeLogRecord(source, record) {
 			return { ...base, type: "close", reason: record.reason };
 		case "provider_error":
 			return { ...base, type: "providerError", error: String(record.error ?? "") };
+		case "host_restart_resume_failed":
+			return { ...base, type: "hostRestartResumeFailed", error: String(record.error ?? "") };
 		case "cooldown_noted":
 			return { ...base, type: "cooldown", selector: record.selector, error: String(record.errorMessage ?? "") };
 		case "fallback_applied":

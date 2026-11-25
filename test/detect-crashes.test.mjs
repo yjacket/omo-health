@@ -2,6 +2,7 @@ import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { detect, senpiEvidence, unfinishedWork } from "../src/detect/crashes.mjs";
+import { planFinding } from "../src/judge/policy.mjs";
 import { makeWorld, raw, sessionState, taskRecord } from "./helpers/world.mjs";
 
 const T0 = Date.parse("2026-09-29T11:50:00Z");
@@ -35,6 +36,24 @@ function observedCrash(memory, options = {}) {
 }
 
 const crashOf = (findings) => findings.find((f) => f.kind === "host-crash");
+
+test("an RPC host restart resume failure requests only an owner toast, without crash evidence", () => {
+	const event = { ms: T0, type: "hostRestartResumeFailed", sessionId: SID, error: "Error: resume rejected" };
+	const tick = (now) => makeWorld({ now, events: [event] });
+	const w = tick(T0 + 5_000);
+	const findings = detect(w);
+	assert.equal(findings.length, 1);
+	const [finding] = findings;
+	assert.equal(finding.kind, "host-restart-resume-failed");
+	assert.equal(finding.severity, "warn");
+	assert.equal(finding.humanNeeded, true);
+	assert.equal(finding.subject.sessionId, SID);
+	assert.ok(finding.detailKo.split("\n")[0].includes(SID), "the toast body identifies the session");
+	assert.match(finding.detailKo, /Error: resume rejected/);
+	assert.deepEqual(planFinding({ finding, record: {}, now: w.now, config: w.config }).requests.map((req) => req.kind), ["toast"]);
+	assert.equal(detect(tick(T0 + 10_000))[0].fp, finding.fp, "same event keeps its notification fingerprint");
+	assert.deepEqual(detect(tick(T0 + 3600_001)), [], "stale log history does not raise a notice");
+});
 
 test("a host seen alive that dies with unfinished work is a crash to resume in a new tab", () => {
 	const memory = {};
