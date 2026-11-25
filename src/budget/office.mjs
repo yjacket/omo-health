@@ -17,7 +17,7 @@ import {
 import { readSubscriptionUsage } from "../collect/subscriptions.mjs";
 import { atomicWriteJson, readJsonSafe, removeSafe } from "../util/fsx.mjs";
 import { redact, truncate } from "../util/text.mjs";
-import { buildBundle, chooseModel } from "./audit.mjs";
+import { FIRST_USER_REQUESTS, MAX_HEALTH_NOTES, MAX_REVIEW_VERDICTS, MAX_USER_REQUESTS, buildBundle, chooseModel } from "./audit.mjs";
 import { pollAudit, startAudit } from "./audit-job.mjs";
 import { calibrate, epochs, externalPercent } from "./calibration.mjs";
 import { readCommands } from "./commands.mjs";
@@ -108,11 +108,10 @@ function goalForEvaluate(goal) {
 	return { status: goal.status, closedMs: null };
 }
 
-/** The last assistant steps and user requests of a transcript tail, for the audit bundle. */
+/** The last assistant steps of a transcript tail, for the audit bundle (owner requests come from the evidence ledger). */
 function recentOf(file) {
 	const steps = [];
-	const requests = [];
-	if (!file) return { steps, requests };
+	if (!file) return { steps };
 	let text = "";
 	try {
 		const stat = fs.statSync(file);
@@ -126,7 +125,7 @@ function recentOf(file) {
 			fs.closeSync(fd);
 		}
 	} catch {
-		return { steps, requests };
+		return { steps };
 	}
 	for (const line of text.split("\n")) {
 		let entry;
@@ -138,13 +137,12 @@ function recentOf(file) {
 		const message = entry?.type === "message" ? entry.message : null;
 		if (!message || !Array.isArray(message.content)) continue;
 		for (const item of message.content) {
-			if (message.role === "user" && item?.type === "text") requests.push(String(item.text ?? ""));
 			if (message.role !== "assistant") continue;
 			if (item?.type === "text" && item.text) steps.push(String(item.text).replace(/\s+/g, " "));
 			else if (item?.type === "toolCall") steps.push(`${item.name}: ${JSON.stringify(item.arguments ?? {})}`);
 		}
 	}
-	return { steps: steps.slice(-60), requests: requests.slice(-3) };
+	return { steps: steps.slice(-60) };
 }
 
 /**
@@ -153,6 +151,11 @@ function recentOf(file) {
  */
 export function createBudgetOffice({ paths, db, clock, config, runner, loggedInProviders, readTaskStores }) {
 	const store = createBudgetStore(db);
+	/** Reviewer runs and the first PR link of a project, from the evidence ledger (C-metrics inputs). */
+	const deliveryOf = (projectId) => {
+		const pr = store.evidence(projectId, "pr", { first: 1 }).items[0] ?? null;
+		return { reviewSpawns: store.evidence(projectId, "review-spawn").total, deliveredMs: pr?.ms ?? null, deliveredUrl: pr?.url ?? null };
+	};
 	let current = typeof config === "function" ? config() : config;
 	const ingest = createIngest({ paths, store, clock, config: () => current, readTaskStores });
 	const latestModelStmt = db.prepare(
@@ -375,11 +378,9 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 								revision: project.revision,
 								auditId: running.auditId,
 								objective,
-								assessment: polled.opinion.assessment,
-								confidence: polled.opinion.confidence,
-								advice: polled.opinion.advice,
-								findings: polled.opinion.findings,
+								opinion: polled.opinion,
 								model: running.model,
+								independence: running.independence ?? null,
 							}));
 						} else {
 							// No verdict: the audit ends without an opinion; no decision was waiting for it.
@@ -417,7 +418,8 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 			// Indicators and audit triggers.
 			const rounds = store.rounds(project.id);
 			const criteria = ing.criteria.get(project.id) ?? null;
-			const ind = indicators({ project: next, rounds, spend: projectSpend, spendSince: (ms) => store.spend({ projectId: project.id, sinceMs: ms }).costUsd, criteria, now });
+			const delivery = deliveryOf(project.id);
+			const ind = indicators({ project: next, rounds, spend: projectSpend, spendSince: (ms) => store.spend({ projectId: project.id, sinceMs: ms }).costUsd, criteria, reviewSpawns: delivery.reviewSpawns, deliveredMs: delivery.deliveredMs, now });
 			const child24hUsd = store.spend({ projectId: project.id, sinceMs: now - DAY, sources: ["child"] }).childUsd;
 			const trig = triggers(ind, budget, { child24hUsd });
 			const marks = { ...(next.data.triggerMarks ?? {}) };
@@ -464,10 +466,15 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 				const last = audits.at(-1) ?? null;
 				const newEvidence = !last
 					|| rounds.length - (last.roundsCount ?? 0) >= 3
+					|| delivery.reviewSpawns - (last.reviewSpawns ?? 0) >= 3
 					|| reasons.includes("change-review")
 					|| (finite(last.spentUsd) && projectSpend.costUsd >= last.spentUsd * 1.5);
 				const allowed = auditAllowed({ project: next, history: auditHistory(), now, cfg: budget, newEvidence });
-				const model = allowed.allowed ? chooseModel({ models: auditCfg.models, loggedIn: providersNow(), accountState }) : null;
+				const verdicts = store.evidence(project.id, "review-verdict", { last: MAX_REVIEW_VERDICTS });
+				// Independent of every model the project paid for and of every reviewer whose verdict it read.
+				const usedModels = [...Object.keys(projectSpend.byModel ?? {}), ...verdicts.items.map((v) => v.model).filter(Boolean)];
+				const choice = allowed.allowed ? chooseModel({ models: auditCfg.models, loggedIn: providersNow(), accountState, usedModels }) : null;
+				const model = choice?.model ?? null;
 				if (allowed.allowed && model) {
 					const auditId = `budget-${createHash("sha256").update(project.id).digest("hex").slice(0, 10)}-${now}`;
 					const recent = recentOf(ing.sessions.get(project.sessionId)?.file);
@@ -478,7 +485,13 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 						criteria,
 						rounds: roundTable,
 						recentSteps: recent.steps,
-						userRequests: recent.requests,
+						userRequests: [
+							...store.evidence(project.id, "request", { first: FIRST_USER_REQUESTS, last: MAX_USER_REQUESTS }).items,
+						],
+						reviews: { spawns: delivery.reviewSpawns, verdictTotal: verdicts.total, verdicts: verdicts.items },
+						healthNotes: store.evidence(project.id, "health-note", { last: MAX_HEALTH_NOTES }).items,
+						earlierAudits: audits.filter((a) => a.opinion).map((a) => ({ ms: a.ms, model: a.model, assessment: a.opinion.assessment, situation: a.opinion.situation ?? null, advice: truncate(String(a.opinion.advice ?? ""), 600) })),
+						delivered: delivery.deliveredMs === null ? null : { prUrl: delivery.deliveredUrl, firstSeen: new Date(delivery.deliveredMs).toISOString(), spentAfterUsd: ind.afterDeliveryUsd },
 						indicators: ind,
 						triggers: trig,
 						ref,
@@ -486,7 +499,7 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 					});
 					try {
 						startAudit({ runner, paths, model, bundle, projectId: project.id, auditId, timeoutMs: auditCfg.timeoutMs });
-						next.data.audits = [...audits, { auditId, ms: now, status: "running", model, triggers: reasons, costUsd: null, costStatus: null, spentUsd: projectSpend.costUsd, roundsCount: rounds.length }];
+						next.data.audits = [...audits, { auditId, ms: now, status: "running", model, independence: choice.independence, triggers: reasons, costUsd: null, costStatus: null, spentUsd: projectSpend.costUsd, roundsCount: rounds.length, reviewSpawns: delivery.reviewSpawns }];
 						appendEvent({ projectId: project.id, kind: "audit-started", data: { auditId, model, reasons } });
 					} catch (error) {
 						appendEvent({ projectId: project.id, kind: "audit-deferred", data: { reason: "start-failed", detail: truncate(error.message, 200), reasons } });
@@ -551,7 +564,7 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 			// The latest approval's stage: a staged grant funds up to the checkpoint it names.
 			const stage = latestApproval?.staged === true ? { nextCheckpoint: latestApproval.nextCheckpoint ?? null } : null;
 			const rounds = store.rounds(p.id);
-			const ind = p._ind ?? indicators({ project: p, rounds, spend, spendSince: (ms) => store.spend({ projectId: p.id, sinceMs: ms }).costUsd, criteria: null, now });
+			const ind = p._ind ?? indicators({ project: p, rounds, spend, spendSince: (ms) => store.spend({ projectId: p.id, sinceMs: ms }).costUsd, criteria: null, ...deliveryOf(p.id), now });
 			const marks = p.data.triggerMarks ?? {};
 			const details = new Map((p._trig ?? []).map((t) => [`${t.kind}:${t.heavy ? "heavy" : "light"}`, t.detail]));
 			const crossed = Object.entries(marks)

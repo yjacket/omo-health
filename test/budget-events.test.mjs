@@ -20,6 +20,42 @@ function ctx(over = {}) {
 	};
 }
 
+test("audit evidence: reviewer spawns (with their round), verdicts, owner requests, PR links and health notes", () => {
+	const spawn = extractEvents(E.assistant({ ms: T0, calls: [
+		{ id: "c1", name: "task", args: { subagent_type: "plan-reviewer", name: "plan-review-r19", task_summary: "Plan review r19: ledger fixes" } },
+		{ id: "c2", name: "task", args: { subagent_type: "explore", task_summary: "find callers" } },
+		{ id: "c3", name: "task", args: { tasks: [{ subagent_type: "omo-native-gate-reviewer", task_summary: "gate review" }] } },
+	] }), ctx());
+	assert.deepEqual(spawn.evidence.map((e) => [e.kind, e.data.agent, e.data.summary]), [
+		["review-spawn", "plan-reviewer", "Plan review r19: ledger fixes"],
+		["review-spawn", "omo-native-gate-reviewer", "gate review"],
+	]);
+	assert.deepEqual(spawn.rounds, [19]);
+
+	const wake = extractEvents({
+		type: "custom_message", customType: "omo-senpi:wake", timestamp: iso(T0),
+		content: "task completion name:other id:x\ntask completion name:plan-review-r19 id:st_1 agent:plan-reviewer\nresult:\"**[REJECT]** identity\"",
+		details: { producerDetails: [{ customType: "senpi-task.completion", details: [
+			{ name: "other", agent_type: "explore" },
+			{ name: "plan-review-r19", agent_type: "plan-reviewer", model: "chatgpt-subscription/gpt-6.2-astra", status: "completed" },
+		] }] },
+	}, ctx());
+	assert.equal(wake.evidence.length, 1);
+	assert.equal(wake.evidence[0].data.model, "chatgpt-subscription/gpt-6.2-astra");
+	assert.match(wake.evidence[0].data.text, /^name:plan-review-r19 .*\*\*\[REJECT\]\*\* identity/s);
+
+	const long = `${"skill wrapper ".repeat(500)}OWNER: plan approval is granted`;
+	const request = extractEvents(E.user(long, T0), ctx()).evidence[0];
+	assert.equal(request.kind, "request");
+	assert.ok(request.data.text.length <= 4000);
+	assert.ok(request.data.text.endsWith("OWNER: plan approval is granted"), "the tail, where a skill wrapper leaves the owner's words, is kept");
+
+	assert.deepEqual(extractEvents(E.toolResult("c", T0, { text: "pr 0 https://github.com/o/r/pull/21 | ok" }), ctx()).evidence, [{ kind: "pr", data: { url: "https://github.com/o/r/pull/21" } }]);
+	assert.deepEqual(extractEvents(E.toolResult("c", T0, { text: "no link" }), ctx()).evidence, []);
+	const note = extractEvents({ type: "custom_message", customType: "omo-health", timestamp: iso(T0), content: "[omo-health 범위 점검] long run", details: { kind: "scope-check" } }, ctx()).evidence[0];
+	assert.deepEqual(note, { kind: "health-note", data: { kind: "scope-check", text: "[omo-health 범위 점검] long run" } });
+});
+
 test("usage id is <session>:<entry.id> when the entry has an id", () => {
 	const entry = E.assistant({ ms: T0, id: "e42", text: "ok" });
 	const out = extractEvents(entry, ctx());

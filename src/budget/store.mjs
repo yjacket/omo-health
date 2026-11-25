@@ -78,6 +78,10 @@ export function createBudgetStore(db) {
 	const recordRoundStmt = db.prepare("INSERT OR IGNORE INTO budget_rounds (project_id, round, first_ms) VALUES (?, ?, ?)");
 	const roundsStmt = db.prepare("SELECT round, first_ms FROM budget_rounds WHERE project_id = ? ORDER BY first_ms ASC, round ASC");
 	const appendEventStmt = db.prepare("INSERT INTO budget_events (ms, project_id, account, kind, data) VALUES (?, ?, ?, ?, ?)");
+	const recordEvidenceStmt = db.prepare("INSERT OR IGNORE INTO budget_evidence (project_id, id, ms, kind, data) VALUES (?, ?, ?, ?, ?)");
+	const evidenceFirstStmt = db.prepare("SELECT ms, data FROM budget_evidence WHERE project_id = ? AND kind = ? ORDER BY ms ASC, id ASC LIMIT ?");
+	const evidenceLastStmt = db.prepare("SELECT ms, data FROM budget_evidence WHERE project_id = ? AND kind = ? ORDER BY ms DESC, id DESC LIMIT ?");
+	const evidenceCountStmt = db.prepare("SELECT COUNT(*) AS n FROM budget_evidence WHERE project_id = ? AND kind = ?");
 
 	return {
 		/** INSERT OR IGNORE every event in one transaction; returns how many rows were actually inserted. */
@@ -252,6 +256,20 @@ export function createBudgetStore(db) {
 
 		rounds(projectId) {
 			return roundsStmt.all(projectId).map((row) => ({ round: row.round, firstMs: row.first_ms }));
+		},
+
+		/** One audit evidence item per transcript entry part; a re-read of the same line inserts nothing. */
+		recordEvidence(projectId, { id, ms, kind, data }) {
+			recordEvidenceStmt.run(projectId, id, ms, kind, JSON.stringify(redactDeep(data ?? {})));
+		},
+
+		/** The oldest `first` and newest `last` items of one kind, oldest first, without repeats, and the total count. */
+		evidence(projectId, kind, { first = 0, last = 0 } = {}) {
+			const parse = (row) => ({ ms: row.ms, ...JSON.parse(row.data) });
+			const total = Number(evidenceCountStmt.get(projectId, kind).n);
+			const head = first > 0 ? evidenceFirstStmt.all(projectId, kind, first).map(parse) : [];
+			const tail = last > 0 ? evidenceLastStmt.all(projectId, kind, Math.min(last, Math.max(0, total - head.length))).map(parse).reverse() : [];
+			return { total, items: [...head, ...tail] };
 		},
 
 		appendEvent({ ms, projectId, account, kind, data }) {

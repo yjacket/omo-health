@@ -269,7 +269,7 @@ export const AUDIT_ASSESSMENT_LABELS = Object.freeze({ justified: "타당", "was
 export const BUDGET_AUDIT_STATUS_LABELS = Object.freeze({ running: "감사 중", done: "완료", failed: "실패", timeout: "시간 초과", unavailable: "모델 없음" });
 
 /** A crossed audit trigger (snapshot projects[].triggers kind; src/budget/metrics.mjs triggers and projects.mjs reasons). */
-export const BUDGET_TRIGGER_LABELS = Object.freeze({ rounds: "회차 반복", budget: "예산 초과", "after-accept": "충족 뒤 지출", descendants: "하위 작업 지출", "estimate-outlier": "견적 이탈", "change-review": "변경 검토" });
+export const BUDGET_TRIGGER_LABELS = Object.freeze({ rounds: "회차 반복", budget: "예산 초과", "after-accept": "충족 뒤 지출", reviews: "리뷰 반복", "after-delivery": "PR 뒤 지출", descendants: "하위 작업 지출", "estimate-outlier": "견적 이탈", "change-review": "변경 검토" });
 
 /** Why an audit was deferred (snapshot projects[].auditDeferred reason). */
 export const BUDGET_AUDIT_DEFERRED_LABELS = Object.freeze({ "no-model": "쓸 모델 없음", "in-flight": "감사 진행 중", "project-day-cap": "프로젝트 하루 한도", "day-cap": "하루 한도", "min-gap": "간격 부족", "start-failed": "시작 실패" });

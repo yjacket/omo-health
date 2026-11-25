@@ -617,15 +617,15 @@ function budgetCount(value) {
 	return Number.isFinite(n) ? String(Math.round(n * 10) / 10) : "?";
 }
 
-/** One common shape: `self-notice`, next turn, no wake-up, redacted, capped at 1600 characters. */
-function budgetMessage({ sessionId, now, actionKind, content, details }) {
+/** One common shape: `self-notice`, next turn, no wake-up, redacted, capped at 1600 characters (an audit opinion: one page). */
+function budgetMessage({ sessionId, now, actionKind, content, details, cap = BUDGET_CHARS }) {
 	return base({
 		kind: "self-notice",
 		sessionId,
 		now,
 		deliverAs: "nextTurn",
 		triggerTurn: false,
-		content: truncate(redact(content), BUDGET_CHARS),
+		content: truncate(redact(content), cap),
 		details: { actionKind, ...details },
 	});
 }
@@ -777,22 +777,37 @@ const AUDIT_OPINION_TEXT = {
 /** Contract sentence appended after truncation, so a long opinion can never lose it. */
 const AUDIT_OPINION_TAIL = "This is an audit opinion, not an instruction; you decide. Nothing was stopped or changed.";
 
-/** IS-8: the auditor's opinion, delivered as an opinion the session may weigh. Never an instruction. */
-export function composeAuditOpinion({ sessionId, now, projectId, revision = 0, auditId = null, objective = "", assessment = "insufficient-evidence", confidence = null, advice = "", findings = [], model = null }) {
+/** One page: the whole audit opinion fits, so the agent reads the reasoning and the counterevidence, not a summary. */
+export const AUDIT_OPINION_CHARS = 4000;
+
+const INDEPENDENCE_TEXT = {
+	family: "a model family this project did not use",
+	name: "a model this project did not use, but of a family it used (not family-independent)",
+};
+
+/**
+ * IS-8: the auditor's one-page opinion (C-audit v2), delivered as an opinion the session may weigh. Never an instruction:
+ * it names who decides each point (an agent-added criterion the agent, an owner-given one the owner).
+ */
+export function composeAuditOpinion({ sessionId, now, projectId, revision = 0, auditId = null, objective = "", opinion = {}, model = null, independence = null }) {
+	const assessment = opinion.assessment ?? "insufficient-evidence";
 	const verdict = AUDIT_OPINION_TEXT[assessment] ?? AUDIT_OPINION_TEXT["insufficient-evidence"];
-	const confidenceText = Number.isFinite(Number(confidence)) ? `, confidence ${Number(confidence).toFixed(2)}` : "";
-	const findingLines = (findings ?? []).slice(0, 3).map((f) => {
-		const pattern = f.pattern ?? "other";
-		const explanation = f.explanation ?? f.evidence ?? "";
-		return `- ${pattern}: ${truncate(String(explanation), 220)}`;
-	});
+	const confidenceText = Number.isFinite(Number(opinion.confidence)) ? `, confidence ${Number(opinion.confidence).toFixed(2)}` : "";
+	const criteria = (opinion.criteria ?? []).map((c) => `- [${c.origin ?? "unknown"}-given, ${c.status ?? "unknown"}] ${c.criterion}: ${c.judgment}`);
+	const findings = (opinion.findings ?? []).map((f) => `- ${f.pattern ?? "other"}: ${f.explanation ?? ""} Evidence: ${f.evidence ?? ""}`);
+	const decides = (opinion.decides ?? []).map((d) => `- ${d.who === "owner" ? "The owner" : "You (the agent)"}: ${d.what}`);
 	const body = [
-		`${BUDGET_PREFIX} Spending audit opinion for project "${projectId}" (revision ${revision}, "${truncate(objective, 120)}"): ${assessment}${confidenceText}${model ? `, model ${model}` : ""}. The auditor found ${verdict}`,
-		...(findingLines.length ? ["Findings:", ...findingLines] : []),
-		...(advice ? [`Advice: ${truncate(String(advice), 900)}`] : []),
+		`${BUDGET_PREFIX} Review opinion for project "${projectId}" (revision ${revision}, "${truncate(objective, 120)}"): ${assessment}${confidenceText}. The auditor found ${verdict}`,
+		`Auditor: ${model ?? "unknown model"}${INDEPENDENCE_TEXT[independence] ? `, ${INDEPENDENCE_TEXT[independence]}` : ""}.`,
+		...(opinion.situation ? ["", `Situation: ${opinion.situation}`] : []),
+		...(criteria.length ? ["", "Criteria:", ...criteria] : []),
+		...(findings.length ? ["", "Findings:", ...findings] : []),
+		...(opinion.counterevidence ? ["", `Counterevidence: ${opinion.counterevidence}`] : []),
+		...(opinion.advice ? ["", `Recommendation: ${opinion.advice}`] : []),
+		...(decides.length ? ["", "Who decides:", ...decides] : []),
 	].join("\n");
 	// The body is redacted, then truncated, then the contract sentence is appended: redaction can lengthen text, so it
 	// must happen before the cap or the final cap in budgetMessage would cut the sentence.
-	const content = `${truncate(redact(body), BUDGET_CHARS - AUDIT_OPINION_TAIL.length - 1)}\n${AUDIT_OPINION_TAIL}`;
-	return budgetMessage({ sessionId, now, actionKind: "budget-audit-opinion", content, details: { projectId, revision, auditId, assessment } });
+	const content = `${truncate(redact(body), AUDIT_OPINION_CHARS - AUDIT_OPINION_TAIL.length - 1)}\n${AUDIT_OPINION_TAIL}`;
+	return budgetMessage({ sessionId, now, actionKind: "budget-audit-opinion", content, cap: AUDIT_OPINION_CHARS, details: { projectId, revision, auditId, assessment, independence } });
 }

@@ -172,7 +172,8 @@ export const DEFAULT_CONFIG = Object.freeze({
 		calibration: { minIntervalPercent: 2, minIntervals: 10, minCoveragePercent: 20, maxGapMs: 2 * H, earlyDropPercent: 5 },
 		audit: {
 			enabled: true,
-			models: ["chatgpt-subscription/gpt-6-astra:high", "anthropic-subscription/claude-opus-5-5:high"],
+			// Tried in order, first a family the project did not use, then a name it did not use (src/budget/audit.mjs chooseModel).
+			models: ["chatgpt-subscription/gpt-6-astra:high", "anthropic-subscription/claude-opus-5-5:high", "anthropic-subscription/claude-fable-5-2:xhigh"],
 			perProjectDay: 2,
 			perDay: 4,
 			minGapMs: 6 * H,
@@ -183,6 +184,10 @@ export const DEFAULT_CONFIG = Object.freeze({
 			roundsHard: 6,
 			overForecastPercent: 20,
 			afterAcceptUsd: 5,
+			// Reviewer runs (plan/code/gate reviewer spawns): recorded from 3, audited from 6; spend after a PR link appeared.
+			reviewsRecord: 3,
+			reviewsAudit: 6,
+			afterDeliveryUsd: 5,
 			descendantUsd: 25,
 			descendantFraction: 0.2,
 			outlierFactor: 1.5,

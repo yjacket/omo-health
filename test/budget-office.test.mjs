@@ -198,12 +198,16 @@ test("(c)-(f), (h): request at $10, estimate -> decision, 100% checkpoint, stage
 	assert.deepEqual(out.snapshot.projects.find((p) => p.id === pid).stage, { nextCheckpoint: "integration done" });
 
 	const opinion = {
-		v: 1,
+		v: 2,
 		auditId,
 		projectId: pid,
 		assessment: "waste-likely",
 		confidence: 0.8,
 		criteriaStatus: "unknown",
+		situation: "Rounds 3-9 reran the same QA pass after the integration was done.",
+		criteria: [],
+		counterevidence: "",
+		decides: [{ who: "agent", what: "Whether to stop the full QA reruns." }],
 		findings: [{ pattern: "repeated-qa-without-acceptance-gain", evidence: "rounds 3-9 rerun the same QA", explanation: "no new acceptance evidence was produced" }],
 		advice: "Stop rerunning the full QA pass; verify only the two new failure paths.",
 		allocationOpinion: { assessment: "revise", reason: "a cheaper path keeps every criterion" },
@@ -668,6 +672,49 @@ test("(n) the snapshot reports backfill progress until every byte of the window 
 	assert.equal(out.snapshot.ingest.pendingFiles, 0);
 	assert.equal(out.snapshot.ingest.totalBytes, total);
 	assert.equal(out.snapshot.ingest.updatedMs, c.clock.now());
+});
+
+// The 01a1ffcb shape: the agent's own criterion (a reviewer approval) never passes, so "spent after acceptance" never
+// fires; the PR link and the reviewer runs after it do, and the bundle shows the auditor what it needs to say so.
+test("(r) spend after a PR link starts one audit whose bundle carries the request, the criterion, the verdicts and the PR", (t) => {
+	const c = setup(t);
+	const pid = `${c.sid}:g1`;
+	c.writeGoal({ id: "g1", objective: "criterion 1: a plan-reviewer unconditional approval receipt exists", createdAt: secs(T0 - 10 * HOUR), updatedAt: secs(T0 - 10 * HOUR) });
+	const verdict = (ms, round) => ({
+		type: "custom_message", customType: "omo-senpi:wake", id: `wake${round}`, timestamp: iso(ms),
+		content: `task completion name:plan-review-r${round} id:st_${round} agent:plan-reviewer(chatgpt-subscription/gpt-6.2-astra) status:completed\nresult:"**[REJECT]** round ${round} edge case in the ledger"`,
+		details: { producerDetails: [{ customType: "senpi-task.completion", details: [{ name: `plan-review-r${round}`, agent_type: "plan-reviewer", model: "chatgpt-subscription/gpt-6.2-astra", status: "completed" }] }] },
+	});
+	const spawn = (ms, round) => E.assistant({ ms, usage: usage(3), calls: [{ id: `call${round}`, name: "task", args: { subagent_type: "plan-reviewer", name: `plan-review-r${round}`, task_summary: `Plan review r${round}: ledger fixes` } }] });
+	writeJsonl(c.file, [
+		E.header(c.sid, c.cwd, T0 - 10 * HOUR),
+		E.user("세션별로 토큰사용량을 표시하자. plan approval 은 이 자리에서 모두 허가하니 더이상 질문하지 말고 바로 진행하라", T0 - 10 * HOUR),
+		spendEntry(T0 - 9 * HOUR, 2),
+		E.toolResult("pr", T0 - 5 * HOUR, { name: "eval", text: "pr 0 https://github.com/yjacket/omo-health/pull/21 | commits 44" }),
+		spawn(T0 - 4 * HOUR, 19),
+		verdict(T0 - 4 * HOUR + MIN, 19),
+		spawn(T0 - 3 * HOUR, 20),
+		verdict(T0 - 3 * HOUR + MIN, 20),
+	]);
+	const runner = createFakeRunner({ outcomes: { "budget-audit": { status: "running" } } });
+	const office = c.office({ runner, loggedIn: ["chatgpt-subscription", "anthropic-subscription"] });
+	for (let i = 0; i < 3; i++) {
+		office.tick({ shadow: false });
+		c.clock.advance(MIN);
+	}
+	const events = c.store.events({ projectId: pid, limit: 200 });
+	assert.ok(events.some((e) => e.kind === "trigger" && e.data.kind === "after-delivery" && e.data.heavy), JSON.stringify(events.map((e) => e.kind)));
+	assert.equal(runner.starts.length, 1, "one audit, not one per tick");
+	const args = runner.starts[0].args;
+	// Main Claude Opus + GPT reviewer: no third family, so the first model whose name the project never used.
+	assert.equal(args[args.indexOf("--model") + 1], "chatgpt-subscription/gpt-6-astra:high");
+	const project = c.store.listProjects().find((p) => p.id === pid);
+	assert.equal(project.data.audits.at(-1).independence, "name");
+	const bundle = fs.readFileSync(args.find((a) => a.startsWith("@")).slice(1), "utf8");
+	for (const part of ["plan approval 은 이 자리에서 모두 허가하니", "plan-reviewer unconditional approval receipt", "**[REJECT]** round 20 edge case", "2 reviewer spawns", "https://github.com/yjacket/omo-health/pull/21"]) {
+		assert.ok(bundle.includes(part), `bundle misses ${part}`);
+	}
+	assert.deepEqual(c.store.rounds(pid).map((r) => r.round), [19, 20], "\"Plan review r19\" counts as round 19");
 });
 
 test("disabled budget: tick returns the empty result and writes no snapshot", (t) => {

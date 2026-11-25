@@ -175,7 +175,10 @@ export function projectOfGoals(sessionId, goals, ms, graceMs) {
 	return best ? `${sessionId}:${best.id}` : null;
 }
 
-/** `<cwd>/.omo/ulw-loop/<sid>/goals.json` -> {total, evidenced, allEvidencedMs|null}. */
+/** Success criteria an audit bundle lists, at most this many. */
+const CRITERIA_ITEMS = 30;
+
+/** `<cwd>/.omo/ulw-loop/<sid>/goals.json` -> {total, evidenced, allEvidencedMs|null, items: per-criterion status}. */
 function readCriteria(cwd, sessionId) {
 	if (!cwd) return null;
 	const data = readJsonSafe(path.join(cwd, ".omo", "ulw-loop", sessionId, "goals.json"));
@@ -190,7 +193,15 @@ function readCriteria(cwd, sessionId) {
 		const updated = toMs(goal?.updatedAt);
 		if (Number.isFinite(updated)) maxUpdated = Math.max(maxUpdated ?? updated, updated);
 	}
-	return { total: goals.length, evidenced, allEvidencedMs: evidenced === goals.length ? maxUpdated : null };
+	const items = goals.flatMap((goal) => (Array.isArray(goal?.successCriteria) ? goal.successCriteria : []).map((criterion) => ({
+		goal: String(goal.title ?? goal.id ?? "").slice(0, 120),
+		goalStatus: goal.status ?? null,
+		id: criterion?.id ?? null,
+		scenario: String(criterion?.scenario ?? "").slice(0, 300),
+		status: criterion?.status ?? null,
+		evidenced: Boolean(criterion?.capturedEvidence),
+	}))).slice(0, CRITERIA_ITEMS);
+	return { total: goals.length, evidenced, allEvidencedMs: evidenced === goals.length ? maxUpdated : null, items };
 }
 
 function listJsonl(dir, recursive) {
@@ -405,6 +416,9 @@ export function createIngest({ paths, store, clock, config, readTaskStores }) {
 						store.recordRound(projectId, round, ms);
 						result.rounds.push({ projectId, round, ms });
 					}
+					out.evidence.forEach((item, index) => {
+						store.recordEvidence(projectId, { id: `${entry.id ?? lineOffset}:${index}`, ms, kind: item.kind, data: item.data });
+					});
 					for (const block of out.blocks) {
 						result.blocks.push({ projectId, sessionId: item.sessionId, ms, kind: block.kind, body: block.body, entryId: entry.id ?? null });
 					}

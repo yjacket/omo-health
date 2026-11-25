@@ -21,12 +21,16 @@ import { GUARD_FLAGS } from "../src/judge/lane.mjs";
 //   terminal event is `{type:"message_end", message}`;
 // - dist/core/agent-session.js:6702 emits exactly that `{type:"message_end", message: appMessage}`.
 const OPINION = {
-	v: 1,
+	v: 2,
 	auditId: "audit-1",
 	projectId: "sess-1:goal-1",
 	assessment: "justified",
 	confidence: 0.8,
 	criteriaStatus: "apparently-met",
+	situation: "Four rounds, each adding acceptance evidence.",
+	criteria: [{ criterion: "parser handles nested lists", origin: "owner", status: "unmet", judgment: "the owner asked for it; round 4 is closing it" }],
+	counterevidence: "round 3 repeated a check",
+	decides: [{ who: "agent", what: "continue with the current approach" }],
 	findings: [{ pattern: "other", evidence: "round 4 in the table", explanation: "each round added new acceptance evidence" }],
 	advice: "Continue with the current approach; spending tracks new acceptance evidence rather than repeated checking.",
 	allocationOpinion: { assessment: "support", reason: "the remaining estimate is inside the approved budget" },
@@ -45,22 +49,49 @@ test("buildBundle caps at 60000 chars and redacts recent steps", () => {
 	});
 	assert.ok(capped.length <= MAX_BUNDLE_CHARS, `bundle is ${capped.length} chars`);
 
-	const bundle = buildBundle({ recentSteps, userRequests: ["request one", "request two", "request three", "request four"] });
+	const longRequest = `owner asked: ${"r".repeat(3000)} keep it simple`;
+	const bundle = buildBundle({ recentSteps, userRequests: [{ ms: Date.UTC(2026, 10, 21), text: longRequest }, { text: "request two" }] });
 	assert.ok(!bundle.includes("abcdefgh12345"), "the token value must not survive");
 	assert.ok(bundle.includes("sk-ant-[REDACTED]"));
 	assert.ok(bundle.includes("step-99"));
 	assert.ok(!bundle.includes("step-39"), "only the last 60 steps reach the bundle");
-	assert.ok(!bundle.includes("request one"), "only the last three user requests reach the bundle");
+	assert.ok(bundle.includes(longRequest), "an owner request reaches the bundle verbatim, not cut to 300 characters");
+	assert.ok(bundle.includes("(2026-11-21T00:00:00.000Z)"));
+	assert.ok(bundle.indexOf("## Recent steps") > bundle.indexOf("## Reviewer runs"), "steps go last so the cap cuts them first");
 
 	const steps = bundle.split("\n").filter((line) => line.startsWith("- step-"));
 	assert.equal(steps.length, 60);
 	assert.ok(steps.every((line) => line.length <= MAX_RECENT_STEP_CHARS + 2));
 });
 
-test("AUDIT_QUESTION names the required waste patterns and the cheaper-path ask", () => {
-	for (const phrase of ["acceptance criteria", "new acceptance evidence", "severity inflation", "cheaper path", "insufficient"]) {
+test("buildBundle carries reviewer verdicts, delivery, notes and earlier opinions", () => {
+	const bundle = buildBundle({
+		goal: { objective: "criterion 1: a plan-reviewer unconditional approval receipt exists" },
+		criteria: { total: 2, evidenced: 1, allEvidencedMs: null, items: [{ goal: "Delivery", id: "C001", scenario: "PR open", status: "pass", evidenced: true }] },
+		reviews: { spawns: 107, verdictTotal: 107, verdicts: [{ ms: Date.UTC(2026, 10, 22, 8), agent: "plan-reviewer", model: "chatgpt-subscription/gpt-6.2-astra", status: "completed", text: "name:r30 result:**[REJECT]** session identity" }] },
+		delivered: { prUrl: "https://github.com/o/r/pull/21", firstSeen: "2026-11-22T06:16:08.481Z", spentAfterUsd: 413 },
+		healthNotes: [{ ms: Date.UTC(2026, 10, 22, 6), kind: "scope-check", text: "long-run note" }],
+		earlierAudits: [{ ms: 1, model: "m", assessment: "justified", advice: "keep going" }],
+	});
+	for (const part of ["plan-reviewer unconditional approval", "107 reviewer spawns", "**[REJECT]** session identity", "gpt-6.2-astra", "pull/21", "\"spentAfterUsd\": 413", "long-run note", "keep going", "\"C001\""]) {
+		assert.ok(bundle.includes(part), `bundle misses ${part}`);
+	}
+});
+
+test("AUDIT_QUESTION asks about criterion origin, feasibility and who may relax a criterion", () => {
+	for (const phrase of ["acceptance criterion", "owner request", "requirement-level", "remaining allowance", "narrowed or dropped", "agent-added criterion", "owner-given criterion", "severity inflation", "insufficient", "never an instruction"]) {
 		assert.ok(AUDIT_QUESTION.includes(phrase), `question misses ${phrase}`);
 	}
+});
+
+test("validateOpinion rejects a v2 opinion with a bad criterion origin or no decider", () => {
+	const origin = validateOpinion({ ...OPINION, criteria: [{ ...OPINION.criteria[0], origin: "reviewer" }] }, { auditId: "audit-1", projectId: "sess-1:goal-1" });
+	assert.equal(origin.ok, false);
+	assert.ok(origin.errors.some((error) => error.startsWith("opinion.criteria[0].origin")), JSON.stringify(origin.errors));
+	const decides = validateOpinion({ ...OPINION, decides: [] }, { auditId: "audit-1", projectId: "sess-1:goal-1" });
+	assert.equal(decides.ok, false);
+	assert.ok(decides.errors.some((error) => error.startsWith("opinion.decides")), JSON.stringify(decides.errors));
+	assert.equal(validateOpinion({ ...OPINION, v: 1 }, { auditId: "audit-1", projectId: "sess-1:goal-1" }).ok, false);
 });
 
 test("validateOpinion accepts a complete strict opinion", () => {
@@ -110,7 +141,7 @@ test("chooseModel skips not-logged-in and short accounts", () => {
 		loggedIn: new Set(["anthropic-subscription", "chatgpt-subscription"]),
 		accountState: (account) => states[account],
 	});
-	assert.equal(chosen, "chatgpt-subscription/gpt-6-astra:high");
+	assert.deepEqual(chosen, { model: "chatgpt-subscription/gpt-6-astra:high", independence: "family" });
 
 	assert.equal(chooseModel({ models, loggedIn: new Set(), accountState: () => "ok" }), null);
 	assert.equal(
@@ -118,10 +149,23 @@ test("chooseModel skips not-logged-in and short accounts", () => {
 		null,
 	);
 	// A provider without a subscription account has no window that could be short.
-	assert.equal(
+	assert.deepEqual(
 		chooseModel({ models: ["opengateway/cheap"], loggedIn: new Set(["opengateway"]), accountState: () => "short" }),
-		"opengateway/cheap",
+		{ model: "opengateway/cheap", independence: "family" },
 	);
+});
+
+test("chooseModel skips families the project used, then falls back to an unused name", () => {
+	const models = ["chatgpt-subscription/gpt-6-astra:high", "anthropic-subscription/claude-opus-5-5:high", "anthropic-subscription/claude-fable-5-2:xhigh"];
+	const loggedIn = new Set(["anthropic-subscription", "chatgpt-subscription"]);
+	// The reviewer was a GPT model: the first choice is a Claude model the session did not use.
+	assert.deepEqual(chooseModel({ models, loggedIn, usedModels: ["gpt-6.2-astra"] }), { model: "anthropic-subscription/claude-opus-5-5:high", independence: "family" });
+	// The 01a1ffcb mix (main Claude Opus, reviewer GPT): no third family, so the first unused name, marked as name-only.
+	assert.deepEqual(chooseModel({ models, loggedIn, usedModels: ["claude-opus-5-5", "chatgpt-subscription/gpt-6.2-astra"] }), { model: "chatgpt-subscription/gpt-6-astra:high", independence: "name" });
+	// ChatGPT short: only the Claude name the project did not use is left.
+	const states = { "chatgpt-subscription/default": "short" };
+	assert.deepEqual(chooseModel({ models, loggedIn, accountState: (a) => states[a] ?? "ok", usedModels: ["claude-opus-5-5", "gpt-6.2-astra"] }), { model: "anthropic-subscription/claude-fable-5-2:xhigh", independence: "name" });
+	assert.equal(chooseModel({ models: [models[1]], loggedIn, usedModels: ["claude-opus-5-5"] }), null);
 });
 
 test("auditArgs carries json mode and every guard flag", () => {

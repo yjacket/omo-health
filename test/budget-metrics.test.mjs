@@ -146,6 +146,20 @@ test("after-accept and descendant spend are heavy triggers on their thresholds",
 	assert.equal(fractionDescendants[0].heavy, true);
 });
 
+test("reviewer runs and spend after a PR link are indicators and triggers", () => {
+	const cfg = { ...CFG, audit: { ...CFG.audit, reviewsRecord: 3, reviewsAudit: 6, afterDeliveryUsd: 5 } };
+	const deliveredMs = kst(2, 9, 0);
+	const ind = indicators({ reviewSpawns: 107, deliveredMs, spendSince: (ms) => (ms === deliveredMs ? 413 : 0) });
+	assert.equal(ind.reviewSpawns, 107);
+	assert.equal(ind.afterDeliveryUsd, 413);
+	const kinds = triggers(ind, cfg).map((t) => [t.kind, t.heavy]);
+	assert.deepEqual(kinds.filter(([kind]) => kind === "reviews" || kind === "after-delivery"), [["reviews", true], ["after-delivery", true]]);
+
+	const early = triggers(indicators({ reviewSpawns: 4, deliveredMs: null }), cfg).map((t) => [t.kind, t.heavy]);
+	assert.deepEqual(early.filter(([kind]) => kind === "reviews" || kind === "after-delivery"), [["reviews", false]], "4 runs are recorded, not audited; no PR, no after-delivery");
+	assert.equal(indicators({}).afterDeliveryUsd, null);
+});
+
 test("auditAllowed: one in flight, 2 per project per day, 4 per day, 6 h gap", () => {
 	const now = kst(10, 12, 0);
 	const base = { project: { id: "p1" }, now, cfg: CFG };

@@ -39,7 +39,11 @@ function latestAdjusted(project) {
 	return null;
 }
 
-export function indicators({ project, rounds = [], spend = {}, spendSince, criteria, now } = {}) {
+/**
+ * `reviewSpawns` counts reviewer spawns (plan, code and gate reviewers) of the project; `deliveredMs` is when a tool
+ * result first showed a PR link. Spend after delivery catches a goal whose own criterion can never pass.
+ */
+export function indicators({ project, rounds = [], spend = {}, spendSince, criteria, reviewSpawns = 0, deliveredMs = null, now } = {}) {
 	const seen = listOf(rounds).filter((entry) => entry && Number.isFinite(entry.firstMs));
 	const roundsCount = seen.length;
 	const firstRoundMs = roundsCount > 0 ? Math.min(...seen.map((entry) => entry.firstMs)) : null;
@@ -70,6 +74,9 @@ export function indicators({ project, rounds = [], spend = {}, spendSince, crite
 		forecastUsd,
 		forecastOverPercent,
 		afterAcceptUsd: Number.isFinite(criteria?.allEvidencedMs) ? usdOf(since(criteria.allEvidencedMs)) : null,
+		reviewSpawns: num(reviewSpawns),
+		deliveredMs: Number.isFinite(deliveredMs) ? deliveredMs : null,
+		afterDeliveryUsd: Number.isFinite(deliveredMs) ? usdOf(since(deliveredMs)) : null,
 	};
 }
 
@@ -112,6 +119,24 @@ export function triggers(ind, cfg, { child24hUsd = 0 } = {}) {
 			kind: "after-accept",
 			heavy: true,
 			detail: `$${afterAcceptUsd.toFixed(2)} spent after all acceptance criteria were evidenced`,
+		});
+	}
+
+	const reviewSpawns = num(ind?.reviewSpawns);
+	if (Number.isFinite(a.reviewsRecord) && reviewSpawns >= a.reviewsRecord) {
+		out.push({
+			kind: "reviews",
+			heavy: Number.isFinite(a.reviewsAudit) && reviewSpawns >= a.reviewsAudit,
+			detail: `${reviewSpawns} reviewer runs`,
+		});
+	}
+
+	const afterDeliveryUsd = ind?.afterDeliveryUsd;
+	if (Number.isFinite(afterDeliveryUsd) && Number.isFinite(a.afterDeliveryUsd) && afterDeliveryUsd >= a.afterDeliveryUsd) {
+		out.push({
+			kind: "after-delivery",
+			heavy: true,
+			detail: `$${afterDeliveryUsd.toFixed(2)} spent after a PR link first appeared`,
 		});
 	}
 

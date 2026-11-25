@@ -2,6 +2,7 @@ import "./helpers/tmp-root.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+	AUDIT_OPINION_CHARS,
 	composeAuditOpinion,
 	composeBudgetCheckpoint,
 	composeBudgetCorrection,
@@ -73,20 +74,28 @@ function checkpoint(overrides = {}) {
 	});
 }
 
-function opinion(overrides = {}) {
+/** A C-audit v2 opinion; `objective`, `model` and `independence` go to the message, everything else into the opinion. */
+function opinion({ objective = OBJECTIVE, model = "anthropic-subscription/claude-opus-5-5:high", independence = "family", ...overrides } = {}) {
 	return composeAuditOpinion({
 		sessionId: SESSION,
 		now: NOW,
 		projectId: PROJECT,
 		revision: 4,
 		auditId: "audit-1",
-		objective: OBJECTIVE,
-		assessment: "waste-likely",
-		confidence: 0.8,
-		findings: [{ pattern: "repeated-qa-without-acceptance-gain", explanation: "three QA rounds found no new acceptance evidence" }],
-		advice: "Cover the two unmet criteria directly instead of rerunning the whole suite.",
-		model: "anthropic-subscription/claude-opus-5-5:high",
-		...overrides,
+		objective,
+		model,
+		independence,
+		opinion: {
+			assessment: "waste-likely",
+			confidence: 0.8,
+			situation: "Three QA rounds ran after the PR opened.",
+			criteria: [{ criterion: "plan-reviewer approval", origin: "agent", status: "unmet", judgment: "the owner never asked for it and pre-approved the plan" }],
+			findings: [{ pattern: "repeated-qa-without-acceptance-gain", evidence: "rounds 3-5", explanation: "three QA rounds found no new acceptance evidence" }],
+			counterevidence: "round 4 found one real defect",
+			advice: "Cover the two unmet criteria directly instead of rerunning the whole suite.",
+			decides: [{ who: "agent", what: "drop the self-added approval criterion and report it" }, { who: "owner", what: "whether the edge-case findings belong in this PR" }],
+			...overrides,
+		},
 	});
 }
 
@@ -256,26 +265,26 @@ test("content stays within 1600 characters with long inputs", () => {
 	const long = request({ objective: "x".repeat(4000), reference: { n: 9, p50: 1, p80: 2, p90: 3, errorRatio: 1.1, calibrated: true } });
 	assert.ok(long.content.length <= 1600);
 	const longOpinion = opinion({ objective: "y".repeat(4000), advice: "z".repeat(4000), findings: [{ pattern: "other", explanation: "w".repeat(4000) }] });
-	assert.ok(longOpinion.content.length <= 1600);
+	assert.ok(longOpinion.content.length <= AUDIT_OPINION_CHARS);
+});
+
+test("the one-page opinion carries every section, the criterion origin and who decides", () => {
+	const message = opinion();
+	for (const part of ["Situation: Three QA rounds", "[agent-given, unmet] plan-reviewer approval", "Findings:", "Evidence: rounds 3-5", "Counterevidence: round 4", "Recommendation: Cover", "Who decides:", "You (the agent): drop the self-added", "The owner: whether the edge-case", "a model family this project did not use"]) {
+		assert.ok(message.content.includes(part), `opinion misses ${part}`);
+	}
+	assert.match(opinion({ independence: "name" }).content, /not family-independent/);
+	assert.equal(message.details.independence, "family");
 });
 
 // Gate review B4: schema-valid but verbose opinion. The body is truncated first, the advisory sentence is kept.
-test("a long schema-valid audit opinion keeps the advisory sentence within 1600 characters", () => {
-	const message = composeAuditOpinion({
-		sessionId: "s",
-		now: 1794484800000,
-		projectId: "11111111-1111-1111-1111-111111111111:22222222-2222-2222-2222-222222222222",
+test("a long schema-valid audit opinion keeps the advisory sentence within one page", () => {
+	const message = opinion({
 		objective: "x".repeat(120),
-		assessment: "waste-likely",
-		confidence: 0.8,
-		model: "chatgpt-subscription/gpt-6-astra:high",
-		findings: Array.from({ length: 3 }, () => ({
-			pattern: "repeated-qa-without-acceptance-gain",
-			explanation: "e".repeat(220),
-		})),
-		advice: "a".repeat(900),
+		findings: Array.from({ length: 8 }, () => ({ pattern: "repeated-qa-without-acceptance-gain", evidence: "v".repeat(400), explanation: "e".repeat(600) })),
+		advice: "a".repeat(1200),
 	});
-	assert.equal(message.content.length, 1600);
+	assert.equal(message.content.length, AUDIT_OPINION_CHARS);
 	assert.ok(message.content.includes("This is an audit opinion, not an instruction; you decide."));
 	assert.ok(message.content.trimEnd().endsWith("Nothing was stopped or changed."));
 	assert.match(message.content, /waste-likely/);
@@ -285,18 +294,12 @@ test("a long schema-valid audit opinion keeps the advisory sentence within 1600 
 test("an audit opinion keeps its advisory sentence when redaction lengthens credential-shaped text", () => {
 	// Each 15-char sk-ant- token becomes the 17-char sk-ant-[REDACTED]; capping before redaction used to cut the sentence.
 	const tokens = Array.from({ length: 40 }, () => "sk-ant-aaaaaaaa").join(" ");
-	const message = composeAuditOpinion({
-		sessionId: SESSION,
-		now: NOW,
-		projectId: "11111111-1111-1111-1111-111111111111:22222222-2222-2222-2222-222222222222",
+	const message = opinion({
 		objective: "x".repeat(120),
-		assessment: "waste-likely",
-		confidence: 0.8,
-		model: "chatgpt-subscription/gpt-6-astra:high",
-		findings: Array.from({ length: 3 }, () => ({ pattern: "repeated-qa-without-acceptance-gain", explanation: "e".repeat(600) })),
-		advice: tokens,
+		findings: Array.from({ length: 8 }, () => ({ pattern: "repeated-qa-without-acceptance-gain", evidence: "v", explanation: "e".repeat(600) })),
+		advice: `${tokens} ${tokens}`,
 	});
-	assert.ok(message.content.length <= 1600, `${message.content.length} chars`);
+	assert.ok(message.content.length <= AUDIT_OPINION_CHARS, `${message.content.length} chars`);
 	assert.ok(message.content.endsWith("This is an audit opinion, not an instruction; you decide. Nothing was stopped or changed."));
 	assert.doesNotMatch(message.content, /sk-ant-a{8}/);
 });

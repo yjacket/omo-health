@@ -57,6 +57,10 @@ const MIGRATIONS = [
 	  created_ms INTEGER NOT NULL, status TEXT NOT NULL, revision INTEGER NOT NULL, data TEXT NOT NULL, closed_ms INTEGER, updated_ms INTEGER NOT NULL);
 	CREATE TABLE budget_rounds (project_id TEXT NOT NULL, round INTEGER NOT NULL, first_ms INTEGER NOT NULL, PRIMARY KEY (project_id, round));
 	CREATE TABLE budget_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, ms INTEGER NOT NULL, project_id TEXT, account TEXT, kind TEXT NOT NULL, data TEXT NOT NULL);`,
+	// Budget audit evidence read from transcripts (src/budget/events.mjs): requests, reviewer spawns and verdicts, notes, PR links.
+	`CREATE TABLE budget_evidence (project_id TEXT NOT NULL, id TEXT NOT NULL, ms INTEGER NOT NULL, kind TEXT NOT NULL, data TEXT NOT NULL,
+	  PRIMARY KEY (project_id, id));
+	CREATE INDEX budget_evidence_kind ON budget_evidence(project_id, kind, ms);`,
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
