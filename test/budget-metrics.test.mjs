@@ -1,7 +1,8 @@
 import "./helpers/tmp-root.mjs";
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { auditAllowed, indicators, triggers } from "../src/budget/metrics.mjs";
+import { auditAllowed, indicators, ladder, triggers } from "../src/budget/metrics.mjs";
+import { DEFAULT_CONFIG } from "../src/config.mjs";
 
 const HOUR = 60 * 60 * 1000;
 const DAY = 24 * HOUR;
@@ -144,6 +145,26 @@ test("after-accept and descendant spend are heavy triggers on their thresholds",
 	const fractionDescendants = triggers({ ...ind, afterAcceptUsd: null, approvedUsd: 500 }, CFG, { child24hUsd: 100 });
 	assert.equal(fractionDescendants[0].kind, "descendants");
 	assert.equal(fractionDescendants[0].heavy, true);
+});
+
+test("reviewer runs and spend after a PR link are indicators for the bundle", () => {
+	const deliveredMs = kst(2, 9, 0);
+	const ind = indicators({ reviewSpawns: 107, deliveredMs, spendSince: (ms) => (ms === deliveredMs ? 413 : 0) });
+	assert.deepEqual([ind.reviewSpawns, ind.deliveredMs, ind.afterDeliveryUsd], [107, deliveredMs, 413]);
+	assert.equal(indicators({}).afterDeliveryUsd, null);
+});
+
+test("ladder: 1x/2x/3x of the approved budget are tiers 1-3 and past 4x calls the owner; without a budget, rounds 10/20/30/40", () => {
+	const cfg = DEFAULT_CONFIG.budget.audit;
+	const at = (budgetRatio, roundsCount = 0, reviewSpawns = 0) => ladder({ budgetRatio, roundsCount, reviewSpawns }, cfg);
+	assert.deepEqual([1.0, 1.01, 2.5, 3.2, 4.1].map((r) => at(r).tier), [0, 1, 2, 3, 4], "exactly 1x is not over");
+	assert.equal(at(2.5).basis, "budget");
+	// With a budget, many review rounds still earn one tier-1 look, not more.
+	assert.deepEqual([at(0.5, 11).tier, at(0.5, 11).basis, at(0.5, 41).tier], [1, "rounds", 1]);
+	// Without a budget the larger of numbered rounds and reviewer runs climbs the ladder.
+	assert.deepEqual([10, 11, 21, 31, 41].map((n) => at(null, n).tier), [0, 1, 2, 3, 4]);
+	assert.deepEqual([at(null, 3, 25).tier, at(null, 3, 25).rounds, at(null, 3, 25).basis], [2, 25, "rounds"]);
+	assert.deepEqual(at(null), { tier: 0, basis: null, ratio: null, rounds: 0 });
 });
 
 test("auditAllowed: one in flight, 2 per project per day, 4 per day, 6 h gap", () => {

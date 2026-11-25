@@ -4,10 +4,12 @@
 import path from "node:path";
 import { unavailableReason } from "../judge/analyst.mjs";
 import { atomicWriteFile, atomicWriteJson, ensureDir, readJsonSafe } from "../util/fsx.mjs";
-import { auditArgs, parseOutput, validateOpinion } from "./audit.mjs";
+import { auditArgs, digestArgs, parseOutput, validateOpinion } from "./audit.mjs";
 
 /** The runner job kind every audit is started with. */
 export const AUDIT_JOB_KIND = "budget-audit";
+/** The quick-lane run that summarizes the raw evidence before an audit; it shares the audit's parser. */
+export const DIGEST_JOB_KIND = "budget-digest";
 
 /**
  * The kind-level contract a polling runner is created with: `createRunner({ ..., contracts: { [AUDIT_JOB_KIND]:
@@ -77,6 +79,34 @@ export function startAudit({ runner, paths, model, bundle, projectId, auditId, t
 		...AUDIT_CONTRACT,
 	});
 	return { ...started, bundleFile };
+}
+
+/** Start the tool-less quick-model digest of one audit's raw evidence (`<jobDir>/raw.md`). */
+export function startDigest({ runner, paths, model, input, auditId, timeoutMs }) {
+	const jobId = `${auditId}-digest`;
+	const dir = path.join(paths.health.jobsDir, jobId);
+	ensureDir(dir);
+	const inputFile = path.join(dir, "raw.md");
+	atomicWriteFile(inputFile, String(input ?? ""));
+	return runner.start({
+		jobId,
+		kind: DIGEST_JOB_KIND,
+		command: process.env.OMO_HEALTH_OMO ?? "omo",
+		args: digestArgs({ model, inputFile }),
+		cwd: dir,
+		timeoutMs,
+		...AUDIT_CONTRACT,
+	});
+}
+
+/** One poll of a digest job: `running`, `done` with the summary text and its usage, or `failed` (no usable summary). */
+export function pollDigest(runner, auditId) {
+	const out = runner.poll(`${auditId}-digest`) ?? { status: "running" };
+	if (out.status === "running") return { status: "running" };
+	const parsed = out.status === "done" && out.result && typeof out.result === "object" ? out.result : null;
+	const text = typeof parsed?.opinionText === "string" ? parsed.opinionText.trim() : "";
+	if (text) return { status: "done", text, usage: parsed.usage ?? null };
+	return { status: "failed", reason: out.reason ?? (out.status === "done" ? "empty-digest" : out.status), usage: parsed?.usage ?? null };
 }
 
 /**

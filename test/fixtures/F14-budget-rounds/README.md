@@ -16,5 +16,5 @@ with a 60-second duration. The real budget office uses an in-memory database and
 on the fixture clock: no process or model is launched.
 
 Expected: the office ingests main and child spend, sends one `budget-request` self-notice,
-starts one audit for the heavy `rounds` trigger, and returns one `budget-audit-opinion` self-notice
+starts one tier-1 audit because twelve rounds pass the review ladder's first step (10) with no approved budget, and returns one `budget-audit-opinion` self-notice
 and one D26 `audit-opinion` finding. Budget remains advisory: no process action.

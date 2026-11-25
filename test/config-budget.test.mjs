@@ -45,7 +45,13 @@ test("budget defaults match C-config exactly", () => {
 		calibration: { minIntervalPercent: 2, minIntervals: 10, minCoveragePercent: 20, maxGapMs: 2 * H, earlyDropPercent: 5 },
 		audit: {
 			enabled: true,
-			models: ["chatgpt-subscription/gpt-6-astra:high", "anthropic-subscription/claude-opus-5-5:high"],
+			topModels: { claude: "anthropic-subscription/claude-fable-5-2", gpt: "chatgpt-subscription/gpt-6.2-astra" },
+			efforts: ["high", "xhigh", "max"],
+			digestLane: "quick",
+			ladderMultiples: [1, 2, 3],
+			ownerMultiple: 4,
+			ladderRounds: [10, 20, 30],
+			ownerRounds: 40,
 			perProjectDay: 2,
 			perDay: 4,
 			minGapMs: 6 * H,
@@ -71,11 +77,11 @@ test("loadConfig returns the budget tree without warnings", () => {
 	assert.deepEqual(warnings, []);
 });
 
-test("budget.audit.models survives a user override", () => {
+test("budget.audit.topModels survives a user override", () => {
 	const { paths } = tempPaths();
-	fs.writeFileSync(paths.health.configFile, JSON.stringify({ budget: { audit: { models: ["anthropic-subscription/claude-sonnet-5-5:high"] } } }));
+	fs.writeFileSync(paths.health.configFile, JSON.stringify({ budget: { audit: { topModels: { claude: "anthropic-subscription/claude-opus-5-5" } } } }));
 	const { config, warnings } = loadConfig({ env: {}, paths });
-	assert.deepEqual(config.budget.audit.models, ["anthropic-subscription/claude-sonnet-5-5:high"]);
+	assert.equal(config.budget.audit.topModels.claude, "anthropic-subscription/claude-opus-5-5");
 	assert.equal(config.budget.audit.perProjectDay, 2, "other audit defaults stay");
 	assert.deepEqual(warnings, []);
 });

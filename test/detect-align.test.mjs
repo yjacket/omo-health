@@ -272,6 +272,26 @@ test("long-run: the same step repeated over numbered rounds asks the analyst, ev
 	assert.equal(detect(world, {})[0]?.cls, "long-run");
 });
 
+test("long-run: reviewer spawn summaries like 'Plan review r19' count as rounds", () => {
+	const { world, session } = longRunSetup();
+	session.steps = Array.from({ length: 8 }, (_, i) => ({ ms: T - (8 - i) * 30 * MIN, tool: "task", kind: "task", agent: "plan-reviewer", text: `Plan review r${19 + i}: ledger fixes` }));
+	const [finding] = detect(world, {});
+	assert.equal(finding?.cls, "long-run");
+	assert.match(finding.data.evidence, /rounds 19\.\.26 \(8 rounds\)/);
+	session.steps = session.steps.map((s, i) => ({ ...s, text: `preview r${i + 1}: layout` }));
+	assert.deepEqual(detect(world, {}), [], "'preview r5' is not a review round");
+});
+
+test("the daily note budget counts one delivery once, though the ledger and the transcript both hold it", () => {
+	const { world, session } = setup();
+	session.activity.files.set("a", { edits: 8, rounds: 8, failsBetween: 2, firstMs: T - 30_000, lastMs: T });
+	// Two deliveries today, each recorded twice a few seconds apart (2026-11-22 06:01Z: memory entry and transcript copy).
+	const twice = (ms, key) => [{ ms, key }, { ms: ms + 2400, key }];
+	const memory = { s1: [...twice(T - 3 * 60 * MIN, "align:s1:stuck:5"), ...twice(T - 2 * 60 * MIN, "align:s1:long-run:1")] };
+	assert.equal(DEFAULT_CONFIG.align.perDay, 4);
+	assert.equal(detect(world, memory)[0]?.cls, "churn", "two notes of a four-note day leave room for a third");
+});
+
 test("long-run: one review per session per everyMs, and the switch turns it off", () => {
 	const { world, session, memory } = longRunSetup();
 	session.steps = progressSteps(T, 37);

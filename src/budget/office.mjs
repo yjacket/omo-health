@@ -9,6 +9,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import {
 	composeAuditOpinion,
+	composeBudgetOwnerCall,
 	composeBudgetCheckpoint,
 	composeBudgetCorrection,
 	composeBudgetDecision,
@@ -17,13 +18,14 @@ import {
 import { readSubscriptionUsage } from "../collect/subscriptions.mjs";
 import { atomicWriteJson, readJsonSafe, removeSafe } from "../util/fsx.mjs";
 import { redact, truncate } from "../util/text.mjs";
-import { buildBundle, chooseModel } from "./audit.mjs";
-import { pollAudit, startAudit } from "./audit-job.mjs";
+import { laneModels } from "../judge/lane.mjs";
+import { FIRST_USER_REQUESTS, MAX_HEALTH_NOTES, MAX_REVIEW_VERDICTS, MAX_USER_REQUESTS, auditModel, buildBundle, buildDigestInput } from "./audit.mjs";
+import { pollAudit, pollDigest, startAudit, startDigest } from "./audit-job.mjs";
 import { calibrate, epochs, externalPercent } from "./calibration.mjs";
 import { readCommands } from "./commands.mjs";
 import { referenceClass } from "./estimates.mjs";
 import { createIngest } from "./ingest.mjs";
-import { auditAllowed, indicators, triggers } from "./metrics.mjs";
+import { auditAllowed, indicators, ladder, triggers } from "./metrics.mjs";
 import { evaluate } from "./projects.mjs";
 import { createBudgetStore, redactDeep } from "./store.mjs";
 import { capacityCheck, summarize, windowState } from "./treasury.mjs";
@@ -34,6 +36,27 @@ const DAY = 24 * HOUR;
 const SUBSCRIPTION_EVERY_MS = 60_000;
 const CALIBRATION_EVERY_MS = 10 * MIN;
 const PRUNE_EVERY_MS = HOUR;
+
+/** One ledger row for an audit or digest run's own usage (source `audit`, charged to the project it looked at). */
+function auditUsageRow({ id, project, model, usage, now }) {
+	return {
+		id,
+		ms: now,
+		sessionId: id,
+		rootSessionId: project.sessionId,
+		projectId: project.id,
+		taskId: null,
+		source: "audit",
+		provider: model?.split("/")[0] ?? null,
+		model: model ?? null,
+		input: usage.input ?? 0,
+		output: usage.output ?? 0,
+		cacheRead: usage.cacheRead ?? 0,
+		cacheWrite: usage.cacheWrite ?? 0,
+		cost: usage.cost ?? null,
+		costStatus: usage.cost == null ? "missing" : "reported",
+	};
+}
 const RECENT_TAIL_BYTES = 512 * 1024;
 // A budget message waits in the project's outbox this long for a delivery report (B3).
 const OUTBOX_TTL_MS = 7 * DAY;
@@ -108,11 +131,10 @@ function goalForEvaluate(goal) {
 	return { status: goal.status, closedMs: null };
 }
 
-/** The last assistant steps and user requests of a transcript tail, for the audit bundle. */
+/** The last assistant steps of a transcript tail, for the audit bundle (owner requests come from the evidence ledger). */
 function recentOf(file) {
 	const steps = [];
-	const requests = [];
-	if (!file) return { steps, requests };
+	if (!file) return { steps };
 	let text = "";
 	try {
 		const stat = fs.statSync(file);
@@ -126,7 +148,7 @@ function recentOf(file) {
 			fs.closeSync(fd);
 		}
 	} catch {
-		return { steps, requests };
+		return { steps };
 	}
 	for (const line of text.split("\n")) {
 		let entry;
@@ -138,13 +160,12 @@ function recentOf(file) {
 		const message = entry?.type === "message" ? entry.message : null;
 		if (!message || !Array.isArray(message.content)) continue;
 		for (const item of message.content) {
-			if (message.role === "user" && item?.type === "text") requests.push(String(item.text ?? ""));
 			if (message.role !== "assistant") continue;
 			if (item?.type === "text" && item.text) steps.push(String(item.text).replace(/\s+/g, " "));
 			else if (item?.type === "toolCall") steps.push(`${item.name}: ${JSON.stringify(item.arguments ?? {})}`);
 		}
 	}
-	return { steps: steps.slice(-60), requests: requests.slice(-3) };
+	return { steps: steps.slice(-60) };
 }
 
 /**
@@ -153,6 +174,11 @@ function recentOf(file) {
  */
 export function createBudgetOffice({ paths, db, clock, config, runner, loggedInProviders, readTaskStores }) {
 	const store = createBudgetStore(db);
+	/** Reviewer runs and the first PR link of a project, from the evidence ledger (C-metrics inputs). */
+	const deliveryOf = (projectId) => {
+		const pr = store.evidence(projectId, "pr", { first: 1 }).items[0] ?? null;
+		return { reviewSpawns: store.evidence(projectId, "review-spawn").total, deliveredMs: pr?.ms ?? null, deliveredUrl: pr?.url ?? null };
+	};
 	let current = typeof config === "function" ? config() : config;
 	const ingest = createIngest({ paths, store, clock, config: () => current, readTaskStores });
 	const latestModelStmt = db.prepare(
@@ -348,23 +374,7 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 						if (usage) {
 							audit.costUsd = usage.cost ?? null;
 							audit.costStatus = usage.costStatus ?? (usage.cost == null ? "missing" : "reported");
-							store.insertUsage([{
-								id: `audit:${running.auditId}`,
-								ms: now,
-								sessionId: `audit:${running.auditId}`,
-								rootSessionId: project.sessionId,
-								projectId: project.id,
-								taskId: null,
-								source: "audit",
-								provider: running.model?.split("/")[0] ?? null,
-								model: running.model ?? null,
-								input: usage.input ?? 0,
-								output: usage.output ?? 0,
-								cacheRead: usage.cacheRead ?? 0,
-								cacheWrite: usage.cacheWrite ?? 0,
-								cost: usage.cost ?? null,
-								costStatus: usage.cost == null ? "missing" : "reported",
-							}]);
+							store.insertUsage([auditUsageRow({ id: `audit:${running.auditId}`, project, model: running.model, usage, now })]);
 						} else audit.costStatus = "missing";
 						if (polled.status === "done") {
 							audit.opinion = polled.opinion;
@@ -375,11 +385,9 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 								revision: project.revision,
 								auditId: running.auditId,
 								objective,
-								assessment: polled.opinion.assessment,
-								confidence: polled.opinion.confidence,
-								advice: polled.opinion.advice,
-								findings: polled.opinion.findings,
+								opinion: polled.opinion,
 								model: running.model,
+								ladder: running.ladder ?? null,
 							}));
 						} else {
 							// No verdict: the audit ends without an opinion; no decision was waiting for it.
@@ -417,7 +425,8 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 			// Indicators and audit triggers.
 			const rounds = store.rounds(project.id);
 			const criteria = ing.criteria.get(project.id) ?? null;
-			const ind = indicators({ project: next, rounds, spend: projectSpend, spendSince: (ms) => store.spend({ projectId: project.id, sinceMs: ms }).costUsd, criteria, now });
+			const delivery = deliveryOf(project.id);
+			const ind = indicators({ project: next, rounds, spend: projectSpend, spendSince: (ms) => store.spend({ projectId: project.id, sinceMs: ms }).costUsd, criteria, reviewSpawns: delivery.reviewSpawns, deliveredMs: delivery.deliveredMs, now });
 			const child24hUsd = store.spend({ projectId: project.id, sinceMs: now - DAY, sources: ["child"] }).childUsd;
 			const trig = triggers(ind, budget, { child24hUsd });
 			const marks = { ...(next.data.triggerMarks ?? {}) };
@@ -428,7 +437,16 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 				if (!shadow) appendEvent({ projectId: project.id, kind: "trigger", data: t });
 			}
 			next.data.triggerMarks = marks;
-			const reasons = [...trig.filter((t) => t.heavy).map((t) => t.kind), ...out.actions.filter((a) => a.type === "audit").flatMap((a) => a.reasons)];
+			// The review-opinion ladder decides when the auditor looks (each tier once); a rule audit (change review, estimate
+			// outlier) still asks for one at the current tier. Triggers are recorded for the dashboard, they start nothing.
+			const step = ladder(ind, auditCfg);
+			const lastTier = (next.data.audits ?? []).reduce((max, a) => Math.max(max, a.tier ?? 0), 0);
+			const ladderDue = step.tier >= 1 && step.tier <= 3 && step.tier > lastTier;
+			const ruleReasons = out.actions.filter((a) => a.type === "audit").flatMap((a) => a.reasons);
+			const reasons = [...(ladderDue ? [`ladder-${step.basis}`] : []), ...ruleReasons];
+			// The effort of this audit; only a ladder audit spends its tier (a rule audit below 1x leaves tier 1 for 1x).
+			const tier = Math.max(1, Math.min(step.tier, 3));
+			const ladderOf = () => (ladderDue ? { ...step } : { tier, basis: "rule", reasons: ruleReasons, ratio: step.ratio, rounds: step.rounds });
 
 			if (shadow) {
 				for (const action of out.actions) {
@@ -456,47 +474,95 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 			// so a goal that disappears between ticks never opens one. A non-active goal records one skip even when
 			// this same tick closed the project (cancelled, cleared, COMPLETED).
 			const goalIsActive = goalActive(goalNow.status);
-			if (reasons.length && auditCfg.enabled && !goalIsActive) {
+			const audits = next.data.audits ?? [];
+			const digesting = audits.find((a) => a.status === "digesting");
+			// Raw evidence the quick digest summarizes, and the auditor's bundle (with the digest once it exists).
+			const verdicts = () => store.evidence(project.id, "review-verdict", { last: MAX_REVIEW_VERDICTS });
+			const raw = () => {
+				const v = verdicts();
+				return {
+					reviews: { spawns: delivery.reviewSpawns, verdictTotal: v.total, verdicts: v.items },
+					healthNotes: store.evidence(project.id, "health-note", { last: MAX_HEALTH_NOTES }).items,
+					recentSteps: recentOf(ing.sessions.get(project.sessionId)?.file).steps,
+				};
+			};
+			const bundleOf = (audit, digest) => buildBundle({
+				project: { id: project.id, auditId: audit.auditId, sessionId: project.sessionId, status: next.status, revision: next.revision, approvedUsd: approvedOf(next), pending: next.data.pending, estimates: next.data.estimates },
+				goal: info?.goal ?? null,
+				criteria,
+				rounds: rounds.map((r, i) => ({ round: r.round, firstMs: r.firstMs, costUsd: store.spend({ projectId: project.id, sinceMs: r.firstMs, untilMs: rounds[i + 1]?.firstMs }).costUsd })),
+				userRequests: store.evidence(project.id, "request", { first: FIRST_USER_REQUESTS, last: MAX_USER_REQUESTS }).items,
+				...raw(),
+				digest,
+				ladder: audit.ladder,
+				earlierAudits: audits.filter((a) => a.opinion).map((a) => ({ ms: a.ms, model: a.model, tier: a.tier ?? null, assessment: a.opinion.assessment, situation: a.opinion.situation ?? null, advice: truncate(String(a.opinion.advice ?? ""), 600) })),
+				delivered: delivery.deliveredMs === null ? null : { prUrl: delivery.deliveredUrl, firstSeen: new Date(delivery.deliveredMs).toISOString(), spentAfterUsd: ind.afterDeliveryUsd },
+				indicators: ind,
+				triggers: trig,
+				ref,
+				treasury,
+			});
+			const launch = (audit, digest) => {
+				try {
+					startAudit({ runner, paths, model: audit.model, bundle: bundleOf(audit, digest), projectId: project.id, auditId: audit.auditId, timeoutMs: auditCfg.timeoutMs });
+					appendEvent({ projectId: project.id, kind: "audit-started", data: { auditId: audit.auditId, model: audit.model, tier: audit.tier, reasons: audit.triggers } });
+					return { ...audit, status: "running" };
+				} catch (error) {
+					appendEvent({ projectId: project.id, kind: "audit-deferred", data: { reason: "start-failed", detail: truncate(error.message, 200), reasons: audit.triggers } });
+					return { ...audit, status: "failed", reason: "start-failed", endedMs: now };
+				}
+			};
+			if (auditCfg.enabled && !goalIsActive) {
 				// A completed, replaced, cancelled, cleared or missing goal is no work left to audit.
-				skipInactiveAudit(project.id);
-			} else if (reasons.length && auditCfg.enabled && next.status !== "closed" && !registered.has(project.id)) {
-				const audits = next.data.audits ?? [];
-				const last = audits.at(-1) ?? null;
-				const newEvidence = !last
-					|| rounds.length - (last.roundsCount ?? 0) >= 3
-					|| reasons.includes("change-review")
-					|| (finite(last.spentUsd) && projectSpend.costUsd >= last.spentUsd * 1.5);
-				const allowed = auditAllowed({ project: next, history: auditHistory(), now, cfg: budget, newEvidence });
-				const model = allowed.allowed ? chooseModel({ models: auditCfg.models, loggedIn: providersNow(), accountState }) : null;
-				if (allowed.allowed && model) {
-					const auditId = `budget-${createHash("sha256").update(project.id).digest("hex").slice(0, 10)}-${now}`;
-					const recent = recentOf(ing.sessions.get(project.sessionId)?.file);
-					const roundTable = rounds.map((r, i) => ({ round: r.round, firstMs: r.firstMs, costUsd: store.spend({ projectId: project.id, sinceMs: r.firstMs, untilMs: rounds[i + 1]?.firstMs }).costUsd }));
-					const bundle = buildBundle({
-						project: { id: project.id, auditId, sessionId: project.sessionId, status: next.status, revision: next.revision, approvedUsd: approvedOf(next), pending: next.data.pending, estimates: next.data.estimates },
-						goal: info?.goal ?? null,
-						criteria,
-						rounds: roundTable,
-						recentSteps: recent.steps,
-						userRequests: recent.requests,
-						indicators: ind,
-						triggers: trig,
-						ref,
-						treasury,
-					});
-					try {
-						startAudit({ runner, paths, model, bundle, projectId: project.id, auditId, timeoutMs: auditCfg.timeoutMs });
-						next.data.audits = [...audits, { auditId, ms: now, status: "running", model, triggers: reasons, costUsd: null, costStatus: null, spentUsd: projectSpend.costUsd, roundsCount: rounds.length }];
-						appendEvent({ projectId: project.id, kind: "audit-started", data: { auditId, model, reasons } });
-					} catch (error) {
-						appendEvent({ projectId: project.id, kind: "audit-deferred", data: { reason: "start-failed", detail: truncate(error.message, 200), reasons } });
+				if (reasons.length) skipInactiveAudit(project.id);
+				if (digesting) next.data.audits = audits.map((a) => (a === digesting ? { ...a, status: "cancelled", reason: "goal-not-active", endedMs: now } : a));
+			} else if (auditCfg.enabled && next.status !== "closed" && !registered.has(project.id)) {
+				// Past the last tier the owner decides: the session is asked, once, to put the question to them.
+				if (step.tier === 4 && !finite(next.data.ownerCalledMs)) {
+					next.data.ownerCalledMs = now;
+					next.data.ownerCall = { ms: now, basis: step.basis, ratio: step.ratio, rounds: step.rounds };
+					created.push(composeBudgetOwnerCall({ sessionId: project.sessionId, now, projectId: project.id, revision: next.revision, objective, ladder: step, spentUsd: projectSpend.costUsd, approvedUsd: approvedOf(next) }));
+					appendEvent({ projectId: project.id, kind: "owner-call", data: next.data.ownerCall });
+				}
+				if (digesting) {
+					// The quick digest ran first; whatever it produced, the auditor starts now (without a digest it reads the raw evidence).
+					const polled = pollDigest(runner, digesting.auditId);
+					if (polled.status !== "running") {
+						if (polled.usage) store.insertUsage([auditUsageRow({ id: `audit:${digesting.auditId}:digest`, project, model: digesting.digestModel, usage: polled.usage, now })]);
+						const started = launch({ ...digesting, digest: polled.status === "done" ? "done" : polled.reason }, polled.status === "done" ? polled.text : null);
+						next.data.audits = audits.map((a) => (a === digesting ? started : a));
 					}
-				} else if (!finite(next.data.auditDeferredMs) || now - next.data.auditDeferredMs >= (auditCfg.minGapMs ?? 6 * HOUR)) {
-					// Visible deferral, never a weak-model fallback.
-					const reason = allowed.allowed ? "no-model" : allowed.reason;
-					next.data.auditDeferredMs = now;
-					next.data.auditDeferredReason = reason;
-					appendEvent({ projectId: project.id, kind: "audit-deferred", data: { reason, reasons } });
+				} else if (reasons.length) {
+					const last = audits.at(-1) ?? null;
+					const newEvidence = !last || ladderDue || reasons.includes("change-review");
+					const allowed = auditAllowed({ project: next, history: auditHistory(), now, cfg: budget, newEvidence });
+					const mainModel = latestModelStmt.get(project.sessionId)?.model ?? null;
+					const model = allowed.allowed ? auditModel({ topModels: auditCfg.topModels, efforts: auditCfg.efforts, mainModel, tier, loggedIn: providersNow(), accountState }) : null;
+					if (allowed.allowed && model) {
+						const audit = {
+							auditId: `budget-${createHash("sha256").update(project.id).digest("hex").slice(0, 10)}-${now}`,
+							ms: now, status: "digesting", model, tier: ladderDue ? step.tier : null, ladder: ladderOf(), triggers: reasons,
+							costUsd: null, costStatus: null, spentUsd: projectSpend.costUsd, roundsCount: rounds.length,
+						};
+						const digestModel = laneModels(paths, auditCfg.digestLane)[0] ?? null;
+						let record;
+						if (digestModel) {
+							try {
+								startDigest({ runner, paths, model: digestModel, input: buildDigestInput(raw()), auditId: audit.auditId, timeoutMs: auditCfg.timeoutMs });
+								record = { ...audit, digestModel };
+								appendEvent({ projectId: project.id, kind: "audit-digest-started", data: { auditId: audit.auditId, model: digestModel, tier: audit.tier } });
+							} catch (error) {
+								record = launch({ ...audit, digest: "start-failed" }, null);
+							}
+						} else record = launch({ ...audit, digest: "no-model" }, null);
+						next.data.audits = [...audits, record];
+					} else if (!finite(next.data.auditDeferredMs) || now - next.data.auditDeferredMs >= (auditCfg.minGapMs ?? 6 * HOUR)) {
+						// Visible deferral, never a weak-model fallback.
+						const reason = allowed.allowed ? "no-model" : allowed.reason;
+						next.data.auditDeferredMs = now;
+						next.data.auditDeferredReason = reason;
+						appendEvent({ projectId: project.id, kind: "audit-deferred", data: { reason, reasons } });
+					}
 				}
 			}
 			for (const action of out.actions) {
@@ -551,7 +617,7 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 			// The latest approval's stage: a staged grant funds up to the checkpoint it names.
 			const stage = latestApproval?.staged === true ? { nextCheckpoint: latestApproval.nextCheckpoint ?? null } : null;
 			const rounds = store.rounds(p.id);
-			const ind = p._ind ?? indicators({ project: p, rounds, spend, spendSince: (ms) => store.spend({ projectId: p.id, sinceMs: ms }).costUsd, criteria: null, now });
+			const ind = p._ind ?? indicators({ project: p, rounds, spend, spendSince: (ms) => store.spend({ projectId: p.id, sinceMs: ms }).costUsd, criteria: null, ...deliveryOf(p.id), now });
 			const marks = p.data.triggerMarks ?? {};
 			const details = new Map((p._trig ?? []).map((t) => [`${t.kind}:${t.heavy ? "heavy" : "light"}`, t.detail]));
 			const crossed = Object.entries(marks)
@@ -587,6 +653,7 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 				triggers: crossed,
 				auditDeferred,
 				lastAudit: redactedAudit((p.data.audits ?? []).at(-1) ?? null),
+				ownerCall: p.data.ownerCall ?? null,
 				rounds,
 			};
 		});

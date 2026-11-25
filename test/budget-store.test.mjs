@@ -95,11 +95,12 @@ test("a previous-version file migrates to the budget tables and keeps its own", 
 
 	const db = openDb({ file: paths.health.dbFile });
 	t.after(() => closeDb(db));
-	assert.equal(SCHEMA_VERSION, 2);
-	assert.equal(db.prepare("PRAGMA user_version").get().user_version, 2);
+	assert.equal(SCHEMA_VERSION, 3);
+	assert.equal(db.prepare("PRAGMA user_version").get().user_version, 3);
 	assert.deepEqual(tables(db), [
 		"baseline_samples",
 		"budget_events",
+		"budget_evidence",
 		"budget_projects",
 		"budget_rounds",
 		"ingest_offsets",

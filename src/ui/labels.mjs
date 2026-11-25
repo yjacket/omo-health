@@ -64,6 +64,7 @@ export const FINDING_LABELS = Object.freeze({
 	"treasury-short": "예산 부족",
 	"treasury-tight": "예산 주의",
 	"audit-opinion": "예산 감사 의견",
+	"owner-call": "계속 여부 확인",
 });
 
 export const ACTION_LABELS = Object.freeze({

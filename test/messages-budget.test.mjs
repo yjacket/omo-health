@@ -2,7 +2,9 @@ import "./helpers/tmp-root.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+	AUDIT_OPINION_CHARS,
 	composeAuditOpinion,
+	composeBudgetOwnerCall,
 	composeBudgetCheckpoint,
 	composeBudgetCorrection,
 	composeBudgetDecision,
@@ -73,20 +75,28 @@ function checkpoint(overrides = {}) {
 	});
 }
 
-function opinion(overrides = {}) {
+/** A C-audit v2 opinion; `objective`, `model` and `independence` go to the message, everything else into the opinion. */
+function opinion({ objective = OBJECTIVE, model = "anthropic-subscription/claude-fable-5-2:high", ladder = { tier: 1, basis: "rounds", ratio: null, rounds: 24 }, ...overrides } = {}) {
 	return composeAuditOpinion({
 		sessionId: SESSION,
 		now: NOW,
 		projectId: PROJECT,
 		revision: 4,
 		auditId: "audit-1",
-		objective: OBJECTIVE,
-		assessment: "waste-likely",
-		confidence: 0.8,
-		findings: [{ pattern: "repeated-qa-without-acceptance-gain", explanation: "three QA rounds found no new acceptance evidence" }],
-		advice: "Cover the two unmet criteria directly instead of rerunning the whole suite.",
-		model: "anthropic-subscription/claude-opus-5-5:high",
-		...overrides,
+		objective,
+		model,
+		ladder,
+		opinion: {
+			assessment: "waste-likely",
+			confidence: 0.8,
+			situation: "Three QA rounds ran after the PR opened.",
+			criteria: [{ criterion: "plan-reviewer approval", origin: "agent", status: "unmet", judgment: "the owner never asked for it and pre-approved the plan" }],
+			findings: [{ pattern: "repeated-qa-without-acceptance-gain", evidence: "rounds 3-5", explanation: "three QA rounds found no new acceptance evidence" }],
+			counterevidence: "round 4 found one real defect",
+			advice: "Cover the two unmet criteria directly instead of rerunning the whole suite.",
+			decides: [{ who: "agent", what: "drop the self-added approval criterion and report it" }, { who: "owner", what: "whether the edge-case findings belong in this PR" }],
+			...overrides,
+		},
 	});
 }
 
@@ -256,26 +266,45 @@ test("content stays within 1600 characters with long inputs", () => {
 	const long = request({ objective: "x".repeat(4000), reference: { n: 9, p50: 1, p80: 2, p90: 3, errorRatio: 1.1, calibrated: true } });
 	assert.ok(long.content.length <= 1600);
 	const longOpinion = opinion({ objective: "y".repeat(4000), advice: "z".repeat(4000), findings: [{ pattern: "other", explanation: "w".repeat(4000) }] });
-	assert.ok(longOpinion.content.length <= 1600);
+	assert.ok(longOpinion.content.length <= AUDIT_OPINION_CHARS);
+});
+
+test("the one-page opinion carries every section, the criterion origin and who decides", () => {
+	const message = opinion();
+	for (const part of ["Situation: Three QA rounds", "[agent-given, unmet] plan-reviewer approval", "Findings:", "Evidence: rounds 3-5", "Counterevidence: round 4", "Recommendation: Cover", "Who decides:", "You (the agent): drop the self-added", "The owner: whether the edge-case", "(review tier 1 of 3: 24 review rounds)"]) {
+		assert.ok(message.content.includes(part), `opinion misses ${part}`);
+	}
+	assert.match(opinion({ ladder: { tier: 2, basis: "budget", ratio: 2.34, rounds: 3 } }).content, /review tier 2 of 3: spend is 2\.3x the approved budget/);
+	assert.equal(message.details.tier, 1);
+});
+
+test("past the last tier the owner call asks the session to put the question to the owner, and stops nothing", () => {
+	const byBudget = composeBudgetOwnerCall({ sessionId: SESSION, now: NOW, projectId: PROJECT, revision: 4, objective: OBJECTIVE, ladder: { tier: 4, basis: "budget", ratio: 4.2, rounds: 5 }, spentUsd: 126, approvedUsd: 30 });
+	assert.equal(byBudget.details.actionKind, "budget-owner-call");
+	assert.match(byBudget.content, /\$126\.00 is spent, 4\.2x the approved \$30\.00/);
+	assert.match(byBudget.content, /ask the owner with the question tool/);
+	assert.match(byBudget.content, /Nothing was stopped or changed/);
+	const byRounds = composeBudgetOwnerCall({ sessionId: SESSION, now: NOW, projectId: PROJECT, ladder: { tier: 4, basis: "rounds", ratio: null, rounds: 41 } });
+	assert.match(byRounds.content, /41 review rounds without an approved budget/);
 });
 
 // Gate review B4: schema-valid but verbose opinion. The body is truncated first, the advisory sentence is kept.
-test("a long schema-valid audit opinion keeps the advisory sentence within 1600 characters", () => {
-	const message = composeAuditOpinion({
-		sessionId: "s",
-		now: 1794484800000,
-		projectId: "11111111-1111-1111-1111-111111111111:22222222-2222-2222-2222-222222222222",
+test("a long schema-valid audit opinion keeps the advisory sentence within one page", () => {
+	const message = opinion({
 		objective: "x".repeat(120),
-		assessment: "waste-likely",
-		confidence: 0.8,
-		model: "chatgpt-subscription/gpt-6-astra:high",
-		findings: Array.from({ length: 3 }, () => ({
-			pattern: "repeated-qa-without-acceptance-gain",
-			explanation: "e".repeat(220),
-		})),
-		advice: "a".repeat(900),
+		situation: "s".repeat(600),
+		criteria: Array.from({ length: 10 }, (_, i) => ({ criterion: `c${i} ${"c".repeat(190)}`, origin: "agent", status: "unmet", judgment: "j".repeat(500) })),
+		findings: Array.from({ length: 8 }, () => ({ pattern: "repeated-qa-without-acceptance-gain", evidence: "v".repeat(400), explanation: "e".repeat(600) })),
+		counterevidence: "k".repeat(800),
+		advice: "a".repeat(1200),
+		decides: Array.from({ length: 4 }, () => ({ who: "owner", what: "w".repeat(300) })),
 	});
-	assert.equal(message.content.length, 1600);
+	assert.ok(message.content.length <= AUDIT_OPINION_CHARS, `${message.content.length} chars`);
+	// Gate review B4: the auditor line keeps its own share; a real project id and a long objective never cut it.
+	const real = composeAuditOpinion({ sessionId: SESSION, now: NOW, projectId: "01a1ffcb-59fb-7563-8d59-9710650ec377:01a1ffcb-59fb-7563-8d59-9710650ec377-goal", objective: "o".repeat(400), model: "anthropic-subscription/claude-fable-5-2:xhigh", ladder: { tier: 2, basis: "budget", ratio: 2.17, rounds: 3 }, opinion: { assessment: "waste-likely", situation: "s" } });
+	assert.ok(real.content.includes("Auditor: anthropic-subscription/claude-fable-5-2:xhigh (review tier 2 of 3: spend is 2.2x the approved budget)."));
+	// Gate review B2: the largest schema-valid opinion still shows every section on the page.
+	for (const part of ["Situation:", "Criteria:", "Findings:", "Counterevidence:", "Recommendation:", "Who decides:", "The owner:"]) assert.ok(message.content.includes(part), `page misses ${part}`);
 	assert.ok(message.content.includes("This is an audit opinion, not an instruction; you decide."));
 	assert.ok(message.content.trimEnd().endsWith("Nothing was stopped or changed."));
 	assert.match(message.content, /waste-likely/);
@@ -285,18 +314,12 @@ test("a long schema-valid audit opinion keeps the advisory sentence within 1600 
 test("an audit opinion keeps its advisory sentence when redaction lengthens credential-shaped text", () => {
 	// Each 15-char sk-ant- token becomes the 17-char sk-ant-[REDACTED]; capping before redaction used to cut the sentence.
 	const tokens = Array.from({ length: 40 }, () => "sk-ant-aaaaaaaa").join(" ");
-	const message = composeAuditOpinion({
-		sessionId: SESSION,
-		now: NOW,
-		projectId: "11111111-1111-1111-1111-111111111111:22222222-2222-2222-2222-222222222222",
+	const message = opinion({
 		objective: "x".repeat(120),
-		assessment: "waste-likely",
-		confidence: 0.8,
-		model: "chatgpt-subscription/gpt-6-astra:high",
-		findings: Array.from({ length: 3 }, () => ({ pattern: "repeated-qa-without-acceptance-gain", explanation: "e".repeat(600) })),
-		advice: tokens,
+		findings: Array.from({ length: 8 }, () => ({ pattern: "repeated-qa-without-acceptance-gain", evidence: "v", explanation: "e".repeat(600) })),
+		advice: `${tokens} ${tokens}`,
 	});
-	assert.ok(message.content.length <= 1600, `${message.content.length} chars`);
+	assert.ok(message.content.length <= AUDIT_OPINION_CHARS, `${message.content.length} chars`);
 	assert.ok(message.content.endsWith("This is an audit opinion, not an instruction; you decide. Nothing was stopped or changed."));
 	assert.doesNotMatch(message.content, /sk-ant-a{8}/);
 });

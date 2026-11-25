@@ -62,6 +62,14 @@ test("wake, nudge and relay-cancel always carry their machine fields", () => {
 	assert.equal(cancel.details.toolCallId, "toolu_grep");
 });
 
+test("scope check has a title and an evidence sentence for every D15 signal (2026-11-22: long-run went out as undefined)", () => {
+	for (const signal of ["churn", "overstep", "stuck", "reopened", "repeat", "after-complete", "long-run"]) {
+		const finding = makeFinding({ detector: "D15", kind: "drift", cls: signal, subject: { sessionId: "s", key: `align:s:${signal}:0` }, data: { signal, metric: 3, evidence: "9 rounds", goal: "g" } });
+		const { content } = composeScopeCheck({ finding, sessionId: "s", now: T });
+		assert.equal(content.includes("undefined"), false, `${signal}: ${content.split("\n").slice(0, 2).join(" / ")}`);
+	}
+});
+
 test("scope check is redacted, never starts a turn, joins a running one, and is forwardable", () => {
 	const finding = makeFinding({ detector: "D15", kind: "drift", cls: "overstep", subject: { sessionId: "c1", taskId: "st_1", key: "align:c1:overstep:0" }, data: { signal: "overstep", metric: 1, goal: "answer the question", lastUserText: "why sk-ant-oat01-abcdefghijklmnop?" } });
 	const own = composeScopeCheck({ finding, sessionId: "c1", now: T });

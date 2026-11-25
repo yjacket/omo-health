@@ -16,12 +16,16 @@ const PROJECT = "sess-1:goal-1";
 const AUDIT = "audit-1";
 
 const OPINION = {
-	v: 1,
+	v: 2,
 	auditId: AUDIT,
 	projectId: PROJECT,
 	assessment: "justified",
 	confidence: 0.8,
 	criteriaStatus: "apparently-met",
+	situation: "Round 4 added new acceptance evidence.",
+	criteria: [],
+	counterevidence: "",
+	decides: [{ who: "agent", what: "Continue the current approach." }],
 	findings: [{ pattern: "other", evidence: "round 4 in the table", explanation: "each round added new acceptance evidence" }],
 	advice: "Continue with the current approach; spending tracks new acceptance evidence rather than repeated checking.",
 	allocationOpinion: { assessment: "support", reason: "the remaining estimate is inside the approved budget" },

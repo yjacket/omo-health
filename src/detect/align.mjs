@@ -69,8 +69,9 @@ export function isInformationAsk(text) {
 
 const GOAL_ACTIVE = new Set(["active", "running", "in_progress", "pending"]);
 const HOUR_MS = 3600_000;
-// A round number written next to a step: "26차 QA", "회귀 점검 25", "QA round 7", "3회차" (not 차이, 차원, 차례, 차단...).
-export const ROUND = /(\d+)\s*(?:차|회차)(?![이원례단량선트])|(?:round|라운드|회귀 점검)\s*#?(\d+)/gi;
+// A round number written next to a step: "26차 QA", "회귀 점검 25", "QA round 7", "3회차" (not 차이, 차원, 차례, 차단...),
+// and a reviewer spawn's short form "Plan review r19" / "리뷰 R3".
+export const ROUND = /(\d+)\s*(?:차|회차)(?![이원례단량선트])|(?:round|라운드|회귀 점검)\s*#?(\d+)|(?:\breview|리뷰)[\s-]*r(\d+)\b/gi;
 
 /** Time spent working: the sum of gaps between consecutive steps that are shorter than idleGapMs. */
 export function activeTime(steps, idleGapMs) {
@@ -91,7 +92,7 @@ export function repeatedRounds(steps) {
 	let text = null;
 	for (const step of steps) {
 		const value = String(step.text ?? "");
-		const numbers = [...value.matchAll(ROUND)].map((m) => Number(m[1] ?? m[2]));
+		const numbers = [...value.matchAll(ROUND)].map((m) => Number(m[1] ?? m[2] ?? m[3]));
 		if (!numbers.length) continue;
 		rounds.add(Math.max(...numbers));
 		text = value;
@@ -202,7 +203,9 @@ export function detect(world, memory = {}) {
 					? `align:${sid}:long-run:${Math.floor(world.now / cfg.longRun.everyMs)}`
 					: `align:${sid}:${signal}:${Math.floor(Math.log2(metric))}`;
 			if (signal === "long-run" && history.some((e) => String(e.key).startsWith(`align:${sid}:long-run:`) && world.now - e.ms < cfg.longRun.everyMs)) continue;
-			if (history.some((e) => e.key === key) || history.filter((e) => new Date(e.ms).toISOString().slice(0, 10) === today).length >= cfg.perDay || history.some((e) => world.now - e.ms < cfg.minGapMs)) continue;
+			// One delivery is in the history twice (the ledger entry and the transcript copy, seconds apart): count notes by key.
+			const todayKeys = new Set(history.filter((e) => new Date(e.ms).toISOString().slice(0, 10) === today).map((e) => e.key));
+			if (history.some((e) => e.key === key) || todayKeys.size >= cfg.perDay || history.some((e) => world.now - e.ms < cfg.minGapMs)) continue;
 			const finding = makeFinding({
 				detector: id, kind: "drift", severity: "info", cls: signal,
 				subject: { sessionId: sid, taskId: session.taskId, parentSessionId: session.parentSessionId, key },

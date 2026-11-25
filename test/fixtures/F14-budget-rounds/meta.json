@@ -21,12 +21,16 @@
   "budgetAudit": {
     "durationMs": 60000,
     "result": {
-      "v": 1,
+      "v": 2,
       "auditId": "filled-by-the-replay",
       "projectId": "00000000-0000-4000-8000-000000000014:goal-export-rounds",
       "assessment": "waste-likely",
       "confidence": 0.82,
       "criteriaStatus": "unknown",
+      "situation": "Twelve QA rounds reran one acceptance suite.",
+      "criteria": [],
+      "counterevidence": "",
+      "decides": [{ "who": "agent", "what": "Whether to stop rerunning the suite." }],
       "findings": [
         {
           "pattern": "repeated-qa-without-acceptance-gain",

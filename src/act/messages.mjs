@@ -617,15 +617,15 @@ function budgetCount(value) {
 	return Number.isFinite(n) ? String(Math.round(n * 10) / 10) : "?";
 }
 
-/** One common shape: `self-notice`, next turn, no wake-up, redacted, capped at 1600 characters. */
-function budgetMessage({ sessionId, now, actionKind, content, details }) {
+/** One common shape: `self-notice`, next turn, no wake-up, redacted, capped at 1600 characters (an audit opinion: one page). */
+function budgetMessage({ sessionId, now, actionKind, content, details, cap = BUDGET_CHARS }) {
 	return base({
 		kind: "self-notice",
 		sessionId,
 		now,
 		deliverAs: "nextTurn",
 		triggerTurn: false,
-		content: truncate(redact(content), BUDGET_CHARS),
+		content: truncate(redact(content), cap),
 		details: { actionKind, ...details },
 	});
 }
@@ -777,22 +777,60 @@ const AUDIT_OPINION_TEXT = {
 /** Contract sentence appended after truncation, so a long opinion can never lose it. */
 const AUDIT_OPINION_TAIL = "This is an audit opinion, not an instruction; you decide. Nothing was stopped or changed.";
 
-/** IS-8: the auditor's opinion, delivered as an opinion the session may weigh. Never an instruction. */
-export function composeAuditOpinion({ sessionId, now, projectId, revision = 0, auditId = null, objective = "", assessment = "insufficient-evidence", confidence = null, advice = "", findings = [], model = null }) {
+/** One page: the whole audit opinion fits, so the agent reads the reasoning and the counterevidence, not a summary. */
+export const AUDIT_OPINION_CHARS = 4000;
+
+/** Why this tier of the ladder looked: spend against the approved budget, or review rounds where there is none. */
+function ladderText(ladder) {
+	if (!ladder || !Number.isFinite(ladder.tier)) return "";
+	if (ladder.basis === "rule") return ` (effort tier ${ladder.tier}, asked by rule: ${(ladder.reasons ?? []).join(", ") || "rule"})`;
+	const why = ladder.basis === "budget" && Number.isFinite(ladder.ratio)
+		? `spend is ${ladder.ratio.toFixed(1)}x the approved budget`
+		: `${ladder.rounds ?? "?"} review rounds`;
+	return ` (review tier ${ladder.tier} of 3: ${why})`;
+}
+
+/**
+ * IS-8: the auditor's one-page opinion (C-audit v2), delivered as an opinion the session may weigh. Never an instruction:
+ * it names who decides each point (an agent-added criterion the agent, an owner-given one the owner).
+ */
+export function composeAuditOpinion({ sessionId, now, projectId, revision = 0, auditId = null, objective = "", opinion = {}, model = null, ladder = null }) {
+	const assessment = opinion.assessment ?? "insufficient-evidence";
 	const verdict = AUDIT_OPINION_TEXT[assessment] ?? AUDIT_OPINION_TEXT["insufficient-evidence"];
-	const confidenceText = Number.isFinite(Number(confidence)) ? `, confidence ${Number(confidence).toFixed(2)}` : "";
-	const findingLines = (findings ?? []).slice(0, 3).map((f) => {
-		const pattern = f.pattern ?? "other";
-		const explanation = f.explanation ?? f.evidence ?? "";
-		return `- ${pattern}: ${truncate(String(explanation), 220)}`;
-	});
+	const confidenceText = Number.isFinite(Number(opinion.confidence)) ? `, confidence ${Number(opinion.confidence).toFixed(2)}` : "";
+	// Every section gets its own share of the page (redacted first: redaction can lengthen text), so a long criteria or
+	// findings list never pushes the recommendation and who-decides off the page. With every section at its maximum the
+	// page cap trims the end of who-decides; the closing sentence is appended after the cap and always kept.
+	const part = (lines, max) => truncate(redact(lines.join("\n")), max);
+	const list = (title, items, max) => (items.length ? ["", part([title, ...items], max)] : []);
+	const one = (label, text, max) => (text ? ["", part([`${label}: ${text}`], max)] : []);
 	const body = [
-		`${BUDGET_PREFIX} Spending audit opinion for project "${projectId}" (revision ${revision}, "${truncate(objective, 120)}"): ${assessment}${confidenceText}${model ? `, model ${model}` : ""}. The auditor found ${verdict}`,
-		...(findingLines.length ? ["Findings:", ...findingLines] : []),
-		...(advice ? [`Advice: ${truncate(String(advice), 900)}`] : []),
+		part([`${BUDGET_PREFIX} Review opinion for project "${projectId}" (revision ${revision}, "${truncate(objective, 120)}"): ${assessment}${confidenceText}. The auditor found ${verdict}`], 420),
+		part([`Auditor: ${model ?? "unknown model"}${ladderText(ladder)}.`], 220),
+		...one("Situation", opinion.situation, 400),
+		...list("Criteria:", (opinion.criteria ?? []).map((c) => `- [${c.origin ?? "unknown"}-given, ${c.status ?? "unknown"}] ${c.criterion}: ${c.judgment}`), 950),
+		...list("Findings:", (opinion.findings ?? []).map((f) => `- ${f.pattern ?? "other"}: ${f.explanation ?? ""} Evidence: ${f.evidence ?? ""}`), 650),
+		...one("Counterevidence", opinion.counterevidence, 380),
+		...one("Recommendation", opinion.advice, 600),
+		...list("Who decides:", (opinion.decides ?? []).map((d) => `- ${d.who === "owner" ? "The owner" : "You (the agent)"}: ${d.what}`), 380),
 	].join("\n");
-	// The body is redacted, then truncated, then the contract sentence is appended: redaction can lengthen text, so it
-	// must happen before the cap or the final cap in budgetMessage would cut the sentence.
-	const content = `${truncate(redact(body), BUDGET_CHARS - AUDIT_OPINION_TAIL.length - 1)}\n${AUDIT_OPINION_TAIL}`;
-	return budgetMessage({ sessionId, now, actionKind: "budget-audit-opinion", content, details: { projectId, revision, auditId, assessment } });
+	// The contract sentence is appended after the cap, so a long opinion can never lose it.
+	const content = `${truncate(body, AUDIT_OPINION_CHARS - AUDIT_OPINION_TAIL.length - 1)}\n${AUDIT_OPINION_TAIL}`;
+	return budgetMessage({ sessionId, now, actionKind: "budget-audit-opinion", content, cap: AUDIT_OPINION_CHARS, details: { projectId, revision, auditId, assessment, tier: ladder?.tier ?? null } });
+}
+
+/**
+ * Past the ladder's last tier (4x the approved budget, or 40 review rounds without one) the owner decides: the session
+ * is asked once to put the question to them. Nothing is stopped; the owner's answer is the session's to act on.
+ */
+export function composeBudgetOwnerCall({ sessionId, now, projectId, revision = 0, objective = "", ladder = {}, spentUsd = 0, approvedUsd = 0 }) {
+	const why = ladder.basis === "budget" && Number.isFinite(ladder.ratio)
+		? `${budgetUsd(spentUsd)} is spent, ${ladder.ratio.toFixed(1)}x the approved ${budgetUsd(approvedUsd)}`
+		: `the work has run ${ladder.rounds ?? "?"} review rounds without an approved budget`;
+	const content = [
+		`${BUDGET_PREFIX} Owner decision needed for project "${projectId}" (revision ${revision}, "${truncate(objective, 120)}"): ${why}, past the last review tier.`,
+		"Before your next step, ask the owner with the question tool whether to continue, narrow the goal, or stop. Say what is already delivered, what remains, and what it has cost; include the latest review opinion's recommendation if there is one.",
+		"Nothing was stopped or changed; the owner's answer decides.",
+	].join("\n");
+	return budgetMessage({ sessionId, now, actionKind: "budget-owner-call", content, details: { projectId, revision, basis: ladder.basis ?? null, ratio: ladder.ratio ?? null, rounds: ladder.rounds ?? null } });
 }

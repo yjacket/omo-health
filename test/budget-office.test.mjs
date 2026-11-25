@@ -83,7 +83,8 @@ function setup(t, { sid = SID } = {}) {
 			fs.mkdirSync(goalDir, { recursive: true });
 			fs.writeFileSync(path.join(goalDir, `${sid}.json`), JSON.stringify({ version: 1, goal: { status: "active", ...goal } }));
 		},
-		office({ runner = createFakeRunner(), loggedIn = ["chatgpt-subscription"] } = {}) {
+		// The transcripts' main model is Claude Opus, so the auditor is the Claude top model (budget.audit.topModels).
+		office({ runner = createFakeRunner(), loggedIn = ["anthropic-subscription"] } = {}) {
 			runner.jobDir = (jobId) => path.join(paths.health.jobsDir, jobId);
 			return createBudgetOffice({ paths, db, clock, config, runner, loggedInProviders: () => new Set(loggedIn) });
 		},
@@ -182,11 +183,13 @@ test("(c)-(f), (h): request at $10, estimate -> decision, 100% checkpoint, stage
 	assert.equal(out.messages[0].details.staged, true);
 	assert.equal(out.messages[0].details.nextCheckpoint, "integration done");
 	assert.match(out.messages[0].content, /funds the work up to the next checkpoint "integration done"/);
-	assert.equal(runner.starts.length, 1, "the change review starts one audit");
+	assert.equal(runner.starts.length, 1, "one audit runs");
 	assert.equal(runner.starts[0].kind, "budget-audit");
 	assert.ok(runner.starts[0].args.includes("--no-tools"));
 	const auditId = runner.starts[0].jobId;
 	project = c.store.getProject(pid);
+	// Spend had already passed 1x when the change came in, so the one audit running is the tier-1 ladder audit.
+	assert.deepEqual([project.data.audits.at(-1).tier, project.data.audits.at(-1).triggers], [1, ["ladder-budget"]]);
 	assert.equal(project.status, "approved");
 	assert.equal(project.data.pending, null);
 	assert.equal(project.revision, 2);
@@ -198,12 +201,16 @@ test("(c)-(f), (h): request at $10, estimate -> decision, 100% checkpoint, stage
 	assert.deepEqual(out.snapshot.projects.find((p) => p.id === pid).stage, { nextCheckpoint: "integration done" });
 
 	const opinion = {
-		v: 1,
+		v: 2,
 		auditId,
 		projectId: pid,
 		assessment: "waste-likely",
 		confidence: 0.8,
 		criteriaStatus: "unknown",
+		situation: "Rounds 3-9 reran the same QA pass after the integration was done.",
+		criteria: [],
+		counterevidence: "",
+		decides: [{ who: "agent", what: "Whether to stop the full QA reruns." }],
 		findings: [{ pattern: "repeated-qa-without-acceptance-gain", evidence: "rounds 3-9 rerun the same QA", explanation: "no new acceptance evidence was produced" }],
 		advice: "Stop rerunning the full QA pass; verify only the two new failure paths.",
 		allocationOpinion: { assessment: "revise", reason: "a cheaper path keeps every criterion" },
@@ -448,11 +455,12 @@ test("(m) a completed goal inside closeGrace starts no audit; an active goal doe
 	const completedMs = T0 - 14 * HOUR;
 	const transcript = (c) => {
 		const entries = [E.header(c.sid, c.cwd, T0 - 20 * HOUR)];
-		for (let i = 1; i <= 7; i++) entries.push(E.assistant({ ms: T0 - (21 - i) * HOUR, text: `QA round ${i} finished`, usage: usage(40 / 7) }));
+		// 11 numbered rounds: past the ladder's first step (10) with no approved budget.
+		for (let i = 1; i <= 11; i++) entries.push(E.assistant({ ms: T0 - (21 - i) * HOUR, text: `QA round ${i} finished`, usage: usage(40 / 7) }));
 		return entries;
 	};
 
-	// A goal completed 14 h ago: still inside the 24 h closeGrace, 7 numbered rounds and $40 spent.
+	// A goal completed 14 h ago: still inside the 24 h closeGrace, 11 numbered rounds and $40 spent.
 	const done = setup(t);
 	const donePid = `${done.sid}:g1`;
 	done.writeGoal({ id: "g1", objective: "finished work", status: "completed", completedAt: secs(completedMs), createdAt: secs(T0 - 22 * HOUR), updatedAt: secs(completedMs) });
@@ -490,7 +498,7 @@ test("(o) a deleted goal file makes the project's goal missing: no later audit s
 	const pid = `${c.sid}:g1`;
 	c.writeGoal({ id: "g1", objective: "vanishing goal", createdAt: secs(T0 - 20 * HOUR), updatedAt: secs(T0 - 14 * HOUR) });
 	const entries = [E.header(c.sid, c.cwd, T0 - 20 * HOUR)];
-	for (let i = 1; i <= 7; i++) entries.push(E.assistant({ ms: T0 - (21 - i) * HOUR, text: `QA round ${i} finished`, usage: usage(40 / 7) }));
+	for (let i = 1; i <= 11; i++) entries.push(E.assistant({ ms: T0 - (21 - i) * HOUR, text: `QA round ${i} finished`, usage: usage(40 / 7) }));
 	writeJsonl(c.file, entries);
 	const runner = createFakeRunner({ outcomes: { "budget-audit": { status: "running" } } });
 	const office = c.office({ runner });
@@ -514,7 +522,7 @@ test("(q) a session that left the backfill window is no longer in progress: no a
 	const pid = `${c.sid}:g1`;
 	c.writeGoal({ id: "g1", objective: "aging goal", createdAt: secs(T0 - 20 * HOUR), updatedAt: secs(T0 - 14 * HOUR) });
 	const entries = [E.header(c.sid, c.cwd, T0 - 20 * HOUR)];
-	for (let i = 1; i <= 7; i++) entries.push(E.assistant({ ms: T0 - (21 - i) * HOUR, text: `QA round ${i} finished`, usage: usage(40 / 7) }));
+	for (let i = 1; i <= 11; i++) entries.push(E.assistant({ ms: T0 - (21 - i) * HOUR, text: `QA round ${i} finished`, usage: usage(40 / 7) }));
 	writeJsonl(c.file, entries);
 	const runner = createFakeRunner({ outcomes: { "budget-audit": { status: "running" } } });
 	const office = c.office({ runner });
@@ -538,7 +546,7 @@ test("(p) a cancelled goal's heavy trigger records one audit-skipped and starts 
 	const pid = `${c.sid}:g1`;
 	c.writeGoal({ id: "g1", objective: "cancelled work", status: "cancelled", completedAt: secs(T0 - 14 * HOUR), createdAt: secs(T0 - 20 * HOUR), updatedAt: secs(T0 - 14 * HOUR) });
 	const entries = [E.header(c.sid, c.cwd, T0 - 20 * HOUR)];
-	for (let i = 1; i <= 7; i++) entries.push(E.assistant({ ms: T0 - (21 - i) * HOUR, text: `QA round ${i} finished`, usage: usage(40 / 7) }));
+	for (let i = 1; i <= 11; i++) entries.push(E.assistant({ ms: T0 - (21 - i) * HOUR, text: `QA round ${i} finished`, usage: usage(40 / 7) }));
 	writeJsonl(c.file, entries);
 	const runner = createFakeRunner({ outcomes: { "budget-audit": { status: "running" } } });
 	const office = c.office({ runner });
@@ -577,7 +585,7 @@ test("(s) no logged-in model defers an audit visibly; a later audit clears the d
 	const pid = `${c.sid}:g1`;
 	c.writeGoal({ id: "g1", objective: "heavy rounds without a model", createdAt: secs(T0 - 2 * HOUR), updatedAt: secs(T0 - 2 * HOUR) });
 	const entries = [E.header(c.sid, c.cwd, T0 - 2 * HOUR)];
-	for (let i = 1; i <= 7; i++) entries.push(E.assistant({ ms: T0 - (8 - i) * 10 * MIN, usage: usage(2), text: `QA round ${i} finished` }));
+	for (let i = 1; i <= 11; i++) entries.push(E.assistant({ ms: T0 - (12 - i) * 10 * MIN, usage: usage(2), text: `QA round ${i} finished` }));
 	writeJsonl(c.file, entries);
 	const loggedIn = [];
 	const runner = createFakeRunner({ outcomes: { "budget-audit": { status: "running" } } });
@@ -588,11 +596,11 @@ test("(s) no logged-in model defers an audit visibly; a later audit clears the d
 	const roundsTrigger = row.triggers.find((t) => t.kind === "rounds");
 	assert.equal(roundsTrigger.heavy, true);
 	assert.equal(roundsTrigger.firstMs, T0);
-	assert.match(roundsTrigger.detail, /7 numbered rounds/);
+	assert.match(roundsTrigger.detail, /11 numbered rounds/);
 	assert.deepEqual(row.auditDeferred, { ms: T0 + MIN, reason: "no-model" });
 	assert.equal(c.store.getProject(pid).data.auditDeferredReason, "no-model");
 	assert.equal(runner.starts.length, 0);
-	loggedIn.push("chatgpt-subscription");
+	loggedIn.push("anthropic-subscription");
 	c.clock.advance(MIN);
 	row = office.tick({}).snapshot.projects.find((p) => p.id === pid);
 	assert.equal(runner.starts.length, 1, "the provider is available now");
@@ -668,6 +676,122 @@ test("(n) the snapshot reports backfill progress until every byte of the window 
 	assert.equal(out.snapshot.ingest.pendingFiles, 0);
 	assert.equal(out.snapshot.ingest.totalBytes, total);
 	assert.equal(out.snapshot.ingest.updatedMs, c.clock.now());
+});
+
+// The 01a1ffcb shape: the agent's own criterion (a reviewer approval) never passes and no budget was approved, so the
+// review rounds climb the ladder; the bundle shows the auditor the request, the criterion, the verdicts and the PR.
+function reviewLoop(c, { from = 19, count = 11 } = {}) {
+	c.writeGoal({ id: "g1", objective: "criterion 1: a plan-reviewer unconditional approval receipt exists", createdAt: secs(T0 - 30 * HOUR), updatedAt: secs(T0 - 30 * HOUR) });
+	const verdict = (ms, round) => ({
+		type: "custom_message", customType: "omo-senpi:wake", id: `wake${round}`, timestamp: iso(ms),
+		content: `task completion name:plan-review-r${round} id:st_${round} agent:plan-reviewer(chatgpt-subscription/gpt-6.2-astra) status:completed\nresult:"**[REJECT]** round ${round} edge case in the ledger"`,
+		details: { producerDetails: [{ customType: "senpi-task.completion", details: [{ name: `plan-review-r${round}`, agent_type: "plan-reviewer", model: "chatgpt-subscription/gpt-6.2-astra", status: "completed" }] }] },
+	});
+	const spawn = (ms, round) => E.assistant({ ms, usage: usage(3), calls: [{ id: `call${round}`, name: "task", args: { subagent_type: "plan-reviewer", name: `plan-review-r${round}`, task_summary: `Plan review r${round}: ledger fixes` } }] });
+	const entries = [
+		E.header(c.sid, c.cwd, T0 - 30 * HOUR),
+		E.user("세션별로 토큰사용량을 표시하자. plan approval 은 이 자리에서 모두 허가하니 더이상 질문하지 말고 바로 진행하라", T0 - 30 * HOUR),
+		spendEntry(T0 - 29 * HOUR, 2),
+		E.toolResult("pr", T0 - 28 * HOUR, { name: "eval", text: "pr 0 https://github.com/yjacket/omo-health/pull/21 | commits 44" }),
+	];
+	for (let i = 0; i < count; i++) entries.push(spawn(T0 - 27 * HOUR + i * 30 * MIN, from + i), verdict(T0 - 27 * HOUR + i * 30 * MIN + MIN, from + i));
+	writeJsonl(c.file, entries);
+}
+
+function ticks(office, c, n = 3) {
+	let out = null;
+	for (let i = 0; i < n; i++) {
+		out = office.tick({ shadow: false });
+		c.clock.advance(MIN);
+	}
+	return out;
+}
+
+test("(r) past 10 review rounds without a budget, the Claude session's top Claude model audits once at high effort", (t) => {
+	const c = setup(t);
+	const pid = `${c.sid}:g1`;
+	reviewLoop(c);
+	const runner = createFakeRunner({ outcomes: { "budget-audit": { status: "running" } } });
+	ticks(c.office({ runner, loggedIn: ["chatgpt-subscription", "anthropic-subscription"] }), c);
+	assert.equal(runner.starts.length, 1, "one audit, not one per tick");
+	const args = runner.starts[0].args;
+	assert.equal(args[args.indexOf("--model") + 1], "anthropic-subscription/claude-fable-5-2:high", "the main session's family, tier 1 effort");
+	for (const flag of ["--no-tools", "--no-session"]) assert.ok(args.includes(flag), `the auditor stays tool-less (${flag})`);
+	const audit = c.store.getProject(pid).data.audits.at(-1);
+	assert.deepEqual([audit.tier, audit.ladder.basis, audit.digest], [1, "rounds", "no-model"]);
+	const bundle = fs.readFileSync(args.find((a) => a.startsWith("@")).slice(1), "utf8");
+	for (const part of ["plan approval 은 이 자리에서 모두 허가하니", "plan-reviewer unconditional approval receipt", "**[REJECT]** round 29 edge case", "11 reviewer spawns", "https://github.com/yjacket/omo-health/pull/21", "## Ladder"]) {
+		assert.ok(bundle.includes(part), `bundle misses ${part}`);
+	}
+	assert.deepEqual(c.store.rounds(pid).map((r) => r.round), Array.from({ length: 11 }, (_, i) => 19 + i), "\"Plan review r19\" counts as round 19");
+});
+
+test("(r2) the quick lane summarizes the raw evidence first; the auditor reads the summary, not the raw verdicts", (t) => {
+	const c = setup(t);
+	reviewLoop(c);
+	fs.mkdirSync(path.dirname(c.paths.authFile), { recursive: true });
+	fs.writeFileSync(c.paths.authFile, JSON.stringify({ opengateway: { type: "api" }, "anthropic-subscription": { type: "oauth" } }));
+	fs.writeFileSync(c.paths.omoJsonc, JSON.stringify({ "[native]": { categories: { quick: { models: ["opengateway/deepseek/deepseek-v4.1-flash:low"] } } } }));
+	const runner = createFakeRunner({ outcomes: {
+		"budget-digest": { status: "done", result: { opinionText: "DIGEST: 11 rejections, all ledger edge cases", usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: 0.01 } } },
+		"budget-audit": { status: "running" },
+	} });
+	const office = c.office({ runner });
+	// Tick 1 registers the project; tick 2 opens the audit with its digest.
+	ticks(office, c, 2);
+	assert.deepEqual(runner.starts.map((s) => s.kind), ["budget-digest"], "the digest runs first");
+	const digestArgs = runner.starts[0].args;
+	assert.equal(digestArgs[digestArgs.indexOf("--model") + 1], "opengateway/deepseek/deepseek-v4.1-flash:low");
+	assert.ok(digestArgs.includes("--no-tools"));
+	assert.match(fs.readFileSync(digestArgs.find((a) => a.startsWith("@")).slice(1), "utf8"), /\*\*\[REJECT\]\*\* round 29/);
+	ticks(office, c, 1);
+	assert.deepEqual(runner.starts.map((s) => s.kind), ["budget-digest", "budget-audit"]);
+	const bundle = fs.readFileSync(runner.starts[1].args.find((a) => a.startsWith("@")).slice(1), "utf8");
+	assert.ok(bundle.includes("DIGEST: 11 rejections, all ledger edge cases"));
+	assert.ok(!bundle.includes("## Reviewer runs"), "the raw verdicts stay with the digest");
+	assert.ok(bundle.includes("plan approval 은 이 자리에서"), "owner requests stay verbatim");
+	assert.equal(c.store.getProject(`${c.sid}:g1`).data.audits.at(-1).digest, "done");
+	assert.equal(c.db.prepare("SELECT COUNT(*) AS n FROM usage_events WHERE source = 'audit'").get().n, 1, "the digest's own cost is on the ledger");
+});
+
+test("(r3) past 40 review rounds the session is asked once to call the owner, and D26 raises a human-needed finding", (t) => {
+	const c = setup(t);
+	reviewLoop(c, { count: 41 });
+	const runner = createFakeRunner({ outcomes: { "budget-audit": { status: "running" } } });
+	const office = c.office({ runner });
+	const outs = [];
+	for (let i = 0; i < 3; i++) {
+		outs.push(office.tick({ shadow: false }));
+		c.clock.advance(MIN);
+	}
+	const calls = outs.flatMap((o) => o.messages).filter((m) => m.details.actionKind === "budget-owner-call");
+	assert.equal(calls.length >= 1, true);
+	assert.equal(new Set(calls.map((m) => m.id)).size, 1, "one owner call, re-offered until delivered");
+	assert.match(calls[0].content, /ask the owner with the question tool/);
+	assert.match(calls[0].content, /41 review rounds/);
+	const row = outs.at(-1).snapshot.projects.find((p) => p.id === `${c.sid}:g1`);
+	assert.equal(row.ownerCall.rounds, 41);
+});
+
+test("(r4) a rule audit below 1x spends no tier: tier 1 still audits when spend passes the approved budget (gate review B1)", (t) => {
+	const c = setup(t);
+	const pid = `${c.sid}:g1`;
+	c.writeGoal({ id: "g1", objective: "approved work", createdAt: secs(T0 - 30 * HOUR), updatedAt: secs(T0 - 30 * HOUR) });
+	writeJsonl(c.file, [E.header(c.sid, c.cwd, T0 - 30 * HOUR), spendEntry(T0 - 29 * HOUR, 35.11)]);
+	const runner = createFakeRunner({ outcomes: { "budget-audit": { status: "running" } } });
+	const office = c.office({ runner });
+	office.tick({ shadow: false });
+	// $30.01 approved earlier, and a change-review audit already ran below 1x a day ago.
+	const project = c.store.getProject(pid);
+	project.data.approvals = [{ requestId: "est-1", ms: T0 - 28 * HOUR, approvedUsd: 30.01, by: "rule" }];
+	project.data.audits = [{ auditId: "rule-1", ms: T0 - 26 * HOUR, status: "done", tier: null, ladder: { tier: 1, basis: "rule", reasons: ["change-review"] }, triggers: ["change-review"], endedMs: T0 - 26 * HOUR }];
+	project.status = "approved";
+	c.store.upsertProject(project);
+	c.clock.advance(MIN);
+	office.tick({ shadow: false });
+	assert.equal(runner.starts.length, 1, "passing 1x opens the tier-1 audit");
+	const audit = c.store.getProject(pid).data.audits.at(-1);
+	assert.deepEqual([audit.tier, audit.ladder.basis, audit.triggers], [1, "budget", ["ladder-budget"]]);
 });
 
 test("disabled budget: tick returns the empty result and writes no snapshot", (t) => {

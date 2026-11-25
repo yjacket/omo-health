@@ -148,7 +148,8 @@ test("an audit opinion polled in memory is redacted in the snapshot, in every fi
 		E.assistant({ ms: T0 - 30 * MIN, usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: { total: 1 } }, text: "working" }),
 	]);
 	const opinion = {
-		v: 1, auditId: "a2", projectId: pid, assessment: "justified", confidence: 0.7, criteriaStatus: "unknown", findings: [],
+		v: 2, auditId: "a2", projectId: pid, assessment: "justified", confidence: 0.7, criteriaStatus: "unknown", findings: [],
+		situation: `Spending tracks new evidence ${SECRET}`, criteria: [], counterevidence: "", decides: [{ who: "agent", what: "Keep going." }],
 		advice: "Keep the current approach; the spending buys new acceptance evidence.",
 		allocationOpinion: { assessment: "not-applicable", reason: `no request pending ${SECRET}` },
 	};
