@@ -303,12 +303,19 @@ export function createBudgetStore(db) {
 			}));
 		},
 
-		/** Retention: usage rows and quota readings expire; projects and their rounds/events are kept. */
+		/**
+		 * Retention: usage rows and quota readings expire, and so does the audit evidence of a project closed before the
+		 * cutoff. A live project keeps all of its evidence (its first PR link and request counts feed every audit);
+		 * projects and their rounds/events are kept.
+		 */
 		prune(now, retentionDays) {
 			const cutoff = now - retentionDays * DAY_MS;
 			return {
 				usageEvents: Number(db.prepare("DELETE FROM usage_events WHERE ms < ?").run(cutoff).changes),
 				quotaSamples: Number(db.prepare("DELETE FROM quota_samples WHERE updated_ms < ?").run(cutoff).changes),
+				evidence: Number(db.prepare(
+					"DELETE FROM budget_evidence WHERE project_id IN (SELECT id FROM budget_projects WHERE status = 'closed' AND closed_ms < ?)",
+				).run(cutoff).changes),
 			};
 		},
 	};
