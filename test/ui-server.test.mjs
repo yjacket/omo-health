@@ -10,7 +10,12 @@ import net from "node:net";
 import { once } from "node:events";
 import os from "node:os";
 import path from "node:path";
-import { after, before, beforeEach, describe, it } from "node:test";
+import { after, before, beforeEach, describe, it as nodeIt } from "node:test";
+
+// Each case gets its own hang guard; a suite-wide timeout cancels healthy cases on a slow runner once the file grows.
+const it = (name, options, fn) => typeof options === "function"
+	? nodeIt(name, { timeout: 20_000 }, options)
+	: nodeIt(name, { timeout: 20_000, ...options }, fn);
 import { fileURLToPath } from "node:url";
 import { runInNewContext } from "node:vm";
 import { MessageChannel, receiveMessageOnPort, Worker } from "node:worker_threads";
@@ -204,7 +209,7 @@ function rawStatus(text) {
 	});
 }
 
-describe("ui server", { timeout: 20_000 }, () => {
+describe("ui server", () => {
 	describe("host, origin and token", () => {
 		it("rejects a foreign Host with 403", async () => {
 			const res = await request({ headers: { host: `evil.com:${port}` } });
