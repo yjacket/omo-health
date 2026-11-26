@@ -201,12 +201,15 @@ function createDocument(html) {
 
 /* ---------- page harness ---------- */
 
-/** Loads index.html, runs app.js and resolves after the first render. `page.state` is what GET /api/state answers. */
-async function openPage(budget) {
+/**
+ * Loads index.html, runs app.js and resolves after the first render. `page.state` is what GET /api/state answers;
+ * `sections` replaces sections of it. A promise in `page.hold` keeps every POST unanswered until it resolves.
+ */
+async function openPage(budget, sections = {}) {
 	const doc = createDocument(fs.readFileSync(path.join(STATIC, "index.html"), "utf8"));
 	const location = { hash: `#t=${"t".repeat(24)}` };
 	const storage = new Map();
-	const page = { doc, location, state: uiState(budget), posts: [], autoRefresh: null, rendered: null };
+	const page = { doc, location, state: { ...uiState(budget), ...sections }, posts: [], hold: null, autoRefresh: null, rendered: null };
 	const context = vm.createContext({
 		document: doc,
 		window: { addEventListener() {} },
@@ -224,7 +227,10 @@ async function openPage(budget) {
 			return 1;
 		},
 		fetch: async (url, options = {}) => {
-			if (options.method === "POST") page.posts.push({ url, body: JSON.parse(options.body) });
+			if (options.method === "POST") {
+				page.posts.push({ url, body: JSON.parse(options.body) });
+				await page.hold;
+			}
 			const body = url === "/api/state" ? page.state : url.startsWith("/api/diagnose") ? { subjects: [] } : { ok: true };
 			return { ok: true, status: 200, json: async () => structuredClone(body) };
 		},
@@ -346,7 +352,7 @@ describe("dashboard budget tab", { timeout: 20_000 }, () => {
 				["budget", false],
 			],
 		);
-		for (const id of ["budget-limits", "budget-projects", "budget-audits"]) assert.equal(page.doc.getElementById(id).hidden, false, id);
+		for (const id of ["budget-limits", "budget-sessions", "budget-projects", "budget-audits"]) assert.equal(page.doc.getElementById(id).hidden, false, id);
 	});
 
 	it("shows every IS-1 field of each window row with its seeded values", async () => {
@@ -580,13 +586,132 @@ describe("dashboard budget tab", { timeout: 20_000 }, () => {
 		cover("BUDGET_AUDIT_DEFERRED_LABELS", [...sourceLiterals("src/budget/metrics.mjs", /reason: "([a-z-]+)"/g), "no-model", "start-failed"], "deferral reason");
 	});
 
+	it("shows each window's session-day pair with its override mark, the p95 only on defaults, and a neutral chip while uncalibrated", async () => {
+		const day = (o) => ({ investigatePercent: 5, ownerPercent: 10, overridden: false, active: true, p95Percent: 3.24, days: 41, ...o });
+		const page = await openPage(
+			snapshot({
+				windows: [
+					windowState({ sessionDay: day({}) }),
+					windowState({ windowId: "w1", sessionDay: day({ investigatePercent: 7.5, ownerPercent: 20, overridden: true }) }),
+					windowState({ windowId: "w2", sessionDay: day({ active: false, p95Percent: null, days: 0 }) }),
+					windowState({ windowId: "w3" }),
+				],
+			}),
+		);
+		const [defaults, overridden, uncalibrated, older] = byClass(page.doc.getElementById("budget-limits-body"), "win").map((row) => byClass(row, "statrow")[0]);
+		const values = (row) => byClass(row, "stat__v").map(text);
+		const chips = (row) => byClass(row, "chip").map((c) => c.className);
+		assert.deepEqual([values(defaults), chips(defaults)], [["5%", "10%", "3.2%"], []]);
+		assert.deepEqual([values(overridden), chips(overridden)], [["7.5%", "20%"], ["chip chip--info"]]);
+		assert.deepEqual([values(uncalibrated), chips(uncalibrated)], [["5%", "10%"], ["chip"]]);
+		assert.equal(older, undefined, "a snapshot written before the session-day fields draws no line");
+	});
+
+	it("lists the last day's session trees: level chip, total with its split, the crossed window's share, the uncounted cost", async () => {
+		const share = (o) => ({ account: CLAUDE, windowId: "claude:7d", label: "7d", usd: 0, percent: 0, investigatePercent: 5, ownerPercent: 10, level: null, ...o });
+		const sessions = [
+			{ sessionId: "sid-owner-0123", objective: "Export QA", totalUsd: 246, mainUsd: 71.4, childUsd: 174.6, uncountedUsd: 0, maxPercent: 30, level: "owner", basis: { kind: "window", account: CLAUDE, windowId: "claude:7d", label: "7d", percent: 12.3, usd: 246, thresholdPercent: 10 }, shares: [share({ windowId: "claude:5h", label: "5h", usd: 100, percent: 30 }), share({ usd: 246, percent: 12.3, level: "owner" })] },
+			{ sessionId: "sid-usd-01234", objective: null, totalUsd: 96.5, mainUsd: 96.5, childUsd: 0, uncountedUsd: 96.5, maxPercent: 0, level: "investigate", basis: { kind: "usd", usd: 96.5, thresholdUsd: 80 }, shares: [share({})] },
+			{ sessionId: "sid-none-0123", objective: "quiet", totalUsd: 31.2, mainUsd: 20, childUsd: 11.2, uncountedUsd: 0, maxPercent: 1.56, level: null, basis: null, shares: [share({ usd: 31.2, percent: 1.56 })] },
+		];
+		const page = await openPage({ ...snapshot(), sessionDay: { investigateUsd: 80, ownerUsd: 160, sessions } });
+		const body = page.doc.getElementById("budget-sessions-body");
+		assert.deepEqual(byClass(byClass(body, "statrow")[0], "stat__v").map(text), ["$80", "$160"]);
+		const rows = rowsOf(page, "budget-sessions");
+		const cells = (row) => descendants(row).filter((n) => n.localName === "th" || n.localName === "td");
+		assert.deepEqual(rows.map((row) => byClass(row, "chip").map((c) => c.className)), [["chip chip--warn"], ["chip chip--info"], []]);
+		for (const part of ["Export QA", "sid-owne", "$246.00", "$71.40", "$174.60"]) assert.ok(text(rows[0]).includes(part), `"${part}" in "${text(rows[0])}"`);
+		const claude = labels.BUDGET_ACCOUNT_LABELS[CLAUDE];
+		const [crossed] = byClass(rows[0], "share");
+		assert.equal(text(crossed), `${claude} 7d 12.3%`, "the window that crossed the level, not the larger 5h share");
+		assert.equal(crossed.getAttribute("title").split("\n").length, 2, "every counted window is in the title");
+		assert.equal(byClass(rows[1], "share").length, 0, "no window counted this tree");
+		assert.equal(text(cells(rows[1]).at(-1)), "$96.50");
+		assert.ok(text(cells(rows[1])[0]).includes("sid-usd-"), "a tree without a goal is named by its session id");
+		assert.equal(text(byClass(rows[2], "share")[0]), `${claude} 7d 1.6%`);
+	});
+
+	describe("number settings", () => {
+		const WINDOW = `${CLAUDE}:claude:7d`;
+		const cell = (key, value, extra = {}) => ({ key, value, applied: value, shadowed: false, ...extra });
+		const settings = (ownerPercent = 10) => ({
+			file: "config.json",
+			applied: {},
+			switches: [],
+			others: [],
+			warnings: [],
+			numbers: [{ ...cell("budget.shortMinBurnHours", 6, { default: 6 }), labelKo: "burn", descKo: "desc", unit: "h" }],
+			sessionDay: {
+				levels: ["audit", "owner"],
+				rows: [
+					{ labelKo: "default", unit: "%", cells: [cell("budget.sessionDayInvestigatePercent", 5, { default: 5 }), cell("budget.sessionDayPercent", ownerPercent, { default: 10 })] },
+					{ unit: "%", window: { name: WINDOW, account: CLAUDE, windowId: "claude:7d", label: "7d", scope: null, active: true, p95Percent: 3.2 }, cells: [cell("sessionDayInvestigatePercent", null, { window: WINDOW, applied: 5 }), cell("sessionDayPercent", 20, { window: WINDOW })] },
+				],
+			},
+		});
+		const fields = (page) => byClass(page.doc.getElementById("settings-body"), "numfield__input");
+		/** Types `value` into the field and leaves it: the browser fires change on the node. */
+		const change = (node, value) => {
+			node.value = value;
+			for (const fn of node.listeners.get("change")) fn({ type: "change", currentTarget: node });
+		};
+
+		it("sends a changed field as a number, an emptied one as null, and refuses a non-number without a request", async () => {
+			const page = await openPage(snapshot(), { settings: settings() });
+			assert.deepEqual(fields(page).map((n) => n.getAttribute("value")), ["5", "10", "", "20", "6"]);
+			await page.after(() => change(fields(page)[1], "15"));
+			await page.after(() => change(fields(page)[2], "7.5"));
+			await page.after(() => change(fields(page)[3], " "));
+			await page.after(() => change(fields(page)[4], "0"));
+			assert.deepEqual(page.posts, [
+				{ url: "/api/setting", body: { key: "budget.sessionDayPercent", value: 15 } },
+				{ url: "/api/setting", body: { window: WINDOW, key: "sessionDayInvestigatePercent", value: 7.5 } },
+				{ url: "/api/setting", body: { window: WINDOW, key: "sessionDayPercent", value: null } },
+				{ url: "/api/setting", body: { key: "budget.shortMinBurnHours", value: 0 } },
+			]);
+			for (const typed of ["12,5", "-1", "1e3", "9".repeat(400)]) change(fields(page)[0], typed);
+			assert.equal(page.posts.length, 4, "a refused value is never sent (a number too large for JSON would arrive as null)");
+			assert.equal(fields(page)[0].getAttribute("aria-invalid"), "true");
+			assert.equal(fields(page)[0].getAttribute("value"), "5", "the field shows the value in the file again");
+			const body = page.doc.getElementById("settings-body");
+			assert.equal(byClass(body, "note--crit").filter((n) => text(n)).length, 1);
+			assert.equal(byClass(byClass(body, "table--thresholds")[0], "note--crit").length, 0, "a cell is too narrow for a sentence: the refusal is drawn under the table");
+		});
+
+		it("keeps a number being typed across a refresh and redraws the card once the field is sent", async () => {
+			const page = await openPage(snapshot(), { settings: settings() });
+			const typed = fields(page)[1];
+			typed.focus();
+			typed.value = "1";
+			page.state = { ...page.state, settings: settings(11) };
+			await page.after(() => page.autoRefresh());
+			assert.equal(fields(page)[1], typed, "the field under the cursor is not replaced");
+			await page.after(() => change(typed, "12"));
+			assert.notEqual(fields(page)[1], typed);
+			assert.equal(fields(page)[1].getAttribute("value"), "11", "the card shows the server's state again");
+			assert.equal(page.doc.activeElement, fields(page)[1], "focus stays on the field");
+		});
+
+		it("shows the sent value in a pending field across a refresh, then the server's state", async () => {
+			const page = await openPage(snapshot(), { settings: settings() });
+			let answer;
+			page.hold = new Promise((resolve) => (answer = resolve));
+			change(fields(page)[1], "15");
+			await page.after(() => page.autoRefresh());
+			assert.deepEqual([fields(page)[1].getAttribute("value"), fields(page)[1].disabled], ["15", true], "the state still says 10");
+			await page.after(() => answer());
+			assert.deepEqual([fields(page)[1].getAttribute("value"), fields(page)[1].disabled], ["10", false]);
+			assert.equal(page.posts.length, 1);
+		});
+	});
+
 	for (const [name, budget] of [
 		["no snapshot yet", null],
 		["an empty snapshot", snapshot({ windows: [], projects: [], audits: [] })],
 	]) {
 		it(`shows 기록 없음 in each card for ${name}, with no render error`, async () => {
 			const page = await openPage(budget);
-			for (const id of ["budget-limits", "budget-projects", "budget-audits"]) {
+			for (const id of ["budget-limits", "budget-sessions", "budget-projects", "budget-audits"]) {
 				assert.equal(page.doc.getElementById(id).hidden, false, id);
 				assert.equal(text(page.doc.getElementById(`${id}-body`)), "기록 없음", id);
 			}

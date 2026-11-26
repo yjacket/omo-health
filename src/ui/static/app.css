@@ -661,6 +661,138 @@ a:hover {
 	align-items: baseline;
 }
 
+/* ---------- number settings: a text field per number; the session-day thresholds are a table of them ---------- */
+
+/* The box holds the number and its unit ($ before, the others after), so every field of a column starts on one edge. */
+.numfield {
+	display: inline-flex;
+	align-items: center;
+	gap: var(--s-1);
+	inline-size: 5.5rem;
+	min-block-size: 2.25rem;
+	padding: var(--s-2);
+	border-radius: var(--r-md);
+	background-color: var(--surface);
+	box-shadow: var(--shadow-ring);
+	cursor: text;
+	transition: box-shadow var(--m-micro) var(--ease);
+}
+
+.numfield:hover {
+	box-shadow: 0 0 0 1px var(--ink-4);
+}
+
+.numfield:has([aria-invalid="true"]) {
+	box-shadow: 0 0 0 1px var(--crit);
+}
+
+.numfield:focus-within {
+	box-shadow: var(--shadow-focus);
+}
+
+.numfield:has(:disabled) {
+	box-shadow: var(--shadow-ring);
+	opacity: 0.5;
+	cursor: default;
+}
+
+.numfield__input {
+	flex: 1 1 0;
+	min-inline-size: 0;
+	padding: 0;
+	border: none;
+	background-color: transparent;
+	color: var(--ink);
+	caret-color: var(--ink);
+	font-family: inherit;
+	font-size: var(--t-body);
+	font-variant-numeric: tabular-nums;
+	line-height: inherit;
+	text-align: end;
+}
+
+.numfield__input::selection {
+	background-color: color-mix(in srgb, var(--focus) 30%, transparent);
+	color: var(--ink);
+}
+
+/* The ring is the box's. */
+.numfield__input:focus-visible {
+	box-shadow: none;
+}
+
+.numfield__input::placeholder {
+	color: var(--ink-3);
+	opacity: 1;
+}
+
+.numfield__unit {
+	color: var(--ink-3);
+	font-size: var(--t-caption);
+}
+
+/* The field, then what it cannot say: its default, the value in force, a refusal. */
+.numset {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: var(--s-1);
+	min-inline-size: 0;
+}
+
+.numset--row {
+	flex-direction: row;
+	flex-wrap: wrap;
+	align-items: baseline;
+	column-gap: var(--s-2);
+}
+
+.numset__note {
+	color: var(--ink-3);
+	font-size: var(--t-caption);
+	font-variant-numeric: tabular-nums;
+}
+
+.numset__note--warn {
+	color: var(--warn);
+}
+
+/* Beside the field there is room for a refusal, on a line of its own. */
+.numset--row > .note {
+	flex-basis: 100%;
+}
+
+.numrow {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: var(--s-1) var(--s-3);
+	min-inline-size: 0;
+}
+
+.numrow > .switch__desc {
+	flex-basis: 100%;
+}
+
+/* A row's name sits on the baseline of its fields; the field columns are only as wide as a field. */
+.table--thresholds tbody th,
+.table--thresholds tbody td {
+	vertical-align: baseline;
+}
+
+.table--thresholds td {
+	inline-size: 1%;
+}
+
+/* The name column gives way first: its heading and a window's hint may wrap, a field never shrinks. */
+.table--thresholds thead th:first-child {
+	white-space: normal;
+}
+
+.table--thresholds .stat {
+	flex-wrap: wrap;
+}
+
 /* ---------- chips ---------- */
 
 .chip {
@@ -1869,7 +2001,8 @@ a:hover {
 	align-items: baseline;
 }
 
-.win__foot {
+.win__foot,
+.statrow {
 	display: flex;
 	flex-wrap: wrap;
 	align-items: center;
@@ -1974,6 +2107,23 @@ a:hover {
 	font-weight: 400;
 }
 
+/* A session tree's share of a window: the window's name quieter than the share, and free to wrap when it is long. */
+.share {
+	display: inline-flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	justify-content: flex-end;
+	gap: var(--s-1);
+	min-inline-size: 0;
+	white-space: normal;
+	overflow-wrap: anywhere;
+}
+
+.share__window {
+	color: var(--ink-3);
+	font-size: var(--t-caption);
+}
+
 .pending {
 	display: flex;
 	flex-direction: column;
@@ -1998,6 +2148,19 @@ a:hover {
 }
 
 @media (max-width: 600px) {
+	/* A finger needs more than the pointer's 2.25rem; in the table a narrower field leaves the row's name room down to 320px. */
+	.numfield {
+		min-block-size: 2.75rem;
+	}
+
+	.table--thresholds .numfield {
+		inline-size: 4.5rem;
+	}
+
+	.share {
+		justify-content: flex-start;
+	}
+
 	.win {
 		padding: var(--s-3);
 	}
@@ -2079,6 +2242,7 @@ a:hover {
 
 	.table--projects td:nth-child(3),
 	.table--projects td:nth-child(6),
+	.table--sessions td:nth-child(3),
 	.table--audits td:nth-child(2),
 	.table--audits td:nth-child(4) {
 		flex-basis: 100%;

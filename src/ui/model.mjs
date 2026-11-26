@@ -1,7 +1,8 @@
 import { ledgerParentSubject, sessionSubjects, subjectKey, subjectOf } from "../session-subject.mjs";
 import path from "node:path";
-import { DEFAULT_CONFIG, loadConfig, SWITCH_KEYS } from "../config.mjs";
-import { getPath, pauseState, SWITCHES } from "../control.mjs";
+import { windowKey } from "../budget/session-day.mjs";
+import { DEFAULT_CONFIG, loadConfig, MAP_ENTRY_KEYS, SWITCH_KEYS } from "../config.mjs";
+import { getPath, NUMBER_KEYS, pauseState, SWITCHES, WINDOW_MAP } from "../control.mjs";
 import { readDecisions } from "../decisions.mjs";
 import { createInvestigations, RESOLVED } from "../investigations.mjs";
 import { endedSelector, readEnded } from "../session-ledger.mjs";
@@ -86,6 +87,8 @@ export function recordsStamp({ health }) {
 export function loadUiInputs({ paths, env, now = Date.now() }) {
 	const stamp = recordsStamp(paths);
 	const { heartbeat, stopped, pidAlive: alive, loaded } = loadDaemonInputs({ paths, env, now });
+	// The number settings write config.json; a file at $OMO_HEALTH_CONFIG merged on top of it can still decide the value in force.
+	const hasExtra = loaded.sources.some((file) => file !== paths.health.configFile && file !== paths.health.configLastGoodFile);
 	let decisions;
 	let decisionsReadMs = null;
 	const started = performance.now();
@@ -130,6 +133,7 @@ export function loadUiInputs({ paths, env, now = Date.now() }) {
 		decisions,
 		decisionsReadMs,
 		loaded,
+		fileConfig: hasExtra ? loadConfig({ env: {}, paths }).config : loaded.config,
 		rawUserConfig: readJsonSafe(paths.health.configFile) ?? null,
 		configStat: statSafe(paths.health.configFile) ?? null,
 	};
@@ -494,8 +498,52 @@ function othersOf(config, defaults, prefix = "") {
 		const where = prefix + key;
 		if (isRecord(def)) return othersOf(config?.[key], def, `${where}.`);
 		const value = config?.[key];
-		return SWITCH_KEYS.includes(where) || JSON.stringify(value) === JSON.stringify(def) ? [] : [{ key: where, value, default: def }];
+		return SWITCH_KEYS.includes(where) || NUMBER_KEYS.includes(where) || JSON.stringify(value) === JSON.stringify(def) ? [] : [{ key: where, value, default: def }];
 	});
+}
+
+/** The session-day thresholds as the settings card lays them out (#33): one row per basis, one cell per level. */
+const SESSION_DAY_LEVELS = Object.freeze(["감사", "사람 확인"]);
+const SESSION_DAY_PERCENT = Object.freeze({ labelKo: "창 기본", unit: "%", keys: ["budget.sessionDayInvestigatePercent", "budget.sessionDayPercent"] });
+const SESSION_DAY_USD = Object.freeze({ labelKo: "창 밖 비용", unit: "$", keys: ["budget.sessionDayInvestigateUsd", "budget.sessionDayUsd"] });
+const BURN_HOURS = Object.freeze({ key: "budget.shortMinBurnHours", labelKo: "예산 부족 판정", descKo: "소진 속도가 이 시간 넘게 이어져야 예산 부족으로 봅니다.", unit: "시간" });
+
+/**
+ * The number settings: `value` is what config.json sets (its default when it sets nothing; null for a window without an
+ * override), `applied` what is in force, and `shadowed` says an extra config file decides it instead of config.json.
+ */
+function numberSettings(inputs) {
+	const { config } = inputs.loaded;
+	const file = inputs.fileConfig ?? config;
+	const cell = (key) => {
+		const value = getPath(file, key);
+		const applied = getPath(config, key);
+		return { key, value, default: getPath(DEFAULT_CONFIG, key), applied, shadowed: applied !== value };
+	};
+	// A window name may hold a dot, so it is looked up as one key, never as a dotted path.
+	const override = (cfg, name, key) => {
+		const map = getPath(cfg, WINDOW_MAP);
+		return Object.hasOwn(map, name) ? map[name][key] : undefined;
+	};
+	const windowCell = (name, key) => {
+		const value = override(file, name, key) ?? null;
+		const applied = override(config, name, key) ?? getPath(config, `budget.${key}`);
+		return { key, window: name, value, applied, shadowed: applied !== (value ?? getPath(file, `budget.${key}`)) };
+	};
+	const windowRow = (name, window) => ({ unit: SESSION_DAY_PERCENT.unit, window: { name, ...window }, cells: MAP_ENTRY_KEYS[WINDOW_MAP].map((key) => windowCell(name, key)) });
+	// Every window of the budget snapshot, then the overrides config.json keeps for a window the snapshot does not list.
+	const rows = new Map();
+	for (const w of (Array.isArray(inputs.budgetSnapshot?.treasury?.windows) ? inputs.budgetSnapshot.treasury.windows : []).filter(isRecord)) {
+		if (typeof w.account !== "string" || !w.account || typeof w.windowId !== "string" || !w.windowId) continue;
+		const day = isRecord(w.sessionDay) ? w.sessionDay : {};
+		rows.set(windowKey(w.account, w.windowId), { account: w.account, windowId: w.windowId, label: text(w.label, 80), scope: text(w.scope, 40), active: day.active === true, p95Percent: num(day.p95Percent) });
+	}
+	for (const name of Object.keys({ ...getPath(config, WINDOW_MAP), ...getPath(file, WINDOW_MAP) })) if (!rows.has(name)) rows.set(name, { missing: true });
+	const pair = (spec) => ({ labelKo: spec.labelKo, unit: spec.unit, cells: spec.keys.map(cell) });
+	return {
+		sessionDay: { levels: SESSION_DAY_LEVELS, rows: [pair(SESSION_DAY_PERCENT), ...Array.from(rows, ([name, window]) => windowRow(name, window)), pair(SESSION_DAY_USD)] },
+		numbers: [{ ...BURN_HOURS, ...cell(BURN_HOURS.key) }],
+	};
 }
 
 export function buildSettings(inputs) {
@@ -512,6 +560,7 @@ export function buildSettings(inputs) {
 	return {
 		file: inputs.paths.health.configFile,
 		switches,
+		...numberSettings(inputs),
 		others: othersOf(loaded.config, DEFAULT_CONFIG),
 		othersNoteKo: "일부 값은 감시기를 다시 시작할 때 반영됩니다.",
 		warnings: loaded.warnings,

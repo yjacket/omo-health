@@ -465,6 +465,27 @@ describe("ui server", () => {
 			assert.equal((await postJson("/api/resume", { x: 1 })).status, 422);
 			assert.equal(fs.existsSync(paths.health.configFile), false);
 		});
+
+		it("rejects a number setting with a wrong key set, an unknown key or window, or a bad value with 422", async () => {
+			const window = "anthropic-subscription/default:claude:7d";
+			for (const body of [
+				{},
+				{ key: "budget.sessionDayPercent" },
+				{ key: "budget.sessionDayPercent", value: 5, extra: 1 },
+				{ key: "budget.reservePercent", value: 5 },
+				{ key: "budget.sessionDayPercent", value: -1 },
+				{ key: "budget.sessionDayPercent", value: "5" },
+				{ window, key: "sessionDayPercent" },
+				{ window, key: "sessionDayPercent", value: 5, extra: 1 },
+				{ window, key: "budget.sessionDayPercent", value: 5 },
+				{ window: "__proto__", key: "sessionDayPercent", value: 5 },
+				{ window: null, key: "sessionDayPercent", value: 5 },
+				{ window, key: "sessionDayPercent", value: -1 },
+			]) {
+				assert.equal((await postJson("/api/setting", body)).status, 422, JSON.stringify(body));
+			}
+			assert.equal(fs.existsSync(paths.health.configFile), false);
+		});
 	});
 
 	describe("request form", () => {
@@ -500,6 +521,7 @@ describe("ui server", () => {
 		it("answers a method on the wrong API route with 405", async () => {
 			assert.equal((await request({ method: "POST", path: "/api/state", headers: { "content-type": "application/json" }, body: "{}" })).status, 405);
 			assert.equal((await request({ path: "/api/pause" })).status, 405);
+			assert.equal((await request({ path: "/api/setting" })).status, 405);
 		});
 
 		it("does not resolve traversal paths", async () => {
@@ -563,6 +585,29 @@ describe("ui server", () => {
 			fs.mkdirSync(path.dirname(paths.health.configFile), { recursive: true });
 			fs.writeFileSync(paths.health.configFile, "{broken");
 			const res = await postJson("/api/switch", { key: "actions.kill", value: false });
+			assert.equal(res.status, 409);
+			assert.equal(res.body.error, "unreadable");
+			assert.equal(fs.readFileSync(paths.health.configFile, "utf8"), "{broken");
+		});
+
+		it("writes a number setting and a window override to config.json and removes them on reset", async () => {
+			const window = "anthropic-subscription/default:claude:7d";
+			const readConfig = () => JSON.parse(fs.readFileSync(paths.health.configFile, "utf8"));
+			const set = await postJson("/api/setting", { key: "budget.sessionDayPercent", value: 15 });
+			assert.equal(set.status, 200);
+			assert.deepEqual(set.body, { ok: true, value: 15, isDefault: false });
+			assert.deepEqual((await postJson("/api/setting", { window, key: "sessionDayInvestigatePercent", value: 7.5 })).body, { ok: true, value: 7.5, isDefault: false });
+			assert.deepEqual(readConfig(), { budget: { sessionDayPercent: 15, windows: { [window]: { sessionDayInvestigatePercent: 7.5 } } } });
+			assert.deepEqual((await postJson("/api/setting", { key: "budget.sessionDayPercent", value: null })).body, { ok: true, value: 10, isDefault: true });
+			assert.deepEqual(readConfig(), { budget: { windows: { [window]: { sessionDayInvestigatePercent: 7.5 } } } });
+			assert.deepEqual((await postJson("/api/setting", { window, key: "sessionDayInvestigatePercent", value: null })).body, { ok: true, value: null, isDefault: true });
+			assert.deepEqual(readConfig(), {});
+		});
+
+		it("refuses a number setting on an unreadable config.json with 409", async () => {
+			fs.mkdirSync(path.dirname(paths.health.configFile), { recursive: true });
+			fs.writeFileSync(paths.health.configFile, "{broken");
+			const res = await postJson("/api/setting", { key: "budget.sessionDayPercent", value: 15 });
 			assert.equal(res.status, 409);
 			assert.equal(res.body.error, "unreadable");
 			assert.equal(fs.readFileSync(paths.health.configFile, "utf8"), "{broken");

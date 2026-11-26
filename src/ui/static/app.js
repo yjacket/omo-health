@@ -36,6 +36,9 @@
 	const PROJECT_COLUMNS = [{ label: "목표" }, { label: "상태", cls: "col-chip" }, { label: "지출", num: true }, { label: "승인", num: true }, { label: "견적 p50", num: true }, { label: "결과" }];
 	const AUDIT_COLUMNS = [{ label: "시각", cls: "col-time" }, { label: "프로젝트" }, { label: "판정", cls: "col-chip" }, { label: "조언", cls: "col-advice" }, { label: "모델", cls: "col-model" }, { label: "비용", num: true }];
 	const COUPON_MAX = 20;
+	// Session-day usage (#33): one root session tree over the last 24 h; the level it crossed as a chip, named like its threshold.
+	const SESSION_DAY_COLUMNS = [{ label: "세션" }, { label: "단계", cls: "col-chip" }, { label: "합계", num: true }, { label: "창 비율", num: true }, { label: "창 밖 비용", num: true }];
+	const SESSION_DAY_LEVEL = { investigate: ["감사", "info"], owner: ["사람 확인", "warn"] };
 	const ENDED_COLUMNS = [{ label: "끝난 시각", cls: "col-time" }, { label: "세션" }, { label: "결말", cls: "col-outcome" }, { label: "토큰", num: true }, { label: "이유" }, { label: "자식 · 시간 · omo", cls: "col-wide" }];
 	// 상위 모델 조사 (an audit of one session): the statuses an open detail follows on the 10 s refresh, and the token judgment as a chip tone.
 	const AUDIT_ACTIVE = new Set(["queued", "launching", "running"]);
@@ -67,6 +70,8 @@
 	let tab = "sessions";
 	// Budget clicks the daemon has not applied yet (it drains the command queue each tick): marked until a snapshot shows them.
 	const sentCoupons = new Map();
+	// Number settings on their way to the server: a field keeps what was sent until the answer arrives, whatever a refresh draws meanwhile.
+	const sentNumbers = new Map();
 
 	function append(node, children) {
 		for (const child of children.flat(Infinity)) {
@@ -1319,6 +1324,105 @@
 		return el("div", { class: "switchrow" }, control, el("p", { class: "switch__desc", text: sw.descKo }), state, sw.overriddenKo ? note(sw.overriddenKo, "warn") : null, errorSlot(group));
 	}
 
+	/* ---------- number settings (#33) ---------- */
+
+	/**
+	 * One number setting as a text field with what the field cannot say: its default, the value an extra config file puts
+	 * in force, a refusal. Sent when the field is left or Enter is pressed; an empty field asks for the default (for a
+	 * window: no override). `name` is the field's accessible name, `hint` what it shows while empty. With `below` the
+	 * refusal is not drawn here but handed over, named: a table cell is too narrow for a sentence.
+	 */
+	function numberSetting(cell, unit, name, { hint, cls = "numset", below } = {}) {
+		const group = cell.window === undefined ? `setting:${cell.key}` : `setting:${cell.window}:${cell.key}`;
+		const refusal = errorSlot(group);
+		if (below) {
+			if (refusal.textContent) refusal.textContent = `${name}: ${refusal.textContent}`;
+			below.push(refusal);
+		}
+		let viaEnter = false;
+		const send = async (event) => {
+			const input = event.currentTarget;
+			const refocus = viaEnter;
+			const typed = input.value.trim();
+			const value = typed === "" ? null : /^\d+(\.\d+)?$/.test(typed) ? Number(typed) : Number.NaN;
+			// The field now holds what was sent, so render() is free to replace it.
+			input.setAttribute("value", input.value);
+			if (value !== null && !Number.isFinite(value)) {
+				errors.set(group, "0 이상의 숫자만 넣을 수 있습니다.");
+				section("settings", lastState.settings, renderSettings);
+			} else {
+				sentNumbers.set(group, input.value);
+				await post("/api/setting", cell.window === undefined ? { key: cell.key, value } : { window: cell.window, key: cell.key, value }, group, () => sentNumbers.delete(group));
+			}
+			// Enter keeps the keyboard on the field, its text selected so the next digits replace it.
+			if (refocus && focusByKey(group) && document.activeElement.dataset.key === group) document.activeElement.select();
+		};
+		const input = el("input", {
+			type: "text",
+			inputmode: "decimal",
+			autocomplete: "off",
+			class: "numfield__input",
+			value: sentNumbers.get(group) ?? cell.value ?? "",
+			placeholder: hint,
+			"aria-label": name,
+			"aria-invalid": errors.has(group) ? "true" : undefined,
+			"data-group": group,
+			"data-key": group,
+			disabled: gone || busy.has(group),
+			onkeydown: (event) => {
+				viaEnter = event.key === "Enter";
+			},
+			oninput: (event) => {
+				viaEnter = false;
+				// Typing again withdraws the last refusal.
+				if (!errors.delete(group)) return;
+				event.currentTarget.removeAttribute("aria-invalid");
+				refusal.textContent = "";
+			},
+			onchange: send,
+		});
+		const mark = el("span", { class: "numfield__unit", "aria-hidden": "true", text: unit });
+		return el(
+			"div",
+			{ class: cls },
+			// The box is a label, so a click on the unit lands in the field.
+			el("label", { class: "numfield" }, unit === "$" ? [mark, input] : [input, mark]),
+			cell.default === undefined ? null : el("span", { class: "numset__note", text: `기본 ${cell.default}` }),
+			cell.shadowed ? el("span", { class: "numset__note numset__note--warn", title: "추가 설정 파일이 이 값을 덮어씁니다.", text: `적용 ${cell.applied}` }) : null,
+			below ? null : refusal,
+		);
+	}
+
+	/** What helps set a window's session-day pair: 보정 전 while the percent pair does not apply yet, else the 30-day p95 of one session's daily share. */
+	function sessionDayHint(active, p95Percent) {
+		if (active !== true) return chip("보정 전");
+		if (!Number.isFinite(p95Percent)) return null;
+		return el("span", { class: "stat", title: "최근 30일, 세션 하나가 하루에 쓴 몫의 95번째 백분위" }, el("span", { class: "stat__k", text: "p95" }), " ", el("span", { class: "stat__v", text: pct(p95Percent) }));
+	}
+
+	/** The session-day thresholds: one row per basis or window, one field per level, then the refusals. A window's empty field follows 창 기본. */
+	function thresholdTable(t) {
+		const refusals = [];
+		const fields = table(
+			"table--thresholds",
+			[{ label: "세션 하루 사용량" }, ...t.levels.map((label) => ({ label }))],
+			t.rows.map((row) => {
+				const w = row.window;
+				const account = w && !w.missing ? named(BUDGET_ACCOUNT_LABELS, w.account) : null;
+				const name = !w ? row.labelKo : w.missing ? w.name : `${account} ${windowLabel(w)}`;
+				const head = !w
+					? row.labelKo
+					: w.missing
+						? mono(w.name)
+						: el("span", { class: "win__name" }, el("span", { class: "win__account", text: account }), el("span", { class: "win__window", text: windowLabel(w) }), sessionDayHint(w.active, w.p95Percent));
+				return { cells: [head, ...row.cells.map((cell, i) => numberSetting(cell, row.unit, `${name} ${t.levels[i]}`, { hint: w ? "기본" : undefined, below: refusals }))] };
+			}),
+		);
+		return [fields, refusals];
+	}
+
+	const numberRow = (n) => el("div", { class: "numrow" }, el("span", { class: "switch__text", text: n.labelKo }), numberSetting(n, n.unit, n.labelKo, { cls: "numset numset--row" }), el("p", { class: "switch__desc", text: n.descKo }));
+
 	function renderSettings(s) {
 		const applied = s.applied ?? {};
 		const header = el(
@@ -1341,7 +1445,16 @@
 					)
 				: empty("기본값에서 바꾼 다른 값이 없습니다."),
 		);
-		return [header, warnings, el("div", { class: "switchlist" }, s.switches.map(switchRow)), others];
+		const thresholds = block(
+			"예산 알림 기준",
+			el(
+				"div",
+				{ class: "split" },
+				el("div", { class: "block" }, thresholdTable(s.sessionDay), note("세션 하나(하위작업 포함)가 24시간 동안 쓴 양이 기준을 넘으면 감사하거나 사람에게 알립니다. 0이면 끕니다.")),
+				el("div", { class: "block" }, s.numbers.map(numberRow)),
+			),
+		);
+		return [header, warnings, el("div", { class: "switchlist" }, s.switches.map(switchRow)), thresholds, others];
 	}
 
 	/* ---------- budget ---------- */
@@ -1349,6 +1462,9 @@
 	const named = (labels, key) => (typeof key === "string" && Object.hasOwn(labels, key) ? labels[key] : show(key));
 	const pct = (v) => (Number.isFinite(v) ? `${Math.round(v * 10) / 10}%` : "-");
 	const usd = (v) => (Number.isFinite(v) ? `$${v.toFixed(2)}` : "-");
+	/** A session-day threshold as the budget tab shows it: 0 is off. */
+	const pctLimit = (v) => (v === 0 ? "끔" : pct(v));
+	const usdLimit = (v) => (v === 0 ? "끔" : Number.isFinite(v) ? `$${v}` : "-");
 	const listOf = (v) => (Array.isArray(v) ? v : []);
 	const firstLine = (text) => (typeof text === "string" ? (text.split(/\r?\n/).find((line) => line.trim()) ?? "").trim() : "") || "-";
 
@@ -1400,6 +1516,21 @@
 		return el("span", { class: "coupons" }, stat("리셋권", String(count)), el("span", { class: "stepper" }, step(-1, "−", "리셋권 빼기"), step(1, "+", "리셋권 더하기")), sent === undefined ? null : chip("반영 대기", "info"));
 	}
 
+	/** The session-day pair in force for a window (#33): overridden for this window or not, then the hint that helps set it. */
+	function sessionDayLine(d) {
+		if (!d || typeof d !== "object") return null;
+		const overridden = d.overridden === true;
+		return el(
+			"div",
+			{ class: "statrow" },
+			el("span", { class: "stat__k", text: "세션 하루" }),
+			stat("감사", pctLimit(d.investigatePercent)),
+			stat("사람 확인", pctLimit(d.ownerPercent)),
+			overridden ? chip("창별 설정", "info") : null,
+			overridden && d.active === true ? null : sessionDayHint(d.active, d.p95Percent),
+		);
+	}
+
 	/** One subscription window: every IS-1 field as a short label. */
 	function windowRow(w) {
 		const stale = w.stale === true;
@@ -1426,6 +1557,7 @@
 				stat("여유", pct(w.freePercent)),
 				stat("하루", pct(w.safeDailyPercent)),
 			),
+			sessionDayLine(w.sessionDay),
 			el(
 				"div",
 				{ class: "win__foot" },
@@ -1453,6 +1585,44 @@
 		return [
 			el("div", { class: "wrap-row" }, chip(`전체 ${named(BUDGET_STATE_LABELS, b.treasury.state)}`, BUDGET_TONE[b.treasury.state]), ingestChip(b.ingest), el("span", { class: "meta", text: `${when(b.updatedMs)} 기준` })),
 			el("ul", { class: "wins" }, windows.map(windowRow)),
+		];
+	}
+
+	/** A session tree's share of the window that crossed its level, else its largest one; every counted window is in the title. */
+	function shareCell(s) {
+		const shares = listOf(s.shares).filter((x) => x && Number.isFinite(x.percent) && x.usd > 0);
+		if (!shares.length) return "-";
+		const name = (x) => `${named(BUDGET_ACCOUNT_LABELS, x.account)} ${show(x.label ?? x.windowId)}`;
+		const crossed = s.basis?.kind === "window" ? shares.find((x) => x.account === s.basis.account && x.windowId === s.basis.windowId) : null;
+		const top = crossed ?? shares.reduce((a, b) => (b.percent > a.percent ? b : a));
+		const title = shares.map((x) => `${name(x)} ${pct(x.percent)} (감사 ${pctLimit(x.investigatePercent)} · 사람 확인 ${pctLimit(x.ownerPercent)})`).join("\n");
+		return el("span", { class: "share", title }, el("span", { class: "share__window", text: name(top) }), " ", el("span", { text: pct(top.percent) }));
+	}
+
+	/** Session trees of the last 24 h (#33): total with the main/sub split, the share of a window or the cost no window counts, and the level crossed. */
+	function renderSessionDay(b) {
+		const day = b?.sessionDay;
+		const sessions = listOf(day?.sessions);
+		if (!sessions.length) return empty("기록 없음");
+		return [
+			el("div", { class: "statrow" }, el("span", { class: "meta", text: "최근 24시간" }), el("span", { class: "stat__k", text: "창 밖 비용" }), stat("감사", usdLimit(day.investigateUsd)), stat("사람 확인", usdLimit(day.ownerUsd))),
+			table(
+				"table--budget table--sessions",
+				SESSION_DAY_COLUMNS,
+				sessions.map((s) => {
+					const id = `세션 ${String(s.sessionId).slice(0, 8)}`;
+					const level = Object.hasOwn(SESSION_DAY_LEVEL, s.level ?? "") ? SESSION_DAY_LEVEL[s.level] : null;
+					return {
+						cells: [
+							el("span", { class: "proj" }, el("span", { class: "proj__objective", text: s.objective || id }), s.objective ? el("span", { class: "proj__meta", text: id }) : null),
+							level ? chip(level[0], level[1]) : "-",
+							el("span", { class: "money" }, el("span", { text: usd(s.totalUsd) }), el("span", { class: "money__split", text: `메인 ${usd(s.mainUsd)} · 서브 ${usd(s.childUsd)}` })),
+							shareCell(s),
+							s.uncountedUsd > 0 ? usd(s.uncountedUsd) : "-",
+						],
+					};
+				}),
+			),
 		];
 	}
 
@@ -1673,8 +1843,11 @@
 		section("controls", state.overview, renderControls);
 		section("investigations", state.investigations, renderInvestigations);
 		section("history", state.history, renderHistory);
-		section("settings", state.settings, renderSettings);
+		// A number being typed is not redrawn under the cursor: the settings card waits until the field is sent or left.
+		const typing = document.activeElement;
+		if (!(typing?.localName === "input" && typing.classList.contains("numfield__input") && typing.value !== typing.getAttribute("value"))) section("settings", state.settings, renderSettings);
 		section("budget-limits", state.budget, renderLimits);
+		section("budget-sessions", state.budget, renderSessionDay);
 		section("budget-projects", state.budget, renderProjects);
 		section("budget-audits", state.budget, renderAudits);
 		for (const d of document.querySelectorAll("details[data-open]")) if (openKeys.has(d.dataset.open)) d.open = true;

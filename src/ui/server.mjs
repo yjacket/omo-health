@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { clearPause, setSwitch, writePause } from "../control.mjs";
+import { clearPause, setNumber, setSwitch, writePause } from "../control.mjs";
 import { writeCommand } from "../budget/commands.mjs";
 import { safeSubjectId } from "../session-id.mjs";
 import { resolveLedgerSubject } from "../session-record.mjs";
@@ -38,6 +38,7 @@ const API_ROUTES = Object.freeze({
 	"/api/pause": "POST",
 	"/api/resume": "POST",
 	"/api/switch": "POST",
+	"/api/setting": "POST",
 	"/api/budget/coupons": "POST",
 	"/api/diagnose": "GET",
 	"/api/session": "GET",
@@ -64,7 +65,13 @@ class HttpFailure extends Error {
 	}
 }
 
-const SWITCH_STATUS = Object.freeze({ "unknown-key": 422, "invalid-value": 422, unreadable: 409 });
+const CONFIG_WRITE_STATUS = Object.freeze({ "unknown-key": 422, "invalid-value": 422, unreadable: 409 });
+/** A config.json write (setSwitch, setNumber) as [status, body]: the value now in the file, or why nothing was written. */
+function configWriteResult(result) {
+	if (result.ok) return [200, { ok: true, value: result.value, isDefault: result.isDefault }];
+	const payload = result.message === undefined ? { error: result.reason } : { error: result.reason, message: result.message };
+	return [CONFIG_WRITE_STATUS[result.reason] ?? 500, payload];
+}
 /** The dashboard's budget routes answer a malformed body with 400; the command queue validates again before writing. */
 const BUDGET_BAD_BODY = () => new HttpFailure(400, { error: "invalid" });
 
@@ -97,10 +104,13 @@ function runAction(paths, route, body, nowMs, startAudit) {
 		}
 		case "/api/switch": {
 			if (!hasExactKeys(body, ["key", "value"])) throw invalid;
-			const result = setSwitch(paths, body.key, body.value);
-			if (result.ok) return [200, { ok: true, value: result.value, isDefault: result.isDefault }];
-			const payload = result.message === undefined ? { error: result.reason } : { error: result.reason, message: result.message };
-			return [SWITCH_STATUS[result.reason] ?? 500, payload];
+			return configWriteResult(setSwitch(paths, body.key, body.value));
+		}
+		case "/api/setting": {
+			// A number setting: { key, value } for a global one, { window, key, value } for one window's override; null resets.
+			const perWindow = Object.hasOwn(body, "window");
+			if (!hasExactKeys(body, perWindow ? ["window", "key", "value"] : ["key", "value"])) throw invalid;
+			return configWriteResult(setNumber(paths, body.key, body.value, perWindow ? body.window : undefined));
 		}
 		case "/api/budget/coupons": {
 			if (!hasExactKeys(body, ["account", "count"])) throw BUDGET_BAD_BODY();

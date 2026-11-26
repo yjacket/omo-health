@@ -9,7 +9,7 @@ import path from "node:path";
 import { after, describe, it } from "node:test";
 import { runInNewContext } from "node:vm";
 import { SWITCH_KEYS } from "../src/config.mjs";
-import { SWITCHES } from "../src/control.mjs";
+import { NUMBER_KEYS, SWITCHES } from "../src/control.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 import { appendEnded } from "../src/session-ledger.mjs";
 import { createSessionFileLocator } from "../src/collect/session-files.mjs";
@@ -1208,6 +1208,73 @@ describe("ui model", () => {
 			assert.equal(settings.unreadable.length, 1);
 			assert.ok(settings.warnings.some((w) => w.includes(paths.health.configLastGoodFile)));
 			assert.equal(settings.switches.find((s) => s.key === "footer.showAll").value, true);
+		});
+	});
+
+	describe("settings numbers", () => {
+		const CLAUDE = "anthropic-subscription/default:claude:7d";
+		const CODEX = "chatgpt-subscription/default:codex:primary";
+		const GONE = "gone/default:old:1d";
+		/** The rows without their labels: what the page sends back and what it compares. */
+		const rowsOf = (settings) => settings.sessionDay.rows.map(({ window, cells }) => ({ window: window ?? null, cells }));
+
+		it("lays out the default pair, one row per snapshot window, a leftover override and the USD pair", () => {
+			const home = makeHome();
+			write(home.paths.health.configFile, { budget: { sessionDayPercent: 15, windows: { [CLAUDE]: { sessionDayInvestigatePercent: 7.5 }, [GONE]: { sessionDayPercent: 30 } } } });
+			const windows = [
+				{ account: "anthropic-subscription/default", windowId: "claude:7d", label: "7d", scope: null, sessionDay: { active: true, p95Percent: 3.2 } },
+				{ account: "chatgpt-subscription/default", windowId: "codex:primary", label: "primary", sessionDay: { active: false, p95Percent: null } },
+				{ account: "", windowId: "nameless" },
+				"junk",
+			];
+			const settings = buildSettings(inputsOf(home, { budgetSnapshot: { treasury: { windows } } }));
+			const cell = (key, value, def, applied = value) => ({ key, value, default: def, applied, shadowed: false });
+			const over = (window, investigate, owner) => [
+				{ key: "sessionDayInvestigatePercent", window, value: investigate, applied: investigate ?? 5, shadowed: false },
+				{ key: "sessionDayPercent", window, value: owner, applied: owner ?? 15, shadowed: false },
+			];
+			assert.deepEqual(rowsOf(settings), [
+				{ window: null, cells: [cell("budget.sessionDayInvestigatePercent", 5, 5), cell("budget.sessionDayPercent", 15, 10)] },
+				{ window: { name: CLAUDE, account: "anthropic-subscription/default", windowId: "claude:7d", label: "7d", scope: null, active: true, p95Percent: 3.2 }, cells: over(CLAUDE, 7.5, null) },
+				{ window: { name: CODEX, account: "chatgpt-subscription/default", windowId: "codex:primary", label: "primary", scope: null, active: false, p95Percent: null }, cells: over(CODEX, null, null) },
+				{ window: { name: GONE, missing: true }, cells: over(GONE, null, 30) },
+				{ window: null, cells: [cell("budget.sessionDayInvestigateUsd", 80, 80), cell("budget.sessionDayUsd", 160, 160)] },
+			]);
+			assert.equal(settings.sessionDay.levels.length, 2);
+		});
+
+		it("offers every number key exactly once and keeps them out of the other-values table", () => {
+			const home = makeHome();
+			write(home.paths.health.configFile, { budget: { sessionDayUsd: 200, shortMinBurnHours: 3, reservePercent: 11 } });
+			const settings = buildSettings(inputsOf(home));
+			const offered = [...settings.sessionDay.rows.flatMap((row) => row.cells), ...settings.numbers].map((c) => c.key);
+			assert.deepEqual(offered.toSorted(), NUMBER_KEYS.toSorted());
+			assert.deepEqual(settings.numbers.map(({ key, value, default: def, applied }) => ({ key, value, default: def, applied })), [{ key: "budget.shortMinBurnHours", value: 3, default: 6, applied: 3 }]);
+			assert.deepEqual(settings.others.map((o) => o.key), ["budget.reservePercent"]);
+		});
+
+		it("shows config.json's own value and marks the one an extra config file puts in force", () => {
+			const home = makeHome();
+			const extra = path.join(home.paths.healthHome, "extra.json");
+			write(home.paths.health.configFile, { budget: { sessionDayPercent: 15 } });
+			write(extra, { budget: { sessionDayPercent: 20, windows: { [CLAUDE]: { sessionDayInvestigatePercent: 9 } } } });
+			const settings = buildSettings(loadUiInputs({ paths: home.paths, env: { ...home.env, OMO_HEALTH_CONFIG: extra }, now: NOW }));
+			assert.deepEqual(rowsOf(settings).slice(0, 2), [
+				{
+					window: null,
+					cells: [
+						{ key: "budget.sessionDayInvestigatePercent", value: 5, default: 5, applied: 5, shadowed: false },
+						{ key: "budget.sessionDayPercent", value: 15, default: 10, applied: 20, shadowed: true },
+					],
+				},
+				{
+					window: { name: CLAUDE, missing: true },
+					cells: [
+						{ key: "sessionDayInvestigatePercent", window: CLAUDE, value: null, applied: 9, shadowed: true },
+						{ key: "sessionDayPercent", window: CLAUDE, value: null, applied: 20, shadowed: true },
+					],
+				},
+			]);
 		});
 	});
 
