@@ -117,6 +117,7 @@ export const WINDOW_MAP = "budget.windows";
 /** A window is named "<account>:<windowId>": no blanks, and a colon inside. */
 const WINDOW_NAME = /^[^\s:]\S*:\S+$/;
 const WINDOW_NAME_MAX = 200;
+const RESERVED_NAMES = new Set(["__proto__", "constructor", "prototype"]);
 
 /**
  * Sets one number setting in config.json; `null` puts it back to its default. With `window` the key is that window's
@@ -124,7 +125,9 @@ const WINDOW_NAME_MAX = 200;
  */
 export function setNumber(paths, key, value, window) {
 	const perWindow = window !== undefined;
-	const known = perWindow ? typeof window === "string" && window.length <= WINDOW_NAME_MAX && WINDOW_NAME.test(window) && MAP_ENTRY_KEYS[WINDOW_MAP].includes(key) : NUMBER_KEYS.includes(key);
+	// A hand-written entry without the "<account>:<windowId>" shape may still be removed (value null), never set.
+	const windowOk = typeof window === "string" && window.length > 0 && window.length <= WINDOW_NAME_MAX && !RESERVED_NAMES.has(window) && (value === null || WINDOW_NAME.test(window));
+	const known = perWindow ? windowOk && MAP_ENTRY_KEYS[WINDOW_MAP].includes(key) : NUMBER_KEYS.includes(key);
 	if (!known) return { ok: false, reason: "unknown-key" };
 	if (value !== null && !(typeof value === "number" && Number.isFinite(value) && value >= 0)) return { ok: false, reason: "invalid-value" };
 	const def = perWindow ? null : getPath(DEFAULT_CONFIG, key);

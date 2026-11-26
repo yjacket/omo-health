@@ -21,6 +21,16 @@ afterEach(() => {
 
 const readConfig = () => JSON.parse(fs.readFileSync(paths.health.configFile, "utf8"));
 
+describe("setNumber on a hand-written window entry without a colon (#33 review)", () => {
+	it("removes it with null but never sets it, and refuses prototype names either way", () => {
+		atomicWriteJson(paths.health.configFile, { budget: { windows: { claude7d: { sessionDayPercent: 20 } } } });
+		assert.deepEqual(setNumber(paths, "sessionDayPercent", 15, "claude7d"), { ok: false, reason: "unknown-key" });
+		assert.equal(setNumber(paths, "sessionDayPercent", null, "claude7d").ok, true);
+		assert.deepEqual(readConfig(), {});
+		for (const name of ["__proto__", "constructor", "prototype"]) assert.deepEqual(setNumber(paths, "sessionDayPercent", null, name), { ok: false, reason: "unknown-key" });
+	});
+});
+
 describe("pause", () => {
 	it("writes untilMs for finite minutes and a bare marker otherwise", () => {
 		assert.deepEqual(writePause(paths, { minutes: 15, now: 1_000 }), { untilMs: 1_000 + 900_000, byCli: true });
