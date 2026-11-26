@@ -24,6 +24,8 @@ const ADOPT_SKEW_MS = 5_000;
 const adoptedTerminationAttempts = (meta) => meta.adoptedTerminationAttempts ?? (meta.adoptedTerminationSent ? 1 : 0);
 /** Job kinds whose argv must pass the analyst guard flags (no session file, no extensions/skills/context, no tools). */
 const GUARDED_KINDS = new Set(["analyst", "audit"]);
+/** Job kinds that must answer with the requested model: fallback is disabled and an applied switch discards the answer. */
+const NO_FALLBACK_KINDS = new Set(["audit", "budget-audit", "budget-digest"]);
 // Print mode writes this prefix only for an applied switch, not exhaustion or reversion.
 const APPLIED_FALLBACK = /^Model fallback:/m;
 const FALLBACK_LOG_MAX = 256 * 1024;
@@ -233,7 +235,7 @@ function runnerOperations({ jobsDir, spawnImpl, clock, env, isAlive, identify, c
 	}
 
 	function fallbackFailure(f, meta, exitCode) {
-		if (meta.kind !== "audit" || !APPLIED_FALLBACK.test(readTextSafe(f.err, ""))) return null;
+		if (!NO_FALLBACK_KINDS.has(meta.kind) || !APPLIED_FALLBACK.test(readTextSafe(f.err, ""))) return null;
 		return finish(f, meta, {
 			status: "failed", reason: "model-fallback", result: null, exitCode,
 		});
@@ -360,7 +362,7 @@ function runnerOperations({ jobsDir, spawnImpl, clock, env, isAlive, identify, c
 					throw spawnError(error, undefined);
 				}
 				const jobEnv = childEnv(env);
-				if (kind === "audit") jobEnv.SENPI_NO_FALLBACK = "1";
+				if (NO_FALLBACK_KINDS.has(kind)) jobEnv.SENPI_NO_FALLBACK = "1";
 				const options = { cwd: cwd ?? f.dir, env: jobEnv, windowsHide: true, stdio: ["ignore", ...fds] };
 				try {
 					// A shell job stays attached: DETACHED_PROCESS makes cmd.exe lose its redirected stdout and stderr. An attached child is in

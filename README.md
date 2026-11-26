@@ -358,7 +358,7 @@ D26은 예산 사무소가 쓴 `budget/snapshot.json`만 읽는 조언용 탐지
 | `budget.staleMs` | 10분 | 이보다 오래된 구독 값은 상태 모름 |
 | `budget.backfillDays` | 8 | 처음 장부를 채울 기간 |
 | `budget.ingestBytesPerTick` | 8 MiB | 틱당 읽는 로그 양 |
-| `budget.retentionDays` | 120 | 지출, 구독 표본 보관 기간 |
+| `budget.retentionDays` | 120 | 지출, 구독 표본, 닫힌 지 이만큼 지난 세션 기록의 감사 근거 보관 기간 |
 | `budget.estimateAfterUsd` | 10 | 견적 요청을 보내는 누적 지출 |
 | `budget.checkpointPercent` | 80 | 체크포인트 알림 지점 |
 | `budget.autoApproveCyclePercent` | 10 | 창의 쓸 수 있는 몫 중 자동 승인 한도 |

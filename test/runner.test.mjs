@@ -108,16 +108,31 @@ test("the child env drops agent, provider and GitHub credentials", () => {
 	assert.deepEqual(childEnv(env), expected);
 });
 
-test("IS-9: only audit child processes disable senpi model fallback", () => {
+test("IS-9: audit, budget-audit and budget-digest child processes disable senpi model fallback; an analyst does not", () => {
 	const { runner, calls } = setup({ env: { PATH: "C:/bin", SENPI_NO_FALLBACK: "0", OMO_NO_FALLBACK: "0", PI_NO_FALLBACK: "0" } });
 	const args = laneArgs({ model: "p/reviewer", bundleFile: "C:/work/bundle.md" });
-	runner.start({ ...baseJob, kind: "analyst", args });
-	runner.start({ ...baseJob, kind: "audit", jobId: "j2", args });
-	assert.deepEqual(calls.map((call) => call.args), [args, args]);
+	const kinds = ["analyst", "audit", "budget-audit", "budget-digest"];
+	for (const [i, kind] of kinds.entries()) runner.start({ ...baseJob, kind, jobId: `j${i + 1}`, args });
+	assert.deepEqual(calls.map((call) => call.args), kinds.map(() => args));
 	assert.deepEqual(calls.map((call) => call.options.env), [
 		{ PATH: "C:/bin" },
 		{ PATH: "C:/bin", SENPI_NO_FALLBACK: "1" },
+		{ PATH: "C:/bin", SENPI_NO_FALLBACK: "1" },
+		{ PATH: "C:/bin", SENPI_NO_FALLBACK: "1" },
 	]);
+});
+
+test("IS-9: a budget-audit or budget-digest answer from a fallback model is discarded (#24 item 4)", () => {
+	const { runner } = setup({ isAlive: DEAD_PID });
+	for (const kind of ["budget-audit", "budget-digest"]) {
+		runner.start({ ...baseJob, kind, jobId: kind, args: laneArgs({ model: "p/reviewer", bundleFile: "C:/work/bundle.md" }), parse: (stdout) => JSON.parse(stdout) });
+		writeJob(runner, "out.txt", '{"opinionText":"from the wrong model"}', kind);
+		writeJob(runner, "err.log", "Model fallback: p/reviewer -> p/audited (provider refused)\n", kind);
+		writeExit(runner, { code: 0 }, kind);
+		const rejected = { status: "failed", reason: "model-fallback", result: null, exitCode: 0 };
+		assert.deepEqual(runner.poll(kind), rejected, kind);
+		assert.deepEqual(readMeta(runner, kind).final, rejected, kind);
+	}
 });
 
 test("IS-9: a restarted runner rejects a fallback verdict already finalized by an older runner", () => {
