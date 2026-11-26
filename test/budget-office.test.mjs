@@ -900,6 +900,49 @@ test("(sd) a session tree past the investigate line gets one audit per 24 h and 
 	assert.match(findings[0].titleKo, /\$170/);
 });
 
+test("(sd2) a finished session-day audit is not repeated inside 24 h; past 24 h a fresh crossing audits again even inside minGapMs; shadow records no event (#33)", (t) => {
+	const c = setup(t);
+	// A gap longer than the 25 h below: only the session-day new-evidence bypass lets the second audit start.
+	c.config.budget.audit.minGapMs = 48 * HOUR;
+	c.writeGoal({ id: "g1", objective: "long running lane", createdAt: secs(T0 - 20 * HOUR), updatedAt: secs(T0 - 20 * HOUR) });
+	writeJsonl(c.file, [E.header(c.sid, c.cwd, T0 - 20 * HOUR), spendEntry(T0 - 2 * HOUR, 90)]);
+	// Each audit ends at its first poll without an opinion, so nothing stays in flight to block the next one.
+	const runner = createFakeRunner({ outcomes: { "budget-audit": { status: "failed" } } });
+	const office = c.office({ runner });
+	const ticks = (n) => {
+		for (let i = 0; i < n; i++) {
+			office.tick({ shadow: false });
+			c.clock.advance(MIN);
+		}
+	};
+	ticks(4);
+	assert.equal(runner.starts.length, 1, "the crossing audits once");
+	assert.notEqual(c.store.getProject(`${SID}:g1`).data.audits[0].status, "running", "the first audit has ended");
+
+	// 12 h later the tree is still past $80 in its last 24 h: no second audit that day.
+	c.clock.advance(12 * HOUR);
+	appendJsonl(c.file, [spendEntry(c.clock.now() - HOUR, 90)]);
+	ticks(3);
+	assert.equal(runner.starts.length, 1, "inside 24 h the stamp holds the gate shut");
+
+	// Past 24 h after the first audit a fresh crossing audits again, although minGapMs (48 h) has not passed.
+	c.clock.advance(13 * HOUR);
+	appendJsonl(c.file, [spendEntry(c.clock.now() - HOUR, 90)]);
+	ticks(3);
+	assert.equal(runner.starts.length, 2);
+	assert.deepEqual(c.store.getProject(`${SID}:g1`).data.audits.map((a) => a.triggers), [["session-day"], ["session-day"]]);
+
+	const shadow = setup(t);
+	shadow.writeGoal({ id: "g1", objective: "long running lane", createdAt: secs(T0 - 20 * HOUR), updatedAt: secs(T0 - 20 * HOUR) });
+	writeJsonl(shadow.file, [E.header(shadow.sid, shadow.cwd, T0 - 20 * HOUR), spendEntry(T0 - 2 * HOUR, 90)]);
+	const quiet = shadow.office({ runner: createFakeRunner() });
+	for (let i = 0; i < 3; i++) {
+		quiet.tick({ shadow: true });
+		shadow.clock.advance(MIN);
+	}
+	assert.equal(shadow.store.events({ limit: 200 }).filter((e) => e.kind === "session-day").length, 0, "shadow writes no session-day event");
+});
+
 test("disabled budget: tick returns the empty result and writes no snapshot", (t) => {
 	const c = setup(t);
 	c.config.budget.enabled = false;

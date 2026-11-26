@@ -629,8 +629,9 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 		}
 		for (const file of consumed) removeSafe(file);
 		// One event per session tree and level per 24 h, with the project an audit could look at (null: no live goal).
+		// Like triggers, shadow mode records none. The dedupe is per process: a restart may write one more event per tree.
 		const projectOfSession = (sessionId) => live.find((p) => p.sessionId === sessionId && goalActive(goalNowOf(goalById.get(p.id), p).status)) ?? null;
-		for (const crossed of crossedBySession.values()) {
+		for (const crossed of shadow ? [] : crossedBySession.values()) {
 			const key = `${crossed.sessionId}|${crossed.level}`;
 			if (now - (sessionDayNoted.get(key) ?? -Infinity) < DAY) continue;
 			sessionDayNoted.set(key, now);

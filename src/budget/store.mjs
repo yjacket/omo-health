@@ -154,10 +154,6 @@ export function createBudgetStore(db) {
 			}));
 		},
 
-		/**
-		 * Aggregates reported USD (and counts missing-cost events). `accounts` filters to one window: the row's
-		 * provider must resolve to that account and the window must apply to the row's model.
-		 */
 		/** Reported-cost rows since `sinceMs` with the fields a per-session-tree share needs (session-day.mjs). */
 		usageRows({ sinceMs, sources }) {
 			const list = sources?.length ? sources : ["main", "child"];
@@ -169,6 +165,10 @@ export function createBudgetStore(db) {
 				.all(sinceMs, ...list);
 		},
 
+		/**
+		 * Aggregates reported USD (and counts missing-cost events). `accounts` filters to one window: the row's
+		 * provider must resolve to that account and the window must apply to the row's model.
+		 */
 		spend({ projectId, rootSessionId, sinceMs, untilMs, sources, accounts } = {}) {
 			const where = [];
 			const params = [];

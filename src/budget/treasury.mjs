@@ -83,6 +83,7 @@ export function windowState({ account, window, samples, calibration, committedUs
 	const burnPerHour = burn?.perHour ?? null;
 	const burnHours = burn?.hours ?? null;
 	// A projection from a rate that has not lasted budget.shortMinBurnHours is a spike, not a trend (#33): it reads tight.
+	// "Lasted" is the span of the samples the rate is averaged over, not a check that the rate held steady inside it.
 	const minBurnHours = finite(cfg?.shortMinBurnHours) ? cfg.shortMinBurnHours : 6;
 	const sustained = burnHours !== null && burnHours >= minBurnHours;
 	const projectedAtResetPercent =

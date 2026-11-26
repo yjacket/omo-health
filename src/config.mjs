@@ -305,6 +305,10 @@ export const MAP_ENTRY_KEYS = Object.freeze({ "budget.windows": Object.freeze(["
 function mergeMap(base, override, where, warnings) {
 	const out = structuredClone(base);
 	for (const [name, entry] of Object.entries(override)) {
+		if (name === "__proto__") {
+			warnings.push(`unknown config key ignored: ${where}.${name}`);
+			continue;
+		}
 		if (!isPlainObject(entry)) {
 			warnings.push(`config ${where}.${name} must be an object; ignored`);
 			continue;
