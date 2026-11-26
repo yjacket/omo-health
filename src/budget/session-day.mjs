@@ -49,7 +49,7 @@ function costOf(row) {
 /**
  * @param {{rows: {rootSessionId: string, source: string, provider: string|null, model: string|null, cost: number|null}[],
  *   states: object[], cfg: object}} input rows already limited to the last 24 h
- * @returns {{investigateUsd: number, ownerUsd: number, sessions: object[]}} sessions sorted by level, then share
+ * @returns {{investigateUsd: number, ownerUsd: number, sessions: object[]}} sessions sorted by level, then total cost, then share
  */
 export function sessionDay({ rows, states, cfg } = {}) {
 	const budget = cfg ?? {};
@@ -104,7 +104,7 @@ export function sessionDay({ rows, states, cfg } = {}) {
 			basis: top?.basis ?? null,
 		};
 	});
-	sessions.sort((a, b) => (LEVELS[b.level] ?? 0) - (LEVELS[a.level] ?? 0) || (b.maxPercent ?? 0) - (a.maxPercent ?? 0) || b.totalUsd - a.totalUsd);
+	sessions.sort((a, b) => (LEVELS[b.level] ?? 0) - (LEVELS[a.level] ?? 0) || b.totalUsd - a.totalUsd || (b.maxPercent ?? 0) - (a.maxPercent ?? 0));
 	return { investigateUsd, ownerUsd, sessions };
 }
 

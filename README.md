@@ -356,7 +356,7 @@ D26은 예산 사무소가 쓴 `budget/snapshot.json`만 읽는 조언용 탐지
 - `budget.sessionDayInvestigateUsd`($100) 이상: 예산 감사를 한 번 돌립니다(사다리 단계는 쓰지 않음, 24시간에 한 번). 알림과 사람 확인은 없습니다. 진행 중인 목표가 없는 세션은 기록만 남습니다.
 - `budget.sessionDayUsd`($200) 이상: D26 `session-day` 경고(사람 확인)를 냅니다. 메인과 하위작업 비용을 나눠 보여 줍니다.
 - 창 % 기준(`budget.sessionDayInvestigatePercent`, `budget.sessionDayPercent`)은 기본으로 꺼져 있습니다(0). 켜면 보정된 창마다 비용에 그 창의 `percentPerUsd`를 곱한 몫(%)을 같은 두 단계에 맞춰 보고, 달러 기준과 둘 중 더 높은 단계가 적용됩니다. 보정 전 창에는 % 기준을 적용하지 않습니다.
-- 창별 기준은 `budget.windows`에 `"<계정>:<창 id>"` 키로 덮어씁니다. 예: `{"budget":{"windows":{"anthropic-subscription/default:claude:7d":{"sessionDayPercent":15}}}}`. 0은 그 기준을 끕니다.
+- 창별 기준은 `budget.windows`에 `"<계정>:<창 id>"` 키로 덮어씁니다. 예: `{"budget":{"windows":{"anthropic-subscription/default:claude:7d":{"sessionDayPercent":15}}}}`. 0은 그 기준을 끕니다. 키 하나만 덮어쓰면 다른 하나는 전역 값(기본 0, 꺼짐)을 따릅니다.
 - 기준은 대시보드 설정 화면에서도 바꿀 수 있고, 다시 시작하지 않아도 다음 틱부터 적용됩니다. 예산 탭은 창마다 적용 중인 기준과, 기본값을 쓰는 창에는 세션 하루 몫의 p95(최근 30일)를 보여 줍니다.
 - 같은 공급자의 계정이 여럿이어도 지금은 `<공급자>/default` 하나로 셉니다. 세션 기록에 계정 정보가 없기 때문입니다.
 

@@ -49,6 +49,8 @@ test("cost a window counts and cost no window counts add up to one total; audit 
 	assert.deepEqual([s.totalUsd, s.mainUsd, s.childUsd], [205, 60, 145]);
 	assert.equal(s.shares[0].usd, 60, "the Claude window still shows its share as a reference");
 	assert.deepEqual([s.level, s.basis], ["owner", { kind: "usd", usd: 205, thresholdUsd: 200 }]);
+	const ordered = sessionDay({ rows: [row("claude", 110), row("codex", 190, { provider: "openai-codex", model: "gpt-6.2" }), row("quiet-claude", 60), row("quiet-codex", 90, { provider: "openai-codex", model: "gpt-6.2" })], states: [CLAUDE], cfg: CFG });
+	assert.deepEqual(ordered.sessions.map((x) => x.sessionId), ["codex", "claude", "quiet-codex", "quiet-claude"], "level, then total cost: a tree no window counts is not ranked below a smaller one");
 	const aliased = byId(sessionDay({ rows: [row("a", 100, { provider: "claude-sdk-oauth" })], states: [CLAUDE], cfg: CFG })).get("a");
 	assert.equal(aliased.shares[0].usd, 100, "budget.providerAliases connects a proxy provider to the account");
 });
@@ -85,6 +87,10 @@ test("budget.windows turns the percent pair on for one window; the USD owner lev
 	assert.deepEqual([s.get("a").level, s.get("a").basis.kind], ["owner", "window"], "$170 = 10.5% of the overridden window");
 	assert.deepEqual([s.get("b").level, s.get("b").basis.kind], ["owner", "usd"], "cost outside the overridden window still meets the USD pair");
 	assert.deepEqual([s.get("c").level, s.get("c").basis.kind], ["investigate", "window"]);
+	const wide = { ...CFG, windows: { [key]: { sessionDayInvestigatePercent: 5, sessionDayPercent: 20 } } };
+	const both = byId(sessionDay({ rows: [row("a", 210)], states: [CLAUDE], cfg: wide })).get("a");
+	assert.equal(both.shares[0].level, "investigate", "$210 = 13% is past the window's 5% only");
+	assert.deepEqual([both.level, both.basis.kind], ["owner", "usd"], "the USD owner level outranks the window's investigate");
 	const off = { ...PERCENT_ON, sessionDayInvestigateUsd: 0, sessionDayUsd: 0, sessionDayInvestigatePercent: 0, sessionDayPercent: 0 };
 	assert.equal(byId(sessionDay({ rows: [row("a", 5000), row("a", 5000, { provider: "github-copilot" })], states: [CLAUDE], cfg: off })).get("a").level, null);
 });
