@@ -193,7 +193,7 @@ export function buildSessionSnapshot(world, findings = [], investigations = [], 
 		const session = liveSessionView(raw, world);
 		const subject = subjectOf(session);
 		const sensor = world.sensors?.get?.(raw.id);
-		const hb = heartbeatOwns(sensor, raw, world.isSharedId?.(raw.id)) ? sensor : undefined;
+		const hb = heartbeatOwns(sensor, raw, world.hasTwin?.(raw.id)) ? sensor : undefined;
 		const hostPid = Number.isFinite(hb?.pid) ? hb.pid : session.hostPid;
 		const omoVersion = Number.isFinite(hostPid) ? (world.hostExits?.liveMarkers?.get?.(hostPid)?.omoVersion ?? null) : null;
 		const goal = session.anchor?.source === "goal" ? { status: session.anchor.status ?? null, objective: clean(session.anchor.objective, 300) } : null;

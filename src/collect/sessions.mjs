@@ -642,6 +642,8 @@ export class SessionRegistry {
 			const own = subjectKey(subjectOf(state));
 			const twins = [...this.trackers.values()].some((other) => other !== tracker && other.state.id === state.id && subjectKey(subjectOf(other.state)) !== own);
 			if (sensor?.pid && heartbeatOwns(sensor, state, twins)) state.hostPid = sensor.pid;
+			// Adopted before the twin appeared: the host is the other session's.
+			else if (sensor?.pid && state.hostPid === sensor.pid) state.hostPid = undefined;
 		}
 	}
 

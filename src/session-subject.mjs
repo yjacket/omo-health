@@ -194,7 +194,7 @@ export function liveSessionView(session, world) {
 export function worldLiveOwners(world) {
 	// A shared ID's ended transcript stays in the registry beside its live twin; only a twin that is live owns its subject.
 	const rows = [...(world?.sessions?.values?.() ?? [])]
-		.filter((row) => !world.isSharedId?.(row.id) || world.isSessionLive(row))
+		.filter((row) => !world.hasTwin?.(row.id) || world.isSessionLive(row))
 		.map((row) => liveSessionView(row, world));
 	return rows.map(sessionSubjects(rows, world));
 }

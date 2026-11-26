@@ -126,15 +126,20 @@ export function buildWorld(input) {
 			return hb && now - (hb.ts ?? 0) <= staleMs ? hb : undefined;
 		},
 
-		/** Two sessions share this ID (different projects): anything addressed by the ID alone could reach either. */
-		isSharedId(sessionId) {
+		/** The registry holds another session with this ID (another project), live or recently ended. */
+		hasTwin(sessionId) {
 			return Boolean(sessionId) && (sessions.sessionsById?.(sessionId)?.length ?? 0) > 1;
 		},
 
-		/** The fresh heartbeat of this very session: with a shared ID, only the twin it names (transcript or project). */
+		/** Two live sessions share this ID: anything addressed by the ID alone could reach either. */
+		isSharedId(sessionId) {
+			return world.hasTwin(sessionId) && sessions.sessionsById(sessionId).filter((session) => world.isSessionLive(session)).length > 1;
+		},
+
+		/** The fresh heartbeat of this very session: with a twin, only the one it names (transcript or project). */
 		sensorOfSession(session) {
 			const hb = session ? world.sensorFor(session.id) : undefined;
-			return heartbeatOwns(hb, session, world.isSharedId(session?.id)) ? hb : undefined;
+			return heartbeatOwns(hb, session, world.hasTwin(session?.id)) ? hb : undefined;
 		},
 
 		/** Is the process that owns this session still running? */

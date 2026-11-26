@@ -45,8 +45,10 @@ function harness({ twinChild = false, mode, background = "background", parentSen
 	const child = sessionState({ id: "c1", kind: stalledKind, taskId: task.taskId, hostPid: HOST, parentSessionId: "p1", rootSessionId: "p1", task, pendingCalls: [{ id: "toolu_grep", name: "bash", args: { command: GREP }, ms: CALL_MS, batchId: "b" }] });
 	const parent = sessionState({ id: "p1", kind: "main", hostPid: HOST, lastMessage: { role: "assistant", stopReason: "stop" } });
 	const sessions = new Map([["c1", child], ["p1", parent]]);
-	// twinChild: a second live session with the child's ID in another project, as the daemon's registry keeps it.
-	const live = { sessions: twinChild ? LiveSessions.of([child, parent, { ...child, cwd: "C:\\dev\\other", file: "C:/tmp/other/c1.jsonl" }]) : sessions };
+	// twinChild: a second session with the child's ID in another project, as the daemon's registry keeps it; "ended"
+	// makes it a transcript whose host is gone.
+	const twin = { ...child, cwd: "C:\\dev\\other", file: "C:/tmp/other/c1.jsonl", ...(twinChild === "ended" ? { task: { ...task, hostPid: 999_999 } } : {}) };
+	const live = { sessions: twinChild ? LiveSessions.of([child, parent, twin]) : sessions };
 	const procRows = new Map([
 		[HOST, { p: HOST, pp: 1, n: "node.exe", c: "2026-09-23T09:00:00Z", cpu: 0, pv: 1e8, cl: "node C:\\x\\@code-yeongyu\\senpi\\dist\\bundle\\cli.js" }],
 		[60168, { p: 60168, pp: HOST, n: "bash.exe", c: iso(CALL_MS + 5), cpu: 0, pv: 1e6, cl: SHELL }],
@@ -394,6 +396,11 @@ test("an action for a session whose ID another live session shares waits until o
 	h.clock.advance(20_000);
 	await h.engine.tick();
 	assert.deepEqual(nudges(), ["skipped:ambiguous-session", "execute"], "the held action runs once the twin is gone");
+
+	// A twin whose host is gone is a recent transcript, not a second live session: nothing is held.
+	const ended = harness({ twinChild: "ended", extraDetectors: [{ name: "fake-d8", detect: () => [nudge] }] });
+	await ended.engine.tick();
+	assert.deepEqual(ended.decisions.filter((d) => d.action?.kind === "nudge").map((d) => d.result), ["execute"]);
 });
 
 test("an action that throws is retried on the next tick instead of being dropped", async () => {

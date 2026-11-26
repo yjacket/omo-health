@@ -48,9 +48,10 @@ function harness(t, { enabled = true, mode = "auto", twin = false } = {}) {
 	const runner = createFakeRunner();
 	runner.jobDir = (jobId) => path.join(paths.health.jobsDir, jobId);
 	const office = createBudgetOffice({ paths, db, clock, config, runner, loggedInProviders: () => new Set() });
-	const main = sessionState({ id: SID, kind: "main" });
-	// twin: a second live session with the same ID in another project; `current` is what the registry reports this tick.
-	const sessions = { current: twin ? LiveSessions.of([main, sessionState({ id: SID, kind: "main", cwd: "C:\\dev\\other", file: "C:/tmp/other.jsonl" })]) : LiveSessions.of([main]) };
+	// twin: a second live session with the same ID in another project (both run under the sensor's host); `current` is
+	// what the registry reports this tick.
+	const main = sessionState({ id: SID, kind: "main", ...(twin ? { hostPid: 4242 } : {}) });
+	const sessions = { current: twin ? LiveSessions.of([main, sessionState({ id: SID, kind: "main", cwd: "C:\\dev\\other", file: "C:/tmp/other.jsonl", hostPid: 4242 })]) : LiveSessions.of([main]) };
 	const engine = createEngine({
 		paths,
 		config,

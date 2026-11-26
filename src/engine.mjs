@@ -1126,7 +1126,7 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 		for (const detector of detectors) {
 			if (disabledDetectors.has(detector.name) && detector.name !== "stall") continue;
 			const excluded = new Set(quarantinedSessions.filter((q) => q.detector === detector.name).map((q) => q.sessionId));
-			const active = LiveSessions.of([...world.sessions.values()].filter((session) => !excluded.has(session.id)));
+			const active = excluded.size ? LiveSessions.of([...world.sessions.values()].filter((session) => !excluded.has(session.id))) : world.sessions;
 			const detectorWorld = excluded.size ? { ...world, sessions: active } : world;
 			let found;
 			try {
@@ -1207,8 +1207,9 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 				if (verdict === "skipped:paused" || verdict === "skipped:ambiguous-session" || (verdict === "skipped:switch-off" && req.kind === "analyze")) {
 					// Not marked executed, so the same action runs once the pause ends or the switch is turned back on; logged once per key.
 					record.pausedKeys ??= new Set();
-					if (record.pausedKeys.has(req.key)) continue;
-					record.pausedKeys.add(req.key);
+					const held = `${verdict}|${req.key}`;
+					if (record.pausedKeys.has(held)) continue;
+					record.pausedKeys.add(held);
 				} else record.executed.add(req.key);
 				const params = { targets: (req.targets ?? req.remedy?.targets ?? []).map((t) => `${t.name ?? "?"}:${t.pid}`), serverPids: (req.serverPids ?? []).map((t) => t.pid) };
 				if (verdict !== "execute") {
