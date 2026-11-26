@@ -17,6 +17,11 @@ export const REQUEST_CHARS = 4000;
 export const VERDICT_CHARS = 1500;
 export const NOTE_CHARS = 1200;
 const PR_URL = /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+/;
+// An owner answer to a question: the question tool's result with status answered, or the answer to a deferred question
+// delivered as a user message. A timeout, a pending acknowledgement and any other user message (agents type into panes
+// too) are not answers.
+const QUESTION_TOOL = /(^|__)ask_user_question$/;
+const DEFERRED_ANSWER = "[Answer to question ";
 
 function headTail(text, max) {
 	if (text.length <= max) return text;
@@ -114,9 +119,13 @@ export function extractEvents(entry, ctx = {}) {
 	if (entry.type === "message" && entry.message?.role === "user") {
 		const text = textOf(entry.message.content).trim();
 		if (text) evidence.push({ kind: "request", data: { text: headTail(redact(text), REQUEST_CHARS) } });
+		if (text.startsWith(DEFERRED_ANSWER)) evidence.push({ kind: "owner-answer", data: { via: "deferred" } });
 		return result;
 	}
 	if (entry.type === "message" && entry.message?.role === "toolResult") {
+		if (QUESTION_TOOL.test(String(entry.message.toolName ?? "")) && entry.message.details?.status === "answered") {
+			evidence.push({ kind: "owner-answer", data: { via: "question-tool" } });
+		}
 		const url = textOf(entry.message.content).match(PR_URL)?.[0];
 		if (url) evidence.push({ kind: "pr", data: { url } });
 		return result;

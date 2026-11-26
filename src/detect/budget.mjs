@@ -10,20 +10,25 @@ import { makeFinding } from "./finding.mjs";
  *   treasury-short  warn, human needed - a window reaches its reserve by reset
  *   treasury-tight  info               - a window is close to the reserve
  *   audit-opinion   info               - the auditor judged spend waste-likely
- *   owner-call      warn, human needed - past the review ladder's last tier the session was asked to call the owner
+ *   owner-call      warn, human needed - past the review ladder's last tier the session was asked to call the owner;
+ *                                        gone once the office records the owner's answer (`ownerCall.answeredMs`)
  * An unknown or stale reading emits nothing: the snapshot has no basis yet.
  */
 export const id = "D26";
 
 const pct = (value) => (Number.isFinite(value) ? `${Math.round(value * 10) / 10}%` : "?");
 const hours = (value) => (Number.isFinite(value) ? `${Math.round(value * 10) / 10}시간` : "?");
+const HOUR_MS = 3600_000;
 
 function windowFinding(window) {
         const account = String(window.account ?? "");
         const windowId = String(window.windowId ?? "");
         if (!account || !windowId) return null;
         const resetsAtMs = Number.isFinite(window.resetsAtMs) ? window.resetsAtMs : "none";
-        const subject = { key: `budget:${window.state}:${account}:${windowId}:${resetsAtMs}` };
+        // The key names the window cycle, not the reading: Claude reports resetsAtMs a few hundred ms off on each read,
+        // just before the hour, so it is rounded to the nearest hour (#27). The next cycle resets a whole window later.
+        const cycle = Number.isFinite(window.resetsAtMs) ? Math.round(window.resetsAtMs / HOUR_MS) * HOUR_MS : "none";
+        const subject = { key: `budget:${window.state}:${account}:${windowId}:${cycle}` };
         const evidence = [
                 `window:${account}:${windowId}`,
                 `state:${window.state}`,
@@ -112,7 +117,7 @@ function auditFinding(audit) {
 
 function ownerCallFinding(project) {
         const call = project?.ownerCall;
-        if (!call || !Number.isFinite(call.ms)) return null;
+        if (!call || !Number.isFinite(call.ms) || Number.isFinite(call.answeredMs)) return null;
         const projectId = String(project.id ?? "");
         const why = call.basis === "budget" && Number.isFinite(call.ratio) ? `승인 예산의 ${call.ratio.toFixed(1)}배를 썼습니다` : `리뷰가 ${call.rounds ?? "?"}차까지 갔습니다`;
         return makeFinding({

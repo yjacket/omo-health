@@ -36,6 +36,28 @@ const DAY = 24 * HOUR;
 const SUBSCRIPTION_EVERY_MS = 60_000;
 const CALIBRATION_EVERY_MS = 10 * MIN;
 const PRUNE_EVERY_MS = HOUR;
+// A ladder tier is spent by an audit that produced an opinion (or is still in flight). A failed, timed-out, unavailable
+// or cancelled attempt leaves the tier open; a retry waits budget.audit.minGapMs after the last attempt, and after this
+// many attempts without an opinion the tier counts as spent so a permanently failing audit cannot loop (#24).
+const LADDER_ATTEMPTS = 3;
+const AUDIT_SPENDS_TIER = new Set(["done", "digesting", "running"]);
+
+/** The highest ladder tier already spent, and how many attempts without an opinion each open tier has had. */
+function ladderState(audits) {
+	let spent = 0;
+	const failed = new Map();
+	for (const audit of audits) {
+		const tier = audit.tier ?? 0;
+		if (!(tier > 0)) continue;
+		if (AUDIT_SPENDS_TIER.has(audit.status)) spent = Math.max(spent, tier);
+		else {
+			const n = (failed.get(tier) ?? 0) + 1;
+			failed.set(tier, n);
+			if (n >= LADDER_ATTEMPTS) spent = Math.max(spent, tier);
+		}
+	}
+	return { spent, failed };
+}
 
 /** One ledger row for an audit or digest run's own usage (source `audit`, charged to the project it looked at). */
 function auditUsageRow({ id, project, model, usage, now }) {
@@ -440,8 +462,10 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 			// The review-opinion ladder decides when the auditor looks (each tier once); a rule audit (change review, estimate
 			// outlier) still asks for one at the current tier. Triggers are recorded for the dashboard, they start nothing.
 			const step = ladder(ind, auditCfg);
-			const lastTier = (next.data.audits ?? []).reduce((max, a) => Math.max(max, a.tier ?? 0), 0);
-			const ladderDue = step.tier >= 1 && step.tier <= 3 && step.tier > lastTier;
+			const tiers = ladderState(next.data.audits ?? []);
+			const ladderDue = step.tier >= 1 && step.tier <= 3 && step.tier > tiers.spent;
+			// A retry of a tier whose audit ended without an opinion is no new evidence: it waits out minGapMs.
+			const ladderRetry = ladderDue && (tiers.failed.get(step.tier) ?? 0) > 0;
 			const ruleReasons = out.actions.filter((a) => a.type === "audit").flatMap((a) => a.reasons);
 			const reasons = [...(ladderDue ? [`ladder-${step.basis}`] : []), ...ruleReasons];
 			// The effort of this audit; only a ladder audit spends its tier (a rule audit below 1x leaves tier 1 for 1x).
@@ -474,6 +498,16 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 			// so a goal that disappears between ticks never opens one. A non-active goal records one skip even when
 			// this same tick closed the project (cancelled, cleared, COMPLETED).
 			const goalIsActive = goalActive(goalNow.status);
+			// The owner call is answered once the session records an owner answer to a question after the call (events.mjs
+			// `owner-answer`): a question-tool result with status answered, or a deferred answer delivered as a user message.
+			const call = next.data.ownerCall;
+			if (call && finite(call.ms) && !finite(call.answeredMs)) {
+				const answer = store.evidence(project.id, "owner-answer", { last: 1 }).items[0];
+				if (answer && answer.ms > call.ms) {
+					next.data.ownerCall = { ...call, answeredMs: answer.ms, answeredVia: answer.via ?? null };
+					appendEvent({ projectId: project.id, kind: "owner-answered", data: next.data.ownerCall });
+				}
+			}
 			const audits = next.data.audits ?? [];
 			const digesting = audits.find((a) => a.status === "digesting");
 			// Raw evidence the quick digest summarizes, and the auditor's bundle (with the digest once it exists).
@@ -534,7 +568,7 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 					}
 				} else if (reasons.length) {
 					const last = audits.at(-1) ?? null;
-					const newEvidence = !last || ladderDue || reasons.includes("change-review");
+					const newEvidence = !last || (ladderDue && !ladderRetry) || reasons.includes("change-review");
 					const allowed = auditAllowed({ project: next, history: auditHistory(), now, cfg: budget, newEvidence });
 					const mainModel = latestModelStmt.get(project.sessionId)?.model ?? null;
 					const model = allowed.allowed ? auditModel({ topModels: auditCfg.topModels, efforts: auditCfg.efforts, mainModel, tier, loggedIn: providersNow(), accountState }) : null;

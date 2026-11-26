@@ -270,6 +270,26 @@ test("task store reader normalizes records, tolerates bad json, and links child 
 	assert.equal(reader.read(cwd).tasks[0], task, "unchanged files are served from cache");
 });
 
+test("findChildSessionFile names its file or takes the only one, never the newest of several", () => {
+	const cwd = tmpDir("omoh-proj-");
+	const storeDir = path.join(cwd, ".omo", "senpi-task");
+	const dir = path.join(storeDir, "children", "st_c", "sessions", "st_c");
+	const write = (name, ms) => {
+		const file = path.join(dir, name);
+		writeJsonl(file, [E.header("x", cwd, T0)]);
+		fs.utimesSync(file, ms / 1000, ms / 1000);
+		return file;
+	};
+	const own = write("2026-09-23T14-00-00-000Z_review.1.jsonl", T0);
+	assert.equal(findChildSessionFile(storeDir, "st_c"), own, "no id: the only file");
+	assert.equal(findChildSessionFile(storeDir, "st_c", "st_c"), own, "the task id counts as no id");
+	assert.equal(findChildSessionFile(storeDir, "st_c", "c9"), undefined, "an id that names no file has no owner yet");
+	const other = write("2026-09-23T14-01-00-000Z_run_review.1.jsonl", T0 + 60_000);
+	assert.equal(findChildSessionFile(storeDir, "st_c"), null, "two files without an id: no owner");
+	assert.equal(findChildSessionFile(storeDir, "st_c", "review.1"), own, "a suffix match on a newer file is not the named one");
+	assert.equal(findChildSessionFile(storeDir, "st_c", "run_review.1"), other);
+});
+
 test("registry discovers main sessions and the children of their projects", () => {
 	const root = tmpDir("omoh-reg-");
 	const env = { OMO_HEALTH_OMO_HOME: path.join(root, "omo"), OMO_HEALTH_HOME: path.join(root, "health"), USERPROFILE: root };

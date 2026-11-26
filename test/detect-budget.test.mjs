@@ -37,6 +37,7 @@ test("owner-call: a project past the ladder's last tier raises one human-needed 
 	assert.equal(finding.subject.key, `budget:owner-call:s:g:${NOW}`);
 	assert.match(finding.detailKo, /4\.2배/);
 	assert.equal(budget.detect({ budget: { enabled: true, projects: [{ id: "s:g", ownerCall: { ...call, basis: "rounds", ratio: null, rounds: 41 } }] } })[0].detailKo.includes("41차"), true);
+	assert.deepEqual(budget.detect({ budget: { enabled: true, projects: [{ id: "s:g", ownerCall: { ...call, answeredMs: LATER } }] } }), [], "an answered call needs no human (#24)");
 });
 
 const snapshot = (partial = {}) => ({
@@ -137,6 +138,17 @@ test("a new account window reset is a new fp", () => {
 	const before = budget.detect(world(snapshot({ treasury: { state: "short", windows: [windowEntry()] } })));
 	const after = budget.detect(world(snapshot({ treasury: { state: "short", windows: [windowEntry({ resetsAtMs: LATER_RESET })] } })));
 	assert.notEqual(before[0].fp, after[0].fp);
+});
+
+test("a reset time that jitters by a few hundred ms keeps one fp per window cycle (#27)", () => {
+	// Two real Claude 7d readings on 2026-11-25, just before the hour, and one that crosses it.
+	const jittered = [1796126399725, 1796126399969, 1796126400050];
+	for (const state of ["short", "tight"]) {
+		const fps = jittered.map((resetsAtMs) => budget.detect(world(snapshot({ treasury: { state, windows: [windowEntry({ state, resetsAtMs })] } })))[0].fp);
+		assert.equal(new Set(fps).size, 1, `${state}: one fp for one cycle`);
+		const nextCycle = budget.detect(world(snapshot({ treasury: { state, windows: [windowEntry({ state, resetsAtMs: jittered[0] + 7 * 24 * 3600_000 })] } })))[0].fp;
+		assert.notEqual(nextCycle, fps[0], `${state}: the next 7d cycle is a new fp`);
+	}
 });
 
 test("an unknown treasury emits nothing", () => {

@@ -3,13 +3,12 @@ import path from "node:path";
 import { promotedTodo } from "../align/steps.mjs";
 import { redirectTargets } from "../detect/classify.mjs";
 import { refreshFailureOf } from "../detect/provider.mjs";
-import { safeSubjectId } from "../session-id.mjs";
 import { listDirSafe, statSafe } from "../util/fsx.mjs";
 import { JsonlTail } from "../util/tail.mjs";
 import { redact, sha1, truncate } from "../util/text.mjs";
 import { toMs } from "../util/time.mjs";
 import { readGoal, readUlwGoals } from "./anchors.mjs";
-import { createTaskStoreReader, findChildSessionFile, senpiTaskStoreDir } from "./tasks.mjs";
+import { createTaskStoreReader, findChildSessionFile, idFromFileName, senpiTaskStoreDir } from "./tasks.mjs";
 
 const HISTORY = 200;
 const STEPS = 200;
@@ -479,12 +478,7 @@ export function entryMs(entry) {
 	return toMs(entry?.timestamp) ?? (Number.isFinite(entry?.message?.timestamp) ? entry.message.timestamp : undefined);
 }
 
-// Accept a date alone or Senpi's ISO timestamp with ":" and "." replaced by "-".
-const SESSION_FILE_NAME = /^\d{4}-\d{2}-\d{2}(?:T\d{2}-\d{2}-\d{2}-\d{3}Z)?_(.+)\.jsonl$/;
-
-export function idFromFileName(file) {
-	return safeSubjectId(SESSION_FILE_NAME.exec(path.basename(file))?.[1]) ?? undefined;
-}
+export { idFromFileName };
 
 /**
  * Discovers main sessions (sensor heartbeats + recently modified session files)
@@ -579,7 +573,8 @@ export class SessionRegistry {
 			let file = this.childFileByTask.get(task.uid ?? task.taskId);
 			if (!file) {
 				file = findChildSessionFile(task.storeDir, task.taskId, task.childSessionId);
-				if (file) this.childFileByTask.set(task.uid ?? task.taskId, file);
+				// A sole candidate stops owning the task once a second file appears; only a named file stays cached.
+				if (file && task.childSessionId && task.childSessionId !== task.taskId) this.childFileByTask.set(task.uid ?? task.taskId, file);
 			}
 			if (!file) continue;
 			const meta = {

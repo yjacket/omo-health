@@ -253,8 +253,27 @@ test("prune expires usage rows and quota readings but keeps projects", (t) => {
 		{ account: "a", windowId: "w", updatedMs: T - DAY, usedPercent: 2, resetsAtMs: null, windowMinutes: null },
 	]);
 	store.upsertProject(project("p1", { updatedMs: T - 100 * DAY }));
-	assert.deepEqual(store.prune(T, 90), { usageEvents: 1, quotaSamples: 1 });
+	assert.deepEqual(store.prune(T, 90), { usageEvents: 1, quotaSamples: 1, evidence: 0 });
 	assert.deepEqual(db.prepare("SELECT id FROM usage_events").all().map((row) => row.id), ["new"]);
 	assert.equal(db.prepare("SELECT COUNT(*) AS n FROM quota_samples").get().n, 1);
 	assert.equal(store.getProject("p1").id, "p1", "retention keeps projects");
+});
+
+test("prune drops the audit evidence of a project closed before the cutoff; a live or recently closed project keeps all of it (#24 item 2)", (t) => {
+	const { store } = setup(t);
+	store.upsertProject(project("old", { status: "closed", closedMs: T - 100 * DAY, updatedMs: T - 100 * DAY }));
+	store.upsertProject(project("recent", { status: "closed", closedMs: T - DAY, updatedMs: T - DAY }));
+	store.upsertProject(project("live", { status: "approved", updatedMs: T }));
+	for (const id of ["old", "recent", "live"]) {
+		// Evidence as old as the project: a live project's first PR link is kept however old it is.
+		store.recordEvidence(id, { id: "e1", ms: T - 200 * DAY, kind: "pr", data: { url: `https://example.test/${id}/1` } });
+		store.recordEvidence(id, { id: "e2", ms: T - 100 * DAY, kind: "request", data: { text: "go" } });
+	}
+	assert.deepEqual(store.prune(T, 90), { usageEvents: 0, quotaSamples: 0, evidence: 2 });
+	assert.deepEqual([store.evidence("old", "pr").total, store.evidence("old", "request").total], [0, 0]);
+	for (const id of ["recent", "live"]) {
+		assert.equal(store.evidence(id, "pr", { first: 1 }).items[0].url, `https://example.test/${id}/1`, id);
+		assert.equal(store.evidence(id, "request").total, 1, id);
+	}
+	assert.equal(store.getProject("old").status, "closed", "the project row itself is kept");
 });

@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
 import { createBudgetOffice } from "../src/budget/office.mjs";
+import { detect as detectBudget } from "../src/detect/budget.mjs";
 import { createBudgetStore } from "../src/budget/store.mjs";
 import { DEFAULT_CONFIG } from "../src/config.mjs";
 import { openDb } from "../src/db/db.mjs";
@@ -452,7 +453,8 @@ test("(l) an unterminated line longer than the cap waits for its newline before 
 
 
 test("(m) a completed goal inside closeGrace starts no audit; an active goal does", (t) => {
-	const completedMs = T0 - 14 * HOUR;
+	// After the last round (T0 - 10 h): main-session rounds after completion are new work and count for no project.
+	const completedMs = T0 - 9 * HOUR;
 	const transcript = (c) => {
 		const entries = [E.header(c.sid, c.cwd, T0 - 20 * HOUR)];
 		// 11 numbered rounds: past the ladder's first step (10) with no approved budget.
@@ -460,7 +462,7 @@ test("(m) a completed goal inside closeGrace starts no audit; an active goal doe
 		return entries;
 	};
 
-	// A goal completed 14 h ago: still inside the 24 h closeGrace, 11 numbered rounds and $40 spent.
+	// A goal completed 9 h ago: still inside the 24 h closeGrace, 11 numbered rounds and $40 spent.
 	const done = setup(t);
 	const donePid = `${done.sid}:g1`;
 	done.writeGoal({ id: "g1", objective: "finished work", status: "completed", completedAt: secs(completedMs), createdAt: secs(T0 - 22 * HOUR), updatedAt: secs(completedMs) });
@@ -544,7 +546,7 @@ test("(q) a session that left the backfill window is no longer in progress: no a
 test("(p) a cancelled goal's heavy trigger records one audit-skipped and starts no audit", (t) => {
 	const c = setup(t);
 	const pid = `${c.sid}:g1`;
-	c.writeGoal({ id: "g1", objective: "cancelled work", status: "cancelled", completedAt: secs(T0 - 14 * HOUR), createdAt: secs(T0 - 20 * HOUR), updatedAt: secs(T0 - 14 * HOUR) });
+	c.writeGoal({ id: "g1", objective: "cancelled work", status: "cancelled", completedAt: secs(T0 - 9 * HOUR), createdAt: secs(T0 - 20 * HOUR), updatedAt: secs(T0 - 9 * HOUR) });
 	const entries = [E.header(c.sid, c.cwd, T0 - 20 * HOUR)];
 	for (let i = 1; i <= 11; i++) entries.push(E.assistant({ ms: T0 - (21 - i) * HOUR, text: `QA round ${i} finished`, usage: usage(40 / 7) }));
 	writeJsonl(c.file, entries);
@@ -776,22 +778,89 @@ test("(r3) past 40 review rounds the session is asked once to call the owner, an
 test("(r4) a rule audit below 1x spends no tier: tier 1 still audits when spend passes the approved budget (gate review B1)", (t) => {
 	const c = setup(t);
 	const pid = `${c.sid}:g1`;
-	c.writeGoal({ id: "g1", objective: "approved work", createdAt: secs(T0 - 30 * HOUR), updatedAt: secs(T0 - 30 * HOUR) });
-	writeJsonl(c.file, [E.header(c.sid, c.cwd, T0 - 30 * HOUR), spendEntry(T0 - 29 * HOUR, 35.11)]);
-	const runner = createFakeRunner({ outcomes: { "budget-audit": { status: "running" } } });
+	c.writeGoal({ id: "g1", objective: "approved work", createdAt: secs(T0 - 2 * HOUR), updatedAt: secs(T0 - 2 * HOUR) });
+	writeJsonl(c.file, [E.header(c.sid, c.cwd, T0 - 2 * HOUR), spendEntry(T0 - HOUR, 9.99)]);
+	const job = { status: "running" };
+	const runner = createFakeRunner({ outcomes: { "budget-audit": job } });
 	const office = c.office({ runner });
+	const step = (entries) => {
+		if (entries) appendJsonl(c.file, entries);
+		c.clock.advance(MIN);
+		const out = office.tick({ shadow: false });
+		office.delivered(out.messages.map((message) => ({ messageId: message.id, delivered: true })));
+		return out;
+	};
 	office.tick({ shadow: false });
-	// $30.01 approved earlier, and a change-review audit already ran below 1x a day ago.
-	const project = c.store.getProject(pid);
-	project.data.approvals = [{ requestId: "est-1", ms: T0 - 28 * HOUR, approvedUsd: 30.01, by: "rule" }];
-	project.data.audits = [{ auditId: "rule-1", ms: T0 - 26 * HOUR, status: "done", tier: null, ladder: { tier: 1, basis: "rule", reasons: ["change-review"] }, triggers: ["change-review"], endedMs: T0 - 26 * HOUR }];
-	project.status = "approved";
-	c.store.upsertProject(project);
-	c.clock.advance(MIN);
-	office.tick({ shadow: false });
-	assert.equal(runner.starts.length, 1, "passing 1x opens the tier-1 audit");
-	const audit = c.store.getProject(pid).data.audits.at(-1);
+	assert.deepEqual(c.kinds(step([spendEntry(T0 - 50 * MIN, 0.02)]).messages), ["budget-request"]);
+	// $18.01 approved on the estimate; $10.01 spent, below 1x.
+	step([E.assistant({ ms: T0 - 40 * MIN, usage: usage(0), text: estimateBlock({ projectId: pid, revision: 0 }) })]);
+	// A large change below 1x is approved staged ($10.01 + $20 = $30.01) and opens the change-review rule audit.
+	step([E.assistant({ ms: T0 - 30 * MIN, usage: usage(0), text: changeBlock({ projectId: pid, revision: 1 }) })]);
+	let project = c.store.getProject(pid);
+	assert.ok(Math.abs(project.data.approvals.at(-1).approvedUsd - 30.01) < 1e-9, `staged ${project.data.approvals.at(-1).approvedUsd}`);
+	assert.equal(runner.starts.length, 1, "the change review runs");
+	const rule = project.data.audits.at(-1);
+	assert.deepEqual([rule.tier, rule.ladder.basis, rule.triggers], [null, "rule", ["change-review"]], "the office records the rule audit without a tier");
+	Object.assign(job, {
+		status: "done",
+		stdout: `${JSON.stringify({ type: "message_end", message: { role: "assistant", model: "claude-fable-5-2", content: [{ type: "text", text: JSON.stringify({ v: 2, auditId: rule.auditId, projectId: pid, assessment: "waste-likely", confidence: 0.8, criteriaStatus: "unknown", situation: "Rounds reran the same QA pass.", criteria: [], counterevidence: "", decides: [{ who: "agent", what: "Whether to stop the reruns." }], findings: [{ pattern: "repeated-qa-without-acceptance-gain", evidence: "the same QA reran", explanation: "no new acceptance evidence" }], advice: "Stop rerunning the full QA pass; verify only the two new failure paths.", allocationOpinion: { assessment: "revise", reason: "a cheaper path keeps every criterion" } }) }], usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: { total: 0.4 } } } })}\n`,
+	});
+	assert.deepEqual(c.kinds(step().messages), ["budget-audit-opinion"]);
+	assert.equal(c.store.getProject(pid).data.audits.at(-1).status, "done");
+	// A day later spend passes the $30.01 approval: tier 1 is still unspent, so its audit opens.
+	c.clock.advance(25 * HOUR);
+	Object.assign(job, { status: "running" });
+	step([spendEntry(T0 + 25 * HOUR, 25)]);
+	assert.equal(runner.starts.length, 2, "passing 1x opens the tier-1 audit");
+	project = c.store.getProject(pid);
+	const audit = project.data.audits.at(-1);
 	assert.deepEqual([audit.tier, audit.ladder.basis, audit.triggers], [1, "budget", ["ladder-budget"]]);
+});
+
+test("(r5) a ladder audit that ends without an opinion leaves its tier open: one retry per minGapMs, at most LADDER_ATTEMPTS attempts (#24)", (t) => {
+	const LADDER_ATTEMPTS = 3; // src/budget/office.mjs
+	const c = setup(t);
+	const pid = `${c.sid}:g1`;
+	reviewLoop(c);
+	// The day caps are not under test here: room for every attempt inside one rolling day.
+	Object.assign(c.config.budget.audit, { perProjectDay: 10, perDay: 10 });
+	const runner = createFakeRunner({ outcomes: { "budget-audit": { status: "timeout", reason: "timeout" } } });
+	const office = c.office({ runner });
+	ticks(office, c, 4);
+	assert.equal(runner.starts.length, 1, "the failed attempt is not retried before minGapMs");
+	assert.equal(c.store.getProject(pid).data.audits.at(-1).status, "timeout");
+	for (let attempt = 2; attempt <= LADDER_ATTEMPTS + 1; attempt++) {
+		c.clock.advance(c.config.budget.audit.minGapMs);
+		ticks(office, c, 2);
+		assert.equal(runner.starts.length, Math.min(attempt, LADDER_ATTEMPTS), `after gap ${attempt - 1}`);
+	}
+	const audits = c.store.getProject(pid).data.audits;
+	assert.deepEqual(audits.map((a) => [a.tier, a.status]), Array.from({ length: LADDER_ATTEMPTS }, () => [1, "timeout"]), "every attempt is the tier-1 ladder audit");
+});
+
+test("(r6) the owner call is answered once the session records the owner's answer to a question; other messages leave it open (#24)", (t) => {
+	const c = setup(t);
+	const pid = `${c.sid}:g1`;
+	reviewLoop(c, { count: 41 });
+	const office = c.office({ runner: createFakeRunner({ outcomes: { "budget-audit": { status: "running" } } }) });
+	const ownerCalls = (out) => detectBudget({ budget: out.snapshot }).filter((f) => f.kind === "owner-call");
+	const question = (status, ms) => {
+		const entry = E.toolResult("q1", ms, { name: "ask_user_question", text: "계속해" });
+		entry.message.details = { status };
+		return entry;
+	};
+	const first = ticks(office, c, 3);
+	assert.equal(ownerCalls(first).length, 1);
+	appendJsonl(c.file, [E.user("[LEAD] your work thread has had no update for 17 min.", c.clock.now()), question("timed_out", c.clock.now())]);
+	const unanswered = ticks(office, c, 1);
+	assert.equal(ownerCalls(unanswered).length, 1, "a timeout or a lead note is no owner answer");
+	const answerMs = c.clock.now();
+	appendJsonl(c.file, [question("answered", answerMs)]);
+	const answered = ticks(office, c, 1);
+	const row = answered.snapshot.projects.find((p) => p.id === pid);
+	assert.deepEqual([row.ownerCall.answeredMs, row.ownerCall.answeredVia], [answerMs, "question-tool"]);
+	assert.deepEqual(ownerCalls(answered), [], "D26 lets the call go");
+	assert.equal(c.store.events({ limit: 50 }).filter((e) => e.kind === "owner-answered").length, 1);
 });
 
 test("disabled budget: tick returns the empty result and writes no snapshot", (t) => {
