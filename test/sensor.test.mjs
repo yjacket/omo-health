@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { beforeEach, test } from "node:test";
 import sensor from "../extension/sensor.mjs";
 import { renderStub } from "../src/install.mjs";
@@ -87,6 +88,8 @@ function setup({ daemonTs, stopped = false, execPath = "node.exe", env, platform
 	const repo = tmpDir("omoh-repo-");
 	fs.mkdirSync(path.join(repo, "bin"), { recursive: true });
 	fs.writeFileSync(path.join(repo, "bin", "omo-health.mjs"), "// fake");
+	fs.mkdirSync(path.join(repo, "src"), { recursive: true });
+	fs.copyFileSync(new URL("../src/launch.mjs", import.meta.url), path.join(repo, "src", "launch.mjs"));
 	let clock = 1_790_000_000_000;
 	const timers = [];
 	const spawned = [];
@@ -674,6 +677,47 @@ test("a stale daemon is restarted through the installed bootstrap when app/boot.
 	await s.fp.emit("session_start", fakeCtx().ctx);
 	assert.equal(s.spawned.length, 1);
 	assert.deepEqual(s.spawned[0].args.slice(DAEMON_NODE_ARGS.length), [boot, "daemon"]);
+});
+
+/** A sensor loaded from a pinned release copy, whose release folder the next package update then deletes (#39). */
+async function sensorFromDeletedRelease(home) {
+	const release = tmpDir("omoh-release-old-");
+	for (const file of ["extension/sensor.mjs", "src/launch.mjs"]) {
+		fs.mkdirSync(path.join(release, path.dirname(file)), { recursive: true });
+		fs.copyFileSync(new URL(`../${file}`, import.meta.url), path.join(release, file));
+	}
+	const { default: releaseSensor } = await import(pathToFileURL(path.join(release, "extension", "sensor.mjs")).href);
+	fs.rmSync(release, { recursive: true, force: true });
+	const clock = 1_790_000_000_000;
+	fs.writeFileSync(path.join(home, "daemon.json"), JSON.stringify({ pid: 4242, ts: clock - 120_000 }));
+	fs.mkdirSync(path.join(home, "app"), { recursive: true });
+	fs.writeFileSync(path.join(home, "app", "boot.mjs"), "// boot");
+	const fp = fakePi();
+	const spawned = [];
+	const handle = releaseSensor(fp.pi, { healthHome: home, now: () => clock, setInterval: () => ({ unref() {} }), clearInterval: () => {}, spawn: (cmd, args, opts) => (spawned.push({ cmd, args, opts }), { unref() {} }), execPath: "node.exe", env: {}, platform: "linux" });
+	await fp.emit("session_start", fakeCtx().ctx);
+	await handle.__test.ensureDaemon();
+	await handle.__test.settle();
+	return spawned;
+}
+
+test("a sensor whose release folder a package update deleted restarts the daemon through current.json's release and logs no error", async () => {
+	const home = tmpDir("omoh-sensor-");
+	const current = tmpDir("omoh-release-new-");
+	fs.mkdirSync(path.join(current, "src"), { recursive: true });
+	fs.copyFileSync(new URL("../src/launch.mjs", import.meta.url), path.join(current, "src", "launch.mjs"));
+	fs.mkdirSync(path.join(home, "app"), { recursive: true });
+	fs.writeFileSync(path.join(home, "app", "current.json"), JSON.stringify({ channel: "package", root: current }));
+	const spawned = await sensorFromDeletedRelease(home);
+	assert.equal(spawned.length, 1);
+	assert.deepEqual(spawned[0].args.slice(DAEMON_NODE_ARGS.length), [path.join(home, "app", "boot.mjs"), "daemon"]);
+	assert.equal(fs.existsSync(path.join(home, "logs", "sensor-errors.log")), false);
+});
+
+test("a sensor whose release folder is gone and no installed release to launch from waits quietly for its reload", async () => {
+	const home = tmpDir("omoh-sensor-");
+	assert.deepEqual(await sensorFromDeletedRelease(home), []);
+	assert.equal(fs.existsSync(path.join(home, "logs", "sensor-errors.log")), false);
 });
 
 test("three failed spawns keep using the installed bootstrap and record unavailable deaths at most once per 30 minutes", async () => {

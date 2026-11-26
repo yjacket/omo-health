@@ -14,7 +14,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HEARTBEAT_MS = 10_000;
 const INBOX_MS = 3_000;
@@ -461,6 +461,14 @@ export default function omoHealthSensor(pi, options = {}) {
 		const boot = path.join(home, "app", "boot.mjs");
 		const script = (await exists(boot)) ? boot : path.join(repoRoot, "bin", "omo-health.mjs");
 		if (!(await exists(script))) return;
+		// A package update deletes the release this sensor was loaded from before the session goes idle and reloads onto
+		// the new one (upgradeCheck), so launch with the release app/current.json names; with neither, wait for the reload (#39).
+		let launchFile = path.join(repoRoot, "src", "launch.mjs");
+		if (!(await exists(launchFile))) {
+			const root = (await readJson(path.join(home, "app", "current.json")))?.root;
+			launchFile = typeof root === "string" ? path.join(root, "src", "launch.mjs") : undefined;
+			if (!launchFile || !(await exists(launchFile))) return;
+		}
 		// One spawner at a time across all sessions on the machine.
 		const claim = path.join(home, "spawn-claim.json");
 		const existing = await readJson(claim);
@@ -471,7 +479,7 @@ export default function omoHealthSensor(pi, options = {}) {
 		if (confirm?.pid !== process.pid || confirm?.sessionId !== sessionId) return;
 		// Loaded fresh (?v=<mtime>): a session keeps the first copy of every plain module URL for its whole life,
 		// so a static import pinned a hot-reloaded sensor to an old launch.mjs (live 2026-09-24, sensor-stub.log).
-		const launchUrl = new URL("../src/launch.mjs", import.meta.url);
+		const launchUrl = pathToFileURL(launchFile);
 		const { launchDaemon } = await import(`${launchUrl.href}?v=${Math.round((await fs.stat(launchUrl)).mtimeMs)}`);
 		const nodePath = await findNode();
 		lastSpawnAt = now();
