@@ -418,6 +418,67 @@ test("busyDeliverAs joins a turn running at delivery time (triggerTurn true) and
 	assert.deepEqual(s.fp.sent.slice(2).map((item) => item.opts), [{ deliverAs: "followUp", triggerTurn: false }, { deliverAs: "followUp", triggerTurn: false }, { deliverAs: "followUp", triggerTurn: true }], "idle: a scope check never starts a turn; a relay keeps its own trigger");
 });
 
+/** A session whose goal file (`<dir>/extensions/goal/s-1.json`) the test rewrites, and one budget message per id in its inbox (#32). */
+async function budgetSession(goal) {
+	const s = setup({ daemonTs: (c) => c });
+	const { ctx } = fakeCtx();
+	const sessionDir = tmpDir("omoh-goal-session-");
+	ctx.sessionManager.getSessionFile = () => path.join(sessionDir, "s-1.jsonl");
+	const goalFile = path.join(sessionDir, "extensions", "goal", "s-1.json");
+	const setGoal = (value) => {
+		fs.mkdirSync(path.dirname(goalFile), { recursive: true });
+		fs.writeFileSync(goalFile, JSON.stringify({ version: 1, goal: value }));
+	};
+	setGoal(goal);
+	await s.fp.emit("session_start", ctx);
+	const dir = path.join(s.home, "inbox", "s-1");
+	fs.mkdirSync(dir, { recursive: true });
+	const post = (id, actionKind) => fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify({ id, kind: "self-notice", sessionId: "s-1", content: `[omo-health budget] ${id}`, deliverAs: "nextTurn", triggerTurn: false, details: { actionKind, projectId: "s-1:g1" } }));
+	const receipt = (id) => JSON.parse(fs.readFileSync(path.join(s.home, "receipts", `${id}.json`), "utf8")).result;
+	return { s, ctx, setGoal, post, receipt, dir };
+}
+
+test("#32: a budget request or decision whose goal already ended is dropped at pickup with a goal-ended receipt", async () => {
+	const b = await budgetSession({ id: "g1", status: "complete", completedAt: 1_790_000_000 });
+	b.post("1-req", "budget-request");
+	b.post("2-dec", "budget-decision");
+	await b.s.handle.__test.inbox();
+	await b.s.fp.emit("input", b.ctx, { source: "interactive", text: "next" });
+	assert.deepEqual(b.s.fp.sent, [], "never shown");
+	assert.deepEqual([b.receipt("1-req"), b.receipt("2-dec")], ["goal-ended", "goal-ended"]);
+	assert.deepEqual(fs.readdirSync(b.dir), []);
+});
+
+test("#32: a request taken while the goal ran is held, and dropped when the goal ended before the next prompt", async () => {
+	// 2026-11-25 01a1dd91: picked up 16:43:38Z, goal complete 16:43:42Z, next prompt 17:40Z.
+	const b = await budgetSession({ id: "g1", status: "active" });
+	b.post("1-req", "budget-request");
+	await b.s.handle.__test.inbox();
+	assert.deepEqual(b.s.fp.sent, [], "not queued in senpi's nextTurn list at pickup");
+	assert.equal(b.receipt("1-req"), "held");
+	b.setGoal({ id: "g1", status: "complete", completedAt: 1_790_000_004 });
+	await b.s.fp.emit("input", b.ctx, { source: "interactive", text: "server load?" });
+	assert.deepEqual(b.s.fp.sent, []);
+	assert.equal(b.receipt("1-req"), "goal-ended");
+});
+
+test("#32: a held request joins the next prompt as nextTurn while its goal is live; a replaced goal drops it", async () => {
+	const b = await budgetSession({ id: "g1", status: "active" });
+	b.post("1-req", "budget-request");
+	await b.s.handle.__test.inbox();
+	await b.s.fp.emit("input", b.ctx, { source: "extension", text: "continue the goal" });
+	assert.deepEqual(b.s.fp.sent.map((item) => [item.message.content, item.opts]), [["[omo-health budget] 1-req", { deliverAs: "nextTurn", triggerTurn: false }]]);
+	assert.equal(b.receipt("1-req"), "delivered");
+	await b.s.fp.emit("input", b.ctx, { source: "interactive", text: "again" });
+	assert.equal(b.s.fp.sent.length, 1, "delivered once");
+	b.post("2-dec", "budget-decision");
+	await b.s.handle.__test.inbox();
+	b.setGoal({ id: "g2", status: "active" });
+	await b.s.fp.emit("input", b.ctx, { source: "interactive", text: "new goal" });
+	assert.equal(b.s.fp.sent.length, 1, "the decision for g1 is not shown under g2");
+	assert.equal(b.receipt("2-dec"), "goal-ended");
+});
+
 test("abort-continue aborts a running turn and resumes only once idle", async () => {
 	const s = setup({ daemonTs: (c) => c });
 	const { ctx } = fakeCtx({ idle: false });

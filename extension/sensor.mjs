@@ -43,6 +43,12 @@ const TERMINAL_MONITOR_EVENT = "terminal_monitor_state";
 const CONTINUATION_HOLD_EVENT = "continuation_hold_state";
 const GOAL_TIMER_EVENT = "goal_continuation_timer_state";
 const GOAL_SCHEDULED_EVENT = "goal_continuation_scheduled";
+// Budget messages that speak to the goal's ongoing work (src/budget/office.mjs GOAL_BOUND, duplicated on purpose): a
+// nextTurn message waits in senpi for the next prompt, which can come long after the goal ended (#32). The sensor holds
+// it and re-checks the goal file when that prompt's input event fires; an ended goal drops it with a goal-ended receipt.
+const GOAL_BOUND = new Set(["budget-request", "budget-decision"]);
+// src/budget/office.mjs GOAL_TERMINAL plus `missing`, the statuses of a goal that ended (paused or blocked has not).
+const GOAL_ENDED = new Set(["complete", "completed", "replaced", "cleared", "cancelled", "missing"]);
 
 function kst(ms) {
 	const shifted = new Date(ms + 9 * 3600_000).toISOString();
@@ -137,13 +143,16 @@ export default function omoHealthSensor(pi, options = {}) {
 	let disabled = false;
 	let widgetOpen = false;
 	let pendingResume;
-	let busy = { heartbeat: false, inbox: false, status: false, ensure: false };
+	let busy = { heartbeat: false, inbox: false, status: false, ensure: false, release: false };
 	let stopped = false;
 	let migration = { sha: null, tries: 0, lastMs: -Infinity };
 	// Goal-wait channel state for the heartbeat (Contract C6): mirrored from pi.events, never invented here.
 	let wakeSources = {};
 	let holds = [];
 	let goalWait = { armed: false, kind: null, dueAtMs: null };
+	// Goal-bound budget messages taken from the inbox, waiting for the next prompt (#32). Memory only, like senpi's own
+	// nextTurn queue they replace.
+	let heldForPrompt = [];
 	const resetChannelState = () => {
 		wakeSources = {};
 		holds = [];
@@ -268,14 +277,47 @@ export default function omoHealthSensor(pi, options = {}) {
 		});
 	});
 
-	async function deliver(message) {
+	function deliver(message) {
 		const payload = { customType: "omo-health", content: message.content, display: true, details: message.details ?? {} };
 		// busyDeliverAs: a turn running right now takes the message at its next tool boundary (senpi joins a running turn only
 		// when triggerTurn is not false); otherwise the message's own delivery applies. A scope check never starts a turn.
 		const join = ["steer", "followUp"].includes(message.busyDeliverAs) && !isIdle();
 		const deliverAs = join ? message.busyDeliverAs : ["steer", "followUp", "nextTurn"].includes(message.deliverAs) ? message.deliverAs : "followUp";
-		pi.sendMessage(payload, { deliverAs, triggerTurn: join || (message.kind === "scope-check" ? false : Boolean(message.triggerTurn)) });
+		return pi.sendMessage(payload, { deliverAs, triggerTurn: join || (message.kind === "scope-check" ? false : Boolean(message.triggerTurn)) });
 	}
+
+	const receipt = (message, result) => writeJsonAtomic(path.join(dirs.receipts, `${message.id}.json`), { id: message.id, sessionId, deliveredMs: now(), kind: message.kind, result });
+
+	const goalBound = (message) => message.kind === "self-notice" && message.deliverAs === "nextTurn" && GOAL_BOUND.has(message.details?.actionKind);
+
+	/** The goal the message was written for is still this session's goal and has not ended. Unverifiable reads as live. */
+	async function goalLive(message) {
+		const projectId = message.details?.projectId;
+		if (typeof projectId !== "string" || !projectId.startsWith(`${sessionId}:`)) return true;
+		let sessionFile;
+		try {
+			sessionFile = ctx?.sessionManager?.getSessionFile?.();
+		} catch {
+			// ignore
+		}
+		if (!sessionFile) return true;
+		const file = await readJson(path.join(path.dirname(sessionFile), "extensions", "goal", `${safeSegment(sessionId)}.json`));
+		const goal = file && typeof file === "object" && "goal" in file ? file.goal : file;
+		if (!goal || typeof goal !== "object" || goal.id !== projectId.slice(sessionId.length + 1)) return false;
+		const status = typeof goal.status === "string" ? goal.status.trim().toLowerCase() : "active";
+		return !GOAL_ENDED.has(status) && goal.completedAt == null;
+	}
+
+	/** The input event of the next prompt: a held message joins that prompt's turn (nextTurn) only if its goal is live. */
+	const releaseHeld = safe("release", async () => {
+		const held = heldForPrompt;
+		heldForPrompt = [];
+		for (const message of held) {
+			const result = message.sessionId !== sessionId ? "session-changed" : (await goalLive(message)) ? "delivered" : "goal-ended";
+			if (result === "delivered") await deliver(message);
+			await receipt(message, result);
+		}
+	});
 
 	const inbox = safe("inbox", async () => {
 		if (await refreshStopped()) return;
@@ -283,7 +325,7 @@ export default function omoHealthSensor(pi, options = {}) {
 		if (pendingResume && isIdle()) {
 			const message = pendingResume;
 			pendingResume = undefined;
-			await deliver({ ...message, deliverAs: "followUp", triggerTurn: true });
+			deliver({ ...message, deliverAs: "followUp", triggerTurn: true });
 			await writeJsonAtomic(path.join(dirs.receipts, `${message.id}.json`), { id: message.id, sessionId, deliveredMs: now(), kind: message.kind, resumed: true });
 		}
 		const dir = path.join(dirs.inbox, safeSegment(sessionId));
@@ -315,14 +357,19 @@ export default function omoHealthSensor(pi, options = {}) {
 					pendingResume = message;
 					result = "aborted-waiting-idle";
 				} else {
-					await deliver({ ...message, deliverAs: "followUp", triggerTurn: true });
+					deliver({ ...message, deliverAs: "followUp", triggerTurn: true });
 				}
+			} else if (goalBound(message)) {
+				if (await goalLive(message)) {
+					heldForPrompt.push(message);
+					result = "held";
+				} else result = "goal-ended";
 			} else if (MESSAGE_KINDS.has(message.kind)) {
-				await deliver(message);
+				deliver(message);
 			} else {
 				result = "unknown-kind";
 			}
-			await writeJsonAtomic(path.join(dirs.receipts, `${message.id}.json`), { id: message.id, sessionId, deliveredMs: now(), kind: message.kind, result });
+			await receipt(message, result);
 			await fs.rm(file, { force: true });
 		}
 	});
@@ -543,6 +590,8 @@ export default function omoHealthSensor(pi, options = {}) {
 			humanInputs.push(lastInputAt);
 			if (humanInputs.length > 20) humanInputs.shift();
 		}
+		// senpi takes nextTurn messages after the input handlers, in the same prompt (agent-session prompt()).
+		if (heldForPrompt.length) await releaseHeld();
 	});
 	pi.on("session_shutdown", async (event) => {
 		stop();

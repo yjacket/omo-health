@@ -15,6 +15,7 @@ import {
 	composeBudgetDecision,
 	composeBudgetRequest,
 } from "../act/messages.mjs";
+import { readReceipt } from "../act/inbox.mjs";
 import { readSubscriptionUsage } from "../collect/subscriptions.mjs";
 import { atomicWriteJson, readJsonSafe, removeSafe } from "../util/fsx.mjs";
 import { redact, truncate } from "../util/text.mjs";
@@ -88,6 +89,19 @@ const GOAL_ACTIVE = new Set(["active", "running", "in_progress", "pending"]);
 
 // Goal statuses that close a project (C-projects rule 1); every other unseen status reads as missing.
 const GOAL_TERMINAL = new Set(["complete", "completed", "replaced", "cleared", "cancelled"]);
+// Messages that speak to the goal's ongoing work: once the goal ended they are dropped, never shown (#32). The sensor
+// re-checks the goal when the next prompt takes them (extension/sensor.mjs GOAL_BOUND) and receipts a drop as goal-ended.
+const GOAL_BOUND = new Set(["budget-request", "budget-decision"]);
+
+function goalBound(message) {
+	return GOAL_BOUND.has(message?.details?.actionKind);
+}
+
+/** The project's goal ended (completed, replaced, cleared, gone): a paused or blocked goal has not. */
+function goalEnded(project) {
+	const status = project.data?.goalStatus;
+	return GOAL_TERMINAL.has(status) || status === "missing" || finite(project.data?.goalCompletedMs);
+}
 
 /** An audit opinion copied from an in-memory poll has not passed through the store yet: redact every string in it. */
 function redactedAudit(audit) {
@@ -613,23 +627,35 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 		}
 		for (const file of consumed) removeSafe(file);
 
-		// 7b. Outbox: drop expired entries and every entry of a closed project (one event each), then hand back every
-		// pending message. A message is never composed twice; the stored object is returned until acknowledge.
+		// 7b. Outbox: drop expired entries, every entry of a closed project and a goal-bound entry whose goal ended (one
+		// event each), then hand back every pending message. A message is never composed twice; the stored object is
+		// returned until acknowledge. A handed goal-bound message the sensor dropped (receipt goal-ended) gets its event here.
 		let pendingMessages = [];
 		if (!shadow) {
 			for (const project of store.listProjects()) {
 				const outbox = project.data?.outbox ?? [];
-				if (!outbox.length) continue;
+				const handed = project.data?.handed ?? [];
+				if (!outbox.length && !handed.length) continue;
+				const expire = (messageId, actionKind, reason) => appendEvent({ projectId: project.id, kind: "message-expired", data: { messageId, actionKind, reason } });
 				const kept = [];
 				for (const entry of outbox) {
-					const reason = project.status === "closed" ? "closed" : now - entry.createdMs > OUTBOX_TTL_MS ? "expired" : null;
+					const reason = project.status === "closed" ? "closed"
+						: now - entry.createdMs > OUTBOX_TTL_MS ? "expired"
+						: goalBound(entry.message) && goalEnded(project) ? "goal-ended"
+						: null;
 					if (!reason) {
 						kept.push(entry);
 						continue;
 					}
-					appendEvent({ projectId: project.id, kind: "message-expired", data: { messageId: entry.id, actionKind: entry.message?.details?.actionKind ?? null, reason } });
+					expire(entry.id, entry.message?.details?.actionKind ?? null, reason);
 				}
-				if (kept.length !== outbox.length) store.upsertProject({ ...project, data: { ...project.data, outbox: kept }, updatedMs: now });
+				// A held receipt means the sensor still waits for the next prompt; any other receipt (or none for a week) ends the watch.
+				const watching = handed.filter((entry) => {
+					const result = readReceipt(paths, entry.id)?.result;
+					if (result === "goal-ended") expire(entry.id, entry.actionKind, "goal-ended");
+					return (result === undefined || result === "held") && now - entry.handedMs <= OUTBOX_TTL_MS;
+				});
+				if (kept.length !== outbox.length || watching.length !== handed.length) store.upsertProject({ ...project, data: { ...project.data, outbox: kept, handed: watching }, updatedMs: now });
 				// Stamped with this tick's time: the inbox sweeps a file whose createdMs is 5 min old, so a notice retried after a
 				// longer wait would be swept the moment it is written. The id stays the same; only an undelivered attempt is retried.
 				pendingMessages.push(...kept.map((entry) => ({ ...entry.message, createdMs: now })));
@@ -729,7 +755,9 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 				const outbox = project.data?.outbox ?? [];
 				const kept = outbox.filter((entry) => !ids.has(entry.id));
 				if (kept.length === outbox.length) continue;
-				store.upsertProject({ ...project, data: { ...project.data, outbox: kept }, updatedMs: now });
+				// A goal-bound message is watched until the sensor receipts it: a goal that ends first drops it there (#32).
+				const handed = outbox.filter((entry) => ids.has(entry.id) && goalBound(entry.message)).map((entry) => ({ id: entry.id, actionKind: entry.message.details.actionKind, handedMs: now }));
+				store.upsertProject({ ...project, data: { ...project.data, outbox: kept, handed: [...(project.data?.handed ?? []), ...handed] }, updatedMs: now });
 			}
 		},
 		snapshot() {

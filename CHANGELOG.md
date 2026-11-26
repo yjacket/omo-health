@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Budget messages: an estimate request or a budget decision reaches the session only while its goal is live (#32). The outbox drops one whose goal ended, and the sensor no longer hands it to senpi's `nextTurn` queue at pickup, where it waited for the next prompt long after the goal ended: it holds the message and, on that prompt's `input` event, re-reads the goal file and adds it as `nextTurn` only if the same goal is not complete, replaced, cleared or gone. A drop is receipted `goal-ended` and recorded as a `message-expired` event with reason `goal-ended`.
 - Decision log: an action row (executed, or held at the gate as `would` or `skipped:*`) is written with `event: "action"`, so a reader that sorts rows by `event` no longer counts it as an `undefined` event next to the finding's `opened` row. Older retained rows without `event` still read as actions by their `action` object. (#34)
 
 ## 0.9.1 - 2026-11-26
