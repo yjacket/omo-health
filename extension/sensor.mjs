@@ -301,20 +301,31 @@ export default function omoHealthSensor(pi, options = {}) {
 			// ignore
 		}
 		if (!sessionFile) return true;
-		const file = await readJson(path.join(path.dirname(sessionFile), "extensions", "goal", `${safeSegment(sessionId)}.json`));
+		// No goal file means the goal is gone; a file that cannot be read or parsed right now (EBUSY, a torn write) is unverifiable.
+		let file;
+		try {
+			file = JSON.parse((await fs.readFile(path.join(path.dirname(sessionFile), "extensions", "goal", `${safeSegment(sessionId)}.json`), "utf8")).replace(/^\uFEFF/, ""));
+		} catch (error) {
+			return error?.code !== "ENOENT";
+		}
 		const goal = file && typeof file === "object" && "goal" in file ? file.goal : file;
 		if (!goal || typeof goal !== "object" || goal.id !== projectId.slice(sessionId.length + 1)) return false;
 		const status = typeof goal.status === "string" ? goal.status.trim().toLowerCase() : "active";
 		return !GOAL_ENDED.has(status) && goal.completedAt == null;
 	}
 
-	/** The input event of the next prompt: a held message joins that prompt's turn (nextTurn) only if its goal is live. */
+	/**
+	 * The input event of a prompt that starts a turn: a held message joins that turn (nextTurn) only if its goal is live.
+	 * The one place the sensor awaits inside an event hook: senpi drains the nextTurn queue right after the input handlers,
+	 * so the send must land first. It costs one goal-file read, and only while a message is held. A message leaves the
+	 * list once it is sent or dropped, so a failure keeps the rest for the next prompt.
+	 */
 	const releaseHeld = safe("release", async () => {
-		const held = heldForPrompt;
-		heldForPrompt = [];
-		for (const message of held) {
+		while (heldForPrompt.length) {
+			const message = heldForPrompt[0];
 			const result = message.sessionId !== sessionId ? "session-changed" : (await goalLive(message)) ? "delivered" : "goal-ended";
 			if (result === "delivered") await deliver(message);
+			heldForPrompt.shift();
 			await receipt(message, result);
 		}
 	});
@@ -325,7 +336,7 @@ export default function omoHealthSensor(pi, options = {}) {
 		if (pendingResume && isIdle()) {
 			const message = pendingResume;
 			pendingResume = undefined;
-			deliver({ ...message, deliverAs: "followUp", triggerTurn: true });
+			void deliver({ ...message, deliverAs: "followUp", triggerTurn: true });
 			await writeJsonAtomic(path.join(dirs.receipts, `${message.id}.json`), { id: message.id, sessionId, deliveredMs: now(), kind: message.kind, resumed: true });
 		}
 		const dir = path.join(dirs.inbox, safeSegment(sessionId));
@@ -357,7 +368,7 @@ export default function omoHealthSensor(pi, options = {}) {
 					pendingResume = message;
 					result = "aborted-waiting-idle";
 				} else {
-					deliver({ ...message, deliverAs: "followUp", triggerTurn: true });
+					void deliver({ ...message, deliverAs: "followUp", triggerTurn: true });
 				}
 			} else if (goalBound(message)) {
 				if (await goalLive(message)) {
@@ -365,7 +376,7 @@ export default function omoHealthSensor(pi, options = {}) {
 					result = "held";
 				} else result = "goal-ended";
 			} else if (MESSAGE_KINDS.has(message.kind)) {
-				deliver(message);
+				void deliver(message);
 			} else {
 				result = "unknown-kind";
 			}
@@ -577,6 +588,7 @@ export default function omoHealthSensor(pi, options = {}) {
 		if (event?.reason === "reload" && carry?.sessionId === sessionId) {
 			lastInputAt = carry.lastInputAt;
 			humanInputs.splice(0, humanInputs.length, ...carry.humanInputs);
+			heldForPrompt = [...(carry.heldForPrompt ?? []), ...heldForPrompt];
 		} else {
 			lastInputAt = now();
 		}
@@ -590,8 +602,9 @@ export default function omoHealthSensor(pi, options = {}) {
 			humanInputs.push(lastInputAt);
 			if (humanInputs.length > 20) humanInputs.shift();
 		}
-		// senpi takes nextTurn messages after the input handlers, in the same prompt (agent-session prompt()).
-		if (heldForPrompt.length) await releaseHeld();
+		// senpi takes nextTurn messages after the input handlers, in the same prompt (agent-session prompt()). Input that
+		// joins a running turn (streamingBehavior steer/followUp) starts no prompt, so a held message waits for one that does.
+		if (heldForPrompt.length && !event?.streamingBehavior && isIdle()) await releaseHeld();
 	});
 	pi.on("session_shutdown", async (event) => {
 		stop();
@@ -599,7 +612,7 @@ export default function omoHealthSensor(pi, options = {}) {
 		if (options.setupOnly) return;
 		// A reload loads a fresh sensor into this same process; it must not find this one's marker.
 		if (globalThis[Symbol.for("omo-health.sensor.active")] === (source ?? repoRoot)) delete globalThis[Symbol.for("omo-health.sensor.active")];
-		if (event?.reason === "reload" && sessionId) globalThis[RELOAD_CARRY] = { sessionId, lastInputAt, humanInputs: [...humanInputs] };
+		if (event?.reason === "reload" && sessionId) globalThis[RELOAD_CARRY] = { sessionId, lastInputAt, humanInputs: [...humanInputs], heldForPrompt: [...heldForPrompt] };
 		if (sessionId) {
 			try {
 				await fs.rm(path.join(dirs.sensors, `${safeSegment(sessionId)}.json`), { force: true });

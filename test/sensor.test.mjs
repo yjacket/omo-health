@@ -479,6 +479,51 @@ test("#32: a held request joins the next prompt as nextTurn while its goal is li
 	assert.equal(b.receipt("2-dec"), "goal-ended");
 });
 
+test("#32: input that joins a running turn releases nothing; the next prompt that starts a turn takes the held request", async () => {
+	const b = await budgetSession({ id: "g1", status: "active" });
+	b.post("1-req", "budget-request");
+	await b.s.handle.__test.inbox();
+	b.ctx.idleValue = false;
+	await b.s.fp.emit("input", b.ctx, { source: "interactive", text: "steer", streamingBehavior: "steer" });
+	assert.deepEqual(b.s.fp.sent, [], "a steer during a turn would leave it in senpi's nextTurn queue");
+	assert.equal(b.receipt("1-req"), "held");
+	b.ctx.idleValue = true;
+	await b.s.fp.emit("input", b.ctx, { source: "interactive", text: "next" });
+	assert.equal(b.s.fp.sent.length, 1);
+	assert.equal(b.receipt("1-req"), "delivered");
+});
+
+test("#32: a paused or blocked goal is live, a torn goal file is unverifiable (live), a missing goal file has ended", async () => {
+	const b = await budgetSession({ id: "g1", status: "paused" });
+	const step = async (id, goal) => {
+		if (goal === undefined) fs.rmSync(path.join(path.dirname(b.ctx.sessionManager.getSessionFile()), "extensions", "goal", "s-1.json"));
+		else if (typeof goal === "string") fs.writeFileSync(path.join(path.dirname(b.ctx.sessionManager.getSessionFile()), "extensions", "goal", "s-1.json"), goal);
+		else b.setGoal(goal);
+		b.post(id, "budget-request");
+		await b.s.handle.__test.inbox();
+		await b.s.fp.emit("input", b.ctx, { source: "interactive", text: id });
+		return b.receipt(id);
+	};
+	assert.equal(await step("1-paused", { id: "g1", status: "paused" }), "delivered");
+	assert.equal(await step("2-blocked", { id: "g1", status: "blocked", blockedReason: "usage limit", blockedAt: 1 }), "delivered");
+	assert.equal(await step("3-torn", '{"version":1,"goal":{"id":"g1"'), "delivered");
+	assert.equal(await step("4-missing", undefined), "goal-ended");
+	assert.equal(b.s.fp.sent.length, 3);
+});
+
+test("#32: an extension reload carries a held request to the next sensor of the same session", async () => {
+	const b = await budgetSession({ id: "g1", status: "active" });
+	b.post("1-req", "budget-request");
+	await b.s.handle.__test.inbox();
+	assert.equal(b.receipt("1-req"), "held");
+	await b.s.fp.emit("session_shutdown", b.ctx, { type: "session_shutdown", reason: "reload" });
+	const next = setup({ daemonTs: (c) => c });
+	await next.fp.emit("session_start", b.ctx, { type: "session_start", reason: "reload" });
+	await next.fp.emit("input", b.ctx, { source: "interactive", text: "after reload" });
+	assert.deepEqual(next.fp.sent.map((item) => item.message.content), ["[omo-health budget] 1-req"]);
+	assert.equal(JSON.parse(fs.readFileSync(path.join(next.home, "receipts", "1-req.json"), "utf8")).result, "delivered");
+});
+
 test("abort-continue aborts a running turn and resumes only once idle", async () => {
 	const s = setup({ daemonTs: (c) => c });
 	const { ctx } = fakeCtx({ idle: false });

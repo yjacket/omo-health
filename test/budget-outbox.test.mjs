@@ -222,6 +222,21 @@ test("(h) #32: a delivered request the sensor dropped as goal-ended gets one mes
 	assert.deepEqual(h.store.getProject(PID).data.handed, [], "the watch ends with the receipt");
 });
 
+test("(i) #32: a request still held a week after delivery is recorded as expired and no longer watched", async (t) => {
+	const h = setup(t);
+	seed(h);
+	h.state.sensor = true;
+	const { engine } = h.makeEngine();
+	await engine.tick();
+	const [sent] = inboxMessages(h.paths, SID);
+	fs.mkdirSync(h.paths.health.receiptsDir, { recursive: true });
+	fs.writeFileSync(path.join(h.paths.health.receiptsDir, `${sent.id}.json`), JSON.stringify({ id: sent.id, sessionId: SID, deliveredMs: h.clock.now(), kind: "self-notice", result: "held" }));
+	h.clock.advance(7 * DAY + MIN);
+	await engine.tick();
+	assert.deepEqual(expiredEvents(h).map((event) => [event.data.messageId, event.data.reason]), [[sent.id, "expired"]]);
+	assert.deepEqual(h.store.getProject(PID).data.handed, []);
+});
+
 test("(f) a sensor that returns after more than five minutes still gets the request, not a swept file", async (t) => {
 	const h = setup(t);
 	seed(h);

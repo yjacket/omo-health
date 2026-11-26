@@ -99,7 +99,7 @@ function goalBound(message) {
 
 /** The project's goal ended (completed, replaced, cleared, gone): a paused or blocked goal has not. */
 function goalEnded(project) {
-	const status = project.data?.goalStatus;
+	const status = typeof project.data?.goalStatus === "string" ? project.data.goalStatus.trim().toLowerCase() : "";
 	return GOAL_TERMINAL.has(status) || status === "missing" || finite(project.data?.goalCompletedMs);
 }
 
@@ -649,11 +649,15 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 					}
 					expire(entry.id, entry.message?.details?.actionKind ?? null, reason);
 				}
-				// A held receipt means the sensor still waits for the next prompt; any other receipt (or none for a week) ends the watch.
+				// A held receipt means the sensor still waits for the next prompt; any other receipt ends the watch. A message
+				// still held (or never receipted) after a week is recorded as expired: no prompt took it.
 				const watching = handed.filter((entry) => {
 					const result = readReceipt(paths, entry.id)?.result;
 					if (result === "goal-ended") expire(entry.id, entry.actionKind, "goal-ended");
-					return (result === undefined || result === "held") && now - entry.handedMs <= OUTBOX_TTL_MS;
+					if (result !== undefined && result !== "held") return false;
+					if (now - entry.handedMs <= OUTBOX_TTL_MS) return true;
+					expire(entry.id, entry.actionKind, "expired");
+					return false;
 				});
 				if (kept.length !== outbox.length || watching.length !== handed.length) store.upsertProject({ ...project, data: { ...project.data, outbox: kept, handed: watching }, updatedMs: now });
 				// Stamped with this tick's time: the inbox sweeps a file whose createdMs is 5 min old, so a notice retried after a
