@@ -42,12 +42,25 @@ test("illustrative case: used 70, reserve 12, committed 8 => free 10", () => {
 	assert.equal(s.state, "ok");
 });
 
-test("short when the projection at reset passes 100", () => {
-	const s = state({ samples: [reading(80, NOW - 2 * HOUR), reading(90, NOW)] });
+test("short when the projection at reset passes 100 at a rate that lasted shortMinBurnHours", () => {
+	const s = state({ samples: [reading(60, NOW - 6 * HOUR), reading(90, NOW)] });
 	assert.equal(s.burnPerHour, 5);
+	assert.equal(s.burnHours, 6);
 	assert.equal(s.hoursLeft, 12);
 	assert.equal(s.projectedAtResetPercent, 150);
 	assert.equal(s.state, "short");
+});
+
+test("a one-hour spike projecting far past 100 reads tight, not short (#33, 2026-11-25 claude:7d)", () => {
+	// The real reading: 17% -> 21% between 15:04Z and 16:04Z with 140 h left projected 581% and raised a human warning.
+	const resetsAtMs = NOW + 140 * HOUR;
+	const s = state({ samples: [reading(17, NOW - HOUR, resetsAtMs), reading(21, NOW, resetsAtMs)] });
+	assert.equal(s.burnHours, 1);
+	assert.equal(s.projectedAtResetPercent, 581);
+	assert.equal(s.state, "tight");
+	assert.equal(capacityCheck({ states: [s], reserveUsd: 0, byModel: { "claude-opus-5-5:high": 1 }, cfg: CFG }).large, false, "a spike does not make an estimate owner-level");
+	const later = state({ samples: [reading(17, NOW - HOUR, resetsAtMs), reading(21, NOW, resetsAtMs)], cfg: { ...CFG, shortMinBurnHours: 1 } });
+	assert.equal(later.state, "short", "budget.shortMinBurnHours is read from the config");
 });
 
 test("tight between 88 and 100", () => {
@@ -115,7 +128,7 @@ test("capacityCheck: owner level above 25% of usable or above free, and on an ap
 	assert.equal(owner.large, true);
 	assert.equal(owner.fits, false);
 
-	const short = state({ samples: [reading(80, NOW - 2 * HOUR), reading(90, NOW)] });
+	const short = state({ samples: [reading(60, NOW - 6 * HOUR), reading(90, NOW)] });
 	assert.equal(short.state, "short");
 	const byShort = capacityCheck({
 		states: [short],
@@ -154,7 +167,7 @@ test("capacityCheck: a scoped window requires only the share of models it applie
 test("summarize takes the worst state and is unknown only when every window is unknown", () => {
 	const ok = state({ samples: [reading(50, NOW - 30 * MIN)] });
 	const stale = state({ samples: [reading(50, NOW - 30 * MIN)], stale: true });
-	const short = state({ samples: [reading(80, NOW - 2 * HOUR), reading(90, NOW)] });
+	const short = state({ samples: [reading(60, NOW - 6 * HOUR), reading(90, NOW)] });
 	assert.equal(summarize([ok, stale]).state, "ok");
 	assert.equal(summarize([short, ok]).state, "short");
 	assert.equal(summarize([stale]).state, "unknown");

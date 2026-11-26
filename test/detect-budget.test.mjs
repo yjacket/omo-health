@@ -94,6 +94,32 @@ test("each kind keeps its severity, human flag and subject key across ticks", ()
 	for (const [kind, finding] of first) assert.equal(second.get(kind).fp, finding.fp, `${kind} keeps one fp across ticks`);
 });
 
+test("session-day: only the owner level of a session tree is a human-needed warning, with its main/subagent split and one fp across ticks (#33)", () => {
+	const tree = (partial = {}) => ({
+		sessionId: "01a1ffcb-59fb-7563-8d59-9710650ec377",
+		projectId: "01a1ffcb:g1",
+		objective: "plan review loop",
+		totalUsd: 282,
+		mainUsd: 270,
+		childUsd: 12,
+		uncountedUsd: 0,
+		level: "owner",
+		basis: { kind: "window", account: "anthropic-subscription/default", windowId: "claude:7d", label: "Claude 주간", percent: 17.5, usd: 282, thresholdPercent: 10 },
+		...partial,
+	});
+	const sessions = [tree(), tree({ sessionId: "b", level: "investigate" }), tree({ sessionId: "c", level: null, basis: null })];
+	const findings = budget.detect(world(snapshot({ sessionDay: { investigateUsd: 80, ownerUsd: 160, sessions } })));
+	assert.equal(findings.length, 1);
+	const [finding] = findings;
+	assert.deepEqual([finding.kind, finding.severity, finding.humanNeeded], ["session-day", "warn", true]);
+	assert.equal(finding.subject.key, "budget:session-day:01a1ffcb-59fb-7563-8d59-9710650ec377");
+	assert.match(finding.titleKo, /17\.5%/);
+	assert.match(finding.detailKo, /메인 \$270, 하위작업 \$12/);
+	const usd = budget.detect(world(snapshot({ sessionDay: { sessions: [tree({ basis: { kind: "usd", usd: 170, thresholdUsd: 160 }, totalUsd: 191 })] } }), LATER));
+	assert.equal(usd[0].fp, finding.fp, "the same session keeps one fp whatever crossed");
+	assert.match(usd[0].detailKo, /\$170/);
+});
+
 test("an owner request needs no human and emits nothing", () => {
 	// Nothing is approved by a human: an increase is settled by the auditor or the rules,
 	// so a leftover owner entry in the snapshot must not surface as a finding.

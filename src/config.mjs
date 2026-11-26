@@ -167,6 +167,17 @@ export const DEFAULT_CONFIG = Object.freeze({
 		maxChangePercent: 100,
 		ownerProjectPercent: 25,
 		burstFactor: 1.25,
+		// A window projection past 100% asks for a human only once its burn rate has lasted this many hours (#33).
+		shortMinBurnHours: 6,
+		// One root session tree (main + every subagent) over the last 24 h, as a share of a calibrated window: past the
+		// first the budget auditor looks once, past the second D26 asks for a human. Cost no calibrated window counts
+		// (an unmapped provider, a proxy, an uncalibrated window) is held to the USD pair instead. `windows` overrides the
+		// percent pair per window, keyed "<account>:<windowId>" (#33).
+		sessionDayInvestigatePercent: 5,
+		sessionDayPercent: 10,
+		sessionDayInvestigateUsd: 80,
+		sessionDayUsd: 160,
+		windows: {},
 		closeGraceMs: 24 * H,
 		providerAliases: ["claude-sdk-oauth=anthropic-subscription"],
 		calibration: { minIntervalPercent: 2, minIntervals: 10, minCoveragePercent: 20, maxGapMs: 2 * H, earlyDropPercent: 5 },
@@ -288,6 +299,27 @@ export const DEFAULT_CONFIG = Object.freeze({
 
 const ENUMS = { mode: ["auto", "shadow"] };
 
+/** Config objects keyed by free-form names: each entry may set only these non-negative numbers. */
+export const MAP_ENTRY_KEYS = Object.freeze({ "budget.windows": Object.freeze(["sessionDayInvestigatePercent", "sessionDayPercent"]) });
+
+function mergeMap(base, override, where, warnings) {
+	const out = structuredClone(base);
+	for (const [name, entry] of Object.entries(override)) {
+		if (!isPlainObject(entry)) {
+			warnings.push(`config ${where}.${name} must be an object; ignored`);
+			continue;
+		}
+		const kept = { ...(out[name] ?? {}) };
+		for (const [key, value] of Object.entries(entry)) {
+			if (!MAP_ENTRY_KEYS[where].includes(key)) warnings.push(`unknown config key ignored: ${where}.${name}.${key}`);
+			else if (typeof value !== "number" || !Number.isFinite(value) || value < 0) warnings.push(`config ${where}.${name}.${key} must be a non-negative number; ignored`);
+			else kept[key] = value;
+		}
+		if (Object.keys(kept).length) out[name] = kept;
+	}
+	return out;
+}
+
 /** The operator switches the daemon reports as effective (heartbeat `config.effective`) and the dashboard can flip. */
 export const SWITCH_KEYS = Object.freeze(["mode", "actions.kill", "actions.detach", "actions.release", "monitorOrphans.enabled", "config.autoRevert", "align.enabled", "analyst.enabled", "goalLiveness.enabled", "footer.showAll", "budget.enabled", "budget.audit.enabled"]);
 
@@ -315,7 +347,7 @@ function mergeValidated(base, override, pathPrefix, warnings) {
 				warnings.push(`config ${where} must be an object; ignored`);
 				continue;
 			}
-			out[key] = mergeValidated(def, value, where, warnings);
+			out[key] = MAP_ENTRY_KEYS[where] ? mergeMap(def, value, where, warnings) : mergeValidated(def, value, where, warnings);
 		} else if (Array.isArray(def)) {
 			if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
 				warnings.push(`config ${where} must be an array of strings; ignored`);

@@ -63,6 +63,7 @@ export const FINDING_LABELS = Object.freeze({
 	drift: "작업 범위 점검 신호",
 	"treasury-short": "예산 부족",
 	"treasury-tight": "예산 주의",
+	"session-day": "세션 하루 사용량",
 	"audit-opinion": "예산 감사 의견",
 	"owner-call": "계속 여부 확인",
 });

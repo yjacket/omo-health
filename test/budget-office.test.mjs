@@ -863,6 +863,43 @@ test("(r6) the owner call is answered once the session records the owner's answe
 	assert.equal(c.store.events({ limit: 50 }).filter((e) => e.kind === "owner-answered").length, 1);
 });
 
+test("(sd) a session tree past the investigate line gets one audit per 24 h and no finding; past the owner line D26 asks for a human (#33)", (t) => {
+	// No subscription reading: the window is uncalibrated, so the tree's cost is held to the USD pair ($80 / $160).
+	const run = (spend) => {
+		const c = setup(t);
+		c.writeGoal({ id: "g1", objective: "long running lane", createdAt: secs(T0 - 20 * HOUR), updatedAt: secs(T0 - 20 * HOUR) });
+		writeJsonl(c.file, [E.header(c.sid, c.cwd, T0 - 20 * HOUR), spendEntry(T0 - 30 * HOUR, 500), spendEntry(T0 - 10 * HOUR, spend * 0.6), spendEntry(T0 - 2 * HOUR, spend * 0.4)]);
+		const runner = createFakeRunner({ outcomes: { "budget-audit": { status: "running" } } });
+		const office = c.office({ runner });
+		let snapshot;
+		for (let i = 0; i < 3; i++) {
+			snapshot = office.tick({ shadow: false }).snapshot;
+			c.clock.advance(MIN);
+		}
+		return { c, runner, snapshot, events: c.store.events({ limit: 200 }) };
+	};
+
+	const investigate = run(90);
+	const [tree] = investigate.snapshot.sessionDay.sessions;
+	assert.deepEqual([tree.sessionId, tree.level, tree.basis.kind, Math.round(tree.totalUsd)], [SID, "investigate", "usd", 90], "only the last 24 h count: the $500 30 h ago does not");
+	assert.equal(tree.projectId, `${SID}:g1`);
+	assert.equal(investigate.runner.starts.length, 1, "one audit across three ticks");
+	assert.equal(investigate.runner.starts[0].kind, "budget-audit");
+	const audit = investigate.c.store.getProject(`${SID}:g1`).data.audits.at(-1);
+	assert.deepEqual(audit.triggers, ["session-day"]);
+	assert.equal(audit.tier, null, "a session-day audit spends no ladder tier");
+	assert.equal(investigate.events.filter((e) => e.kind === "session-day").length, 1, "one session-day event per level per 24 h");
+	assert.deepEqual(detectBudget({ budget: investigate.snapshot }).filter((f) => f.kind === "session-day"), [], "investigate raises no finding");
+	assert.deepEqual(investigate.snapshot.treasury.windows, [], "no reading, no window rows");
+
+	const owner = run(170);
+	assert.equal(owner.snapshot.sessionDay.sessions[0].level, "owner");
+	const findings = detectBudget({ budget: owner.snapshot }).filter((f) => f.kind === "session-day");
+	assert.equal(findings.length, 1);
+	assert.deepEqual([findings[0].severity, findings[0].humanNeeded], ["warn", true]);
+	assert.match(findings[0].titleKo, /\$170/);
+});
+
 test("disabled budget: tick returns the empty result and writes no snapshot", (t) => {
 	const c = setup(t);
 	c.config.budget.enabled = false;

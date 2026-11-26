@@ -27,6 +27,7 @@ import { referenceClass } from "./estimates.mjs";
 import { createIngest } from "./ingest.mjs";
 import { auditAllowed, indicators, ladder, triggers } from "./metrics.mjs";
 import { evaluate } from "./projects.mjs";
+import { sessionDay, shareDistribution, windowKey, windowThresholds } from "./session-day.mjs";
 import { createBudgetStore, redactDeep } from "./store.mjs";
 import { capacityCheck, summarize, windowState } from "./treasury.mjs";
 
@@ -36,6 +37,8 @@ const DAY = 24 * HOUR;
 const SUBSCRIPTION_EVERY_MS = 60_000;
 const CALIBRATION_EVERY_MS = 10 * MIN;
 const PRUNE_EVERY_MS = HOUR;
+// The per-session-day share distribution (p95 on the dashboard) looks back this far, recomputed with calibration.
+const SHARE_HISTORY_MS = 30 * DAY;
 // A ladder tier is spent by an audit that produced an opinion (or is still in flight). A failed, timed-out, unavailable
 // or cancelled attempt leaves the tier open; a retry waits budget.audit.minGapMs after the last attempt, and after this
 // many attempts without an opinion the tier counts as spent so a permanently failing audit cannot loop (#24).
@@ -213,6 +216,9 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 	const calibrations = new Map(); // `${account}|${windowId}` -> calibrate() result
 	const wouldActions = new Set(); // shadow: would-action events already recorded this process
 	const auditSkipped = new Set(); // project ids whose goal-not-active skip was already recorded this process
+	const sessionDayNoted = new Map(); // `${sessionId}|${level}` -> ms of the last session-day event (one per 24 h)
+	let distribution = {};
+	let distributionMs = -Infinity;
 	let ingestProgress = null;
 	let lastSnapshot = null;
 
@@ -354,6 +360,13 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 		const treasury = summarize(states);
 		const accountState = (account) => summarize(states.filter((s) => s.account === account)).state;
 		const capacity = (byModel) => (reserveUsd) => capacityCheck({ states, reserveUsd, byModel, cfg: budget });
+		// 5b. Session-day usage: each root session tree's last 24 h against the windows (#33).
+		const daily = sessionDay({ rows: store.usageRows({ sinceMs: now - DAY }), states, cfg: budget });
+		if (now - distributionMs >= CALIBRATION_EVERY_MS) {
+			distributionMs = now;
+			distribution = shareDistribution({ rows: store.usageRows({ sinceMs: now - SHARE_HISTORY_MS }), states, cfg: budget });
+		}
+		const crossedBySession = new Map(daily.sessions.filter((s) => s.level).map((s) => [s.sessionId, s]));
 
 		// 6. Coupons (the daemon is the only writer of the coupons file). There is no decide command: readCommands
 		// already drops a leftover one without effect.
@@ -466,7 +479,9 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 			const ladderDue = step.tier >= 1 && step.tier <= 3 && step.tier > tiers.spent;
 			// A retry of a tier whose audit ended without an opinion is no new evidence: it waits out minGapMs.
 			const ladderRetry = ladderDue && (tiers.failed.get(step.tier) ?? 0) > 0;
-			const ruleReasons = out.actions.filter((a) => a.type === "audit").flatMap((a) => a.reasons);
+			// A session tree past the investigate threshold gets one audit per 24 h through the same path (#33).
+			const sessionDayDue = crossedBySession.has(project.sessionId) && !(finite(next.data.sessionDayAuditMs) && now - next.data.sessionDayAuditMs < DAY);
+			const ruleReasons = [...out.actions.filter((a) => a.type === "audit").flatMap((a) => a.reasons), ...(sessionDayDue ? ["session-day"] : [])];
 			const reasons = [...(ladderDue ? [`ladder-${step.basis}`] : []), ...ruleReasons];
 			// The effort of this audit; only a ladder audit spends its tier (a rule audit below 1x leaves tier 1 for 1x).
 			const tier = Math.max(1, Math.min(step.tier, 3));
@@ -568,7 +583,7 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 					}
 				} else if (reasons.length) {
 					const last = audits.at(-1) ?? null;
-					const newEvidence = !last || (ladderDue && !ladderRetry) || reasons.includes("change-review");
+					const newEvidence = !last || (ladderDue && !ladderRetry) || reasons.includes("change-review") || reasons.includes("session-day");
 					const allowed = auditAllowed({ project: next, history: auditHistory(), now, cfg: budget, newEvidence });
 					const mainModel = latestModelStmt.get(project.sessionId)?.model ?? null;
 					const model = allowed.allowed ? auditModel({ topModels: auditCfg.topModels, efforts: auditCfg.efforts, mainModel, tier, loggedIn: providersNow(), accountState }) : null;
@@ -590,6 +605,7 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 							}
 						} else record = launch({ ...audit, digest: "no-model" }, null);
 						next.data.audits = [...audits, record];
+						if (reasons.includes("session-day")) next.data.sessionDayAuditMs = now;
 					} else if (!finite(next.data.auditDeferredMs) || now - next.data.auditDeferredMs >= (auditCfg.minGapMs ?? 6 * HOUR)) {
 						// Visible deferral, never a weak-model fallback.
 						const reason = allowed.allowed ? "no-model" : allowed.reason;
@@ -612,6 +628,14 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 			live[live.indexOf(original)] = { ...next, _ind: ind, _trig: trig };
 		}
 		for (const file of consumed) removeSafe(file);
+		// One event per session tree and level per 24 h, with the project an audit could look at (null: no live goal).
+		const projectOfSession = (sessionId) => live.find((p) => p.sessionId === sessionId && goalActive(goalNowOf(goalById.get(p.id), p).status)) ?? null;
+		for (const crossed of crossedBySession.values()) {
+			const key = `${crossed.sessionId}|${crossed.level}`;
+			if (now - (sessionDayNoted.get(key) ?? -Infinity) < DAY) continue;
+			sessionDayNoted.set(key, now);
+			appendEvent({ projectId: projectOfSession(crossed.sessionId)?.id ?? null, kind: "session-day", data: { sessionId: crossed.sessionId, level: crossed.level, basis: crossed.basis, totalUsd: crossed.totalUsd, mainUsd: crossed.mainUsd, childUsd: crossed.childUsd } });
+		}
 
 		// 7b. Outbox: drop expired entries and every entry of a closed project (one event each), then hand back every
 		// pending message. A message is never composed twice; the stored object is returned until acknowledge.
@@ -701,7 +725,14 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 		const external = {};
 		const windows = states.map((state, i) => {
 			external[state.windowId] = meta[i].external;
-			return { ...state, coupons: coupons[state.account] ?? 0, updatedMs: meta[i].updatedMs, error: meta[i].error, calibrationIntervals: meta[i].calibrationIntervals };
+			const thresholds = windowThresholds(budget, state.account, state.windowId);
+			const shares = distribution[windowKey(state.account, state.windowId)] ?? null;
+			const daySettings = { ...thresholds, active: state.calibrated === true && finite(state.percentPerUsd), p95Percent: shares?.p95Percent ?? null, days: shares?.days ?? 0 };
+			return { ...state, coupons: coupons[state.account] ?? 0, updatedMs: meta[i].updatedMs, error: meta[i].error, calibrationIntervals: meta[i].calibrationIntervals, sessionDay: daySettings };
+		});
+		const sessionRows = daily.sessions.slice(0, 20).map((s) => {
+			const project = projectOfSession(s.sessionId) ?? shown.find((p) => p.sessionId === s.sessionId) ?? null;
+			return { ...s, projectId: project?.id ?? null, objective: project ? truncate(redact(project.objective ?? ""), 120) : null };
 		});
 		const snapshot = {
 			v: 1,
@@ -710,6 +741,7 @@ export function createBudgetOffice({ paths, db, clock, config, runner, loggedInP
 			ingest: ingestProgress ? { ...ingestProgress, updatedMs: now } : null,
 			treasury: { state: treasury.state, windows, external },
 			projects: projectRows,
+			sessionDay: { investigateUsd: daily.investigateUsd, ownerUsd: daily.ownerUsd, sessions: sessionRows },
 			audits: auditRows,
 			events: store.events({ limit: 50 }),
 		};
