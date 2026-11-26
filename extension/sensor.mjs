@@ -150,8 +150,8 @@ export default function omoHealthSensor(pi, options = {}) {
 	let wakeSources = {};
 	let holds = [];
 	let goalWait = { armed: false, kind: null, dueAtMs: null };
-	// Goal-bound budget messages taken from the inbox, waiting for the next prompt (#32). Memory only, like senpi's own
-	// nextTurn queue they replace.
+	// Goal-bound budget messages taken from the inbox, waiting for the next prompt (#32). In memory like senpi's own
+	// nextTurn queue they replace; an extension reload hands them to the next sensor through RELOAD_CARRY.
 	let heldForPrompt = [];
 	const resetChannelState = () => {
 		wakeSources = {};
@@ -604,6 +604,8 @@ export default function omoHealthSensor(pi, options = {}) {
 		}
 		// senpi takes nextTurn messages after the input handlers, in the same prompt (agent-session prompt()). Input that
 		// joins a running turn (streamingBehavior steer/followUp) starts no prompt, so a held message waits for one that does.
+		// Not covered: another extension's input handler ending this input as handled; the sensor cannot see that, and the
+		// released message then waits in senpi's queue for the next prompt as it did before #32.
 		if (heldForPrompt.length && !event?.streamingBehavior && isIdle()) await releaseHeld();
 	});
 	pi.on("session_shutdown", async (event) => {
