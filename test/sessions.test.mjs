@@ -317,6 +317,27 @@ test("registry discovers main sessions and the children of their projects", () =
 	assert.equal(child.pending.get("g").args.command, "grep x");
 });
 
+test("two live sessions with one ID in different projects stay two entries, and the heartbeat's host pid goes only to its own twin (#23 item 3)", () => {
+	const root = tmpDir("omoh-twins-");
+	const paths = resolvePaths({ OMO_HEALTH_OMO_HOME: path.join(root, "omo"), OMO_HEALTH_HOME: path.join(root, "health"), USERPROFILE: root });
+	const projectA = path.join(root, "a");
+	const projectB = path.join(root, "b");
+	const fileA = path.join(paths.sessionsDir, "--a--", "2026-09-23T14-00-00-000Z_tw.jsonl");
+	const fileB = path.join(paths.sessionsDir, "--b--", "2026-09-23T14-00-00-000Z_tw.jsonl");
+	writeJsonl(fileA, [E.header("tw", projectA, T0 - 3600_000), E.user("work in a", T0 - 60_000)]);
+	writeJsonl(fileB, [E.header("tw", projectB, T0 - 3600_000), E.user("work in b", T0 - 60_000)]);
+	const registry = new SessionRegistry({ paths, config: DEFAULT_CONFIG, clock: createFakeClock(Date.now()) });
+	const sensors = new Map([["tw", { sessionId: "tw", pid: 4242, cwd: projectA, sessionFile: fileA, ts: Date.now() }]]);
+	const snap = registry.refresh({ sensors });
+	assert.equal(snap.sessions.size, 2);
+	const twins = snap.sessions.sessionsById("tw");
+	assert.deepEqual(twins.map((s) => s.cwd).sort(), [projectA, projectB].sort());
+	assert.equal(snap.sessions.get("tw"), undefined, "a bare shared ID names no single session");
+	assert.equal(snap.sessions.has("tw"), true);
+	assert.equal(twins.find((s) => s.cwd === projectA).hostPid, 4242);
+	assert.equal(twins.find((s) => s.cwd === projectB).hostPid, undefined, "the other twin does not take the heartbeat's host");
+});
+
 test("registry discovers children in the agent projects store when the project has no local store", () => {
 	const root = tmpDir("omoh-proj-store-");
 	const env = { OMO_HEALTH_OMO_HOME: path.join(root, "omo"), OMO_HEALTH_HOME: path.join(root, "health"), USERPROFILE: root };

@@ -68,6 +68,22 @@ test("buildSessionSnapshot groups live main sessions by omo version (newest firs
 	assert.equal(rows.has("c1"), false, "children are not top-level rows");
 });
 
+test("two live sessions sharing an ID in different folders are two rows, and the heartbeat speaks only for its own (#23 item 3)", () => {
+	const world = makeWorld({
+		now: NOW,
+		sessions: [
+			sessionState({ id: "tw", cwd: "C:\\dev\\a", file: "C:/s/a/tw.jsonl", startedMs: NOW - 5000, hostPid: 100 }),
+			sessionState({ id: "tw", cwd: "C:\\dev\\b", file: "C:/s/b/tw.jsonl", startedMs: NOW - 4000, hostPid: 200 }),
+		],
+		procsFresh: true,
+		procSnapshots: [{ takenAtMs: NOW, rows: [host(100, 1), host(200, 1)] }],
+		sensors: [{ sessionId: "tw", pid: 100, cwd: "C:\\dev\\a", sessionFile: "C:/s/a/tw.jsonl", ts: NOW - 1000, idle: true, executingTools: 0 }],
+	});
+	const rows = buildSessionSnapshot(world, [], [], NOW).groups.flatMap((g) => g.sessions);
+	assert.deepEqual(rows.map((r) => [r.sessionId, r.cwd, r.host?.pid]), [["tw", "C:\\dev\\a", 100], ["tw", "C:\\dev\\b", 200]]);
+	assert.equal(rows[1].lastInputMs, null, "the other twin shows no heartbeat state");
+});
+
 test("buildSessionSnapshot picks the title from name, goal, first request, else 제목 없음", () => {
 	const rows = rowsOf(buildSessionSnapshot(boardWorld(), [], [], NOW));
 	assert.deepEqual([rows.get("m1").title, rows.get("m1").titleSource], ["Named session", "name"]);

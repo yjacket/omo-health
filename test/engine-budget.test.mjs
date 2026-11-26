@@ -12,6 +12,7 @@ import * as align from "../src/detect/align.mjs";
 import * as budgetDetector from "../src/detect/budget.mjs";
 import { createEngine, loadDetectors } from "../src/engine.mjs";
 import { resolvePaths } from "../src/paths.mjs";
+import { LiveSessions } from "../src/session-subject.mjs";
 import { createFakeClock } from "../src/util/time.mjs";
 import { createFakeRunner } from "./fakes/runner.mjs";
 import { E, iso, tmpDir, writeJsonl } from "./helpers/fixtures.mjs";
@@ -27,14 +28,14 @@ const secs = (ms) => Math.trunc(ms / 1000);
 function sources(clock, sessions) {
 	return {
 		procs: { snapshot: async () => ({ takenAtMs: clock.now(), rows: [] }), os: async () => ({}), ports: async () => [], close() {} },
-		registry: { refresh: () => ({ sessions, tasks: [] }) },
+		registry: { refresh: () => ({ sessions: sessions.current ?? sessions, tasks: [] }) },
 		logs: { read() {}, drain: () => [], stats: new Map() },
 		versions: () => ({ omoAi: "1.0.0", senpi: "1.0.0" }),
 	};
 }
 
 /** An engine with the real budget office (in-memory DB) and the real D26 detector; one main session with a fresh sensor. */
-function harness(t, { enabled = true, mode = "auto" } = {}) {
+function harness(t, { enabled = true, mode = "auto", twin = false } = {}) {
 	const root = tmpDir("omoh-engine-budget-");
 	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
 	const paths = resolvePaths({ USERPROFILE: root, OMO_HEALTH_HOME: path.join(root, "health"), OMO_HEALTH_OMO_HOME: path.join(root, "omo") });
@@ -47,7 +48,10 @@ function harness(t, { enabled = true, mode = "auto" } = {}) {
 	const runner = createFakeRunner();
 	runner.jobDir = (jobId) => path.join(paths.health.jobsDir, jobId);
 	const office = createBudgetOffice({ paths, db, clock, config, runner, loggedInProviders: () => new Set() });
-	const sessions = new Map([[SID, sessionState({ id: SID, kind: "main" })]]);
+	// twin: a second live session with the same ID in another project (both run under the sensor's host); `current` is
+	// what the registry reports this tick.
+	const main = sessionState({ id: SID, kind: "main", ...(twin ? { hostPid: 4242 } : {}) });
+	const sessions = { current: twin ? LiveSessions.of([main, sessionState({ id: SID, kind: "main", cwd: "C:\\dev\\other", file: "C:/tmp/other.jsonl", hostPid: 4242 })]) : LiveSessions.of([main]) };
 	const engine = createEngine({
 		paths,
 		config,
@@ -62,7 +66,7 @@ function harness(t, { enabled = true, mode = "auto" } = {}) {
 		},
 		options: { selfPid: 1 },
 	});
-	return { root, paths, clock, config, engine, store: createBudgetStore(db) };
+	return { root, paths, clock, config, engine, sessions, main, store: createBudgetStore(db) };
 }
 
 /** A goal session that spent $12 (>= estimateAfterUsd) and a 7-day window burning 10 %/h with 48 h left (short). */
@@ -113,6 +117,17 @@ test("an engine tick with the budget on writes the snapshot, delivers the budget
 	h.clock.advance(MIN);
 	await h.engine.tick();
 	assert.equal(inboxMessages(h.paths, SID).length, 1);
+});
+
+test("a budget message for an ID two live sessions share stays in the outbox until one session holds it (#23 item 3)", async (t) => {
+	const h = harness(t, { twin: true });
+	seed(h);
+	await h.engine.tick();
+	assert.deepEqual(inboxMessages(h.paths, SID), [], "either twin's sensor could take a message in the shared inbox");
+	h.sessions.current = LiveSessions.of([h.main]);
+	h.clock.advance(MIN);
+	await h.engine.tick();
+	assert.deepEqual(inboxMessages(h.paths, SID).map((m) => m.details.actionKind), ["budget-request"]);
 });
 
 test("shadow mode writes the snapshot but delivers nothing", async (t) => {

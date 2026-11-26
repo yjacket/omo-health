@@ -2,6 +2,7 @@ import { spawnSync as nodeSpawnSync } from "node:child_process";
 import path from "node:path";
 import { readParkRecords, validateParkRecord } from "../collect/parks.mjs";
 import { pathKey } from "../paths.mjs";
+import { projectKeyOf } from "../session-subject.mjs";
 import { atomicWriteJson, readJsonSafe, removeSafe } from "../util/fsx.mjs";
 import { launchInOrca } from "./orca-launch.mjs";
 import { createHerdrCli, resumeInNewTab } from "./terminal.mjs";
@@ -204,9 +205,11 @@ export async function runParkLifecycle(ctx) {
 	const bySession = new Map();
 	for (const entry of live) {
 		if (!UNFINISHED.has(entry.record.status)) continue;
-		const list = bySession.get(entry.record.sessionId) ?? [];
+		// One episode per session: the same ID parked from two projects is two sessions, neither supersedes the other.
+		const key = JSON.stringify([entry.record.sessionId, projectKeyOf(entry.record.cwd)]);
+		const list = bySession.get(key) ?? [];
 		list.push(entry);
-		bySession.set(entry.record.sessionId, list);
+		bySession.set(key, list);
 	}
 	for (const list of bySession.values()) {
 		list.sort((a, b) => b.record.createdAt - a.record.createdAt);
@@ -220,6 +223,8 @@ export async function runParkLifecycle(ctx) {
 		// A pending record that is not due yet is left untouched: the parking session writes it before it shuts down,
 		// so its own heartbeat may still be live and must not complete the episode.
 		if (entry.record.status === "pending" && now < entry.record.resetAt + PARK_TIMING.graceMs) return undefined;
+		// Another session holds the ID: its heartbeat and --session processes may be that one's. Wait, untouched.
+		if (ctx.world.hasTwin?.(sid)) return undefined;
 		if (liveHeartbeat(ctx.world, sid)) return write(entry, { ...entry.record, status: "completed", reason: "already-live" }, "already-live");
 		const procs = sessionProcesses(ctx.world, sid);
 		// No trustworthy process table: nothing proves the session is not starting, so no launch this tick.
