@@ -1,6 +1,7 @@
 import { EventWindow } from "../../src/collect/logs.mjs";
 import { normalizeRows, ProcessTracker } from "../../src/collect/procs.mjs";
 import { DEFAULT_CONFIG } from "../../src/config.mjs";
+import { LiveSessions } from "../../src/session-subject.mjs";
 import { buildWorld } from "../../src/state.mjs";
 
 function deepMerge(base, over) {
@@ -77,8 +78,8 @@ export function makeWorld(options = {}) {
 	const tracker = new ProcessTracker();
 	let procs;
 	for (const snap of options.procSnapshots ?? []) procs = tracker.update({ takenAtMs: snap.takenAtMs, rows: normalizeRows(snap.rows) });
-	const sessions = new Map();
-	for (const s of options.sessions ?? []) sessions.set(s.id, s);
+	// The registry the daemon builds (SessionRegistry.snapshot): keyed by subject, so same-ID sessions stay apart.
+	const sessions = LiveSessions.of(options.sessions ?? []);
 	const events = new EventWindow(24 * 3600_000);
 	if (options.events) events.add(options.events, now);
 	return buildWorld({

@@ -181,6 +181,13 @@ test("gate: actionScope limits every action but toasts to the listed session tre
 	assert.equal(gate({ key: "analyze:x:look0", kind: "analyze" }, { mode: "auto", paused: false, config: scoped, executed: new Set(), subject: { sessionId: "other" } }), "skipped:out-of-scope");
 	assert.equal(gate({ key: "toast:x:0", kind: "toast" }, { mode: "auto", paused: false, config: scoped, executed: new Set(), subject: {} }), "execute");
 	assert.equal(gate(kill, { mode: "auto", paused: false, config: cfg, executed: new Set(), subject: { sessionId: "other" } }), "execute", "empty scope = everything");
+	// #23 item 3: with a shared ID an action could reach either twin; only notices that change nothing still flow.
+	for (const kind of ["kill-pids", "nudge", "crash-resume", "park-resume", "self-notice"]) {
+		assert.equal(gate({ key: `${kind}:x:0`, kind }, { mode: "auto", paused: false, config: cfg, executed: new Set(), subject: { sessionId: "tw" }, ambiguous: true }), "skipped:ambiguous-session", kind);
+	}
+	for (const kind of ["toast", "notify", "analyze"]) {
+		assert.notEqual(gate({ key: `${kind}:x:0`, kind }, { mode: "auto", paused: false, config: cfg, executed: new Set(), subject: { sessionId: "tw" }, ambiguous: true }), "skipped:ambiguous-session", kind);
+	}
 });
 
 test("gate: a main-session subject gets the analyst's look, and a process action only as release-shell on an analyst-proven wrong command", () => {

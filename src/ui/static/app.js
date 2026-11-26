@@ -417,7 +417,8 @@
 
 	/** One main session: the head row is the accordion toggle; the body shows details, the child tree and the health rows. */
 	function sessionCard(s) {
-		const key = s.sessionId ?? s.title;
+		// Two sessions can share an ID in different folders; the folder keeps their rows apart.
+		const key = s.sessionId ? `${s.sessionId}@${s.cwd ?? ""}` : s.title;
 		const open = openSessions.has(key);
 		const health = collectHealth(s);
 		const first = health.rows.find((r) => r.kind === "finding")?.f ?? null;

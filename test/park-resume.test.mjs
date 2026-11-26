@@ -47,7 +47,7 @@ function parkRecord(over = {}) {
 }
 
 /** A parks dir, a fake clock and fake launcher/terminal/toast actors; tick() runs one lifecycle pass. */
-function harness({ record = parkRecord(), config = DEFAULT_CONFIG, launch } = {}) {
+function harness({ record = parkRecord(), config = DEFAULT_CONFIG, launch, sessions } = {}) {
 	const root = tmpDir("park-resume-");
 	const paths = resolvePaths({ OMO_HEALTH_HOME: path.join(root, "health"), OMO_HEALTH_OMO_HOME: path.join(root, "omo"), USERPROFILE: root });
 	fs.mkdirSync(paths.health.parksDir, { recursive: true });
@@ -65,7 +65,7 @@ function harness({ record = parkRecord(), config = DEFAULT_CONFIG, launch } = {}
 			return { ok: true, handle };
 		});
 	h.tick = ({ hb, procs = [], fresh = true } = {}) => {
-		const world = makeWorld({ now: h.now, config, sensors: hb ? [{ v: 1, sessionId: SID, pid: HOST, ts: h.now, ...hb }] : [], procSnapshots: [{ takenAtMs: h.now, rows: [OTHER, ...(hb ? [hostRow(HOST, h.now - MIN)] : []), ...procs] }], procsFresh: fresh });
+		const world = makeWorld({ now: h.now, config, sessions: h.sessions, sensors: hb ? [{ v: 1, sessionId: SID, pid: HOST, ts: h.now, ...hb }] : [], procSnapshots: [{ takenAtMs: h.now, rows: [OTHER, ...(hb ? [hostRow(HOST, h.now - MIN)] : []), ...procs] }], procsFresh: fresh });
 		return runParkLifecycle({
 			paths,
 			config,
@@ -94,9 +94,31 @@ function harness({ record = parkRecord(), config = DEFAULT_CONFIG, launch } = {}
 			decide: (d) => h.decisions.push(d),
 		});
 	};
+	h.sessions = sessions;
 	if (record) h.put(record);
 	return h;
 }
+
+test("park-resume: a live twin with the same ID in another project neither completes nor relaunches the parked session; it waits (#23 item 3)", async () => {
+	const twins = [sessionState({ id: SID, cwd: "C:/dev/project", file: "C:/s/project.jsonl" }), sessionState({ id: SID, cwd: "C:/dev/other", file: "C:/s/other.jsonl" })];
+	const h = harness({ sessions: twins });
+	await h.tick({ hb: { cwd: "C:/dev/other", sessionFile: "C:/s/other.jsonl" }, procs: [sessionProc(7000, START - 10 * MIN)] });
+	assert.equal(h.read().status, "pending", "the other twin's heartbeat or --session process says nothing about this one");
+	assert.equal(h.launches.length, 0);
+	h.sessions = [twins[0]];
+	h.now += MIN;
+	await h.tick();
+	assert.equal(h.launches.length, 1, "it resumes once only one session holds the ID");
+});
+
+test("park-resume: two parked sessions with one ID in different projects do not supersede each other (#23 item 3)", async () => {
+	const h = harness({ record: null });
+	h.put(parkRecord({ cwd: "C:/dev/project" }));
+	h.put(parkRecord({ createdAt: CREATED + MIN, cwd: "C:/dev/other", terminal: { kind: "orca", orca: { worktree: "C:/dev/other" } } }));
+	await h.tick();
+	assert.deepEqual([h.read().status, h.read(CREATED + MIN).status], ["launched", "launched"]);
+	assert.deepEqual(h.launches.map((r) => r.cwd).sort(), ["C:/dev/other", "C:/dev/project"]);
+});
 
 test("park-resume: claim, launch, ack, complete", async () => {
 	const h = harness();

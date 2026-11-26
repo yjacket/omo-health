@@ -19,6 +19,7 @@ import { createEngine } from "../src/engine.mjs";
 import { createAnalyst } from "../src/judge/analyst.mjs";
 import { createInvestigations } from "../src/investigations.mjs";
 import { buildSessionRecord } from "../src/session-record.mjs";
+import { LiveSessions } from "../src/session-subject.mjs";
 import { createFakeRunner } from "./fakes/runner.mjs";
 import { resolvePaths } from "../src/paths.mjs";
 import { createFakeClock } from "../src/util/time.mjs";
@@ -34,7 +35,7 @@ const iso = (ms) => new Date(ms).toISOString();
 const GREP = "grep -o 'x\\{0,1800\\}y' omo.js | head -1";
 const SHELL = `"C:\\Program Files\\Git\\bin\\bash.exe" -c "${GREP.replace(/"/g, '\\"')}"`;
 
-function harness({ mode, background = "background", parentSensor = true, pause = false, withKill = true, stalledKind = "child", taskStatus = "running", taskTerminalAtMs, killFailures = 0, extraDetectors = [], sensorVersion, sensorIdle = true, footer, analyst, baseline, config: extraConfig = {} } = {}) {
+function harness({ twinChild = false, mode, background = "background", parentSensor = true, pause = false, withKill = true, stalledKind = "child", taskStatus = "running", taskTerminalAtMs, killFailures = 0, extraDetectors = [], sensorVersion, sensorIdle = true, footer, analyst, baseline, config: extraConfig = {} } = {}) {
 	const root = tmpDir("omoh-engine-");
 	const paths = resolvePaths({ OMO_HEALTH_HOME: path.join(root, "h"), OMO_HEALTH_OMO_HOME: path.join(root, "o"), USERPROFILE: root });
 	fs.mkdirSync(paths.healthHome, { recursive: true });
@@ -44,6 +45,10 @@ function harness({ mode, background = "background", parentSensor = true, pause =
 	const child = sessionState({ id: "c1", kind: stalledKind, taskId: task.taskId, hostPid: HOST, parentSessionId: "p1", rootSessionId: "p1", task, pendingCalls: [{ id: "toolu_grep", name: "bash", args: { command: GREP }, ms: CALL_MS, batchId: "b" }] });
 	const parent = sessionState({ id: "p1", kind: "main", hostPid: HOST, lastMessage: { role: "assistant", stopReason: "stop" } });
 	const sessions = new Map([["c1", child], ["p1", parent]]);
+	// twinChild: a second session with the child's ID in another project, as the daemon's registry keeps it; "ended"
+	// makes it a transcript whose host is gone.
+	const twin = { ...child, cwd: "C:\\dev\\other", file: "C:/tmp/other/c1.jsonl", ...(twinChild === "ended" ? { task: { ...task, hostPid: 999_999 } } : {}) };
+	const live = { sessions: twinChild ? LiveSessions.of([child, parent, twin]) : sessions };
 	const procRows = new Map([
 		[HOST, { p: HOST, pp: 1, n: "node.exe", c: "2026-09-23T09:00:00Z", cpu: 0, pv: 1e8, cl: "node C:\\x\\@code-yeongyu\\senpi\\dist\\bundle\\cli.js" }],
 		[60168, { p: 60168, pp: HOST, n: "bash.exe", c: iso(CALL_MS + 5), cpu: 0, pv: 1e6, cl: SHELL }],
@@ -81,7 +86,7 @@ function harness({ mode, background = "background", parentSensor = true, pause =
 			{ name: "runaway", ...runaway },
 			...extraDetectors,
 		],
-		sources: { procs, registry: { refresh: () => ({ sessions, tasks: [task] }) }, logs: { read() {}, drain: () => [], stats: new Map() } },
+		sources: { procs, registry: { refresh: () => ({ sessions: live.sessions, tasks: [task] }) }, logs: { read() {}, drain: () => [], stats: new Map() } },
 		actors: {
 			kill: withKill
 				? (args) =>
@@ -108,7 +113,7 @@ function harness({ mode, background = "background", parentSensor = true, pause =
 		},
 		options: { selfPid: 1 },
 	});
-	return { engine, clock, child, sessions, procRows, killed, sent, toasts, decisions, paths, investigations: createInvestigations({ paths, clock }) };
+	return { engine, clock, child, sessions, live, procRows, killed, sent, toasts, decisions, paths, investigations: createInvestigations({ paths, clock }) };
 }
 
 async function runUntil(h, untilMs, stepMs = 20_000) {
@@ -376,6 +381,26 @@ test("a nudge about a child is never rerouted to the main session or a toast (us
 	assert.ok(h.decisions.some((d) => d.action?.kind === "nudge"), "the nudge was planned and gated through");
 	assert.equal(h.sent.length, 0);
 	assert.equal(h.toasts.length, 0);
+});
+
+test("an action for a session whose ID another live session shares waits until only one holds the ID (#23 item 3)", async () => {
+	const nudge = makeFinding({ detector: "D8", kind: "stopped-on-errors", severity: "warn", subject: { sessionId: "c1", taskId: "st_01a0ced9", parentSessionId: "p1", rootSessionId: "p1", key: "errstop" }, evidence: [], titleKo: "t", detailKo: "d", data: { remedy: { kind: "nudge" } } });
+	const h = harness({ twinChild: true, extraDetectors: [{ name: "fake-d8", detect: () => [nudge] }] });
+	await h.engine.tick();
+	const nudges = () => h.decisions.filter((d) => d.action?.kind === "nudge").map((d) => d.result);
+	assert.deepEqual(nudges(), ["skipped:ambiguous-session"]);
+	h.clock.advance(20_000);
+	await h.engine.tick();
+	assert.deepEqual(nudges(), ["skipped:ambiguous-session"], "held, logged once");
+	h.live.sessions = h.sessions;
+	h.clock.advance(20_000);
+	await h.engine.tick();
+	assert.deepEqual(nudges(), ["skipped:ambiguous-session", "execute"], "the held action runs once the twin is gone");
+
+	// A twin whose host is gone is a recent transcript, not a second live session: nothing is held.
+	const ended = harness({ twinChild: "ended", extraDetectors: [{ name: "fake-d8", detect: () => [nudge] }] });
+	await ended.engine.tick();
+	assert.deepEqual(ended.decisions.filter((d) => d.action?.kind === "nudge").map((d) => d.result), ["execute"]);
 });
 
 test("an action that throws is retried on the next tick instead of being dropped", async () => {
