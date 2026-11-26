@@ -40,6 +40,12 @@ test("budget defaults match C-config exactly", () => {
 		maxChangePercent: 100,
 		ownerProjectPercent: 25,
 		burstFactor: 1.25,
+		shortMinBurnHours: 6,
+		sessionDayInvestigatePercent: 5,
+		sessionDayPercent: 10,
+		sessionDayInvestigateUsd: 80,
+		sessionDayUsd: 160,
+		windows: {},
 		closeGraceMs: 24 * H,
 		providerAliases: ["claude-sdk-oauth=anthropic-subscription"],
 		calibration: { minIntervalPercent: 2, minIntervals: 10, minCoveragePercent: 20, maxGapMs: 2 * H, earlyDropPercent: 5 },
@@ -93,6 +99,23 @@ test("an unknown budget key logs unknown config key ignored and keeps defaults",
 	assert.equal(config.budget.enabled, false, "a valid sibling still applies");
 	assert.equal(config.budget.audit.perDay, 4);
 	assert.deepEqual(warnings, ["unknown config key ignored: budget.audit.bogus"]);
+});
+
+test("budget.windows takes per-window session-day thresholds keyed by account:window; bad entries are warned and dropped (#33)", () => {
+	const { dir, paths } = tempPaths();
+	const key = "anthropic-subscription/default:claude:7d";
+	fs.writeFileSync(paths.health.configFile, JSON.stringify({ budget: { sessionDayPercent: 12, windows: { [key]: { sessionDayPercent: 20 }, "chatgpt-subscription/default:codex:primary": { sessionDayInvestigatePercent: -1, bogus: 3 }, broken: 7 } } }));
+	const extra = path.join(dir, "extra.json");
+	fs.writeFileSync(extra, JSON.stringify({ budget: { windows: { [key]: { sessionDayInvestigatePercent: 8 } } } }));
+	const { config, warnings } = loadConfig({ env: { OMO_HEALTH_CONFIG: extra }, paths });
+	assert.equal(config.budget.sessionDayPercent, 12);
+	assert.deepEqual(config.budget.windows, { [key]: { sessionDayPercent: 20, sessionDayInvestigatePercent: 8 } }, "a later file adds to the same window");
+	assert.deepEqual(warnings, [
+		"config budget.windows.chatgpt-subscription/default:codex:primary.sessionDayInvestigatePercent must be a non-negative number; ignored",
+		"unknown config key ignored: budget.windows.chatgpt-subscription/default:codex:primary.bogus",
+		"config budget.windows.broken must be an object; ignored",
+	]);
+	assert.deepEqual(DEFAULT_CONFIG.budget.windows, {}, "the defaults are not mutated");
 });
 
 test("a negative budget.reservePercent keeps the default 10 (QA failure scenario)", () => {

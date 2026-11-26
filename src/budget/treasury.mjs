@@ -31,8 +31,8 @@ function currentEpoch(samples, earlyDropPercent) {
 	return samples.slice(start);
 }
 
-// (last - first usedPercent) / hours over the current epoch's samples inside the last 24 h.
-// Fewer than 2 samples or a span under 1 h => null (no burn estimate).
+// (last - first usedPercent) / hours over the current epoch's samples inside the last 24 h, and how many hours that
+// rate covers. Fewer than 2 samples or a span under 1 h => null (no burn estimate).
 function burnRate(samples, now, earlyDropPercent) {
 	const epoch = currentEpoch(samples, earlyDropPercent).filter((sample) => sample.updatedMs >= now - DAY_MS);
 	if (epoch.length < 2) return null;
@@ -40,7 +40,7 @@ function burnRate(samples, now, earlyDropPercent) {
 	const last = epoch[epoch.length - 1];
 	const spanMs = last.updatedMs - first.updatedMs;
 	if (spanMs < HOUR_MS) return null;
-	return (last.usedPercent - first.usedPercent) / (spanMs / HOUR_MS);
+	return { perHour: (last.usedPercent - first.usedPercent) / (spanMs / HOUR_MS), hours: spanMs / HOUR_MS };
 }
 
 function scopeOf(window) {
@@ -79,7 +79,13 @@ export function windowState({ account, window, samples, calibration, committedUs
 	const committedPercent = calibrated ? committed * calibrationHigh : null;
 	const freePercent = usedPercent === null ? null : Math.max(0, 100 - usedPercent - reservePercent - (committedPercent ?? 0));
 
-	const burnPerHour = burnRate(reading, now, earlyDropOf(cfg));
+	const burn = burnRate(reading, now, earlyDropOf(cfg));
+	const burnPerHour = burn?.perHour ?? null;
+	const burnHours = burn?.hours ?? null;
+	// A projection from a rate that has not lasted budget.shortMinBurnHours is a spike, not a trend (#33): it reads tight.
+	// "Lasted" is the span of the samples the rate is averaged over, not a check that the rate held steady inside it.
+	const minBurnHours = finite(cfg?.shortMinBurnHours) ? cfg.shortMinBurnHours : 6;
+	const sustained = burnHours !== null && burnHours >= minBurnHours;
 	const projectedAtResetPercent =
 		usedPercent === null || burnPerHour === null || hoursLeft === null ? null : usedPercent + burnPerHour * hoursLeft;
 	const safeDailyPercent =
@@ -93,7 +99,7 @@ export function windowState({ account, window, samples, calibration, committedUs
 	let state;
 	if (stale === true || usedPercent === null) state = "unknown";
 	else if (usedPercent >= 100) state = "short";
-	else if (projectedAtResetPercent !== null && projectedAtResetPercent > 100) state = "short";
+	else if (projectedAtResetPercent !== null && projectedAtResetPercent > 100 && sustained) state = "short";
 	else if ((projectedAtResetPercent !== null && projectedAtResetPercent > 100 - reservePercent) || freePercent < 5) state = "tight";
 	else state = "ok";
 
@@ -109,6 +115,7 @@ export function windowState({ account, window, samples, calibration, committedUs
 		committedPercent,
 		freePercent,
 		burnPerHour,
+		burnHours,
 		projectedAtResetPercent,
 		safeDailyPercent,
 		state,

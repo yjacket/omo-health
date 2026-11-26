@@ -7,8 +7,12 @@ import { makeFinding } from "./finding.mjs";
  * Pure and advisory. It reads only `world.budget` (the snapshot's own `enabled`
  * flag decides), never stops a session, edits a goal or writes anything.
  * Findings:
- *   treasury-short  warn, human needed - a window reaches its reserve by reset
+ *   treasury-short  warn, human needed - a window passes 100% by reset at a burn rate that has lasted
+ *                                        budget.shortMinBurnHours (a shorter spike reads tight)
  *   treasury-tight  info               - a window is close to the reserve
+ *   session-day     warn, human needed - one root session tree used budget.sessionDayPercent of a window (or
+ *                                        budget.sessionDayUsd of uncounted cost) in the last 24 h (#33); the
+ *                                        investigate level below it only opens an audit and raises nothing
  *   audit-opinion   info               - the auditor judged spend waste-likely
  *   owner-call      warn, human needed - past the review ladder's last tier the session was asked to call the owner;
  *                                        gone once the office records the owner's answer (`ownerCall.answeredMs`)
@@ -115,6 +119,36 @@ function auditFinding(audit) {
         });
 }
 
+function sessionDayFinding(session) {
+        if (session.level !== "owner" || !session.basis) return null;
+        const sessionId = String(session.sessionId ?? "");
+        if (!sessionId) return null;
+        const basis = session.basis;
+        const usd = (value) => (Number.isFinite(value) ? `$${Math.round(value)}` : "?");
+        const amount = basis.kind === "window" ? `${basis.label ?? basis.windowId}의 ${pct(basis.percent)}` : usd(basis.usd);
+        // USD basis: cost of an uncalibrated window, an unmapped provider or a proxy, which no window % can express.
+        const limit = basis.kind === "window" ? `기준 ${pct(basis.thresholdPercent)}` : `창 %로 환산하지 못한 비용, 기준 ${usd(basis.thresholdUsd)}`;
+        const subjectName = session.objective ? truncate(session.objective, 40) : sessionId.slice(0, 8);
+        return makeFinding({
+                detector: id,
+                kind: "session-day",
+                severity: "warn",
+                humanNeeded: true,
+                subject: { key: `budget:session-day:${sessionId}` },
+                evidence: [
+                        `session:${sessionId}`,
+                        `basis:${basis.kind === "window" ? `${basis.account}:${basis.windowId}` : "usd"}`,
+                        `value:${basis.kind === "window" ? basis.percent : basis.usd}`,
+                        `totalUsd:${session.totalUsd}`,
+                        `mainUsd:${session.mainUsd}`,
+                        `childUsd:${session.childUsd}`,
+                ],
+                titleKo: `세션 하루 사용량: ${subjectName} ${amount}`,
+                detailKo: `이 세션(하위작업 포함)이 최근 24시간에 ${amount}를 썼습니다(${limit}). 메인 ${usd(session.mainUsd)}, 하위작업 ${usd(session.childUsd)}. 아무것도 멈추지 않았습니다.`,
+                data: { sessionDay: { sessionId, projectId: session.projectId ?? null, level: session.level, basis, totalUsd: session.totalUsd, mainUsd: session.mainUsd, childUsd: session.childUsd } },
+        });
+}
+
 function ownerCallFinding(project) {
         const call = project?.ownerCall;
         if (!call || !Number.isFinite(call.ms) || Number.isFinite(call.answeredMs)) return null;
@@ -139,6 +173,10 @@ export function detect(world) {
         const out = [];
         for (const window of budget.treasury?.windows ?? []) {
                 const finding = windowFinding(window ?? {});
+                if (finding) out.push(finding);
+        }
+        for (const session of budget.sessionDay?.sessions ?? []) {
+                const finding = sessionDayFinding(session ?? {});
                 if (finding) out.push(finding);
         }
         for (const audit of budget.audits ?? []) {

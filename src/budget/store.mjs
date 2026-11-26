@@ -154,6 +154,17 @@ export function createBudgetStore(db) {
 			}));
 		},
 
+		/** Reported-cost rows since `sinceMs` with the fields a per-session-tree share needs (session-day.mjs). */
+		usageRows({ sinceMs, sources }) {
+			const list = sources?.length ? sources : ["main", "child"];
+			return db
+				.prepare(
+					`SELECT ms, root_session_id AS rootSessionId, source, provider, model, cost FROM usage_events
+					 WHERE ms >= ? AND cost_status = 'reported' AND cost IS NOT NULL AND source IN (${list.map(() => "?").join(", ")})`,
+				)
+				.all(sinceMs, ...list);
+		},
+
 		/**
 		 * Aggregates reported USD (and counts missing-cost events). `accounts` filters to one window: the row's
 		 * provider must resolve to that account and the window must apply to the row's model.

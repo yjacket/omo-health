@@ -69,7 +69,7 @@ function harness(t, { enabled = true, mode = "auto", twin = false } = {}) {
 	return { root, paths, clock, config, engine, sessions, main, store: createBudgetStore(db) };
 }
 
-/** A goal session that spent $12 (>= estimateAfterUsd) and a 7-day window burning 10 %/h with 48 h left (short). */
+/** A goal session that spent $12 (>= estimateAfterUsd) and a 7-day window burning 40% over 6 h with 48 h left (short). */
 function seed(h) {
 	const cwd = path.join(h.root, "proj");
 	fs.mkdirSync(cwd, { recursive: true });
@@ -82,7 +82,7 @@ function seed(h) {
 		E.assistant({ ms: T0 - 2 * HOUR, usage: { input: 10, output: 20, cacheRead: 0, cacheWrite: 0, cost: { total: 12 } }, text: "working" }),
 	]);
 	const resetsAtMs = T0 + 48 * HOUR;
-	h.store.insertQuotaSamples([{ account: ACCOUNT, windowId: "claude:7d", updatedMs: T0 - 2 * HOUR, usedPercent: 60, resetsAtMs, windowMinutes: 10080 }]);
+	h.store.insertQuotaSamples([{ account: ACCOUNT, windowId: "claude:7d", updatedMs: T0 - 6 * HOUR, usedPercent: 40, resetsAtMs, windowMinutes: 10080 }]);
 	fs.mkdirSync(path.dirname(h.paths.subscriptionUsageFile), { recursive: true });
 	fs.writeFileSync(h.paths.subscriptionUsageFile, JSON.stringify({
 		accounts: { [ACCOUNT]: { plan: "max", updatedAt: T0, nextAt: T0 + MIN, windows: [{ id: "claude:7d", label: "7d", windowMinutes: 10080, usedPercent: 80, resetsAt: iso(resetsAtMs) }] } },

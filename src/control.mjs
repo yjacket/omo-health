@@ -1,5 +1,5 @@
 import path from "node:path";
-import { DEFAULT_CONFIG } from "./config.mjs";
+import { DEFAULT_CONFIG, MAP_ENTRY_KEYS } from "./config.mjs";
 import { atomicWriteJson, readJsonSafe, removeSafe, statSafe } from "./util/fsx.mjs";
 
 /** True while automatic actions are paused (an unreadable pause file counts as paused). */
@@ -69,24 +69,19 @@ export function getPath(obj, dottedKey) {
 	return cur;
 }
 
-export function setSwitch(paths, key, value) {
-	const spec = SWITCHES.find((s) => s.key === key);
-	if (!spec) return { ok: false, reason: "unknown-key" };
-	const valid = spec.type === "boolean" ? typeof value === "boolean" : spec.values.some((v) => v.value === value);
-	if (!valid) return { ok: false, reason: "invalid-value" };
+/** Writes `value` at `parts` of config.json; with `drop` removes that key and every parent it leaves empty. */
+function writeConfigValue(paths, parts, value, drop) {
 	const file = paths.health.configFile;
 	let root = {};
 	if (statSafe(file)) {
 		root = readJsonSafe(file);
 		if (!isPlainObject(root)) return { ok: false, reason: "unreadable", message: `${file} is not a valid JSON object` };
 	}
-	const parts = key.split(".");
-	const isDefault = getPath(DEFAULT_CONFIG, key) === value;
 	const chain = [root];
 	for (const part of parts.slice(0, -1)) {
 		let next = chain.at(-1)[part];
 		if (!isPlainObject(next)) {
-			if (isDefault) break;
+			if (drop) break;
 			next = {};
 			chain.at(-1)[part] = next;
 		}
@@ -94,7 +89,7 @@ export function setSwitch(paths, key, value) {
 	}
 	const leaf = parts.at(-1);
 	if (chain.length === parts.length) {
-		if (isDefault) delete chain.at(-1)[leaf];
+		if (drop) delete chain.at(-1)[leaf];
 		else chain.at(-1)[leaf] = value;
 	}
 	for (let i = chain.length - 1; i > 0; i--) {
@@ -102,5 +97,41 @@ export function setSwitch(paths, key, value) {
 		delete chain[i - 1][parts[i - 1]];
 	}
 	atomicWriteJson(file, root);
-	return { ok: true, file, value, isDefault };
+	return { ok: true, file };
+}
+
+export function setSwitch(paths, key, value) {
+	const spec = SWITCHES.find((s) => s.key === key);
+	if (!spec) return { ok: false, reason: "unknown-key" };
+	const valid = spec.type === "boolean" ? typeof value === "boolean" : spec.values.some((v) => v.value === value);
+	if (!valid) return { ok: false, reason: "invalid-value" };
+	const isDefault = getPath(DEFAULT_CONFIG, key) === value;
+	const written = writeConfigValue(paths, key.split("."), value, isDefault);
+	return written.ok ? { ...written, value, isDefault } : written;
+}
+
+/** The number settings the dashboard edits (#33): non-negative numbers, 0 turns a threshold off. */
+export const NUMBER_KEYS = Object.freeze(["budget.sessionDayInvestigatePercent", "budget.sessionDayPercent", "budget.sessionDayInvestigateUsd", "budget.sessionDayUsd", "budget.shortMinBurnHours"]);
+/** The config map whose entries override the session-day percent pair per window. */
+export const WINDOW_MAP = "budget.windows";
+/** A window is named "<account>:<windowId>": no blanks, and a colon inside. */
+const WINDOW_NAME = /^[^\s:]\S*:\S+$/;
+const WINDOW_NAME_MAX = 200;
+const RESERVED_NAMES = new Set(["__proto__", "constructor", "prototype"]);
+
+/**
+ * Sets one number setting in config.json; `null` puts it back to its default. With `window` the key is that window's
+ * override in budget.windows (one of MAP_ENTRY_KEYS), and `null` removes the override.
+ */
+export function setNumber(paths, key, value, window) {
+	const perWindow = window !== undefined;
+	// A hand-written entry without the "<account>:<windowId>" shape may still be removed (value null), never set.
+	const windowOk = typeof window === "string" && window.length > 0 && window.length <= WINDOW_NAME_MAX && !RESERVED_NAMES.has(window) && (value === null || WINDOW_NAME.test(window));
+	const known = perWindow ? windowOk && MAP_ENTRY_KEYS[WINDOW_MAP].includes(key) : NUMBER_KEYS.includes(key);
+	if (!known) return { ok: false, reason: "unknown-key" };
+	if (value !== null && !(typeof value === "number" && Number.isFinite(value) && value >= 0)) return { ok: false, reason: "invalid-value" };
+	const def = perWindow ? null : getPath(DEFAULT_CONFIG, key);
+	const isDefault = value === null || value === def;
+	const written = writeConfigValue(paths, perWindow ? [...WINDOW_MAP.split("."), window, key] : key.split("."), value, isDefault);
+	return written.ok ? { ...written, value: isDefault ? def : value, isDefault } : written;
 }
