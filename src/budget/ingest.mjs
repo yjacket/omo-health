@@ -2,10 +2,11 @@
 // transcript inside the backfill window (bounded bytes per run), turns them into usage rows (idempotent ids), round
 // sightings and budget blocks, and reports the goals each main session has had.
 //
-// Attribution: a main-session event belongs to the goal whose [createdMs, (completedMs ?? Infinity) + closeGraceMs)
-// holds the event time (latest createdMs wins). A subagent event belongs for life to the goal its task was created
-// under: projectOf(task.created_at) over the root session's goals, a function of stored records only, so a restart
-// that re-reads from offset 0 attributes every row the same way.
+// Attribution: a main-session event belongs to the goal whose [createdMs, completedMs ?? Infinity) holds the event
+// time (latest createdMs wins); main-session work after a goal completed is new work and belongs to no project until
+// the next goal exists, like a session that never had a goal. A subagent event belongs for life to the goal its task
+// was created under: projectOf(task.created_at) over the root session's goals with closeGraceMs added to completedMs,
+// a function of stored records only, so a restart that re-reads from offset 0 attributes every row the same way.
 import fs from "node:fs";
 import path from "node:path";
 import { createTaskStoreReader, senpiTaskStoreDir } from "../collect/tasks.mjs";
@@ -378,7 +379,7 @@ export function createIngest({ paths, store, clock, config, readTaskStores }) {
 
 				const sessionGoals = item.source === "main" ? goalsFor(item.sessionId) : null;
 				const projectOf = item.source === "main"
-					? (ms) => projectOfGoals(item.sessionId, sessionGoals, ms, graceMs)
+					? (ms) => projectOfGoals(item.sessionId, sessionGoals, ms, 0)
 					: () => item.fixedProjectId;
 				const usage = [];
 				let start = 0;

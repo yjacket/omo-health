@@ -452,7 +452,8 @@ test("(l) an unterminated line longer than the cap waits for its newline before 
 
 
 test("(m) a completed goal inside closeGrace starts no audit; an active goal does", (t) => {
-	const completedMs = T0 - 14 * HOUR;
+	// After the last round (T0 - 10 h): main-session rounds after completion are new work and count for no project.
+	const completedMs = T0 - 9 * HOUR;
 	const transcript = (c) => {
 		const entries = [E.header(c.sid, c.cwd, T0 - 20 * HOUR)];
 		// 11 numbered rounds: past the ladder's first step (10) with no approved budget.
@@ -460,7 +461,7 @@ test("(m) a completed goal inside closeGrace starts no audit; an active goal doe
 		return entries;
 	};
 
-	// A goal completed 14 h ago: still inside the 24 h closeGrace, 11 numbered rounds and $40 spent.
+	// A goal completed 9 h ago: still inside the 24 h closeGrace, 11 numbered rounds and $40 spent.
 	const done = setup(t);
 	const donePid = `${done.sid}:g1`;
 	done.writeGoal({ id: "g1", objective: "finished work", status: "completed", completedAt: secs(completedMs), createdAt: secs(T0 - 22 * HOUR), updatedAt: secs(completedMs) });
@@ -544,7 +545,7 @@ test("(q) a session that left the backfill window is no longer in progress: no a
 test("(p) a cancelled goal's heavy trigger records one audit-skipped and starts no audit", (t) => {
 	const c = setup(t);
 	const pid = `${c.sid}:g1`;
-	c.writeGoal({ id: "g1", objective: "cancelled work", status: "cancelled", completedAt: secs(T0 - 14 * HOUR), createdAt: secs(T0 - 20 * HOUR), updatedAt: secs(T0 - 14 * HOUR) });
+	c.writeGoal({ id: "g1", objective: "cancelled work", status: "cancelled", completedAt: secs(T0 - 9 * HOUR), createdAt: secs(T0 - 20 * HOUR), updatedAt: secs(T0 - 9 * HOUR) });
 	const entries = [E.header(c.sid, c.cwd, T0 - 20 * HOUR)];
 	for (let i = 1; i <= 11; i++) entries.push(E.assistant({ ms: T0 - (21 - i) * HOUR, text: `QA round ${i} finished`, usage: usage(40 / 7) }));
 	writeJsonl(c.file, entries);
