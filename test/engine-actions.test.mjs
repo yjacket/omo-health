@@ -14,7 +14,7 @@ import * as tokens from "../src/detect/tokens.mjs";
 
 const T0 = Date.parse("2026-10-19T10:00:00Z");
 
-function harness({ findings, sensors, sessions, config = {}, analyst, investigations, detectorName = "test-actions" }) {
+function harness({ findings, sensors, sessions, config = {}, analyst, investigations, detectorName = "test-actions", mode = "auto" }) {
 	const root = tmpDir("omoh-actions-");
 	const paths = resolvePaths({ OMO_HEALTH_HOME: path.join(root, "h"), OMO_HEALTH_OMO_HOME: path.join(root, "o"), USERPROFILE: root });
 	fs.mkdirSync(paths.healthHome, { recursive: true });
@@ -28,7 +28,7 @@ function harness({ findings, sensors, sessions, config = {}, analyst, investigat
 	const engine = createEngine({
 		paths,
 		config: { ...DEFAULT_CONFIG, ...config },
-		mode: "auto",
+		mode,
 		clock,
 		detectors: [{ name: detectorName, detect: (world, memory) => (typeof findings === "function" ? findings(world, memory) : findings) }],
 		sources: {
@@ -67,6 +67,18 @@ test("a D4 burn spike's hold survives a daemon restart: a dip right after it is 
 	await h2.engine.tick();
 	assert.notEqual(h2.engine.records.get(fp)?.state, "resolved", "the dip within burnHoldMs does not end the episode");
 	assert.ok(!h2.decisions.some((d) => d.fp === fp && d.event === "resolved"), "no resolve row after the restart");
+});
+
+test("every action decision, executed or gated, is written as event action (#34)", async () => {
+	const toast = makeFinding({ detector: "D26", kind: "treasury-short", severity: "warn", humanNeeded: true, subject: { key: "treasury" }, titleKo: "예산 부족" });
+	const executed = harness({ findings: [toast], sensors: new Map() });
+	await executed.engine.tick();
+	const wake = makeFinding({ detector: "D21", kind: "goal-wait-idle", subject: { sessionId: "p1", key: "silent:0" }, titleKo: "goal 세션 대기", data: { remedy: { kind: "goal-wake", reason: "idle-monitor" }, sources: [] } });
+	const gated = harness({ findings: [wake], sensors: new Map([["p1", { sessionId: "p1", pid: 1, ts: T0, idle: true, sensorVersion: "0.8.0" }]]), mode: "shadow" });
+	await gated.engine.tick();
+	const rows = [...executed.decisions, ...gated.decisions].filter((d) => d.action);
+	assert.deepEqual(rows.map((d) => [d.action.kind, d.result]), [["toast", "execute"], ["analyze", "would"], ["goal-wake", "would"]]);
+	assert.deepEqual(rows.map((d) => d.event), ["action", "action", "action"]);
 });
 
 test("a goal wake carries its sources and the analyst verdict, and marks whyNoticed", async () => {

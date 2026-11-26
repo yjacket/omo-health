@@ -40,7 +40,8 @@ const TEXT_MAX = 2000;
 // Entries with more than one role list their discriminator before the default.
 // A gate row is retained as the outcome of an action decision, not as an execution.
 export const DECISION_EVENT_SHAPES = Object.freeze({
-	"(no event)": Object.freeze({ action: "action" }),
+	// Older retained action rows carry no event; every reader still takes a row with an `action` object as an action (#34).
+	action: "action",
 	opened: "finding",
 	reopened: "finding",
 	severity: "finding",

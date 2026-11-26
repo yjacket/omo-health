@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased
+- Decision log: an action row (executed, or held at the gate as `would` or `skipped:*`) is written with `event: "action"`, so a reader that sorts rows by `event` no longer counts it as an `undefined` event next to the finding's `opened` row. Older retained rows without `event` still read as actions by their `action` object. (#34)
+
 ## 0.9.1 - 2026-11-26
 - Review-opinion ladder: a tier is spent only by an audit that gave an opinion. An audit that fails, times out, finds no model or is cancelled leaves its tier open; the retry waits `budget.audit.minGapMs` (6 h) after the last attempt, and after 3 attempts without an opinion the tier counts as spent. (#24)
 - D26 `owner-call` goes away once the session records the owner's answer after the call: a question-tool result with status `answered`, or a deferred answer that arrives as a `[Answer to question ...]` user message. A timeout, a pending question and any other user message are not answers. The snapshot keeps `ownerCall.answeredMs` and an `owner-answered` event. (#24)

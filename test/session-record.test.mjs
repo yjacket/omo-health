@@ -63,6 +63,9 @@ test("plan38 action producer shapes survive record, detail and audit projection"
 		// src/engine.mjs:1191,1216 (gate and execution).
 		[{ ...ordinary, result: "would" }, "release-shell", "would", "기다리던 셸 해제"],
 		[{ ...ordinary, result: "execute", outcome: { killed: ["proc:5"], survived: [], noop: [], quiet: true } }, "release-shell", "execute", "기다리던 셸 해제", { killed: 1 }],
+		// The same rows as written since #34, with event "action".
+		[{ ...ordinary, event: "action", result: "would" }, "release-shell", "would", "기다리던 셸 해제"],
+		[{ ...ordinary, event: "action", result: "execute", outcome: { killed: ["proc:5"], survived: [], noop: [], quiet: true } }, "release-shell", "execute", "기다리던 셸 해제", { killed: 1 }],
 		// src/engine.mjs:327.
 		...[["shown", true, false], ["cooldown", false, false], ["failed", false, true]].map(([toast, delivered, error]) =>
 			[{ ...inv, result: "hold-toast", toast }, "hold-toast", toast, "조사 지연 알림", { delivered, error }]),
