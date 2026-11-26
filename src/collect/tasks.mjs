@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { safeSubjectId } from "../session-id.mjs";
 import { listDirSafe, statSafe } from "../util/fsx.mjs";
 import { toMs } from "../util/time.mjs";
 
@@ -100,25 +101,45 @@ export function normalizeTask(raw, storeDir) {
 	};
 }
 
-/** Locate the child session JSONL of a task (newest file wins when ids are missing). */
+// Accept a date alone or Senpi's ISO timestamp with ":" and "." replaced by "-".
+const SESSION_FILE_NAME = /^\d{4}-\d{2}-\d{2}(?:T\d{2}-\d{2}-\d{2}-\d{3}Z)?_(.+)\.jsonl$/;
+
+export function idFromFileName(file) {
+	return safeSubjectId(SESSION_FILE_NAME.exec(path.basename(file))?.[1]) ?? undefined;
+}
+
+/** A task directory proves ownership only with one candidate. Stop at the second;
+ * null is a veto, undefined means this directory has no candidate. */
+export function soleChildSessionFile(dir) {
+	let entries;
+	try {
+		entries = fs.opendirSync(dir);
+		let file;
+		for (let entry; (entry = entries.readSync());) {
+			if (!entry.name.endsWith(".jsonl")) continue;
+			const candidate = path.join(dir, entry.name);
+			if (!entry.isFile() && !(entry.isSymbolicLink() && statSafe(candidate)?.isFile())) continue;
+			if (file) return null;
+			file = candidate;
+		}
+		return file;
+	} catch (error) {
+		return error.code === "ENOENT" || error.code === "ENOTDIR" ? undefined : null;
+	} finally {
+		entries?.closeSync();
+	}
+}
+
+/**
+ * Locate the child session JSONL of a task: the file named for `childSessionId`, else (no id, or the task id)
+ * the directory's only transcript. Undefined means no candidate; null means several, so none is the owner.
+ */
 export function findChildSessionFile(storeDir, taskId, childSessionId) {
 	const dir = path.join(storeDir, "children", taskId, "sessions", taskId);
-	const files = listDirSafe(dir).filter((name) => name.endsWith(".jsonl"));
-	if (!files.length) return undefined;
-	if (childSessionId) {
-		const exact = files.find((name) => name.endsWith(`_${childSessionId}.jsonl`));
-		if (exact) return path.join(dir, exact);
-	}
-	let newest;
-	let newestMs = -1;
-	for (const name of files) {
-		const stat = statSafe(path.join(dir, name));
-		if (stat && stat.mtimeMs > newestMs) {
-			newest = name;
-			newestMs = stat.mtimeMs;
-		}
-	}
-	return newest ? path.join(dir, newest) : undefined;
+	if (!childSessionId || childSessionId === taskId) return soleChildSessionFile(dir);
+	const exact = listDirSafe(dir).find((name) =>
+		idFromFileName(name) === childSessionId && statSafe(path.join(dir, name))?.isFile());
+	return exact && path.join(dir, exact);
 }
 
 const RUN_EVENTS_TAIL_BYTES = 8192;

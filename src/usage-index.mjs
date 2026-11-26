@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { addModelCounters, compactFragmentBuffer, emptyModelBilling, emptyUsage, FRAGMENT_RESERVE_BYTES, isExactInode, MODEL_KEY_LENGTH, MODEL_KEY_LIMIT, readUsage, readUsageFileStamp, retainedFragmentBytes, sameFileStamp } from "./collect/usage.mjs";
+import { soleChildSessionFile } from "./collect/tasks.mjs";
 import { pathKey } from "./paths.mjs";
 import { parseSubjectKey, SubjectMap, subjectKey, subjectOf, uniqueMatch } from "./session-subject.mjs";
 import { atomicWriteChunks, statSafe } from "./util/fsx.mjs";
@@ -141,28 +142,6 @@ function ownerTotals(usage) {
 		costUnknown: src.costUnknown === true,
 		turns: src.turns ?? 0,
 	};
-}
-
-/** A task directory proves ownership only with one candidate. Stop at the second;
- * null is a veto, undefined means this directory has no candidate. */
-export function soleChildSessionFile(dir) {
-	let entries;
-	try {
-		entries = fs.opendirSync(dir);
-		let file;
-		for (let entry; (entry = entries.readSync());) {
-			if (!entry.name.endsWith(".jsonl")) continue;
-			const candidate = join(dir, entry.name);
-			if (!entry.isFile() && !(entry.isSymbolicLink() && statSafe(candidate)?.isFile())) continue;
-			if (file) return null;
-			file = candidate;
-		}
-		return file;
-	} catch (error) {
-		return error.code === "ENOENT" || error.code === "ENOTDIR" ? undefined : null;
-	} finally {
-		entries?.closeSync();
-	}
 }
 
 export const isTaskOnlyEntry = (entry) => entry?.kind === "child" && Boolean(entry.taskId) && entry.id === entry.taskId;
