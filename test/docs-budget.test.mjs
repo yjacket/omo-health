@@ -37,9 +37,9 @@ test("the README estimate example matches the block the request message carries"
 	assert.match(read("README.md"), /<omo-budget kind="estimate">\n\{"v":1,"requestId":"req-1","projectId":"<project>","baseRevision":0,"remainingUsd":\{"p10":<p10>,"p50":<p50>,"p90":<p90>\},"workClass":"mixed","basis":\{"workUnits":\[\{"description":"<work unit>","count":<count>\}\],"assumptions":\[\]\},"nextCheckpoint":"<next checkpoint>"\}\n<\/omo-budget>/);
 });
 
-test("package version is 0.9.0 and the changelog has its entry", () => {
-	assert.equal(JSON.parse(read("package.json")).version, "0.9.0");
-	assert.match(read("CHANGELOG.md"), /^## 0\.9\.0 - \d{4}-\d{2}-\d{2}$/m);
+test("package version is 0.9.1 and the changelog has its entry", () => {
+	assert.equal(JSON.parse(read("package.json")).version, "0.9.1");
+	assert.match(read("CHANGELOG.md"), /^## 0\.9\.1 - \d{4}-\d{2}-\d{2}$/m);
 });
 
 test("every command in the README command table exists in COMMANDS", () => {
