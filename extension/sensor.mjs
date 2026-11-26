@@ -462,7 +462,8 @@ export default function omoHealthSensor(pi, options = {}) {
 		const script = (await exists(boot)) ? boot : path.join(repoRoot, "bin", "omo-health.mjs");
 		if (!(await exists(script))) return;
 		// A package update deletes the release this sensor was loaded from before the session goes idle and reloads onto
-		// the new one (upgradeCheck), so launch with the release app/current.json names; with neither, wait for the reload (#39).
+		// the new one (upgradeCheck), so launch through the release app/current.json names; when neither has a launch.mjs,
+		// wait quietly for the reload (#39).
 		let launchFile = path.join(repoRoot, "src", "launch.mjs");
 		if (!(await exists(launchFile))) {
 			const root = (await readJson(path.join(home, "app", "current.json")))?.root;

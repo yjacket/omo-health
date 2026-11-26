@@ -36,6 +36,8 @@ function quoteArg(arg) {
  * the user's profile environment, not the caller's, so runs that redirect
  * omo-health through OMO_HEALTH_* variables (tests, sandboxes) keep the plain
  * detached spawn, as do other platforms and any WMI failure.
+ * A sensor still loaded from an older, deleted release calls the installed release's copy (extension/sensor.mjs
+ * ensureDaemon, #39), so these options stay backward compatible.
  * @returns {Promise<{via: "wmi"|"spawn", pid?: number, wmiError?: string}>}
  */
 export function launchDaemon({ script, extraArgs = [], execPath = process.execPath, env = process.env, platform = process.platform, spawnImpl = spawn }) {
