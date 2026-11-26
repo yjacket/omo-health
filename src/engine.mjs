@@ -30,6 +30,7 @@ import { ANALYST_POLL_MS } from "./judge/analyst.mjs";
 import { compactFinding, triageSignature } from "./judge/triage.mjs";
 import { createInvestigations, RESOLVED } from "./investigations.mjs";
 import { installedOmoRoot } from "./paths.mjs";
+import { LiveSessions } from "./session-subject.mjs";
 import { buildWorld } from "./state.mjs";
 import { listDirSafe, readJsonSafe, statSafe } from "./util/fsx.mjs";
 import { truncate } from "./util/text.mjs";
@@ -423,6 +424,12 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 		if (!selfOnly && target?.rootSessionId && target.rootSessionId !== sessionId) candidates.push(target.rootSessionId);
 		if (!selfOnly && finding.subject?.rootSessionId) candidates.push(finding.subject.rootSessionId);
 		for (const candidate of candidates) {
+			// The inbox is one folder per ID that every sensor of the ID reads: with a shared ID either twin could take it.
+			if (candidate && world.isSharedId?.(candidate)) {
+				record?.history.push({ atMs: clock.now(), kind: "ambiguous-session", status: "skipped", detail: `two sessions share ${candidate}` });
+				log?.warn?.("delivery_ambiguous", { sessionId: candidate, kind: message.kind, messageId: message.id });
+				continue;
+			}
 			if (candidate && world.sensorFor(candidate)) {
 				const file = actors.send ? actors.send({ ...message, sessionId: candidate }) : sendToSession(paths, { ...message, sessionId: candidate });
 				return { delivered: true, via: "inbox", sessionId: candidate, file, messageId: message.id };
@@ -1119,7 +1126,7 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 		for (const detector of detectors) {
 			if (disabledDetectors.has(detector.name) && detector.name !== "stall") continue;
 			const excluded = new Set(quarantinedSessions.filter((q) => q.detector === detector.name).map((q) => q.sessionId));
-			const active = new Map([...world.sessions].filter(([id]) => !excluded.has(id)));
+			const active = LiveSessions.of([...world.sessions.values()].filter((session) => !excluded.has(session.id)));
 			const detectorWorld = excluded.size ? { ...world, sessions: active } : world;
 			let found;
 			try {
@@ -1128,10 +1135,12 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 				failures.push(`detector:${detector.name}:${error.message}`);
 				log?.error?.("detector_failed", { detector: detector.name, error: error.message, stack: truncate(error.stack, 800) });
 				found = [];
-				for (const [id, session] of [...active].slice(0, 50)) {
-					const subset = new Map([[id, session]]);
-					if (session.parentSessionId && active.has(session.parentSessionId)) subset.set(session.parentSessionId, active.get(session.parentSessionId));
-					for (const [childId, child] of active) if (child.parentSessionId === id) subset.set(childId, child);
+				for (const session of [...active.values()].slice(0, 50)) {
+					const id = session.id;
+					const members = [session];
+					if (session.parentSessionId && active.get(session.parentSessionId)) members.push(active.get(session.parentSessionId));
+					for (const child of active.values()) if (child.parentSessionId === id) members.push(child);
+					const subset = LiveSessions.of(new Set(members));
 					try { found.push(...detector.detect({ ...world, sessions: subset }, memoryFor(detector.name))); }
 					catch (sessionError) {
 						quarantinedSessions.push({ detector: detector.name, sessionId: id, untilMs: now + 6 * 3600_000 });
@@ -1192,9 +1201,10 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 		/** Gate, perform and log one plan's requests; shared by findings and reports. */
 		const runRequests = async (plan, finding, record, subjectKind) => {
 			for (const req of plan.requests) {
-				const verdict = gate(req, { mode: effectiveMode(), paused, config, executed: record.executed, subject: finding.subject, subjectKind, disabledActions });
+				const verdict = gate(req, { mode: effectiveMode(), paused, config, executed: record.executed, subject: finding.subject, subjectKind, disabledActions, ambiguous: world.isSharedId(finding.subject?.sessionId) });
 				if (verdict === "skipped:done") continue;
-				if (verdict === "skipped:paused" || (verdict === "skipped:switch-off" && req.kind === "analyze")) {
+				// A shared ID is temporary like a pause: the action runs once only one session holds the ID.
+				if (verdict === "skipped:paused" || verdict === "skipped:ambiguous-session" || (verdict === "skipped:switch-off" && req.kind === "analyze")) {
 					// Not marked executed, so the same action runs once the pause ends or the switch is turned back on; logged once per key.
 					record.pausedKeys ??= new Set();
 					if (record.pausedKeys.has(req.key)) continue;
@@ -1309,7 +1319,7 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 					world,
 					parkRecords,
 					memory: memoryFor("crashes"),
-					gate: (req, sessionId) => gate(req, { mode: effectiveMode(), paused, config, subject: { sessionId }, subjectKind: world.sessions.get(sessionId)?.kind, disabledActions }),
+					gate: (req, sessionId) => gate(req, { mode: effectiveMode(), paused, config, subject: { sessionId }, subjectKind: world.sessions.get(sessionId)?.kind, disabledActions, ambiguous: world.isSharedId(sessionId) }),
 					launchers: actors.parkLaunchers ?? defaultLaunchers({ paths, herdrCli: actors.herdr }),
 					terminals: actors.parkTerminals ?? defaultTerminals({ herdrCli: actors.herdr }),
 					notifier: actors.notifier,

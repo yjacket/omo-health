@@ -1,4 +1,4 @@
-import { childSubjectOf, liveSessionView, subjectKey, subjectOf, taskParentResolver, uniqueMatch, worldLiveOwners } from "./session-subject.mjs";
+import { childSubjectOf, heartbeatOwns, liveSessionView, subjectKey, subjectOf, taskParentResolver, uniqueMatch, worldLiveOwners } from "./session-subject.mjs";
 import path from "node:path";
 import { endedKey } from "./session-ledger.mjs";
 import { ambiguousLedgerTaskIds } from "./session-record.mjs";
@@ -192,7 +192,8 @@ export function buildSessionSnapshot(world, findings = [], investigations = [], 
 		if (raw.kind !== "main" || !world.isSessionLive(raw)) continue;
 		const session = liveSessionView(raw, world);
 		const subject = subjectOf(session);
-		const hb = world.sensors?.get?.(session.id);
+		const sensor = world.sensors?.get?.(raw.id);
+		const hb = heartbeatOwns(sensor, raw, world.isSharedId?.(raw.id)) ? sensor : undefined;
 		const hostPid = Number.isFinite(hb?.pid) ? hb.pid : session.hostPid;
 		const omoVersion = Number.isFinite(hostPid) ? (world.hostExits?.liveMarkers?.get?.(hostPid)?.omoVersion ?? null) : null;
 		const goal = session.anchor?.source === "goal" ? { status: session.anchor.status ?? null, objective: clean(session.anchor.objective, 300) } : null;

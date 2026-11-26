@@ -573,11 +573,13 @@ export const MAIN_SESSION_BLOCKED = new Set(["kill-pids", "release-shell", "deta
 
 /**
  * Gate a request through mode, pause and per-kind switches.
- * @returns {"execute"|"would"|"skipped:paused"|"skipped:switch-off"|"skipped:done"|"skipped:out-of-scope"|"skipped:main-session"}
+ * `ambiguous`: two sessions share the subject's ID, so an action addressed by that ID could reach either one.
+ * @returns {"execute"|"would"|"skipped:paused"|"skipped:switch-off"|"skipped:done"|"skipped:out-of-scope"|"skipped:main-session"|"skipped:ambiguous-session"}
  */
-export function gate(req, { mode, paused, config, executed, subject, subjectKind, disabledActions }) {
+export function gate(req, { mode, paused, config, executed, subject, subjectKind, disabledActions, ambiguous = false }) {
 	if (disabledActions?.has(req.kind)) return "skipped:switch-off";
 	if (executed?.has(req.key)) return "skipped:done";
+	if (ambiguous && req.kind !== "toast" && req.kind !== "notify" && req.kind !== "analyze") return "skipped:ambiguous-session";
 	if (subjectKind === "main" && MAIN_SESSION_BLOCKED.has(req.kind) && !(req.kind === "release-shell" && provesWrongCommand(req.triage, config))) return "skipped:main-session";
 	if (config.actionScope?.length && req.kind !== "toast" && req.kind !== "notify") {
 		const ids = [subject?.sessionId, subject?.parentSessionId, subject?.rootSessionId].filter(Boolean);

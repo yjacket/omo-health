@@ -7,6 +7,7 @@ import { listDirSafe, statSafe } from "../util/fsx.mjs";
 import { JsonlTail } from "../util/tail.mjs";
 import { redact, sha1, truncate } from "../util/text.mjs";
 import { toMs } from "../util/time.mjs";
+import { heartbeatOwns, LiveSessions, subjectKey, subjectOf } from "../session-subject.mjs";
 import { readGoal, readUlwGoals } from "./anchors.mjs";
 import { createTaskStoreReader, findChildSessionFile, idFromFileName, senpiTaskStoreDir } from "./tasks.mjs";
 
@@ -637,17 +638,20 @@ export class SessionRegistry {
 			: ulw.length ? { objective: ulw.map((item) => item.title).join("; "), status: ulw.every((item) => item.status === "complete") ? "complete" : "active", source: "ulw" }
 			: null;
 		if (tracker.kind === "main") {
-			const sensor = sensors?.get?.(tracker.state.id);
-			if (sensor?.pid) tracker.state.hostPid = sensor.pid;
+			const sensor = sensors?.get?.(state.id);
+			const own = subjectKey(subjectOf(state));
+			const twins = [...this.trackers.values()].some((other) => other !== tracker && other.state.id === state.id && subjectKey(subjectOf(other.state)) !== own);
+			if (sensor?.pid && heartbeatOwns(sensor, state, twins)) state.hostPid = sensor.pid;
 		}
 	}
 
 	snapshot() {
-		const sessions = new Map();
+		const sessions = new LiveSessions();
 		const completions = [];
 		for (const tracker of this.trackers.values()) {
 			const state = tracker.state;
-			sessions.set(state.id, { ...state, task: tracker.task });
+			// Keyed like the token path: two live sessions with one ID in different projects are two entries.
+			sessions.set(subjectKey(subjectOf(state)), { ...state, task: tracker.task });
 			if (tracker.completions.length) completions.push(...tracker.completions.splice(0));
 		}
 		return { sessions, tasks: this.tasks, projects: [...this.projects], badTaskRecords: this.badTaskRecords, completions };

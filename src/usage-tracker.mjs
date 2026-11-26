@@ -337,18 +337,22 @@ export function createUsageTracker({ paths, index, locator, clock, log, ledgerFs
 			let budget = maxBytes;
 			let ownershipChanged = false;
 			const sensorSessions = new Set();
+			// One entry per live subject; an ID two live sessions share resolves to neither (null).
 			const byId = new Map();
-			for (const [id, raw] of world?.sessions ?? []) {
+			const sessions = [];
+			for (const raw of world?.sessions?.values?.() ?? []) {
 				const session = liveSessionView(raw, world);
 				if (session !== raw) sensorSessions.add(session);
-				byId.set(id, session);
+				sessions.push(session);
+				byId.set(raw.id, byId.has(raw.id) ? null : session);
 			}
-			const sessions = [...byId.values()];
 			const resolve = sessionSubjects([...sessions, ...ledgerRows.values()], world);
 			const liveSubject = sessionSubjects(sessions, world);
 			const taskParent = taskParentResolver(world, paths?.agentDir);
 			resolveLiveCwdParent = (id) => {
-				const row = byId.get(id) ?? ledgerRows.getForSubject({ sessionId: id });
+				const live = byId.get(id);
+				if (live === null) return null;
+				const row = live ?? ledgerRows.getForSubject({ sessionId: id });
 				if (!row) return null;
 				return resolve(row);
 			};

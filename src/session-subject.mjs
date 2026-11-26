@@ -119,9 +119,70 @@ function sortedOwners(owners) {
 	return [...owners.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([, owner]) => owner);
 }
 
+/**
+ * The live registry: one entry per {project, session id, task id}, so two live sessions that share an ID in different
+ * projects stay apart. A bare ID still resolves, but only to the one session that owns it: `get` is undefined and
+ * `sessionsById` lists every owner when it is shared, so an ID-only caller cannot pick one twin by accident.
+ */
+export class LiveSessions extends Map {
+	#byId = new Map();
+
+	static of(sessions) {
+		const out = new LiveSessions();
+		for (const session of sessions) out.set(subjectKey(subjectOf(session)), session);
+		return out;
+	}
+
+	set(key, session) {
+		this.delete(key);
+		super.set(key, session);
+		const id = session?.id;
+		if (!this.#byId.has(id)) this.#byId.set(id, new Map());
+		this.#byId.get(id).set(key, session);
+		return this;
+	}
+
+	get(key) {
+		if (super.has(key)) return super.get(key);
+		const owners = this.#byId.get(key);
+		return owners?.size === 1 ? owners.values().next().value : undefined;
+	}
+
+	has(key) {
+		return super.has(key) || this.#byId.has(key);
+	}
+
+	delete(key) {
+		if (!super.has(key)) return false;
+		const id = super.get(key)?.id;
+		super.delete(key);
+		const owners = this.#byId.get(id);
+		owners?.delete(key);
+		if (owners && !owners.size) this.#byId.delete(id);
+		return true;
+	}
+
+	clear() {
+		super.clear();
+		this.#byId.clear();
+	}
+
+	sessionsById(id) {
+		return [...(this.#byId.get(id)?.values() ?? [])];
+	}
+}
+
+/** A heartbeat names its session by ID only. When the ID is shared, it belongs to the twin of its transcript or project. */
+export function heartbeatOwns(heartbeat, session, twins) {
+	if (!heartbeat || !twins) return Boolean(heartbeat);
+	if (heartbeat.sessionFile && heartbeat.sessionFile === session.file) return true;
+	const own = projectKeyOf(heartbeat.cwd);
+	return own !== null && own === subjectOf(session).projectKey;
+}
+
 /** Project the sensor's exact live transcript without changing the raw-ID runtime registry. */
 export function liveSessionView(session, world) {
-	const heartbeat = session?.kind === "main" ? world?.sensorFor?.(session.id) : undefined;
+	const heartbeat = session?.kind !== "main" ? undefined : world?.sensorOfSession ? world.sensorOfSession(session) : world?.sensorFor?.(session.id);
 	if (typeof heartbeat?.sessionFile !== "string" || !heartbeat.sessionFile) return session;
 	// A heartbeat without cwd may inherit it only from the very same transcript.
 	const sameFile = heartbeat.sessionFile === session.file;
@@ -131,7 +192,10 @@ export function liveSessionView(session, world) {
 }
 
 export function worldLiveOwners(world) {
-	const rows = [...(world?.sessions?.values?.() ?? [])].map((row) => liveSessionView(row, world));
+	// A shared ID's ended transcript stays in the registry beside its live twin; only a twin that is live owns its subject.
+	const rows = [...(world?.sessions?.values?.() ?? [])]
+		.filter((row) => !world.isSharedId?.(row.id) || world.isSessionLive(row))
+		.map((row) => liveSessionView(row, world));
 	return rows.map(sessionSubjects(rows, world));
 }
 

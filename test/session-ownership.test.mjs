@@ -382,7 +382,8 @@ test("plan99 a fresh heartbeat owns the live file despite a raw-ID registry coll
 		const order = last === "A" ? [fileB, fileA] : [fileA, fileB];
 		registry.trackers = new Map(order.map((file) => [file, registry.trackers.get(file)]));
 		const world = buildWorld({ now, paths, sensors, registry: registry.snapshot() });
-		assert.equal(world.sessions.get(sessionId).file, order.at(-1));
+		// #23 item 3: the shared ID no longer collapses to the tracker enumerated last; both transcripts stay entries.
+		assert.deepEqual(world.sessions.sessionsById(sessionId).map((s) => s.file).sort(), [fileA, fileB].sort());
 		assert.ok(appendEnded(paths, main(sessionId, b), { nowMs: now }));
 
 		const index = createUsageIndex({ file: paths.health.usageIndexFile, clock });
@@ -408,7 +409,9 @@ test("plan99 a fresh heartbeat owns the live file despite a raw-ID registry coll
 			sensors.set(sessionId, { ts: now, sessionId, cwd: a });
 			tracker.tick(world);
 			const fallback = buildSessionSnapshot(world, [], [], now, { tokensOf: tracker.tokensOf }).groups[0].sessions[0];
-			assert.deepEqual([fallback.cwd, fallback.tokens.total], [b, 99], "a heartbeat without a file preserves registry attribution");
+			// #23 item 3: the twins are two entries, so a heartbeat without a file is matched by its project, not by
+			// whichever transcript the registry enumerated last (B, which already ended).
+			assert.deepEqual([fallback.cwd, fallback.tokens.total], [a, 17], "a heartbeat without a file speaks for the twin of its project");
 		}
 	});
 });

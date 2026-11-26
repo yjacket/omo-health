@@ -1,5 +1,6 @@
 import { ProcessTable, respawnStorms } from "./collect/procs.mjs";
 import { EventWindow } from "./collect/logs.mjs";
+import { heartbeatOwns } from "./session-subject.mjs";
 
 const SENPI_HOST_RE = /senpi[\\/]+dist[\\/]+bundle[\\/]+cli\.js/i;
 const OMO_LAUNCHER_RE = /omo-ai[\\/]+bin[\\/]+omo\.js/i;
@@ -125,6 +126,17 @@ export function buildWorld(input) {
 			return hb && now - (hb.ts ?? 0) <= staleMs ? hb : undefined;
 		},
 
+		/** Two sessions share this ID (different projects): anything addressed by the ID alone could reach either. */
+		isSharedId(sessionId) {
+			return Boolean(sessionId) && (sessions.sessionsById?.(sessionId)?.length ?? 0) > 1;
+		},
+
+		/** The fresh heartbeat of this very session: with a shared ID, only the twin it names (transcript or project). */
+		sensorOfSession(session) {
+			const hb = session ? world.sensorFor(session.id) : undefined;
+			return heartbeatOwns(hb, session, world.isSharedId(session?.id)) ? hb : undefined;
+		},
+
 		/** Is the process that owns this session still running? */
 		isSessionLive(session) {
 			if (!session) return false;
@@ -136,7 +148,7 @@ export function buildWorld(input) {
 				return (task.createdAtMs ?? 0) <= now && (task.terminalAtMs === undefined || task.terminalAtMs > now);
 			}
 			if (session.kind === "main") {
-				if (world.sensorFor(session.id)) return true;
+				if (world.sensorOfSession(session)) return true;
 				return Number.isFinite(session.hostPid) && liveHostPids.has(session.hostPid);
 			}
 			const task = session.task ?? tasksById.get(session.taskId);
