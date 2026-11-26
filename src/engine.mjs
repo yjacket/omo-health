@@ -1215,7 +1215,7 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 						record.lastActionKind = req.kind;
 					}
 					record.history.push({ atMs: now, kind: req.kind, status: verdict });
-					decision({ fp: finding.fp, detector: finding.detector, kind: finding.kind, cls: finding.cls, rule: finding.data?.classification?.rule, action: { key: req.key, kind: req.kind, params }, result: verdict, subject: pickSubject(finding.subject), evidence: finding.evidence });
+					decision({ fp: finding.fp, detector: finding.detector, kind: finding.kind, cls: finding.cls, event: "action", rule: finding.data?.classification?.rule, action: { key: req.key, kind: req.kind, params }, result: verdict, subject: pickSubject(finding.subject), evidence: finding.evidence });
 					results.push({ fp: finding.fp, kind: req.kind, result: verdict });
 					continue;
 				}
@@ -1240,7 +1240,7 @@ export function createEngine({ paths, config, clock, log, sources, actors = {}, 
 					items.push({ description: finding.data.description, monitorId: finding.data.monitorId, count: record.killedCount, persistent: Boolean(finding.data.persistent), killed: result.outcome.killed.map((proc) => `${proc.pid}:${proc.ctime}`), sessionFile: sessionFileFor(finding.data.sessionDir, finding.subject.sessionId) });
 					stoppedMonitors.set(finding.subject.sessionId, items);
 				}
-				decision({ fp: finding.fp, detector: finding.detector, kind: finding.kind, cls: finding.cls, rule: finding.data?.classification?.rule, action: { key: req.key, kind: req.kind, params }, result: "execute", outcome: summarize(result), subject: pickSubject(finding.subject), evidence: finding.evidence, ...(req.reportId ? { reportId: req.reportId } : {}) });
+				decision({ fp: finding.fp, detector: finding.detector, kind: finding.kind, cls: finding.cls, event: "action", rule: finding.data?.classification?.rule, action: { key: req.key, kind: req.kind, params }, result: "execute", outcome: summarize(result), subject: pickSubject(finding.subject), evidence: finding.evidence, ...(req.reportId ? { reportId: req.reportId } : {}) });
 				results.push({ fp: finding.fp, kind: req.kind, result: "execute", outcome: result });
 			}
 		};
