@@ -81,6 +81,16 @@ function seed(h) {
 	]);
 }
 
+/** Rewrites the seeded goal g1 as completed at `ms`. */
+function completeGoal(h, ms) {
+	const file = path.join(h.paths.sessionsDir, "--proj--", "extensions", "goal", `${SID}.json`);
+	fs.writeFileSync(file, JSON.stringify({ version: 1, goal: { status: "complete", id: "g1", objective: "keep the budget message", createdAt: secs(T0 - 3 * HOUR), updatedAt: secs(ms), completedAt: secs(ms) } }));
+}
+
+function expiredEvents(h) {
+	return h.store.events({ projectId: PID, limit: 200 }).filter((event) => event.kind === "message-expired");
+}
+
 function inboxMessages(paths, sessionId) {
 	const dir = path.join(paths.health.inboxDir, sessionId);
 	if (!fs.existsSync(dir)) return [];
@@ -170,6 +180,61 @@ test("(e) an outbox entry older than 7 days is dropped with one message-expired 
 	assert.equal(expired.length, 1);
 	assert.equal(expired[0].data.messageId, first.messages[0].id);
 	assert.equal(expired[0].data.reason, "expired");
+});
+
+test("(g) #32: a pending request whose goal ended is dropped with message-expired goal-ended, never delivered", async (t) => {
+	const h = setup(t);
+	seed(h);
+	const { engine } = h.makeEngine();
+	await engine.tick();
+	const pendingId = outbox(h)[0].id;
+	completeGoal(h, T0 + 30_000);
+	h.state.sensor = true;
+	h.clock.advance(MIN);
+	await engine.tick();
+	assert.deepEqual(inboxMessages(h.paths, SID), [], "inside the close grace the project is not closed, yet the request is not sent");
+	assert.deepEqual(outbox(h), []);
+	assert.deepEqual(expiredEvents(h).map((event) => [event.data.messageId, event.data.actionKind, event.data.reason]), [[pendingId, "budget-request", "goal-ended"]]);
+});
+
+test("(h) #32: a delivered request the sensor dropped as goal-ended gets one message-expired event; a held one gets none", async (t) => {
+	const h = setup(t);
+	seed(h);
+	h.state.sensor = true;
+	const { engine } = h.makeEngine();
+	await engine.tick();
+	const [sent] = inboxMessages(h.paths, SID);
+	assert.equal(sent.details.actionKind, "budget-request");
+	const receipt = (result) => {
+		fs.mkdirSync(h.paths.health.receiptsDir, { recursive: true });
+		fs.writeFileSync(path.join(h.paths.health.receiptsDir, `${sent.id}.json`), JSON.stringify({ id: sent.id, sessionId: SID, deliveredMs: h.clock.now(), kind: "self-notice", result }));
+	};
+	receipt("held");
+	h.clock.advance(MIN);
+	await engine.tick();
+	assert.deepEqual(expiredEvents(h), [], "held: the sensor still waits for the next prompt");
+	receipt("goal-ended");
+	h.clock.advance(MIN);
+	await engine.tick();
+	h.clock.advance(MIN);
+	await engine.tick();
+	assert.deepEqual(expiredEvents(h).map((event) => [event.data.messageId, event.data.actionKind, event.data.reason]), [[sent.id, "budget-request", "goal-ended"]]);
+	assert.deepEqual(h.store.getProject(PID).data.handed, [], "the watch ends with the receipt");
+});
+
+test("(i) #32: a request still held a week after delivery is recorded as expired and no longer watched", async (t) => {
+	const h = setup(t);
+	seed(h);
+	h.state.sensor = true;
+	const { engine } = h.makeEngine();
+	await engine.tick();
+	const [sent] = inboxMessages(h.paths, SID);
+	fs.mkdirSync(h.paths.health.receiptsDir, { recursive: true });
+	fs.writeFileSync(path.join(h.paths.health.receiptsDir, `${sent.id}.json`), JSON.stringify({ id: sent.id, sessionId: SID, deliveredMs: h.clock.now(), kind: "self-notice", result: "held" }));
+	h.clock.advance(7 * DAY + MIN);
+	await engine.tick();
+	assert.deepEqual(expiredEvents(h).map((event) => [event.data.messageId, event.data.reason]), [[sent.id, "expired"]]);
+	assert.deepEqual(h.store.getProject(PID).data.handed, []);
 });
 
 test("(f) a sensor that returns after more than five minutes still gets the request, not a swept file", async (t) => {
