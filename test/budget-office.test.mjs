@@ -864,7 +864,7 @@ test("(r6) the owner call is answered once the session records the owner's answe
 });
 
 test("(sd) a session tree past the investigate line gets one audit per 24 h and no finding; past the owner line D26 asks for a human (#33)", (t) => {
-	// No subscription reading: the window is uncalibrated, so the tree's cost is held to the USD pair ($80 / $160).
+	// No subscription reading: the tree's total cost is held to the USD pair ($100 / $200, #40).
 	const run = (spend) => {
 		const c = setup(t);
 		c.writeGoal({ id: "g1", objective: "long running lane", createdAt: secs(T0 - 20 * HOUR), updatedAt: secs(T0 - 20 * HOUR) });
@@ -879,9 +879,9 @@ test("(sd) a session tree past the investigate line gets one audit per 24 h and 
 		return { c, runner, snapshot, events: c.store.events({ limit: 200 }) };
 	};
 
-	const investigate = run(90);
+	const investigate = run(150);
 	const [tree] = investigate.snapshot.sessionDay.sessions;
-	assert.deepEqual([tree.sessionId, tree.level, tree.basis.kind, Math.round(tree.totalUsd)], [SID, "investigate", "usd", 90], "only the last 24 h count: the $500 30 h ago does not");
+	assert.deepEqual([tree.sessionId, tree.level, tree.basis.kind, Math.round(tree.totalUsd)], [SID, "investigate", "usd", 150], "only the last 24 h count: the $500 30 h ago does not");
 	assert.equal(tree.projectId, `${SID}:g1`);
 	assert.equal(investigate.runner.starts.length, 1, "one audit across three ticks");
 	assert.equal(investigate.runner.starts[0].kind, "budget-audit");
@@ -892,12 +892,12 @@ test("(sd) a session tree past the investigate line gets one audit per 24 h and 
 	assert.deepEqual(detectBudget({ budget: investigate.snapshot }).filter((f) => f.kind === "session-day"), [], "investigate raises no finding");
 	assert.deepEqual(investigate.snapshot.treasury.windows, [], "no reading, no window rows");
 
-	const owner = run(170);
+	const owner = run(250);
 	assert.equal(owner.snapshot.sessionDay.sessions[0].level, "owner");
 	const findings = detectBudget({ budget: owner.snapshot }).filter((f) => f.kind === "session-day");
 	assert.equal(findings.length, 1);
 	assert.deepEqual([findings[0].severity, findings[0].humanNeeded], ["warn", true]);
-	assert.match(findings[0].titleKo, /\$170/);
+	assert.match(findings[0].titleKo, /\$250/);
 });
 
 test("(sd2) a finished session-day audit is not repeated inside 24 h; past 24 h a fresh crossing audits again even inside minGapMs; shadow records no event (#33)", (t) => {
@@ -905,7 +905,7 @@ test("(sd2) a finished session-day audit is not repeated inside 24 h; past 24 h 
 	// A gap longer than the 25 h below: only the session-day new-evidence bypass lets the second audit start.
 	c.config.budget.audit.minGapMs = 48 * HOUR;
 	c.writeGoal({ id: "g1", objective: "long running lane", createdAt: secs(T0 - 20 * HOUR), updatedAt: secs(T0 - 20 * HOUR) });
-	writeJsonl(c.file, [E.header(c.sid, c.cwd, T0 - 20 * HOUR), spendEntry(T0 - 2 * HOUR, 90)]);
+	writeJsonl(c.file, [E.header(c.sid, c.cwd, T0 - 20 * HOUR), spendEntry(T0 - 2 * HOUR, 150)]);
 	// Each audit ends at its first poll without an opinion, so nothing stays in flight to block the next one.
 	const runner = createFakeRunner({ outcomes: { "budget-audit": { status: "failed" } } });
 	const office = c.office({ runner });
@@ -919,22 +919,22 @@ test("(sd2) a finished session-day audit is not repeated inside 24 h; past 24 h 
 	assert.equal(runner.starts.length, 1, "the crossing audits once");
 	assert.notEqual(c.store.getProject(`${SID}:g1`).data.audits[0].status, "running", "the first audit has ended");
 
-	// 12 h later the tree is still past $80 in its last 24 h: no second audit that day.
+	// 12 h later the tree is still past $100 in its last 24 h: no second audit that day.
 	c.clock.advance(12 * HOUR);
-	appendJsonl(c.file, [spendEntry(c.clock.now() - HOUR, 90)]);
+	appendJsonl(c.file, [spendEntry(c.clock.now() - HOUR, 30)]);
 	ticks(3);
 	assert.equal(runner.starts.length, 1, "inside 24 h the stamp holds the gate shut");
 
 	// Past 24 h after the first audit a fresh crossing audits again, although minGapMs (48 h) has not passed.
 	c.clock.advance(13 * HOUR);
-	appendJsonl(c.file, [spendEntry(c.clock.now() - HOUR, 90)]);
+	appendJsonl(c.file, [spendEntry(c.clock.now() - HOUR, 150)]);
 	ticks(3);
 	assert.equal(runner.starts.length, 2);
 	assert.deepEqual(c.store.getProject(`${SID}:g1`).data.audits.map((a) => a.triggers), [["session-day"], ["session-day"]]);
 
 	const shadow = setup(t);
 	shadow.writeGoal({ id: "g1", objective: "long running lane", createdAt: secs(T0 - 20 * HOUR), updatedAt: secs(T0 - 20 * HOUR) });
-	writeJsonl(shadow.file, [E.header(shadow.sid, shadow.cwd, T0 - 20 * HOUR), spendEntry(T0 - 2 * HOUR, 90)]);
+	writeJsonl(shadow.file, [E.header(shadow.sid, shadow.cwd, T0 - 20 * HOUR), spendEntry(T0 - 2 * HOUR, 150)]);
 	const quiet = shadow.office({ runner: createFakeRunner() });
 	for (let i = 0; i < 3; i++) {
 		quiet.tick({ shadow: true });

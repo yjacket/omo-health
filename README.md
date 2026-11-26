@@ -351,11 +351,11 @@ D26은 예산 사무소가 쓴 `budget/snapshot.json`만 읽는 조언용 탐지
 
 ### 세션 하루 사용량
 
-루트 세션 트리(메인 세션과 모든 하위작업, 감사 비용 제외)가 최근 24시간에 쓴 비용을 창마다 봅니다. 보정된 창에서는 비용에 그 창의 `percentPerUsd`를 곱해 창의 몫(%)으로 셉니다.
+루트 세션 트리(메인 세션과 모든 하위작업, 감사 비용 제외)가 최근 24시간에 쓴 전체 비용을 봅니다. 공급자와 창에 관계없이 모두 합칩니다.
 
-- `budget.sessionDayInvestigatePercent`(5%) 이상: 예산 감사를 한 번 돌립니다(사다리 단계는 쓰지 않음, 24시간에 한 번). 알림과 사람 확인은 없습니다. 진행 중인 목표가 없는 세션은 기록만 남습니다.
-- `budget.sessionDayPercent`(10%) 이상: D26 `session-day` 경고(사람 확인)를 냅니다. 메인과 하위작업 비용을 나눠 보여 줍니다.
-- 보정 전 창에는 % 기준을 적용하지 않습니다. 어느 보정된 창에도 잡히지 않는 비용(창이 없는 공급자, 별칭 없는 프록시, 보정 전 창)은 합쳐서 `budget.sessionDayInvestigateUsd`($80)와 `budget.sessionDayUsd`($160)에 맞춰 봅니다.
+- `budget.sessionDayInvestigateUsd`($100) 이상: 예산 감사를 한 번 돌립니다(사다리 단계는 쓰지 않음, 24시간에 한 번). 알림과 사람 확인은 없습니다. 진행 중인 목표가 없는 세션은 기록만 남습니다.
+- `budget.sessionDayUsd`($200) 이상: D26 `session-day` 경고(사람 확인)를 냅니다. 메인과 하위작업 비용을 나눠 보여 줍니다.
+- 창 % 기준(`budget.sessionDayInvestigatePercent`, `budget.sessionDayPercent`)은 기본으로 꺼져 있습니다(0). 켜면 보정된 창마다 비용에 그 창의 `percentPerUsd`를 곱한 몫(%)을 같은 두 단계에 맞춰 보고, 달러 기준과 둘 중 더 높은 단계가 적용됩니다. 보정 전 창에는 % 기준을 적용하지 않습니다.
 - 창별 기준은 `budget.windows`에 `"<계정>:<창 id>"` 키로 덮어씁니다. 예: `{"budget":{"windows":{"anthropic-subscription/default:claude:7d":{"sessionDayPercent":15}}}}`. 0은 그 기준을 끕니다.
 - 기준은 대시보드 설정 화면에서도 바꿀 수 있고, 다시 시작하지 않아도 다음 틱부터 적용됩니다. 예산 탭은 창마다 적용 중인 기준과, 기본값을 쓰는 창에는 세션 하루 몫의 p95(최근 30일)를 보여 줍니다.
 - 같은 공급자의 계정이 여럿이어도 지금은 `<공급자>/default` 하나로 셉니다. 세션 기록에 계정 정보가 없기 때문입니다.
@@ -380,8 +380,8 @@ D26은 예산 사무소가 쓴 `budget/snapshot.json`만 읽는 조언용 탐지
 | `budget.ownerProjectPercent` | 25 | 쓸 수 있는 몫 중 이 비율을 넘는 요청은 큰 요청 |
 | `budget.burstFactor` | 1.25 | 몰아 쓰기 여유 배수 |
 | `budget.shortMinBurnHours` | 6 | `treasury-short` 경고에 필요한 소비 속도 지속 시간 |
-| `budget.sessionDayInvestigatePercent`, `budget.sessionDayPercent` | 5 / 10 | 세션 트리 24시간 사용량(창의 %): 감사, 사람 확인 |
-| `budget.sessionDayInvestigateUsd`, `budget.sessionDayUsd` | 80 / 160 | 창에 잡히지 않는 비용의 같은 기준(USD) |
+| `budget.sessionDayInvestigateUsd`, `budget.sessionDayUsd` | 100 / 200 | 세션 트리 24시간 전체 비용(USD): 감사, 사람 확인 |
+| `budget.sessionDayInvestigatePercent`, `budget.sessionDayPercent` | 0 / 0 | 같은 기준을 창의 %로(0은 꺼짐) |
 | `budget.windows` | 없음 | 창별 세션 하루 기준 덮어쓰기 |
 | `budget.closeGraceMs` | 24시간 | 닫힌 뒤에도 늦은 서브에이전트 지출을 붙이는 기간 |
 | `budget.providerAliases` | `claude-sdk-oauth=anthropic-subscription` | 공급자 별칭 |

@@ -169,14 +169,14 @@ export const DEFAULT_CONFIG = Object.freeze({
 		burstFactor: 1.25,
 		// A window projection past 100% asks for a human only once its burn rate has lasted this many hours (#33).
 		shortMinBurnHours: 6,
-		// One root session tree (main + every subagent) over the last 24 h, as a share of a calibrated window: past the
-		// first the budget auditor looks once, past the second D26 asks for a human. Cost no calibrated window counts
-		// (an unmapped provider, a proxy, an uncalibrated window) is held to the USD pair instead. `windows` overrides the
-		// percent pair per window, keyed "<account>:<windowId>" (#33).
-		sessionDayInvestigatePercent: 5,
-		sessionDayPercent: 10,
-		sessionDayInvestigateUsd: 80,
-		sessionDayUsd: 160,
+		// One root session tree (main + every subagent, audit cost excluded) over the last 24 h: past the first of a pair
+		// the budget auditor looks once, past the second D26 asks for a human. The USD pair holds the tree's total cost
+		// across every provider and window (#40). The percent pair holds its share of each calibrated window and is off
+		// (0) by default; `windows` overrides it per window, keyed "<account>:<windowId>" (#33).
+		sessionDayInvestigatePercent: 0,
+		sessionDayPercent: 0,
+		sessionDayInvestigateUsd: 100,
+		sessionDayUsd: 200,
 		windows: {},
 		closeGraceMs: 24 * H,
 		providerAliases: ["claude-sdk-oauth=anthropic-subscription"],

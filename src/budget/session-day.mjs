@@ -1,8 +1,9 @@
-// Session-day usage (#33): one root session tree (main + every subagent) over the last 24 h, as a share of each
-// calibrated subscription window. Pure: rows, window states and the budget config are injected.
-// A row counts toward a window when its provider resolves to the window's account and the window applies to its
-// model (same rule as store.spend). A row no calibrated window counts (an unmapped provider, a proxy, an
-// uncalibrated window) is held to the USD thresholds instead. A threshold of 0 is off.
+// Session-day usage (#33, #40): one root session tree (main + every subagent, audit cost excluded) over the last 24 h.
+// Pure: rows, window states and the budget config are injected.
+// The tree's total cost, whatever provider or window it went to, is held to the USD pair ($100 audit, $200 owner).
+// Each calibrated window also gets the tree's share (%): a row counts toward a window when its provider resolves to
+// the window's account and the window applies to its model (same rule as store.spend). The percent pair is off (0)
+// by default; `budget.windows` or the global percent keys turn it on. A threshold of 0 is off.
 import { accountOf, windowApplies } from "./accounts.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -22,8 +23,8 @@ export function windowThresholds(cfg, account, windowId) {
 	const override = budget.windows?.[windowKey(account, windowId)] ?? {};
 	const pick = (key, fallback) => (finite(override[key]) ? override[key] : finite(budget[key]) ? budget[key] : fallback);
 	return {
-		investigatePercent: pick("sessionDayInvestigatePercent", 5),
-		ownerPercent: pick("sessionDayPercent", 10),
+		investigatePercent: pick("sessionDayInvestigatePercent", 0),
+		ownerPercent: pick("sessionDayPercent", 0),
 		overridden: finite(override.sessionDayInvestigatePercent) || finite(override.sessionDayPercent),
 	};
 }
@@ -53,8 +54,8 @@ function costOf(row) {
 export function sessionDay({ rows, states, cfg } = {}) {
 	const budget = cfg ?? {};
 	const aliases = budget.providerAliases;
-	const investigateUsd = finite(budget.sessionDayInvestigateUsd) ? budget.sessionDayInvestigateUsd : 80;
-	const ownerUsd = finite(budget.sessionDayUsd) ? budget.sessionDayUsd : 160;
+	const investigateUsd = finite(budget.sessionDayInvestigateUsd) ? budget.sessionDayInvestigateUsd : 100;
+	const ownerUsd = finite(budget.sessionDayUsd) ? budget.sessionDayUsd : 200;
 	const windows = countingWindows(states, budget);
 	const trees = new Map();
 	for (const row of Array.isArray(rows) ? rows : []) {
@@ -62,20 +63,16 @@ export function sessionDay({ rows, states, cfg } = {}) {
 		if (cost === null || !row.rootSessionId) continue;
 		let tree = trees.get(row.rootSessionId);
 		if (!tree) {
-			tree = { sessionId: row.rootSessionId, totalUsd: 0, mainUsd: 0, childUsd: 0, uncountedUsd: 0, byWindow: windows.map(() => 0) };
+			tree = { sessionId: row.rootSessionId, totalUsd: 0, mainUsd: 0, childUsd: 0, byWindow: windows.map(() => 0) };
 			trees.set(row.rootSessionId, tree);
 		}
 		tree.totalUsd += cost;
 		if (row.source === "main") tree.mainUsd += cost;
 		else tree.childUsd += cost;
 		const account = accountOf(row.provider, aliases);
-		let counted = false;
 		windows.forEach((w, i) => {
-			if (account !== w.account || !windowApplies(w.window, row.model)) return;
-			tree.byWindow[i] += cost;
-			counted = true;
+			if (account === w.account && windowApplies(w.window, row.model)) tree.byWindow[i] += cost;
 		});
-		if (!counted) tree.uncountedUsd += cost;
 	}
 	const sessions = [...trees.values()].map((tree) => {
 		const shares = windows.map((w, i) => ({
@@ -88,11 +85,11 @@ export function sessionDay({ rows, states, cfg } = {}) {
 			ownerPercent: w.ownerPercent,
 			level: levelOf(tree.byWindow[i] * w.percentPerUsd, w.investigatePercent, w.ownerPercent),
 		}));
-		const usdLevel = levelOf(tree.uncountedUsd, investigateUsd, ownerUsd);
+		const usdLevel = levelOf(tree.totalUsd, investigateUsd, ownerUsd);
 		// The basis is what crossed the highest level; among windows the largest share wins.
 		const candidates = [
 			...shares.filter((s) => s.level).map((s) => ({ level: s.level, rank: s.percent / (s.level === "owner" ? s.ownerPercent : s.investigatePercent), basis: { kind: "window", account: s.account, windowId: s.windowId, label: s.label, percent: s.percent, usd: s.usd, thresholdPercent: s.level === "owner" ? s.ownerPercent : s.investigatePercent } })),
-			...(usdLevel ? [{ level: usdLevel, rank: tree.uncountedUsd / (usdLevel === "owner" ? ownerUsd : investigateUsd), basis: { kind: "usd", usd: tree.uncountedUsd, thresholdUsd: usdLevel === "owner" ? ownerUsd : investigateUsd } }] : []),
+			...(usdLevel ? [{ level: usdLevel, rank: tree.totalUsd / (usdLevel === "owner" ? ownerUsd : investigateUsd), basis: { kind: "usd", usd: tree.totalUsd, thresholdUsd: usdLevel === "owner" ? ownerUsd : investigateUsd } }] : []),
 		].sort((a, b) => LEVELS[b.level] - LEVELS[a.level] || b.rank - a.rank);
 		const top = candidates[0] ?? null;
 		const maxShare = shares.reduce((best, s) => (best === null || s.percent > best.percent ? s : best), null);
@@ -101,7 +98,6 @@ export function sessionDay({ rows, states, cfg } = {}) {
 			totalUsd: tree.totalUsd,
 			mainUsd: tree.mainUsd,
 			childUsd: tree.childUsd,
-			uncountedUsd: tree.uncountedUsd,
 			shares,
 			maxPercent: maxShare?.percent ?? null,
 			level: top?.level ?? null,

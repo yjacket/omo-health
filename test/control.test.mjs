@@ -109,7 +109,7 @@ describe("setNumber", () => {
 		atomicWriteJson(paths.health.configFile, { budget: { enabled: false } });
 		assert.deepEqual(setNumber(paths, "budget.sessionDayPercent", 15), { ok: true, file: paths.health.configFile, value: 15, isDefault: false });
 		assert.deepEqual(readConfig(), { budget: { enabled: false, sessionDayPercent: 15 } });
-		assert.deepEqual(setNumber(paths, "budget.sessionDayPercent", null), { ok: true, file: paths.health.configFile, value: 10, isDefault: true });
+		assert.deepEqual(setNumber(paths, "budget.sessionDayPercent", null), { ok: true, file: paths.health.configFile, value: 0, isDefault: true });
 		assert.deepEqual(readConfig(), { budget: { enabled: false } });
 	});
 
@@ -124,9 +124,9 @@ describe("setNumber", () => {
 		assert.deepEqual(setNumber(paths, "sessionDayPercent", 20, WINDOW), { ok: true, file: paths.health.configFile, value: 20, isDefault: false });
 		// The global default is still an override for this window: it pins the window when the global value changes.
 		assert.equal(setNumber(paths, "sessionDayInvestigatePercent", DEFAULT_CONFIG.budget.sessionDayInvestigatePercent, WINDOW).isDefault, false);
-		assert.deepEqual(readConfig(), { budget: { windows: { [WINDOW]: { sessionDayPercent: 20, sessionDayInvestigatePercent: 5 } } } });
+		assert.deepEqual(readConfig(), { budget: { windows: { [WINDOW]: { sessionDayPercent: 20, sessionDayInvestigatePercent: 0 } } } });
 		assert.deepEqual(setNumber(paths, "sessionDayPercent", null, WINDOW), { ok: true, file: paths.health.configFile, value: null, isDefault: true });
-		assert.deepEqual(readConfig(), { budget: { windows: { [WINDOW]: { sessionDayInvestigatePercent: 5 } } } });
+		assert.deepEqual(readConfig(), { budget: { windows: { [WINDOW]: { sessionDayInvestigatePercent: 0 } } } });
 		assert.equal(setNumber(paths, "sessionDayInvestigatePercent", null, WINDOW).ok, true);
 		assert.deepEqual(readConfig(), {});
 	});

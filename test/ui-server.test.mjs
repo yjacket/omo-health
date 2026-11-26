@@ -598,7 +598,7 @@ describe("ui server", () => {
 			assert.deepEqual(set.body, { ok: true, value: 15, isDefault: false });
 			assert.deepEqual((await postJson("/api/setting", { window, key: "sessionDayInvestigatePercent", value: 7.5 })).body, { ok: true, value: 7.5, isDefault: false });
 			assert.deepEqual(readConfig(), { budget: { sessionDayPercent: 15, windows: { [window]: { sessionDayInvestigatePercent: 7.5 } } } });
-			assert.deepEqual((await postJson("/api/setting", { key: "budget.sessionDayPercent", value: null })).body, { ok: true, value: 10, isDefault: true });
+			assert.deepEqual((await postJson("/api/setting", { key: "budget.sessionDayPercent", value: null })).body, { ok: true, value: 0, isDefault: true });
 			assert.deepEqual(readConfig(), { budget: { windows: { [window]: { sessionDayInvestigatePercent: 7.5 } } } });
 			assert.deepEqual((await postJson("/api/setting", { window, key: "sessionDayInvestigatePercent", value: null })).body, { ok: true, value: null, isDefault: true });
 			assert.deepEqual(readConfig(), {});
