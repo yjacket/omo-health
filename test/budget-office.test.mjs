@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { test } from "node:test";
 import { createBudgetOffice } from "../src/budget/office.mjs";
+import { detect as detectBudget } from "../src/detect/budget.mjs";
 import { createBudgetStore } from "../src/budget/store.mjs";
 import { DEFAULT_CONFIG } from "../src/config.mjs";
 import { openDb } from "../src/db/db.mjs";
@@ -792,6 +793,52 @@ test("(r4) a rule audit below 1x spends no tier: tier 1 still audits when spend 
 	assert.equal(runner.starts.length, 1, "passing 1x opens the tier-1 audit");
 	const audit = c.store.getProject(pid).data.audits.at(-1);
 	assert.deepEqual([audit.tier, audit.ladder.basis, audit.triggers], [1, "budget", ["ladder-budget"]]);
+});
+
+test("(r5) a ladder audit that ends without an opinion leaves its tier open: one retry per minGapMs, at most LADDER_ATTEMPTS attempts (#24)", (t) => {
+	const LADDER_ATTEMPTS = 3; // src/budget/office.mjs
+	const c = setup(t);
+	const pid = `${c.sid}:g1`;
+	reviewLoop(c);
+	// The day caps are not under test here: room for every attempt inside one rolling day.
+	Object.assign(c.config.budget.audit, { perProjectDay: 10, perDay: 10 });
+	const runner = createFakeRunner({ outcomes: { "budget-audit": { status: "timeout", reason: "timeout" } } });
+	const office = c.office({ runner });
+	ticks(office, c, 4);
+	assert.equal(runner.starts.length, 1, "the failed attempt is not retried before minGapMs");
+	assert.equal(c.store.getProject(pid).data.audits.at(-1).status, "timeout");
+	for (let attempt = 2; attempt <= LADDER_ATTEMPTS + 1; attempt++) {
+		c.clock.advance(c.config.budget.audit.minGapMs);
+		ticks(office, c, 2);
+		assert.equal(runner.starts.length, Math.min(attempt, LADDER_ATTEMPTS), `after gap ${attempt - 1}`);
+	}
+	const audits = c.store.getProject(pid).data.audits;
+	assert.deepEqual(audits.map((a) => [a.tier, a.status]), Array.from({ length: LADDER_ATTEMPTS }, () => [1, "timeout"]), "every attempt is the tier-1 ladder audit");
+});
+
+test("(r6) the owner call is answered once the session records the owner's answer to a question; other messages leave it open (#24)", (t) => {
+	const c = setup(t);
+	const pid = `${c.sid}:g1`;
+	reviewLoop(c, { count: 41 });
+	const office = c.office({ runner: createFakeRunner({ outcomes: { "budget-audit": { status: "running" } } }) });
+	const ownerCalls = (out) => detectBudget({ budget: out.snapshot }).filter((f) => f.kind === "owner-call");
+	const question = (status, ms) => {
+		const entry = E.toolResult("q1", ms, { name: "ask_user_question", text: "계속해" });
+		entry.message.details = { status };
+		return entry;
+	};
+	const first = ticks(office, c, 3);
+	assert.equal(ownerCalls(first).length, 1);
+	appendJsonl(c.file, [E.user("[LEAD] your work thread has had no update for 17 min.", c.clock.now()), question("timed_out", c.clock.now())]);
+	const unanswered = ticks(office, c, 1);
+	assert.equal(ownerCalls(unanswered).length, 1, "a timeout or a lead note is no owner answer");
+	const answerMs = c.clock.now();
+	appendJsonl(c.file, [question("answered", answerMs)]);
+	const answered = ticks(office, c, 1);
+	const row = answered.snapshot.projects.find((p) => p.id === pid);
+	assert.deepEqual([row.ownerCall.answeredMs, row.ownerCall.answeredVia], [answerMs, "question-tool"]);
+	assert.deepEqual(ownerCalls(answered), [], "D26 lets the call go");
+	assert.equal(c.store.events({ limit: 50 }).filter((e) => e.kind === "owner-answered").length, 1);
 });
 
 test("disabled budget: tick returns the empty result and writes no snapshot", (t) => {
