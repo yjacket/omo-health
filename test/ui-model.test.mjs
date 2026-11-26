@@ -1218,7 +1218,7 @@ describe("ui model", () => {
 		/** The rows without their labels: what the page sends back and what it compares. */
 		const rowsOf = (settings) => settings.sessionDay.rows.map(({ window, cells }) => ({ window: window ?? null, cells }));
 
-		it("lays out the default pair, one row per snapshot window, a leftover override and the USD pair", () => {
+		it("lays out the USD pair, the default percent pair, one row per snapshot window and a leftover override", () => {
 			const home = makeHome();
 			write(home.paths.health.configFile, { budget: { sessionDayPercent: 15, windows: { [CLAUDE]: { sessionDayInvestigatePercent: 7.5 }, [GONE]: { sessionDayPercent: 30 } } } });
 			const windows = [
@@ -1230,15 +1230,15 @@ describe("ui model", () => {
 			const settings = buildSettings(inputsOf(home, { budgetSnapshot: { treasury: { windows } } }));
 			const cell = (key, value, def, applied = value) => ({ key, value, default: def, applied, shadowed: false });
 			const over = (window, investigate, owner) => [
-				{ key: "sessionDayInvestigatePercent", window, value: investigate, applied: investigate ?? 5, shadowed: false },
+				{ key: "sessionDayInvestigatePercent", window, value: investigate, applied: investigate ?? 0, shadowed: false },
 				{ key: "sessionDayPercent", window, value: owner, applied: owner ?? 15, shadowed: false },
 			];
 			assert.deepEqual(rowsOf(settings), [
-				{ window: null, cells: [cell("budget.sessionDayInvestigatePercent", 5, 5), cell("budget.sessionDayPercent", 15, 10)] },
+				{ window: null, cells: [cell("budget.sessionDayInvestigateUsd", 100, 100), cell("budget.sessionDayUsd", 200, 200)] },
+				{ window: null, cells: [cell("budget.sessionDayInvestigatePercent", 0, 0), cell("budget.sessionDayPercent", 15, 0)] },
 				{ window: { name: CLAUDE, account: "anthropic-subscription/default", windowId: "claude:7d", label: "7d", scope: null, active: true, p95Percent: 3.2 }, cells: over(CLAUDE, 7.5, null) },
 				{ window: { name: CODEX, account: "chatgpt-subscription/default", windowId: "codex:primary", label: "primary", scope: null, active: false, p95Percent: null }, cells: over(CODEX, null, null) },
 				{ window: { name: GONE, missing: true }, cells: over(GONE, null, 30) },
-				{ window: null, cells: [cell("budget.sessionDayInvestigateUsd", 80, 80), cell("budget.sessionDayUsd", 160, 160)] },
 			]);
 			assert.equal(settings.sessionDay.levels.length, 2);
 		});
@@ -1259,12 +1259,12 @@ describe("ui model", () => {
 			write(home.paths.health.configFile, { budget: { sessionDayPercent: 15 } });
 			write(extra, { budget: { sessionDayPercent: 20, windows: { [CLAUDE]: { sessionDayInvestigatePercent: 9 } } } });
 			const settings = buildSettings(loadUiInputs({ paths: home.paths, env: { ...home.env, OMO_HEALTH_CONFIG: extra }, now: NOW }));
-			assert.deepEqual(rowsOf(settings).slice(0, 2), [
+			assert.deepEqual(rowsOf(settings).slice(1, 3), [
 				{
 					window: null,
 					cells: [
-						{ key: "budget.sessionDayInvestigatePercent", value: 5, default: 5, applied: 5, shadowed: false },
-						{ key: "budget.sessionDayPercent", value: 15, default: 10, applied: 20, shadowed: true },
+						{ key: "budget.sessionDayInvestigatePercent", value: 0, default: 0, applied: 0, shadowed: false },
+						{ key: "budget.sessionDayPercent", value: 15, default: 0, applied: 20, shadowed: true },
 					],
 				},
 				{

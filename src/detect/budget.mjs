@@ -10,8 +10,8 @@ import { makeFinding } from "./finding.mjs";
  *   treasury-short  warn, human needed - a window passes 100% by reset at a burn rate that has lasted
  *                                        budget.shortMinBurnHours (a shorter spike reads tight)
  *   treasury-tight  info               - a window is close to the reserve
- *   session-day     warn, human needed - one root session tree used budget.sessionDayPercent of a window (or
- *                                        budget.sessionDayUsd of uncounted cost) in the last 24 h (#33); the
+ *   session-day     warn, human needed - one root session tree cost budget.sessionDayUsd in total (or, when set,
+ *                                        budget.sessionDayPercent of a window) in the last 24 h (#33, #40); the
  *                                        investigate level below it only opens an audit and raises nothing
  *   audit-opinion   info               - the auditor judged spend waste-likely
  *   owner-call      warn, human needed - past the review ladder's last tier the session was asked to call the owner;
@@ -126,8 +126,8 @@ function sessionDayFinding(session) {
         const basis = session.basis;
         const usd = (value) => (Number.isFinite(value) ? `$${Math.round(value)}` : "?");
         const amount = basis.kind === "window" ? `${basis.label ?? basis.windowId}의 ${pct(basis.percent)}` : usd(basis.usd);
-        // USD basis: cost of an uncalibrated window, an unmapped provider or a proxy, which no window % can express.
-        const limit = basis.kind === "window" ? `기준 ${pct(basis.thresholdPercent)}` : `창 %로 환산하지 못한 비용, 기준 ${usd(basis.thresholdUsd)}`;
+        // USD basis: the tree's total cost over every provider and window (#40).
+        const limit = basis.kind === "window" ? `기준 ${pct(basis.thresholdPercent)}` : `기준 ${usd(basis.thresholdUsd)}`;
         const subjectName = session.objective ? truncate(session.objective, 40) : sessionId.slice(0, 8);
         return makeFinding({
                 detector: id,

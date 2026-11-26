@@ -607,16 +607,18 @@ describe("dashboard budget tab", { timeout: 20_000 }, () => {
 		assert.equal(older, undefined, "a snapshot written before the session-day fields draws no line");
 	});
 
-	it("lists the last day's session trees: level chip, total with its split, the crossed window's share, the uncounted cost", async () => {
+	it("lists the last day's session trees: level chip, total with its split (the USD basis), the crossed window's share", async () => {
 		const share = (o) => ({ account: CLAUDE, windowId: "claude:7d", label: "7d", usd: 0, percent: 0, investigatePercent: 5, ownerPercent: 10, level: null, ...o });
 		const sessions = [
-			{ sessionId: "sid-owner-0123", objective: "Export QA", totalUsd: 246, mainUsd: 71.4, childUsd: 174.6, uncountedUsd: 0, maxPercent: 30, level: "owner", basis: { kind: "window", account: CLAUDE, windowId: "claude:7d", label: "7d", percent: 12.3, usd: 246, thresholdPercent: 10 }, shares: [share({ windowId: "claude:5h", label: "5h", usd: 100, percent: 30 }), share({ usd: 246, percent: 12.3, level: "owner" })] },
-			{ sessionId: "sid-usd-01234", objective: null, totalUsd: 96.5, mainUsd: 96.5, childUsd: 0, uncountedUsd: 96.5, maxPercent: 0, level: "investigate", basis: { kind: "usd", usd: 96.5, thresholdUsd: 80 }, shares: [share({})] },
-			{ sessionId: "sid-none-0123", objective: "quiet", totalUsd: 31.2, mainUsd: 20, childUsd: 11.2, uncountedUsd: 0, maxPercent: 1.56, level: null, basis: null, shares: [share({ usd: 31.2, percent: 1.56 })] },
+			{ sessionId: "sid-owner-0123", objective: "Export QA", totalUsd: 246, mainUsd: 71.4, childUsd: 174.6, maxPercent: 30, level: "owner", basis: { kind: "window", account: CLAUDE, windowId: "claude:7d", label: "7d", percent: 12.3, usd: 246, thresholdPercent: 10 }, shares: [share({ windowId: "claude:5h", label: "5h", usd: 100, percent: 30 }), share({ usd: 246, percent: 12.3, level: "owner" })] },
+			{ sessionId: "sid-usd-01234", objective: null, totalUsd: 150, mainUsd: 150, childUsd: 0, maxPercent: 0, level: "investigate", basis: { kind: "usd", usd: 150, thresholdUsd: 100 }, shares: [share({})] },
+			{ sessionId: "sid-none-0123", objective: "quiet", totalUsd: 31.2, mainUsd: 20, childUsd: 11.2, maxPercent: 1.56, level: null, basis: null, shares: [share({ usd: 31.2, percent: 1.56 })] },
 		];
-		const page = await openPage({ ...snapshot(), sessionDay: { investigateUsd: 80, ownerUsd: 160, sessions } });
+		const page = await openPage({ ...snapshot(), sessionDay: { investigateUsd: 100, ownerUsd: 200, sessions } });
 		const body = page.doc.getElementById("budget-sessions-body");
-		assert.deepEqual(byClass(byClass(body, "statrow")[0], "stat__v").map(text), ["$80", "$160"]);
+		const [limits] = byClass(body, "statrow");
+		assert.ok(text(limits).includes("전체 비용"), text(limits));
+		assert.deepEqual(byClass(limits, "stat__v").map(text), ["$100", "$200"]);
 		const rows = rowsOf(page, "budget-sessions");
 		const cells = (row) => descendants(row).filter((n) => n.localName === "th" || n.localName === "td");
 		assert.deepEqual(rows.map((row) => byClass(row, "chip").map((c) => c.className)), [["chip chip--warn"], ["chip chip--info"], []]);
@@ -626,7 +628,8 @@ describe("dashboard budget tab", { timeout: 20_000 }, () => {
 		assert.equal(text(crossed), `${claude} 7d 12.3%`, "the window that crossed the level, not the larger 5h share");
 		assert.equal(crossed.getAttribute("title").split("\n").length, 2, "every counted window is in the title");
 		assert.equal(byClass(rows[1], "share").length, 0, "no window counted this tree");
-		assert.equal(text(cells(rows[1]).at(-1)), "$96.50");
+		assert.equal(cells(rows[1]).length, 4, "session, level, total, window share");
+		assert.ok(text(cells(rows[1])[2]).includes("$150.00"));
 		assert.ok(text(cells(rows[1])[0]).includes("sid-usd-"), "a tree without a goal is named by its session id");
 		assert.equal(text(byClass(rows[2], "share")[0]), `${claude} 7d 1.6%`);
 	});

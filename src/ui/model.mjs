@@ -505,7 +505,7 @@ function othersOf(config, defaults, prefix = "") {
 /** The session-day thresholds as the settings card lays them out (#33): one row per basis, one cell per level. */
 const SESSION_DAY_LEVELS = Object.freeze(["감사", "사람 확인"]);
 const SESSION_DAY_PERCENT = Object.freeze({ labelKo: "창 기본", unit: "%", keys: ["budget.sessionDayInvestigatePercent", "budget.sessionDayPercent"] });
-const SESSION_DAY_USD = Object.freeze({ labelKo: "창 밖 비용", unit: "$", keys: ["budget.sessionDayInvestigateUsd", "budget.sessionDayUsd"] });
+const SESSION_DAY_USD = Object.freeze({ labelKo: "전체 비용", unit: "$", keys: ["budget.sessionDayInvestigateUsd", "budget.sessionDayUsd"] });
 const BURN_HOURS = Object.freeze({ key: "budget.shortMinBurnHours", labelKo: "예산 부족 판정", descKo: "소진 속도가 이 시간 넘게 이어져야 예산 부족으로 봅니다.", unit: "시간" });
 
 /**
@@ -541,7 +541,7 @@ function numberSettings(inputs) {
 	for (const name of Object.keys({ ...getPath(config, WINDOW_MAP), ...getPath(file, WINDOW_MAP) })) if (!rows.has(name)) rows.set(name, { missing: true });
 	const pair = (spec) => ({ labelKo: spec.labelKo, unit: spec.unit, cells: spec.keys.map(cell) });
 	return {
-		sessionDay: { levels: SESSION_DAY_LEVELS, rows: [pair(SESSION_DAY_PERCENT), ...Array.from(rows, ([name, window]) => windowRow(name, window)), pair(SESSION_DAY_USD)] },
+		sessionDay: { levels: SESSION_DAY_LEVELS, rows: [pair(SESSION_DAY_USD), pair(SESSION_DAY_PERCENT), ...Array.from(rows, ([name, window]) => windowRow(name, window))] },
 		numbers: [{ ...BURN_HOURS, ...cell(BURN_HOURS.key) }],
 	};
 }

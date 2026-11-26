@@ -37,7 +37,7 @@
 	const AUDIT_COLUMNS = [{ label: "시각", cls: "col-time" }, { label: "프로젝트" }, { label: "판정", cls: "col-chip" }, { label: "조언", cls: "col-advice" }, { label: "모델", cls: "col-model" }, { label: "비용", num: true }];
 	const COUPON_MAX = 20;
 	// Session-day usage (#33): one root session tree over the last 24 h; the level it crossed as a chip, named like its threshold.
-	const SESSION_DAY_COLUMNS = [{ label: "세션" }, { label: "단계", cls: "col-chip" }, { label: "합계", num: true }, { label: "창 비율", num: true }, { label: "창 밖 비용", num: true }];
+	const SESSION_DAY_COLUMNS = [{ label: "세션" }, { label: "단계", cls: "col-chip" }, { label: "합계", num: true }, { label: "창 비율", num: true }];
 	const SESSION_DAY_LEVEL = { investigate: ["감사", "info"], owner: ["사람 확인", "warn"] };
 	const ENDED_COLUMNS = [{ label: "끝난 시각", cls: "col-time" }, { label: "세션" }, { label: "결말", cls: "col-outcome" }, { label: "토큰", num: true }, { label: "이유" }, { label: "자식 · 시간 · omo", cls: "col-wide" }];
 	// 상위 모델 조사 (an audit of one session): the statuses an open detail follows on the 10 s refresh, and the token judgment as a chip tone.
@@ -1451,7 +1451,7 @@
 			el(
 				"div",
 				{ class: "split" },
-				el("div", { class: "block" }, thresholdTable(s.sessionDay), note("세션 하나(하위작업 포함)가 24시간 동안 쓴 양이 기준을 넘으면 감사하거나 사람에게 알립니다. 0이면 끕니다.")),
+				el("div", { class: "block" }, thresholdTable(s.sessionDay), note("세션 하나(하위작업 포함)가 24시간 동안 쓴 비용이나 창 몫이 기준을 넘으면 감사하거나 사람에게 알립니다. 0이면 끕니다.")),
 				el("div", { class: "block" }, s.numbers.map(numberRow)),
 			),
 		);
@@ -1600,13 +1600,13 @@
 		return el("span", { class: "share", title }, el("span", { class: "share__window", text: name(top) }), " ", el("span", { text: pct(top.percent) }));
 	}
 
-	/** Session trees of the last 24 h (#33): total with the main/sub split, the share of a window or the cost no window counts, and the level crossed. */
+	/** Session trees of the last 24 h (#33, #40): total with the main/sub split (the USD basis), the share of a window, and the level crossed. */
 	function renderSessionDay(b) {
 		const day = b?.sessionDay;
 		const sessions = listOf(day?.sessions);
 		if (!sessions.length) return empty("기록 없음");
 		return [
-			el("div", { class: "statrow" }, el("span", { class: "meta", text: "최근 24시간" }), el("span", { class: "stat__k", text: "창 밖 비용" }), stat("감사", usdLimit(day.investigateUsd)), stat("사람 확인", usdLimit(day.ownerUsd))),
+			el("div", { class: "statrow" }, el("span", { class: "meta", text: "최근 24시간" }), el("span", { class: "stat__k", text: "전체 비용" }), stat("감사", usdLimit(day.investigateUsd)), stat("사람 확인", usdLimit(day.ownerUsd))),
 			table(
 				"table--budget table--sessions",
 				SESSION_DAY_COLUMNS,
@@ -1619,7 +1619,6 @@
 							level ? chip(level[0], level[1]) : "-",
 							el("span", { class: "money" }, el("span", { text: usd(s.totalUsd) }), el("span", { class: "money__split", text: `메인 ${usd(s.mainUsd)} · 서브 ${usd(s.childUsd)}` })),
 							shareCell(s),
-							s.uncountedUsd > 0 ? usd(s.uncountedUsd) : "-",
 						],
 					};
 				}),
